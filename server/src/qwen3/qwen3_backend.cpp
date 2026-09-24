@@ -7,7 +7,7 @@
 
 #include "qwen3_backend.h"
 #include "qwen3_drafter.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 
@@ -19,8 +19,9 @@
 #include <cstdio>
 #include <cmath>
 #include <sstream>
+#include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── Cache management ───────────────────────────────────────────────────
 
@@ -76,7 +77,8 @@ void free_qwen3_snapshot(Qwen3Snapshot & s) {
 
 // ── Construction / destruction ─────────────────────────────────────────
 
-Qwen3Backend::Qwen3Backend(const Qwen3BackendConfig & cfg) : cfg_(cfg) {}
+Qwen3Backend::Qwen3Backend(Qwen3BackendConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Qwen3Backend::~Qwen3Backend() { shutdown(); }
 
@@ -90,11 +92,11 @@ bool Qwen3Backend::init() {
     }
 
     if (!load_qwen3_drafter_model(cfg_.model_path, backend_, w_)) {
-        std::fprintf(stderr, "[qwen3] model load failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "[qwen3] model load failed: %s\n", luce_last_error());
         return false;
     }
     std::printf("[qwen3] loaded %s (%d layers, hidden=%d, vocab=%d)\n",
-                cfg_.model_path, w_.n_layer, w_.n_embd, w_.n_vocab);
+                cfg_.model_path.c_str(), w_.n_layer, w_.n_embd, w_.n_vocab);
 
     if (!create_qwen3_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
         std::fprintf(stderr, "[qwen3] cache creation failed\n");
@@ -677,12 +679,19 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
 
     // Restore KV cache from snapshot
     const auto & snap = snapshots_[slot];
+    if (snap.cur_pos > (int) req.prompt.size()) {
+        std::fprintf(stderr,
+            "[pc] Qwen3 snapshot longer than prompt (%d > %zu); fresh prefill\n",
+            snap.cur_pos, req.prompt.size());
+        return generate_impl(req, io);
+    }
     for (int il = 0; il < cache_.n_layer; ++il) {
         ggml_backend_tensor_copy(snap.k_snap[il], cache_.k[il]);
         ggml_backend_tensor_copy(snap.v_snap[il], cache_.v[il]);
     }
     cache_.cur_pos = snap.cur_pos;
     const int prefix_len = snap.cur_pos;
+    result.restored_prefix_tokens = prefix_len;
 
     // Set up sampler
     sampler_ = req.sampler;
@@ -953,7 +962,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
 
     if (!drafter_loaded_) {
         if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
             if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return result;
         }
@@ -961,8 +970,10 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     }
 
     result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio);
-    result.ok = true;
+        drafter_ctx_, req.input_ids, req.keep_ratio,
+        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
+        req.score_query_end);
+    result.ok = !result.compressed_ids.empty();
 
     if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
         free_drafter();
@@ -1010,7 +1021,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
 
     if (!drafter_loaded_) {
         if (!load_drafter(drafter_path, 999, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
             if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             io.emit(-1);
             return false;
@@ -1032,7 +1043,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
 
 void Qwen3Backend::free_drafter() {
     if (drafter_loaded_) {
-        dflash::common::free_drafter(drafter_ctx_);
+        luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
     }
 }
@@ -1061,4 +1072,4 @@ void Qwen3Backend::shutdown() {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

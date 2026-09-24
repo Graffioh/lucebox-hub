@@ -32,7 +32,7 @@
 #  include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -113,7 +113,7 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
     }
     if (!draft_ok) {
         std::fprintf(stderr, "[draft-ipc-daemon] draft load failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         stream_status(stream_fd, -1);
         ggml_backend_free(backend);
         if (shared_payload && shared_payload != MAP_FAILED) {
@@ -500,4 +500,4 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
 #endif
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -1,6 +1,6 @@
 # Thinking budget — separate think vs reply token caps
 
-A design spec for `dflash_server`'s handling of "thinking" requests:
+A design spec for `luce_server`'s handling of "thinking" requests:
 prompts where the model is expected to produce an internal reasoning
 trace before its visible reply. The spec covers the request opt-in
 (including per-request budget controls), the configuration surface,
@@ -75,7 +75,7 @@ see which source supplied each value.
 ### 3.2 Server CLI
 
 ```
-dflash_server \
+luce_server \
   --think-max-tokens 32256 \         # Phase-1 ceiling
   --default-max-tokens 32768 \       # Combined ceiling when the
                                      # request omits max_tokens
@@ -205,6 +205,10 @@ ceiling (e.g. `effort: "max"` on a model whose card has no
 There are two equivalent ways a client opts into the budget envelope.
 Both unlock Level 1, Level 2, and `finish_details` emission.
 
+By themselves, `chat_template_kwargs.thinking` and
+`chat_template_kwargs.enable_thinking` only control prompt rendering. They do
+not activate the budget envelope or `finish_details` emission.
+
 ### 4.1 Anthropic-style `thinking`
 
 ```json
@@ -245,7 +249,7 @@ to pick a token number. The effective phase-1 budget is the
 `--reasoning-effort-<tier>` value at the chosen tier; the reply
 reserve falls back to `--hard-limit-reply-budget`.
 
-The five-tier vocabulary is a dflash extension to the
+The five-tier vocabulary is a luce extension to the
 OpenAI Responses three-tier (`low | medium | high`) standard.
 Clients that send only OpenAI-standard values continue to work; the
 extra tiers (`x-high`, `max`) let clients opt in to the model card's
@@ -405,7 +409,7 @@ picked one shape and tooling has fragmented around it.
 | Qwen3 native | inline `<think>...</think>` in `message.content` | not exposed |
 | OpenRouter | `message.reasoning` (flat) + `message.reasoning_details[]` (typed-block list) | `usage.completion_tokens_details.reasoning_tokens` |
 
-dflash_server emits the reasoning text under **all** of the flat-
+luce_server emits the reasoning text under **all** of the flat-
 string names plus the typed-block list, and the OpenAI-shaped token
 count, so any client written against any of these shapes works
 without per-server remapping:

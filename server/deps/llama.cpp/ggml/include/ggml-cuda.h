@@ -19,9 +19,19 @@ extern "C" {
 #endif
 #define GGML_CUDA_MAX_DEVICES       16
 
-// Maximum token width handled by the registry-aware DS4 mixed-weight MMV
-// kernels. DeepSeek4's fused verifier uses the same limit before graph build.
-#define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 4
+// Default dispatch ceiling for the registry-aware DS4 mixed-weight MMV
+// kernels. Monolithic paged serving can opt into the wider, separately tested
+// grid.z token range without changing the single-request or other-device policy.
+#define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 5
+#define GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS 16
+
+// HIP registry-only opt-in DS4V BF16 linear capability (not NVIDIA/CUDA).
+// Lookup "ggml_backend_hip_vision_bias_bf16_workspace" as size_t (*)(ggml_backend_t):
+// nonzero means the explicit op is available, and returns its retained external
+// workspace reservation (76 MiB). Unsupported op shapes must fail, not fallback.
+// "ggml_backend_hip_vision_bias_bf16_launches" has the same signature and returns
+// actual successful Lt submissions, with or without bias. Registry names retain
+// their original spelling; both modes require a matching GGML/HIP library set.
 
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
@@ -37,7 +47,8 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
 // Skip the expensive per-node CUDA/HIP graph property comparison on the
 // calling thread once a stable graph has already been captured.  Callers must
 // bracket only immutable-topology graphs whose tensor addresses and shapes do
-// not change; input contents may still be updated in place.
+// not change; input contents may still be updated in place.  Bypass requires a
+// known matching non-zero graph generation UID.
 GGML_BACKEND_API bool ggml_backend_cuda_set_skip_props_check(bool skip);
 
 // Retire CUDA/HIP graph-cache entries whose graph key points into a metadata
@@ -49,9 +60,51 @@ GGML_BACKEND_API size_t ggml_backend_cuda_graph_invalidate_range(
         const void *   begin,
         size_t         size);
 
+// Returns true when the CUDA/HIP backend has instantiated a legacy device
+// pool. Meta backends recursively inspect every rank-local backend. This lets
+// callers and tests distinguish a trimmable cache from a VMM arena.
+GGML_BACKEND_API bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend);
+
+// Release cached temporary allocations held by CUDA/HIP legacy device pools.
+// Meta backends recursively trim every rank-local backend. Each CUDA/HIP
+// backend is synchronized first, and graph executables that may reference
+// released pool blocks are retired. VMM pools are already a contiguous
+// reusable arena and are left intact. Returns total bytes released.
+GGML_BACKEND_API size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend);
+
 // Disable CUDA/HIP graph capture and replay on the calling thread. Returns the
 // previous value so scoped callers can restore nested overrides correctly.
 GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);
+
+// Number of launches of the dense F32 dim-0 concat-transpose specialization.
+// Intended for focused correctness tests of the dispatch guard.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
+
+// Calling-thread launch counters for quantized matrix-vector (MMVQ), its
+// grouped-expert MMID specialization, and matrix-matrix (MMQ) kernels.
+// Intended for focused tests that must prove which dispatch path executed
+// rather than only checking numerical output.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
+
+// Calling-thread launch counters for the scalar and grouped-column GDN
+// kernels. Focused qualification tests use these to reject silent fallback.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void);
+GGML_BACKEND_API bool ggml_backend_cuda_supports_gdn_grouped_cols(int device);
+
+// Calling-thread launch counter for the head-size-256 MMA fattn kernel.
+// Qualification tests use this to reject silent fallback to the tile kernel.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_mma256_launch_count(void);
+
+// Calling-thread launch counter for the head-size-256 rocWMMA fattn kernel.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void);
+
+// Calling-thread launch counter for the head-size-256 WMMA paged-attention
+// kernel (stage-1; gated by LUCE_PAGED_WMMA).
+GGML_BACKEND_API size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void);
 
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
@@ -69,11 +122,25 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
+// Current compute stream of a CUDA/HIP backend (cudaStream_t / hipStream_t
+// returned as an opaque pointer), so work submitted outside ggml can be
+// enqueued stream-ordered with the kernels of the same backend instead of
+// synchronizing the host. The stream is created lazily on first use.
+// Returns NULL for non-CUDA/HIP backends.
+GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+
+// Device ordinal the backend was created for, or -1 for non-CUDA/HIP backends.
+GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
+
 // Override the plain quantized MUL_MAT MMVQ column ceiling on the calling
 // thread. Pass zero to restore LUCE_MMVQ_MAX_NCOLS. This is intentionally
 // thread-local so one graph builder can select a safe topology without
 // changing concurrent requests or other CUDA/HIP backends.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
+
+// Calling-thread DS4 mixed-expert dispatch ceiling, scoped to a graph compute.
+// Accepts 0 (the default of five) or 1..16; returns the previous ceiling.
+GGML_BACKEND_API int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
@@ -87,6 +154,63 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 // ggml_backend_graph_compute() producing `logits` has returned.
 GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * logits, int k,
                                                   float * probs_out, int32_t * ids_out);
+
+// Batched concurrent-tree commit. Validation is fail-closed before any kernel
+// launches; all layer replay logs and convolution windows commit on one device
+// synchronization.
+GGML_BACKEND_API bool ggml_backend_cuda_gdn_replay_log_commit_many(
+        const struct ggml_tensor * const * replay_logs,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids);
+
+// Promote accepted packed-tree K/V scratch rows into pager-owned rows.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_cache_commit_many(
+        struct ggml_tensor * const * caches, int n_caches,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base, int tree_scratch_stride);
+
+// Promote accepted BF16 tree feature rows into slot-local feature rings.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_feature_commit(
+        const struct ggml_tensor * source, struct ggml_tensor * destination,
+        const struct ggml_tensor * destination_rows);
+
+// Validate every packed-tree destination before changing any cache. Once the
+// first kernel launches, a device failure is fatal because fallback cannot
+// recover from a partially committed state.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
+        struct ggml_tensor * const * caches,
+        int n_caches,
+        const struct ggml_tensor * feature_source,
+        struct ggml_tensor * feature_destination,
+        const struct ggml_tensor * feature_destination_rows,
+        const struct ggml_tensor * const * replay_logs,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride);
+
+// Attach learned per-expert decode tables to a mixed-precision tensor. The
+// host variants copy the tables to the device that owns `base`. Call the
+// matching unregister function before releasing the tensor's backing buffer.
+// Returns false without registering when validation or device setup fails.
+GGML_BACKEND_API bool ggml_cuda_rocmfp3_mix_register_host(
+        const void * base, size_t expert_stride, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host);
+GGML_BACKEND_API bool ggml_cuda_rocmfp2_mix_register_host(
+        const void * base, size_t expert_stride, int n_experts, int out, int in,
+        const void * codebooks_bf16_host, const uint8_t * modes_host);
+GGML_BACKEND_API void ggml_cuda_rocmfp2_mix_unregister(const void * base);
+GGML_BACKEND_API void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
 #ifdef  __cplusplus
 }

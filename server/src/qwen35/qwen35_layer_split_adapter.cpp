@@ -4,6 +4,7 @@
 
 #include "common/backend_precision.h"
 #include "common/chain_rollback_policy.h"
+#include "common/draft_swa.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -12,6 +13,7 @@
 #include "common/snapshot_backend.h"
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
+#include "qwen35/prefill_helpers.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 #include "kv_quant.h"
@@ -25,12 +27,13 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
-        const Qwen35LayerSplitAdapterConfig & cfg)
-    : cfg_(cfg) {}
+        Qwen35LayerSplitAdapterConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
 
@@ -40,7 +43,7 @@ bool Qwen35LayerSplitAdapter::init() {
     }
 
     const LayerSplitRuntimeInit runtime_cfg{
-        cfg_.target_path,
+        cfg_.target_path.c_str(),
         &cfg_.device,
         "target-split",
     };
@@ -72,7 +75,7 @@ bool Qwen35LayerSplitAdapter::init() {
         if (!load_target_gguf_partial(cfg_.target_path, shard.backend, plan,
                                       shard.weights)) {
             std::fprintf(stderr, "[target-split] load gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -96,7 +99,7 @@ bool Qwen35LayerSplitAdapter::init() {
                                              cfg_.run_dflash &&
                                              split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "[target-split] cache gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             return false;
         }
         std::fprintf(stderr, "[target-split] gpu=%d layers=[%d,%d)\n",
@@ -125,16 +128,16 @@ bool Qwen35LayerSplitAdapter::init() {
 }
 
 void Qwen35LayerSplitAdapter::kvflash_read_config() {
-    if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
+    if (!std::getenv("LUCE_KVFLASH") || shards_.empty()) return;
     const bool target_shard_split =
         cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled();
     kvflash_drafter_path_ = target_shard_split
         ? std::string{}
-        : kvflash_find_drafter(cfg_.target_path);
+        : kvflash_find_drafter(cfg_.target_path.c_str());
 
     ggml_type kv_k = GGML_TYPE_Q8_0;
     ggml_type kv_v = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k, kv_v);
+    luce::resolve_kv_types(kv_k, kv_v);
 
     int64_t min_free = std::numeric_limits<int64_t>::max();
     int64_t max_bytes_per_token = 0;
@@ -167,7 +170,7 @@ void Qwen35LayerSplitAdapter::kvflash_read_config() {
         cfg_.device.max_ctx, KvFlashConfig{},
         !kvflash_drafter_path_.empty(), budget);
     if (kvflash_tokens_ > 0) {
-        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        const char * tau = std::getenv("LUCE_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
     }
 }
@@ -251,7 +254,7 @@ void Qwen35LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
                 std::fprintf(stderr,
                     "[target-split][kvflash] drafter load failed (%s); "
                     "staying on LRU residency\n",
-                    dflash27b_last_error());
+                    luce_last_error());
                 kvflash_drafter_failed_ = true;
                 return;
             }
@@ -295,7 +298,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
     const size_t remote_begin = mixed_plan.remote_begin;
     const PlacementBackend remote_backend = mixed_plan.remote_backend;
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const auto info = inspect_gguf_model_info(cfg_.target_path.c_str());
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr, "[target-split] failed to inspect target layer count\n");
@@ -332,7 +335,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
         if (!load_target_gguf_partial(cfg_.target_path, local.backend, local_plan,
                                       local.weights)) {
             std::fprintf(stderr, "[target-split] mixed local load gpu=%d: %s\n",
-                         local.gpu, dflash27b_last_error());
+                         local.gpu, luce_last_error());
             return false;
         }
     }
@@ -354,7 +357,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
                                          /*allocate_target_feat=*/false,
                                          kvflash_tokens_)) {
             std::fprintf(stderr, "[target-split] mixed local cache gpu=%d: %s\n",
-                         local.gpu, dflash27b_last_error());
+                         local.gpu, luce_last_error());
             return false;
         }
     }
@@ -429,7 +432,8 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
             : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+        if (!remote_draft_.start(
+                cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
             std::fprintf(stderr,
@@ -437,9 +441,9 @@ bool Qwen35LayerSplitAdapter::load_draft() {
                 cfg_.draft_gpu);
             return false;
         }
-        draft_weights_.n_embd = DFLASH27B_TARGET_HIDDEN;
-        draft_weights_.block_size = DFLASH27B_DRAFT_BLOCK_SIZE;
-        draft_weights_.n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        draft_weights_.n_embd = LUCE_TARGET_HIDDEN;
+        draft_weights_.block_size = LUCE_DRAFT_BLOCK_SIZE;
+        draft_weights_.n_target_layers = LUCE_DRAFT_N_TARGET_LAYERS;
         if (cfg_.draft_swa_window > 0) {
             draft_weights_.swa_window = cfg_.draft_swa_window;
         }
@@ -466,20 +470,24 @@ bool Qwen35LayerSplitAdapter::load_draft() {
         draft_backend_owned_ = true;
     }
 
-    std::string draft_path(cfg_.draft_path ? cfg_.draft_path : "");
+    const std::string & draft_path = *cfg_.draft_path;
     const bool draft_ok = draft_path.size() >= 5 &&
             draft_path.substr(draft_path.size() - 5) == ".gguf"
-        ? load_draft_gguf(cfg_.draft_path, draft_backend_, draft_weights_,
+        ? load_draft_gguf(*cfg_.draft_path, draft_backend_, draft_weights_,
                           &shards_.front().weights)
-        : load_draft_safetensors(cfg_.draft_path, draft_backend_,
+        : load_draft_safetensors(*cfg_.draft_path, draft_backend_,
                                  draft_weights_, &shards_.front().weights);
     if (!draft_ok) {
         std::fprintf(stderr, "[target-split] draft load gpu=%d: %s\n",
-                     cfg_.draft_gpu, dflash27b_last_error());
+                     cfg_.draft_gpu, luce_last_error());
         return false;
     }
     if (cfg_.draft_swa_window > 0) {
-        draft_weights_.swa_window = cfg_.draft_swa_window;
+        const DraftSwaOverrideResult swa =
+            apply_draft_swa_window_override(
+                draft_weights_, cfg_.draft_swa_window);
+        std::fprintf(stderr, "[target-split] draft SWA layers: %d/%d (window=%d)\n",
+                     swa.swa_layers, swa.total_layers, swa.effective_window);
     }
 
     const int cap = std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
@@ -534,10 +542,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
             base_pos, (size_t)base_pos + prompt.size(), cfg_.device.max_ctx);
         return false;
     }
-    int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        ubatch = std::max(1, std::atoi(s));
-    }
+    const int ubatch = qwen35_prefill_ubatch(
+        cfg_.chunk > 0 ? cfg_.chunk : 512);
     if (use_mixed_target_split()) {
         const bool ok = run_qwen35_mixed_layer_split_forward(
             shards_, remote_target_shard_, shards_.front().weights,
@@ -1372,7 +1378,7 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
                           pflash_drafter_)) {
             std::fprintf(stderr,
                          "[target-split][compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             return result;
         }
         pflash_drafter_loaded_ = true;
@@ -1380,7 +1386,9 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
     }
 
     result.compressed_ids = drafter_score_and_compress(
-        pflash_drafter_, req.input_ids, req.keep_ratio);
+        pflash_drafter_, req.input_ids, req.keep_ratio,
+        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
+        req.score_query_end);
     result.ok = !result.compressed_ids.empty();
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
@@ -1392,12 +1400,12 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
 void Qwen35LayerSplitAdapter::free_drafter() {
     remote_draft_.close();
     if (pflash_drafter_loaded_) {
-        dflash::common::free_drafter(pflash_drafter_);
+        luce::common::free_drafter(pflash_drafter_);
         pflash_drafter_loaded_ = false;
     }
     kvflash_scorer_.reset();
     if (kvflash_drafter_loaded_) {
-        dflash::common::free_drafter(kvflash_drafter_);
+        luce::common::free_drafter(kvflash_drafter_);
         kvflash_drafter_loaded_ = false;
     }
     step_graph_destroy(draft_sg_);
@@ -1445,4 +1453,4 @@ void Qwen35LayerSplitAdapter::shutdown() {
     shards_.clear();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

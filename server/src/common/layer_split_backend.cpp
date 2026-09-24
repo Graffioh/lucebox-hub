@@ -9,7 +9,7 @@
 #include <cmath>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 LayerSplitBackend::LayerSplitBackend(std::unique_ptr<LayerSplitAdapter> adapter)
     : adapter_(std::move(adapter)) {}
@@ -193,8 +193,10 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
     GenerateRequest delta_req = req;
     delta_req.prompt = std::vector<int32_t>(
         req.prompt.begin() + snap_pos, req.prompt.end());
-    return run_from_state(delta_req, io, snap_pos, /*reset_state=*/false,
-                          req.prompt);
+    result = run_from_state(delta_req, io, snap_pos, /*reset_state=*/false,
+                            req.prompt);
+    if (result.ok()) result.restored_prefix_tokens = snap_pos;
+    return result;
 }
 
 ModelBackend::CompressResult
@@ -278,4 +280,4 @@ void LayerSplitBackend::shutdown() {
     if (adapter_) adapter_->shutdown();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

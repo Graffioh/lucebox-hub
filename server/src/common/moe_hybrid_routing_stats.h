@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridRoutingStats {
     int n_layer       = 0;
@@ -24,6 +24,7 @@ struct MoeHybridRoutingStats {
 
     bool init(int n_layer, int n_expert, int n_expert_used);
     bool init(const MoeHybridConfig & cfg);
+    bool valid(std::string * err = nullptr) const;
     bool matches(int n_layer, int n_expert, int n_expert_used) const;
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
@@ -50,4 +51,4 @@ private:
     size_t index_of(int layer_idx, int expert_idx) const;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

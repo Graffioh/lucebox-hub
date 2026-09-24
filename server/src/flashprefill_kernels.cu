@@ -35,18 +35,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include "device_runtime.h"
-#if !defined(DFLASH27B_BACKEND_HIP)
+#if !defined(LUCE_BACKEND_HIP)
 #include <mma.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // ── cp.async helpers (sm_8x) ─────────────────────────────────────────
 // 16-byte (uint4) async global → shared copy. Issued by every thread that
 // participates in the cooperative load. wait_all() drains all outstanding
 // transfers; commit_group()/wait_group(N) supports multi-stage pipelines.
-#if !defined(DFLASH27B_BACKEND_HIP)
+#if !defined(LUCE_BACKEND_HIP)
 __device__ inline void cp_async16(void * smem_ptr, const void * gmem_ptr) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
@@ -279,7 +279,7 @@ extern "C" void launch_compute_block_score_bf16(
 // QK / softmax / PV reduction reading from shared mem. This avoids
 // re-loading K/V from HBM Q_TILE times per row, which was the dominant
 // cost of the v1 scalar kernel.
-#if !defined(DFLASH27B_BACKEND_HIP)
+#if !defined(LUCE_BACKEND_HIP)
 template <int Q_TILE, int K_TILE, int BLOCK, int D_HEAD>
 __global__ void sparse_flash_forward_kernel_bf16(
     const __nv_bfloat16 * __restrict__ Q,
@@ -878,9 +878,9 @@ extern "C" void launch_sparse_flash_forward_bf16(
     const int M = (seq_len + block_size - 1) / block_size;
     const int q_tiles = (seq_len + q_tile - 1) / q_tile;
     dim3 grid(q_tiles, batch * n_q_heads, 1);
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     if (q_tile == 64 && block_size == 128 && head_dim == 128) {
-        if (std::getenv("DFLASH_FP_HIP_ROW") == nullptr) {
+        if (std::getenv("LUCE_FP_HIP_ROW") == nullptr) {
             constexpr int HIP_WAVE = 32;
             constexpr int HIP_Q_ROWS = 4;
             constexpr int HIP_K_TILE = 32;
@@ -1046,6 +1046,6 @@ extern "C" void launch_block_select(
 }
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common
 
 #endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800

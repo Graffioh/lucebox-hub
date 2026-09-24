@@ -1200,9 +1200,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_GROUPED_SRC",
 
     "PAGED_ATTN",
+    "MUL_MAT_BIAS_BF16",
+    "RMS_NORM_VISION_F32",
+    "SOFT_MAX_VISION_F32",
+    "MUL_MAT_VISION_AV_F32",
+    "DS4_MOE_COMBINE",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1327,9 +1332,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*grouped(Y)",
 
     "paged_attn(q,k,v)",
+    "bf16(X*Y+bias)",
+    "rms_norm_vision_f32(x)",
+    "soft_max_vision_f32(x)",
+    "vision_av_f32(v,p)",
+    "ds4_moe_combine(down,w,shared)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3308,6 +3318,62 @@ struct ggml_tensor * ggml_rms_norm_inplace(
     return ggml_rms_norm_impl(ctx, a, eps, true);
 }
 
+// ggml_rms_norm_vision_f32
+
+struct ggml_tensor * ggml_rms_norm_vision_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 eps) {
+    GGML_ASSERT(a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(a->ne[0] == 1024 && a->ne[1] >= 16 && a->ne[1] <= INT_MAX/1024);
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(isfinite(eps) && eps >= 0.0f);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params(result, &eps, sizeof(eps));
+    result->op = GGML_OP_RMS_NORM_VISION_F32;
+    result->src[0] = a;
+    return result;
+}
+
+// ggml_soft_max_vision_f32
+
+struct ggml_tensor * ggml_soft_max_vision_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores) {
+    GGML_ASSERT(scores && scores->type == GGML_TYPE_F32);
+    GGML_ASSERT(scores->ne[0] >= 16 && scores->ne[0] <= 4096);
+    int64_t elements = scores->ne[0];
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        GGML_ASSERT(scores->ne[i] > 0 && scores->ne[i] <= (INT_MAX/(int64_t)sizeof(float))/elements);
+        elements *= scores->ne[i];
+    }
+    GGML_ASSERT(ggml_is_contiguous(scores));
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, scores);
+    result->op = GGML_OP_SOFT_MAX_VISION_F32;
+    result->src[0] = scores;
+    return result;
+}
+
+// ggml_mul_mat_vision_av_f32
+
+struct ggml_tensor * ggml_mul_mat_vision_av_f32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * probabilities) {
+    GGML_ASSERT(v && probabilities && v->type == GGML_TYPE_F32 && probabilities->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->ne[0] == 64 && v->ne[1] == 16 && v->ne[3] == 1);
+    const int64_t n = v->ne[2];
+    GGML_ASSERT(n >= 16 && n <= 4096);
+    GGML_ASSERT(probabilities->ne[0] == n && probabilities->ne[1] == n &&
+                probabilities->ne[2] == 16 && probabilities->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(v) && ggml_is_contiguous(probabilities));
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, n, 16);
+    result->op = GGML_OP_MUL_MAT_VISION_AV_F32;
+    result->src[0] = v;
+    result->src[1] = probabilities;
+    return result;
+}
+
 // ggml_rms_norm_back
 
 struct ggml_tensor * ggml_rms_norm_back(
@@ -3419,6 +3485,25 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_bias_bf16(
+        struct ggml_context * ctx, struct ggml_tensor * w,
+        struct ggml_tensor * x, struct ggml_tensor * b) {
+    GGML_ASSERT(w && x);
+    GGML_ASSERT(w->type == GGML_TYPE_BF16 && x->type == GGML_TYPE_BF16);
+    GGML_ASSERT(ggml_is_contiguous(w) && ggml_is_contiguous(x));
+    GGML_ASSERT(w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(w->ne[0] > 0 && w->ne[0] <= INT_MAX && w->ne[1] > 0 && w->ne[1] <= INT_MAX);
+    GGML_ASSERT(x->ne[0] == w->ne[0] && x->ne[1] > 0 && x->ne[1] <= INT_MAX);
+    if (b) {
+        GGML_ASSERT(b->type == GGML_TYPE_BF16 && ggml_is_contiguous(b));
+        GGML_ASSERT(b->ne[0] == w->ne[1] && ggml_is_vector(b));
+    }
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, w->ne[1], x->ne[1]);
+    result->op = GGML_OP_MUL_MAT_BIAS_BF16;
+    result->src[0] = w; result->src[1] = x; result->src[2] = b;
+    return result;
+}
+
 struct ggml_tensor * ggml_mul_mat_grouped_src(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3458,6 +3543,23 @@ void ggml_mul_mat_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+void ggml_mul_mat_set_mixed_mmq(
+        struct ggml_tensor * op, enum ggml_mixed_mmq_policy policy) {
+    GGML_ASSERT(op->op == GGML_OP_MUL_MAT ||
+                op->op == GGML_OP_MUL_MAT_ID ||
+                op->op == GGML_OP_MUL_MAT_GROUPED_SRC);
+    GGML_ASSERT(policy >= GGML_MIXED_MMQ_DEFAULT && policy <= GGML_MIXED_MMQ_ENABLED);
+    // Word 0 is precision; word 14 is the grouped-source group count.
+    ggml_set_op_params_i32(op, 15, (int32_t) policy);
+}
+
+enum ggml_mixed_mmq_policy ggml_mul_mat_get_mixed_mmq(const struct ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_MUL_MAT ||
+                op->op == GGML_OP_MUL_MAT_ID ||
+                op->op == GGML_OP_MUL_MAT_GROUPED_SRC);
+    return (enum ggml_mixed_mmq_policy) ggml_get_op_params_i32(op, 15);
 }
 
 // ggml_mul_mat_id
@@ -4036,20 +4138,16 @@ struct ggml_tensor * ggml_transpose(
 
 // ggml_get_rows
 
-struct ggml_tensor * ggml_get_rows(
+static struct ggml_tensor * ggml_get_rows_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
+        struct ggml_tensor  * b,
+        enum ggml_type        type) {
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(a->ne[3] == b->ne[2]);
     GGML_ASSERT(b->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_I32);
 
-    // TODO: implement non F32 return
-    enum ggml_type type = GGML_TYPE_F32;
-    if (a->type == GGML_TYPE_I32) {
-        type = a->type;
-    }
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
 
     result->op     = GGML_OP_GET_ROWS;
@@ -4057,6 +4155,16 @@ struct ggml_tensor * ggml_get_rows(
     result->src[1] = b;
 
     return result;
+}
+
+struct ggml_tensor * ggml_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    // TODO: implement other non-F32 return types where callers need them.
+    const enum ggml_type type = a->type == GGML_TYPE_I32
+        ? GGML_TYPE_I32 : GGML_TYPE_F32;
+    return ggml_get_rows_impl(ctx, a, b, type);
 }
 
 // ggml_get_rows_back
@@ -4107,6 +4215,16 @@ struct ggml_tensor * ggml_set_rows(
     result->src[1] = c;
     result->src[2] = a; // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
 
+    return result;
+}
+
+struct ggml_tensor * ggml_set_rows_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    struct ggml_tensor * result = ggml_set_rows(ctx, a, b, c);
+    ggml_set_op_params_i32(result, 0, 1);
     return result;
 }
 
@@ -4254,6 +4372,33 @@ struct ggml_tensor * ggml_soft_max_ext_inplace(
         float                 scale,
         float                 max_bias) {
     return ggml_soft_max_impl(ctx, a, mask, scale, max_bias, true);
+}
+
+struct ggml_tensor * ggml_soft_max_ext_sink_col(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * sinks,
+        float                 scale) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(sinks && sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_nelements(sinks) == ggml_nrows(a));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[3] = { 0, 0, /*sink_col*/ 1 };
+    const float max_bias = 0.0f;
+    memcpy(params + 0, &scale,    sizeof(float));
+    memcpy(params + 1, &max_bias, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_SOFT_MAX;
+    result->src[0] = a;
+    result->src[1] = NULL;
+    result->src[2] = sinks;
+
+    return result;
 }
 
 void ggml_soft_max_add_sinks(
@@ -5586,6 +5731,54 @@ void ggml_flash_attn_ext_set_ds4_sparse(
     ggml_set_op_params_i32(a, 6, (int32_t) packed_layout);
 }
 
+void ggml_flash_attn_ext_set_ds4_indexer_topk(
+        struct ggml_tensor * a,
+        struct ggml_tensor * selected) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(selected && selected->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(selected));
+    const int32_t keep_rows = ggml_get_op_params_i32(a, 5);
+    GGML_ASSERT(keep_rows < 0 && keep_rows != INT32_MIN);
+    GGML_ASSERT(selected->ne[0] == -(int64_t) keep_rows);
+    GGML_ASSERT(selected->ne[1] == a->src[0]->ne[1]);
+    GGML_ASSERT(selected->ne[2] == 1 && selected->ne[3] == 1);
+    a->src[5] = selected;
+}
+
+void ggml_flash_attn_ext_set_ds4_kv_segments(
+        struct ggml_tensor * a,
+        struct ggml_tensor * compressed,
+        struct ggml_tensor * preserved_tail) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    // src[6] carries optional RoPE positions (main); segments use src[7]/src[8].
+    GGML_ASSERT(a->src[7] == NULL && a->src[8] == NULL);
+    // The only segmented kernel reads one latent K/V tensor (MLA).
+    GGML_ASSERT(a->src[1] == a->src[2]);
+    GGML_ASSERT(compressed && preserved_tail);
+    GGML_ASSERT(compressed->type == a->src[1]->type);
+    GGML_ASSERT(preserved_tail->type == a->src[1]->type);
+    GGML_ASSERT(compressed->ne[0] == a->src[1]->ne[0]);
+    GGML_ASSERT(preserved_tail->ne[0] == a->src[1]->ne[0]);
+    GGML_ASSERT(compressed->ne[2] == 1 && compressed->ne[3] == 1);
+    GGML_ASSERT(preserved_tail->ne[2] == 1 && preserved_tail->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(compressed));
+    GGML_ASSERT(ggml_is_contiguous(preserved_tail));
+    a->src[7] = compressed;
+    a->src[8] = preserved_tail;
+}
+
+void ggml_flash_attn_ext_set_ds4_causal_ratio(
+        struct ggml_tensor * a,
+        int                  ratio) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ratio > 0 && ratio <= 0xffff);
+    const uint32_t flags =
+        (uint32_t) ggml_get_op_params_i32(a, 7) & 0x0000ffffu;
+    ggml_set_op_params_i32(
+        a, 7, (int32_t) (flags | ((uint32_t) ratio << 16)));
+}
+
 void ggml_flash_attn_ext_set_ds4_inverse_rope(
         struct ggml_tensor * a,
         int                  kv_start,
@@ -5601,7 +5794,12 @@ void ggml_flash_attn_ext_set_ds4_inverse_rope(
     GGML_ASSERT(kv_start >= 0);
     // Bit 0: inverse RoPE on attention output. Bit 1: Q still needs forward
     // RoPE. Both directions share the position and YaRN parameters below.
-    ggml_set_op_params_i32(a, 7, 1 | (q_unrotated ? 2 : 0));
+    // Preserve optional DS4 causal-layout metadata in the upper 16 bits so
+    // callers can configure these independent features in either order.
+    const uint32_t causal_ratio =
+        (uint32_t) ggml_get_op_params_i32(a, 7) & 0xffff0000u;
+    ggml_set_op_params_i32(
+        a, 7, (int32_t) (causal_ratio | 1u | (q_unrotated ? 2u : 0u)));
     ggml_set_op_params_i32(a, 8, kv_start);
     ggml_set_op_params_f32(a, 9, freq_base);
     ggml_set_op_params_f32(a, 10, freq_scale);
@@ -5610,6 +5808,19 @@ void ggml_flash_attn_ext_set_ds4_inverse_rope(
     ggml_set_op_params_f32(a, 13, beta_fast);
     ggml_set_op_params_f32(a, 14, beta_slow);
     ggml_set_op_params_i32(a, 15, n_ctx_orig);
+}
+
+void ggml_flash_attn_ext_set_ds4_rope_positions(
+        struct ggml_tensor * a,
+        struct ggml_tensor * positions) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT((ggml_get_op_params_i32(a, 7) & 1) != 0);
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(positions && positions->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(positions));
+    GGML_ASSERT(positions->ne[0] == a->src[0]->ne[1]);
+    GGML_ASSERT(positions->ne[1] == 1 && positions->ne[2] == 1 && positions->ne[3] == 1);
+    a->src[6] = positions;
 }
 
 bool ggml_flash_attn_ext_is_ds4(const struct ggml_tensor * a) {
@@ -5672,21 +5883,43 @@ struct ggml_tensor * ggml_flash_attn_sparse(
 
 // ggml_paged_attn
 
-struct ggml_tensor * ggml_paged_attn(
+static struct ggml_tensor * ggml_paged_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * block_table,
         struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
         float                 scale,
         int                   block_size,
-        int                   max_kv_seq_len) {
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_width,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(block_table->type == GGML_TYPE_I32);
     GGML_ASSERT(kv_seq_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(active_slot_ids == NULL || active_slot_ids->type == GGML_TYPE_I32);
+    // Ragged causal positions only make sense for compact batches that carry
+    // an explicit row -> block-table-column mapping.
+    GGML_ASSERT(query_positions == NULL || active_slot_ids != NULL);
+    GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
+
+    const bool tree_mode = parent_ids != NULL || tree_sizes != NULL;
+    GGML_ASSERT((parent_ids == NULL) == (tree_sizes == NULL));
+    GGML_ASSERT(!tree_mode || active_slot_ids != NULL);
+    // Mixed direct-commit batches use causal positions for a compact AR
+    // prefix and -1 for the fixed-width tree tail. Pure trees keep this null.
+    GGML_ASSERT(!tree_mode || query_positions == NULL ||
+                query_positions->ne[0] == q->ne[1]);
+    GGML_ASSERT(!tree_mode || parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(!tree_mode || tree_sizes->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5696,21 +5929,71 @@ struct ggml_tensor * ggml_paged_attn(
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
 
     GGML_ASSERT(block_table->ne[0] > 0);
-    GGML_ASSERT(block_table->ne[1] == q->ne[1]);
     GGML_ASSERT(block_table->ne[2] == 1 && block_table->ne[3] == 1);
-    GGML_ASSERT(kv_seq_lens->ne[0] == q->ne[1]);
+    GGML_ASSERT(block_table->ne[1] == kv_seq_lens->ne[0]);
     GGML_ASSERT(kv_seq_lens->ne[1] == 1 && kv_seq_lens->ne[2] == 1 && kv_seq_lens->ne[3] == 1);
+    if (active_slot_ids) {
+        GGML_ASSERT(ggml_is_contiguous(active_slot_ids));
+        // Compact/ragged batches: n_query stays decoupled from the number of
+        // physical block-table columns (block_table->ne[1]).
+        GGML_ASSERT(active_slot_ids->ne[0] == q->ne[1]);
+        GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
+        if (query_positions) {
+            GGML_ASSERT(ggml_is_contiguous(query_positions));
+            GGML_ASSERT(query_positions->ne[0] == q->ne[1]);
+            GGML_ASSERT(query_positions->ne[1] == 1 && query_positions->ne[2] == 1 && query_positions->ne[3] == 1);
+        }
+    } else {
+        GGML_ASSERT(block_table->ne[1] == q->ne[1]);
+    }
 
     GGML_ASSERT(block_size > 0);
     GGML_ASSERT(k->ne[1] % block_size == 0);
     GGML_ASSERT(max_kv_seq_len > 0);
-    GGML_ASSERT(max_kv_seq_len <= k->ne[1]);
+    // This is a padded logical launch bound, not a physical-cache extent.
+    // Each row clamps its actual sequence length to the block-table capacity
+    // and validates every resolved physical block before dereferencing K/V.
+    GGML_ASSERT((int64_t) max_kv_seq_len + tree_width <= INT32_MAX);
+
+    if (tree_mode) {
+        GGML_ASSERT(tree_width > 0);
+        GGML_ASSERT(tree_scratch_base > 0);
+        GGML_ASSERT(tree_scratch_base % block_size == 0);
+        GGML_ASSERT(tree_scratch_stride >= tree_width);
+        GGML_ASSERT(ggml_is_contiguous(parent_ids));
+        GGML_ASSERT(ggml_is_contiguous(tree_sizes));
+        GGML_ASSERT(parent_ids->ne[0] == tree_width);
+        GGML_ASSERT(parent_ids->ne[1] == tree_sizes->ne[0]);
+        GGML_ASSERT(parent_ids->ne[2] == 1 && parent_ids->ne[3] == 1);
+        GGML_ASSERT(tree_sizes->ne[1] == 1 && tree_sizes->ne[2] == 1 && tree_sizes->ne[3] == 1);
+        GGML_ASSERT(parent_ids->ne[1] > 0);
+        GGML_ASSERT(parent_ids->ne[1] <= INT64_MAX / tree_width);
+        const int64_t tree_rows = parent_ids->ne[1] * tree_width;
+        GGML_ASSERT(q->ne[1] >= tree_rows);
+        GGML_ASSERT(query_positions || q->ne[1] == tree_rows);
+
+        // Every physical sequence slot owns one non-overlapping scratch slab.
+        // Bound the largest address with int64 arithmetic before the GPU sees
+        // the int32 op parameters.
+        const int64_t scratch_end =
+            (int64_t) tree_scratch_base +
+            (block_table->ne[1] - 1) * (int64_t) tree_scratch_stride +
+            tree_width;
+        GGML_ASSERT(scratch_end <= k->ne[1]);
+    } else {
+        GGML_ASSERT(tree_width == 0);
+        GGML_ASSERT(tree_scratch_base == 0);
+        GGML_ASSERT(tree_scratch_stride == 0);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, block_size);
     ggml_set_op_params_i32(result, 2, max_kv_seq_len);
+    ggml_set_op_params_i32(result, 3, tree_width);
+    ggml_set_op_params_i32(result, 4, tree_scratch_base);
+    ggml_set_op_params_i32(result, 5, tree_scratch_stride);
 
     result->op     = GGML_OP_PAGED_ATTN;
     result->src[0] = q;
@@ -5718,8 +6001,56 @@ struct ggml_tensor * ggml_paged_attn(
     result->src[2] = v;
     result->src[3] = block_table;
     result->src[4] = kv_seq_lens;
+    result->src[5] = active_slot_ids;
+    result->src[6] = query_positions;
+    result->src[7] = parent_ids;
+    result->src[8] = tree_sizes;
 
     return result;
+}
+
+struct ggml_tensor * ggml_paged_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens,
+        active_slot_ids, query_positions, scale, block_size,
+        max_kv_seq_len, NULL, NULL, 0, 0, 0);
+}
+
+struct ggml_tensor * ggml_paged_attn_ext_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->ne[0] > 0 && parent_ids->ne[0] <= INT_MAX);
+    const int tree_width = (int) parent_ids->ne[0];
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens,
+        active_slot_ids, query_positions, scale, block_size,
+        max_kv_seq_len, parent_ids, tree_sizes, tree_width,
+        tree_scratch_base, tree_scratch_stride);
 }
 
 // ggml_flash_attn_back
@@ -5841,6 +6172,205 @@ struct ggml_tensor * ggml_ssm_conv_tree(
 
     result->src[2] = parent_ids;
 
+    return result;
+}
+
+// dflash: fused conv step. Same op id as ggml_ssm_conv; op_params[0] = 2
+// marks step mode (1 is the SpecLA layout), srcs are
+// (x, c, conv_state, conv_input_out).
+struct ggml_tensor * ggml_ssm_conv_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * conv_state,
+        struct ggml_tensor  * conv_input_out) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    // The CUDA/HIP step kernel instantiates K in {3, 4, 5, 9}; other tap
+    // counts would load fine and abort on the first decode.
+    GGML_ASSERT(d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9);
+    GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_state->ne[1] == d_inner);
+    GGML_ASSERT(conv_state->ne[2] == n_s);
+    GGML_ASSERT(conv_state->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_state->nb[1] == (size_t)(d_conv - 1) * sizeof(float));
+    if (conv_input_out) {
+        GGML_ASSERT(conv_input_out->type == GGML_TYPE_F32);
+        GGML_ASSERT(conv_input_out->ne[0] >= d_conv - 1 + n_t);
+        GGML_ASSERT(conv_input_out->ne[1] == d_inner);
+        GGML_ASSERT(conv_input_out->ne[2] == n_s);
+        GGML_ASSERT(conv_input_out->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+    ggml_set_op_params_i32(result, 0, 2);   // step mode (1 = SpecLA heavy-light conv)
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = conv_state;
+    result->src[3] = conv_input_out;
+
+    return result;
+}
+
+// dflash: tree-window conv step (see ggml.h). op_params[0] = 4; srcs are
+// (x, c, conv_state, state_slot_ids, parent_ids). The packed result carries
+// silu(conv) [C, T, S] followed by the window [K-1+T, C, S].
+struct ggml_tensor * ggml_ssm_conv_tree_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * conv_state,
+        struct ggml_tensor  * state_slot_ids,
+        struct ggml_tensor  * parent_ids) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_slot_ids != NULL && state_slot_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(parent_ids != NULL && parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(conv_state));
+    GGML_ASSERT(ggml_is_contiguous(state_slot_ids));
+    GGML_ASSERT(ggml_is_contiguous(parent_ids));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    GGML_ASSERT(d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9);
+    GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_state->ne[1] == d_inner);
+    GGML_ASSERT(conv_state->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(state_slot_ids) == n_s);
+    GGML_ASSERT(ggml_nelements(parent_ids) == n_t * n_s);
+
+    const int64_t packed = d_inner * n_t * n_s + (d_conv - 1 + n_t) * d_inner * n_s;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, packed);
+    ggml_set_op_params_i32(result, 0, 4);   // tree-window step mode
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = conv_state;
+    result->src[3] = state_slot_ids;
+    result->src[4] = parent_ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dflash_dyn_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * dyn,
+        int                   site,
+        int                   kernel,
+        int                   group_size) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dyn->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dyn));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(group_size > 0 && x->ne[0] % group_size == 0);
+    GGML_ASSERT(kernel > 0 && site >= 0);
+    GGML_ASSERT(dyn->ne[1] == x->ne[1]);
+    GGML_ASSERT(dyn->ne[0] >= (int64_t)(site + 1) * kernel * (x->ne[0] / group_size));
+    // base is [hidden, K, 2] (per-tap rows, then site planes); contiguity
+    // makes flat row (site*K + k) valid with stride nb[1].
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(base->ne[0] == x->ne[0]);
+    GGML_ASSERT(base->ne[1] * base->ne[2] >= (int64_t)(site + 1) * kernel);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_op_params_i32(result, 0, 3);   // dflash2 grouped dyn-conv mode
+    ggml_set_op_params_i32(result, 1, site);
+    ggml_set_op_params_i32(result, 2, kernel);
+    ggml_set_op_params_i32(result, 3, group_size);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = base;
+    result->src[2] = dyn;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_specla(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * hld,
+        struct ggml_tensor  * factor_ptrs,
+        int                   n_layers,
+        int                   layer,
+        int                   pending_bank,
+        int                   n_boundaries,
+        int                   n_chains,
+        int                   n_waves,
+        int                   max_parallel_chains) {
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_matrix(state));
+    GGML_ASSERT(hld->type == GGML_TYPE_I32 && ggml_is_contiguous(hld));
+    GGML_ASSERT(factor_ptrs->type == GGML_TYPE_I64 &&
+                ggml_nelements(factor_ptrs) == 8 &&
+                ggml_is_contiguous(factor_ptrs));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 &&
+                state->type == GGML_TYPE_F32);
+    // The CUDA kernel raw-indexes these tensors and does not consume strides.
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(x->ne[0] == c->ne[1]);
+    GGML_ASSERT(state->ne[0] == c->ne[0] - 1 && state->ne[1] == c->ne[1]);
+    GGML_ASSERT(x->ne[2] == 1 && state->ne[2] == 1);
+
+    const int64_t d_inner = x->ne[0];
+    const int64_t n_t = x->ne[1];
+    GGML_ASSERT(c->ne[0] == 3 || c->ne[0] == 4 ||
+                c->ne[0] == 5 || c->ne[0] == 9);
+    GGML_ASSERT(n_layers > 0 && layer >= 0 && layer < n_layers);
+    GGML_ASSERT(pending_bank == 0 || pending_bank == 1);
+    GGML_ASSERT(n_boundaries >= 0 && n_chains > 0 && n_waves > 0);
+    GGML_ASSERT(max_parallel_chains > 0 && max_parallel_chains <= n_chains);
+    // n_boundaries is used only for output sizing below; the runtime boundary
+    // layout is packed in the HLD meta tensor.
+    const int64_t packed_rows = n_t + (c->ne[0] - 1)*n_boundaries;
+    struct ggml_tensor * result =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, packed_rows);
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 2, n_chains);
+    ggml_set_op_params_i32(result, 3, n_waves);
+    ggml_set_op_params_i32(result, 4, n_layers);
+    ggml_set_op_params_i32(result, 5, layer);
+    ggml_set_op_params_i32(result, 6, pending_bank);
+    ggml_set_op_params_i32(result, 7, max_parallel_chains);
+    result->op = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = state;
+    result->src[3] = hld;
+    result->src[4] = factor_ptrs;
     return result;
 }
 
@@ -6519,14 +7049,15 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * active_slot_ids) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6540,6 +7071,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(active_slot_ids == NULL || active_slot_ids->type == GGML_TYPE_I32);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
@@ -6550,7 +7082,13 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
+    if (active_slot_ids) {
+        GGML_ASSERT(active_slot_ids->ne[0] == n_seqs);
+        GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
+    } else {
+        GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    }
 
     // Pack output, final new_state, and per-step intermediate states into one tensor.
     // Layout (in units of `S_v * H`-wide rows):
@@ -6572,8 +7110,20 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[8] = active_slot_ids;
 
     return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, NULL);
 }
 
 struct ggml_tensor * ggml_gated_delta_net_inplace(
@@ -6589,11 +7139,93 @@ struct ggml_tensor * ggml_gated_delta_net_inplace(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_active_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * active_slot_ids) {
+    GGML_ASSERT(active_slot_ids != NULL);
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(
+        ctx, q, k, v, g, beta, state, active_slot_ids);
+    ggml_set_op_params_i32(result, 1, 1);
+    return result;
+}
+
+// dflash: mapped verify (see ggml.h). op_params[11] = 1, src[8] maps the
+// compact sequences to the slabs they read, and the packed result holds only
+// the attention output. g/beta need contiguous rows and one shared layout.
+struct ggml_tensor * ggml_gated_delta_net_mapped_verify(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * state_slot_ids) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_are_same_stride(q, k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous_rows(g));
+    GGML_ASSERT(ggml_is_contiguous_rows(beta));
+    GGML_ASSERT(ggml_are_same_stride(g, beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(state_slot_ids != NULL);
+    GGML_ASSERT(ggml_is_contiguous(state_slot_ids));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_slot_ids->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    // scalar gate only: [1, H, T, B]
+    GGML_ASSERT(g->ne[0] == 1);
+    GGML_ASSERT(beta->ne[0] == 1);
+    GGML_ASSERT(g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == n_seqs);
+
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
+    GGML_ASSERT(ggml_nelements(state_slot_ids) == n_seqs);
+
+    // Attention output only; the final state and the intermediates are
+    // neither written nor allocated. ggml_gated_delta_net_capture_replay_log
+    // appends its rows after these.
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 1, 0);
+    ggml_set_op_params_i32(result, 11, 1);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[8] = state_slot_ids;
+
+    return result;
+}
+
 void ggml_gated_delta_net_set_skip_intermediate(
         struct ggml_tensor * tensor,
         bool                 skip_intermediate) {
     GGML_ASSERT(tensor != NULL);
     GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
     ggml_set_op_params_i32(tensor, 0, skip_intermediate ? 1 : 0);
 
     const struct ggml_tensor * v = tensor->src[2];
@@ -6606,12 +7238,93 @@ void ggml_gated_delta_net_set_skip_intermediate(
     // Compact only the plain chain path. Tree/persistent variants need
     // intermediate states for branch reloads or explicit capture storage.
     const bool can_compact = tensor->src[6] == NULL && tensor->src[7] == NULL;
-    tensor->ne[1] = n_tokens*n_seqs + S_v*n_seqs;
+    // A plain in-place GDN writes final state directly into src[5], so its
+    // packed result does not need the otherwise mandatory final-state region.
+    // Active-slot buckets retain that region as scratch for negative padding
+    // rows, which deliberately have no physical recurrent-state slab.
+    const bool inplace_state = ggml_get_op_params_i32(tensor, 1) != 0;
+    const bool active_slots = tensor->src[8] != NULL;
+    tensor->ne[1] = n_tokens*n_seqs +
+                    (inplace_state && !active_slots ? 0 : S_v*n_seqs);
     if (!skip_intermediate || !can_compact) {
         tensor->ne[1] += S_v*n_tokens*n_seqs;
     }
     tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
     tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+}
+
+struct ggml_tensor * ggml_gated_delta_net_capture_replay_log(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tensor) {
+    GGML_ASSERT(ctx != NULL && tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
+    GGML_ASSERT(tensor->src[6] == NULL);
+
+    const struct ggml_tensor * v = tensor->src[2];
+    const struct ggml_tensor * g = tensor->src[3];
+    GGML_ASSERT(v != NULL && g != NULL);
+    const int64_t S_v = v->ne[0];
+    const int64_t H = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs = v->ne[3];
+    const bool kda = g->ne[0] == S_v;
+    const int64_t replay_log_width = kda ? 3*S_v : 2*S_v + 1;
+    GGML_ASSERT(replay_log_width > 0 && H > 0 && n_tokens > 0 && n_seqs > 0);
+    GGML_ASSERT(replay_log_width <= INT64_MAX/H);
+    const int64_t replay_log_head = replay_log_width*H;
+    GGML_ASSERT(replay_log_head <= INT64_MAX/n_tokens);
+    const int64_t replay_log_token = replay_log_head*n_tokens;
+    GGML_ASSERT(replay_log_token <= INT64_MAX/n_seqs);
+    const int64_t replay_log_elements = replay_log_token*n_seqs;
+    GGML_ASSERT(tensor->ne[0] > 0);
+    GGML_ASSERT(replay_log_elements <= INT64_MAX - (tensor->ne[0] - 1));
+    const int64_t replay_log_rows =
+        (replay_log_elements + tensor->ne[0] - 1)/tensor->ne[0];
+    GGML_ASSERT(tensor->ne[1] > 0 && tensor->ne[1] <= INT32_MAX);
+    GGML_ASSERT(replay_log_rows <= INT64_MAX - tensor->ne[1]);
+    const int32_t replay_log_row_offset = (int32_t) tensor->ne[1];
+    GGML_ASSERT((size_t) replay_log_row_offset <= SIZE_MAX/tensor->nb[1]);
+    const size_t replay_log_byte_offset =
+        (size_t) replay_log_row_offset*tensor->nb[1];
+
+    tensor->ne[1] += replay_log_rows;
+    tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+    ggml_set_op_params_i32(tensor, 3, replay_log_row_offset);
+
+    return ggml_dup(ctx, ggml_view_4d(
+        ctx, tensor, replay_log_width, H, n_tokens, n_seqs,
+        (size_t) replay_log_width*sizeof(float),
+        (size_t) replay_log_head*sizeof(float),
+        (size_t) replay_log_token*sizeof(float),
+        replay_log_byte_offset));
+}
+
+// dflash: raw-gate mode (see ggml.h). [dt_bias | A] -> src[9],
+// op_params[10] = 1. (src[8] / op_params[2] belong to the compact-decode and
+// SpecLA variants.)
+void ggml_gated_delta_net_set_raw_gates(
+        struct ggml_tensor * tensor,
+        struct ggml_tensor * gate_ba) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(gate_ba != NULL);
+    GGML_ASSERT(gate_ba->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(gate_ba));
+    const struct ggml_tensor * v = tensor->src[2];
+    GGML_ASSERT(ggml_nelements(gate_ba) == 2*v->ne[1]);
+    // scalar gate only (no KDA), no tree mode, no SpecLA / compact decode;
+    // the mapped-verify variant (op_params[11]) carries src[8] read-only.
+    GGML_ASSERT(tensor->src[3]->ne[0] == 1);
+    GGML_ASSERT(tensor->src[6] == NULL);
+    GGML_ASSERT(tensor->src[8] == NULL || ggml_get_op_params_i32(tensor, 11) != 0);
+    GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
+    tensor->src[9] = gate_ba;
+    ggml_set_op_params_i32(tensor, 10, 1);
 }
 
 // dflash: tree-mode variant. Same op, with parent_ids plumbed into
@@ -6670,6 +7383,79 @@ struct ggml_tensor * ggml_gated_delta_net_tree_persist(
 
     result->src[7] = persist_inter;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_specla(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * hld,
+        struct ggml_tensor  * factor_ptrs,
+        int                   n_layers,
+        int                   layer,
+        int                   pending_bank,
+        int                   n_boundaries,
+        int                   n_chains,
+        int                   n_waves,
+        int                   max_parallel_chains) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(hld->type == GGML_TYPE_I32 && ggml_is_contiguous(hld));
+    GGML_ASSERT(factor_ptrs->type == GGML_TYPE_I64 &&
+                ggml_nelements(factor_ptrs) == 8 &&
+                ggml_is_contiguous(factor_ptrs));
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q, v));
+    // The CUDA launcher passes q strides for both q and k.
+    GGML_ASSERT(ggml_are_same_stride(q, k));
+    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    const int64_t S = v->ne[0];
+    const int64_t H = v->ne[1];
+    const int64_t T = v->ne[2];
+    GGML_ASSERT(S == 16 || S == 32 || S == 64 || S == 128);
+    GGML_ASSERT(v->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(g, beta));
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H &&
+                g->ne[2] == T && g->ne[3] == 1);
+    GGML_ASSERT(state->ne[0] == S && state->ne[1] == S &&
+                state->ne[2] == H && state->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(state) == S*S*H);
+    GGML_ASSERT(n_layers > 0 && layer >= 0 && layer < n_layers);
+    GGML_ASSERT(pending_bank == 0 || pending_bank == 1);
+    GGML_ASSERT(n_boundaries >= 0 && n_chains > 0 && n_waves > 0);
+    GGML_ASSERT(max_parallel_chains > 0 && max_parallel_chains <= n_chains);
+    // n_boundaries is used only for output sizing below; the runtime boundary
+    // layout is packed in the HLD meta tensor.
+    const int64_t packed = S*H*T + (int64_t)n_boundaries*S*S*H;
+    struct ggml_tensor * result =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, packed);
+    ggml_set_op_params_i32(result, 1, 1);
+    ggml_set_op_params_i32(result, 2, 1);
+    ggml_set_op_params_i32(result, 4, n_chains);
+    ggml_set_op_params_i32(result, 5, n_waves);
+    ggml_set_op_params_i32(result, 6, n_layers);
+    ggml_set_op_params_i32(result, 7, layer);
+    ggml_set_op_params_i32(result, 8, pending_bank);
+    ggml_set_op_params_i32(result, 9, max_parallel_chains);
+    result->op = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = hld;
+    result->src[7] = factor_ptrs;
     return result;
 }
 
@@ -7287,6 +8073,10 @@ static void ggml_compute_backward(
         case GGML_OP_NONE: {
             // noop
         } break;
+        case GGML_OP_MUL_MAT_BIAS_BF16: // inference-only, no backward kernel
+        case GGML_OP_RMS_NORM_VISION_F32:
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
         case GGML_OP_COUNT:
         default: {
             GGML_ABORT("%s: unsupported ggml op for backward pass: %s\n", __func__, ggml_op_name(tensor->op));
@@ -8397,6 +9187,49 @@ struct ggml_tensor * ggml_ds4_moe_align_ids(
     return result;
 }
 
+struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * global_ids,
+        struct ggml_tensor  * router_weights,
+        struct ggml_tensor  * local_id_lut,
+        struct ggml_tensor  * main_candidate_lut,
+        int                   main_slots_x4,
+        bool                  main_owner) {
+    GGML_ASSERT(global_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(router_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(local_id_lut->type == GGML_TYPE_I32);
+    GGML_ASSERT(main_candidate_lut->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(global_ids, router_weights));
+    GGML_ASSERT(global_ids->ne[0] > 0 && global_ids->ne[0] <= INT_MAX / 4 &&
+                global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX &&
+                global_ids->ne[2] == 1 && global_ids->ne[3] == 1);
+    GGML_ASSERT(local_id_lut->ne[0] == 1 &&
+                local_id_lut->ne[1] > 0 && local_id_lut->ne[1] <= INT_MAX &&
+                local_id_lut->ne[2] == global_ids->ne[1] &&
+                local_id_lut->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(local_id_lut, main_candidate_lut));
+    GGML_ASSERT(ggml_is_contiguous(global_ids));
+    GGML_ASSERT(ggml_is_contiguous(router_weights));
+    GGML_ASSERT(ggml_is_contiguous(local_id_lut));
+    GGML_ASSERT(ggml_is_contiguous(main_candidate_lut));
+    GGML_ASSERT(main_slots_x4 > 0 &&
+                main_slots_x4 <= 4 * (int) global_ids->ne[0]);
+    const int64_t main_quota =
+        ((int64_t) main_slots_x4 * global_ids->ne[1] + 2) / 4;
+    GGML_ASSERT(main_quota > 0 && main_quota <= INT_MAX);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, global_ids);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = global_ids;
+    result->src[1] = router_weights;
+    result->src[2] = local_id_lut;
+    result->src[3] = main_candidate_lut;
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_BALANCED_OWNER_IDS);
+    ggml_set_op_params_i32(result, 1, (int32_t) main_quota);
+    ggml_set_op_params_i32(result, 2, main_owner ? 1 : 0);
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_deferred_peer_copy(
         struct ggml_context * ctx,
         struct ggml_tensor  * src) {
@@ -8410,6 +9243,28 @@ struct ggml_tensor * ggml_ds4_deferred_peer_copy(
     // op_params[2..3] is populated by the backend scheduler with the native
     // event handle after backend assignment and before graph allocation.
     ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_DEFERRED_PEER_COPY);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_cluster_allreduce(
+        struct ggml_context     * ctx,
+        struct ggml_tensor      * a,
+        ggml_cluster_allreduce_fn fn,
+        void                    * user) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(fn != NULL);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = a;
+
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_CLUSTER_ALLREDUCE);
+    memcpy(&result->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_FN_WORD],
+           &fn, sizeof(fn));
+    memcpy(&result->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_USER_WORD],
+           &user, sizeof(user));
 
     return result;
 }
@@ -8516,17 +9371,26 @@ struct ggml_tensor * ggml_ds4_hc_post_split(
     GGML_ASSERT(ggml_is_contiguous(residual_hc));
     GGML_ASSERT(ggml_is_contiguous(main_block));
     GGML_ASSERT(ggml_is_contiguous(peer_block));
-    GGML_ASSERT(ggml_is_contiguous(split));
+    GGML_ASSERT(split->nb[0] == sizeof(float));
+    GGML_ASSERT(split->nb[1] >= split->ne[0] * split->nb[0]);
+    GGML_ASSERT(split->ne[2] == 1 && split->ne[3] == 1);
     GGML_ASSERT(n_hc > 0 && n_hc <= 8);
+    GGML_ASSERT(residual_hc->ne[2] == 1 && residual_hc->ne[3] == 1);
+    GGML_ASSERT(main_block->ne[2] == 1 && main_block->ne[3] == 1);
+    GGML_ASSERT(peer_block->ne[2] == 1 && peer_block->ne[3] == 1);
     const int64_t mix_dim = 2*(int64_t)n_hc + (int64_t)n_hc*n_hc;
-    GGML_ASSERT(ggml_nelements(split) == mix_dim);
-    GGML_ASSERT(ggml_nelements(residual_hc) % n_hc == 0);
-    const int64_t n_embd = ggml_nelements(residual_hc) / n_hc;
-    GGML_ASSERT(ggml_nelements(main_block) == n_embd);
-    GGML_ASSERT(ggml_nelements(peer_block) == n_embd);
+    const int64_t n_tokens = residual_hc->ne[1];
+    GGML_ASSERT(n_tokens > 0);
+    GGML_ASSERT(split->ne[0] == mix_dim && split->ne[1] == n_tokens);
+    GGML_ASSERT(residual_hc->ne[0] % n_hc == 0);
+    const int64_t n_embd = residual_hc->ne[0] / n_hc;
+    GGML_ASSERT(main_block->ne[0] == n_embd && main_block->ne[1] == n_tokens);
+    GGML_ASSERT(peer_block->ne[0] == n_embd && peer_block->ne[1] == n_tokens);
 
-    struct ggml_tensor * result = ggml_new_tensor_1d(
-        ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc);
+    struct ggml_tensor * result = n_tokens == 1
+        ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc)
+        : ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, (int64_t) n_embd * n_hc, n_tokens);
     result->op = GGML_OP_DS4_HC;
     result->src[0] = residual_hc;
     result->src[1] = main_block;
@@ -8597,7 +9461,8 @@ struct ggml_tensor * ggml_ds4_indexer_score_masked(
         struct ggml_tensor  * visibility_mask,
         int                   kv_start,
         int                   ratio) {
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
+    GGML_ASSERT((q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16) &&
+                q->ne[0] == 128);
     GGML_ASSERT(head_weights->type == GGML_TYPE_F32);
     GGML_ASSERT(index_comp->type == GGML_TYPE_F16 && index_comp->ne[0] == 128);
     GGML_ASSERT(ggml_is_contiguous(q));
@@ -8656,5 +9521,40 @@ struct ggml_tensor * ggml_ds4_indexer_mask(
     result->src[0] = base_mask;
     result->src[1] = selected;
     ggml_set_op_params_i32(result, 0, raw_rows);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * down_e,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * shared_out) {
+    GGML_ASSERT(down_e != NULL);
+    GGML_ASSERT(weights != NULL);
+    GGML_ASSERT(down_e->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(down_e->nb[0] == sizeof(float));
+    GGML_ASSERT(down_e->ne[0] % 4 == 0);
+    GGML_ASSERT(down_e->ne[3] == 1);
+    GGML_ASSERT(weights->nb[0] == sizeof(float));
+    GGML_ASSERT(down_e->ne[1] == weights->ne[0]);
+    GGML_ASSERT(down_e->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+    if (shared_out != NULL) {
+        GGML_ASSERT(shared_out->type == GGML_TYPE_F32);
+        GGML_ASSERT(shared_out->nb[0] == sizeof(float));
+        GGML_ASSERT(shared_out->ne[0] == down_e->ne[0]);
+        GGML_ASSERT(shared_out->ne[1] == down_e->ne[2]);
+        GGML_ASSERT(shared_out->ne[2] == 1);
+        GGML_ASSERT(shared_out->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, down_e->ne[0], down_e->ne[2]);
+    result->op = GGML_OP_DS4_MOE_COMBINE;
+    result->src[0] = down_e;
+    result->src[1] = weights;
+    result->src[2] = shared_out;
     return result;
 }

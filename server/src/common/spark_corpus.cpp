@@ -7,7 +7,7 @@
 #include <fstream>
 #include <system_error>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 namespace fs = std::filesystem;
@@ -132,8 +132,8 @@ std::vector<std::string> spark_scrape_corpus(std::size_t max_chunks, std::size_t
     const char * home = std::getenv("HOME");
     const fs::path home_dir = home ? fs::path(home) : fs::path();
 
-    const fs::path claude_dir = env_or("DFLASH_SPARK_CLAUDE_DIR", home_dir / ".claude" / "projects");
-    const fs::path codex_dir  = env_or("DFLASH_SPARK_CODEX_DIR",  home_dir / ".codex" / "sessions");
+    const fs::path claude_dir = env_or("LUCE_SPARK_CLAUDE_DIR", home_dir / ".claude" / "projects");
+    const fs::path codex_dir  = env_or("LUCE_SPARK_CODEX_DIR",  home_dir / ".codex" / "sessions");
 
     scan_dir(claude_dir, max_chunks, chunk_chars, min_chars,
              [](const fs::path &) { return true; }, claude_session_text, out);
@@ -145,4 +145,4 @@ std::vector<std::string> spark_scrape_corpus(std::size_t max_chunks, std::size_t
     return out;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

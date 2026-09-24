@@ -19,7 +19,7 @@
 using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -104,7 +104,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         bool capture_ssm_intermediates) {
     if (shards_.empty()) return false;
     if (rollback_poisoned_) {
-        if (std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr) {
+        if (std::getenv("LUCE_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr) {
             std::fprintf(stderr,
                 "[target-split][rollback-poison] verify_batch_refused_while_poisoned=1 base_pos=%d n_tokens=%zu\n",
                 base_pos, tokens.size());
@@ -112,8 +112,8 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
         return false;
     }
     Qwen35SplitCaptureStats capture_stats;
-    const bool capture_selftest = std::getenv("DFLASH_SPLIT_CAPTURE_SELFTEST") != nullptr;
-    const bool capture_diag = std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
+    const bool capture_selftest = std::getenv("LUCE_SPLIT_CAPTURE_SELFTEST") != nullptr;
+    const bool capture_diag = std::getenv("LUCE_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
     const bool local_only = !(remote_target_shard_ && remote_target_shard_->active());
     const bool storage_ready = split_fast_rollback_storage_ready(shards_);
     const bool capture_enabled = capture_ssm_intermediates &&
@@ -229,7 +229,7 @@ bool Qwen35LayerSplitDFlashTarget::supports_fast_rollback() const {
     const bool storage_ready = split_fast_rollback_storage_ready(shards_);
     const bool supported = env_enabled && local_only && storage_ready &&
         split_capture_validated_;
-    if (std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr) {
+    if (std::getenv("LUCE_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr) {
         std::fprintf(stderr,
             "[target-split][chain-rollback] split_chain_fast_rollback_supported=%d env_enabled=%d capture_validated=%d local_only=%d storage_ready=%d split_tree_verify_supported=0 split_rollback_to_tree_supported=0\n",
             supported ? 1 : 0, env_enabled ? 1 : 0,
@@ -241,7 +241,7 @@ bool Qwen35LayerSplitDFlashTarget::supports_fast_rollback() const {
 
 bool Qwen35LayerSplitDFlashTarget::rollback_to(int base_pos, int commit_n) {
     const auto t0 = std::chrono::steady_clock::now();
-    const bool diag = std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
+    const bool diag = std::getenv("LUCE_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
     last_rollback_context_fatal_ = false;
     auto fail = [&](const char * why, cudaError_t err = cudaSuccess) {
         const bool has_cuda_error = err != cudaSuccess;
@@ -475,7 +475,7 @@ bool Qwen35LayerSplitDFlashTarget::rollback_to_tree(
         return false;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    const bool diag = std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
+    const bool diag = std::getenv("LUCE_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
     last_rollback_context_fatal_ = false;
     enum class Phase { AValidate, BRestore, CBarrier1, DCompact, EBarrier2, FCommit };
     auto phase_name = [](Phase p) -> const char * {
@@ -863,4 +863,4 @@ const std::vector<int> & Qwen35LayerSplitDFlashTarget::capture_layer_ids() const
     return capture_ids_;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -12,27 +12,27 @@
 //
 // Backends:
 //   - Default: WMMA m16n16k16 sparse forward (sm_70+). Functional everywhere.
-//   - Set env DFLASH_FP_USE_BSA=1 to dispatch to the Block-Sparse-Attention
+//   - Set env LUCE_FP_USE_BSA=1 to dispatch to the Block-Sparse-Attention
 //     kernel (FA-2 derived, m16n8k16 PTX, sm_80+ via cuBLAS BF16 GEMM).
-//     Requires building with -DDFLASH27B_ENABLE_BSA=ON. ~3x faster than WMMA
+//     Requires building with -DLUCE_ENABLE_BSA=ON. ~3x faster than WMMA
 //     on RTX 3090 at S=128K.
 //
 // Tunables (env vars):
-//   DFLASH_FP_USE_BSA      [0/1] enable BSA backend (default: 0).
-//   DFLASH_FP_ALPHA        [float in (0,1)] override FlashPrefillConfig.alpha.
+//   LUCE_FP_USE_BSA      [0/1] enable BSA backend (default: 0).
+//   LUCE_FP_ALPHA        [float in (0,1)] override FlashPrefillConfig.alpha.
 //                          Higher = stricter selection = fewer K-blocks per Q
 //                          row = faster but riskier. Default 0.12. For long
 //                          context with broad needles, 0.85-0.99 work well.
-//   DFLASH_FP_PROFILE      [set] log per-stage timing (mean / score / select /
+//   LUCE_FP_PROFILE      [set] log per-stage timing (mean / score / select /
 //                          forward) to stderr.
-//   DFLASH_FP_DUMP_COUNTS  [set] log per-row select counts to stderr.
+//   LUCE_FP_DUMP_COUNTS  [set] log per-row select counts to stderr.
 
 #pragma once
 
 #include <cstdint>
 #include "ggml-backend.h"
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // Algorithmic parameters for the FlashPrefill selection + sparse forward.
@@ -64,7 +64,7 @@ int flash_prefill_forward_bf16(
 // Same as flash_prefill_forward_bf16 but operates on F16 (half) tensors.
 // Uses F16 WMMA (m16n8k16) and cooperative shared-memory loads.
 // Compiled when the Volta/Turing WMMA or Pascal scalar F16 path is enabled.
-#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+#if defined(LUCE_HAVE_VOLTA_FLASHPREFILL) || defined(LUCE_HAVE_PASCAL_FLASHPREFILL)
 int flash_prefill_forward_f16(
     const void * Q, const void * K, const void * V, void * O,
     int batch, int seq_len, int n_q_heads, int n_k_heads, int head_dim,
@@ -105,13 +105,13 @@ inline int flash_prefill_forward(
     ggml_type qkv_type,
     const FlashPrefillConfig & cfg)
 {
-#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
+#if defined(LUCE_HAVE_FLASHPREFILL) || defined(LUCE_HAVE_SM80_FLASHPREFILL)
     if (qkv_type == GGML_TYPE_BF16) {
         return flash_prefill_forward_bf16(Q, K, V, O,
             batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
     }
 #endif
-#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) || defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+#if defined(LUCE_HAVE_VOLTA_FLASHPREFILL) || defined(LUCE_HAVE_PASCAL_FLASHPREFILL)
     if (qkv_type == GGML_TYPE_F16) {
         return flash_prefill_forward_f16(Q, K, V, O,
             batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
@@ -121,7 +121,7 @@ inline int flash_prefill_forward(
         batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, qkv_type, cfg);
 }
 
-#ifdef DFLASH27B_HAVE_BSA
+#ifdef LUCE_HAVE_BSA
 // Free BSA persistent device buffers (blockmask, head_mask_type, softmax_lse).
 // Safe to call any time; idempotent. Useful before unloading the drafter to
 // give the daemon's target gen path the full VRAM headroom.
@@ -129,4 +129,4 @@ extern "C" void dflash_bsa_free_persistent();
 #endif
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common

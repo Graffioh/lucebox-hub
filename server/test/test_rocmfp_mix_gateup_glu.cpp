@@ -11,11 +11,11 @@
 //
 // WHAT IS PROVEN HERE, and what is not:
 //
-//  * The two dot products are bit-identical to the unfused launches. That IS assertable and is
-//    the property the whole change rests on: FUSE_GLU is a template parameter over ONE
-//    accumulation body, so the fold order per row cannot drift between instantiations. Checked
-//    by running the unfused entry point and comparing against the fused result reconstructed
-//    through the inverse of the clamp-free branch (see `exact_when_unclamped`).
+//  * The two dot products are bit-identical to the unfused launches. That IS assertable:
+//    every GLU mode instantiates ONE accumulation body, and the two-pass finalizer reads the
+//    ordinary up result written by that same body. Checked by running the unfused entry point
+//    and comparing against the fused result reconstructed through the inverse of the
+//    clamp-free branch (see `exact_when_unclamped`).
 //
 //  * The GLU value is compared to a HOST reference at a tight tolerance, not bit-exactly. The
 //    kernel applies ggml_cuda_op_swiglu_ds4_single on device; the device and host expf() are not
@@ -33,18 +33,18 @@
 //    tensor with an undecoded one.
 
 #include "ds4_test_gpu_runtime.h"
+#include "CppUnitTestFramework.hpp"
+#include "ggml-cuda.h"
+#include "ggml-alloc.h"
+#include "common/cuda_graph_overrides.h"
+using CppUnitTestFramework::CommonFixture;
+#undef CHECK
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
-extern "C" void ggml_cuda_rocmfp2_mix_register_host(
-    const void * base, size_t nb02, int n_experts, int out, int in,
-    const void * codebooks_bf16_host, const uint8_t * modes_host,
-    const uint8_t * rotations_host);
-extern "C" void ggml_cuda_rocmfp2_mix_unregister(const void * base);
 
 bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     const void * vx, const float * src1, const int32_t * ids, float * dst,
@@ -54,6 +54,22 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
     int64_t dst_s1, int64_t dst_s2, cudaStream_t stream);
 
 bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
+    const void * vx_up, const void * vx_gate,
+    const float * src1, const int32_t * ids, float * dst,
+    int in, int out, int n_expert_used, int n_tokens, int ne11,
+    int64_t ids_s0, int64_t ids_s1,
+    int64_t src1_s1, int64_t src1_s2,
+    int64_t dst_s1, int64_t dst_s2,
+    float glu_limit, cudaStream_t stream);
+
+bool ggml_cuda_rocmfp3_mix_mul_mat_id(
+    const void * vx, const float * src1, const int32_t * ids, float * dst,
+    int in, int out, int n_expert_used, int n_tokens, int ne11,
+    int64_t ids_s0, int64_t ids_s1,
+    int64_t src1_s1, int64_t src1_s2,
+    int64_t dst_s1, int64_t dst_s2, cudaStream_t stream);
+
+bool ggml_cuda_rocmfp3_mix_mul_mat_id_glu(
     const void * vx_up, const void * vx_gate,
     const float * src1, const int32_t * ids, float * dst,
     int in, int out, int n_expert_used, int n_tokens, int ne11,
@@ -87,8 +103,6 @@ static int g_fails = 0;
 // Kernel-vs-kernel comparison, so this fills plausible blocks rather than reimplementing the
 // encoder.
 static constexpr int QK = 32;
-static constexpr int BLOCK_BYTES = 10;
-static constexpr int K = 4;          // levels for qtype 106
 
 static uint32_t xs = 0x9E3779B9u;
 static uint32_t rnd() { xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5; return xs; }
@@ -110,16 +124,33 @@ static float host_swiglu_ds4(float gate, float up, float limit) {
     return silu * up;
 }
 
-int main() {
+namespace {
+struct RocmfpMixGateupGluFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+    void check_fused_gateup_glu(bool fp3);
+};
+}
+
+void RocmfpMixGateupGluFixture::check_fused_gateup_glu(bool fp3) {
+    g_fails = 0;
+    const int BLOCK_BYTES = fp3 ? 14 : 10;
+    const int K = fp3 ? 8 : 4;
+    const auto register_mix = fp3 ? ggml_cuda_rocmfp3_mix_register_host : ggml_cuda_rocmfp2_mix_register_host;
+    const auto unregister_mix = fp3 ? ggml_cuda_rocmfp3_mix_unregister : ggml_cuda_rocmfp2_mix_unregister;
+    const auto mul_mat_id = fp3 ? ggml_cuda_rocmfp3_mix_mul_mat_id : ggml_cuda_rocmfp2_mix_mul_mat_id;
+    const auto mul_mat_id_glu = fp3 ? ggml_cuda_rocmfp3_mix_mul_mat_id_glu : ggml_cuda_rocmfp2_mix_mul_mat_id_glu;
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
-        std::fprintf(stderr, "SKIP: no HIP device\n");
-        return 0;
+        SKIP("no HIP device available");
     }
+    int device = 0;
+    HIP_OK(cudaGetDevice(&device));
 
-    // in must be a multiple of 128: the wide block load reads 128 weights at a time and would
-    // read past the tensor on the final block (register_host enforces this).
-    const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = 2;
+    // FP2 requires multiples of 128 for its wide block load; FP3 accepts
+    // multiples of 32. Use a shape supported by both.
+    // On gfx1151, q > 2 exercises the two-pass GLU finalizer. The sweep below
+    // also covers the one-pass kernel and every supported DS4 verifier width.
+    const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS;
     const int nb = in / QK;
     const size_t rows_bytes = (size_t) out * nb * BLOCK_BYTES;
 
@@ -129,10 +160,10 @@ int main() {
     // Keep the UE4M3 scale indices in a sane range so the dots do not overflow to inf, which
     // would make every comparison below vacuous.
     for (size_t blk = 0; blk < wup.size() / BLOCK_BYTES; ++blk) {
-        wup  [blk * BLOCK_BYTES + 8] = (uint8_t) (0x30 | (wup  [blk * BLOCK_BYTES + 8] & 0x80));
-        wup  [blk * BLOCK_BYTES + 9] = (uint8_t) (0x30 | (wup  [blk * BLOCK_BYTES + 9] & 0x80));
-        wgate[blk * BLOCK_BYTES + 8] = (uint8_t) (0x30 | (wgate[blk * BLOCK_BYTES + 8] & 0x80));
-        wgate[blk * BLOCK_BYTES + 9] = (uint8_t) (0x30 | (wgate[blk * BLOCK_BYTES + 9] & 0x80));
+        wup  [blk * BLOCK_BYTES + BLOCK_BYTES - 2] = (uint8_t) (0x30 | (wup  [blk * BLOCK_BYTES + BLOCK_BYTES - 2] & 0x80));
+        wup  [blk * BLOCK_BYTES + BLOCK_BYTES - 1] = (uint8_t) (0x30 | (wup  [blk * BLOCK_BYTES + BLOCK_BYTES - 1] & 0x80));
+        wgate[blk * BLOCK_BYTES + BLOCK_BYTES - 2] = (uint8_t) (0x30 | (wgate[blk * BLOCK_BYTES + BLOCK_BYTES - 2] & 0x80));
+        wgate[blk * BLOCK_BYTES + BLOCK_BYTES - 1] = (uint8_t) (0x30 | (wgate[blk * BLOCK_BYTES + BLOCK_BYTES - 1] & 0x80));
     }
 
     // DIFFERENT codebooks for gate and up on purpose. Producers may emit matching ones,
@@ -144,7 +175,9 @@ int main() {
         books_gate[i] = f32_to_bf16( 0.5f - 0.21f * (float) (i % 5));
     }
     std::vector<uint8_t> modes_up(n_experts, 1), modes_gate(n_experts, 1);  // 1 = adaptive
-    std::vector<uint8_t> rots(n_experts, 0);
+    // Routed experts 1/3/5 cover fixed/learned, learned/fixed and learned/learned.
+    modes_up[1] = 0;
+    modes_gate[3] = 0;
 
     void * d_up = nullptr, * d_gate = nullptr;
     float * d_x = nullptr, * d_up_out = nullptr, * d_gate_out = nullptr, * d_fused = nullptr;
@@ -170,10 +203,15 @@ int main() {
     for (size_t i = 0; i < idsh.size(); ++i) idsh[i] = (int32_t) ((i * 2 + 1) % n_experts);
     HIP_OK(cudaMemcpy(d_ids, idsh.data(), sizeof(int32_t) * idsh.size(), cudaMemcpyHostToDevice));
 
-    ggml_cuda_rocmfp2_mix_register_host(d_up, rows_bytes, n_experts, out, in,
-                                        books_up.data(), modes_up.data(), rots.data());
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out, in,
-                                        books_gate.data(), modes_gate.data(), rots.data());
+    CHECK(!register_mix(
+              d_up, rows_bytes, n_experts, out, in - (fp3 ? 1 : 32),
+              books_up.data(), modes_up.data()));
+    CHECK(register_mix(
+              d_up, rows_bytes, n_experts, out, in,
+              books_up.data(), modes_up.data()));
+    CHECK(register_mix(
+              d_gate, rows_bytes, n_experts, out, in,
+              books_gate.data(), modes_gate.data()));
 
     const int64_t ids_s0 = 1, ids_s1 = n_used;
     const int64_t src1_s1 = 0, src1_s2 = in;         // ne11 == 1 -> slot broadcast
@@ -181,11 +219,11 @@ int main() {
     const float limit = 7.0f;
 
     // ---- the unfused pair, which the fused launch must reproduce -------------------------
-    CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_up, d_x, d_ids, d_up_out, in, out, n_used, ntok, 1,
+    CHECK(mul_mat_id(d_up, d_x, d_ids, d_up_out, in, out, n_used, ntok, 1,
                                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, nullptr));
-    CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_gate, d_x, d_ids, d_gate_out, in, out, n_used, ntok, 1,
+    CHECK(mul_mat_id(d_gate, d_x, d_ids, d_gate_out, in, out, n_used, ntok, 1,
                                            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, nullptr));
-    CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+    CHECK(mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                in, out, n_used, ntok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                limit, nullptr));
@@ -195,6 +233,43 @@ int main() {
     HIP_OK(cudaMemcpy(hu.data(), d_up_out,   sizeof(float) * yn, cudaMemcpyDeviceToHost));
     HIP_OK(cudaMemcpy(hg.data(), d_gate_out, sizeof(float) * yn, cudaMemcpyDeviceToHost));
     HIP_OK(cudaMemcpy(hf.data(), d_fused,    sizeof(float) * yn, cudaMemcpyDeviceToHost));
+
+    // Exercise the actual graph dispatcher at the row cap. Its result must
+    // retain the registry-aware vector dot products, not quantize activations
+    // through the larger-batch MMQ fallback. This catches a missing override
+    // in either mixed qtype's dispatcher, independently of GLU admission.
+    // Use the device that owns the direct-launch allocations and reference.
+    ggml_backend_t backend = ggml_backend_cuda_init(device);
+    REQUIRE_TRUE(backend != nullptr);
+    REQUIRE_TRUE(ggml_backend_cuda_get_device_id(backend) == device);
+    ggml_context * ctx = ggml_init({ggml_tensor_overhead()*32 + ggml_graph_overhead_custom(32, false), nullptr, true});
+    REQUIRE_TRUE(ctx != nullptr);
+    const auto type = fp3 ? GGML_TYPE_Q3_1_ROCMFP3_MIX : GGML_TYPE_Q2_1_ROCMFP2_MIX;
+    auto * weight = ggml_new_tensor_3d(ctx, type, in, out, n_experts);
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in, 1, ntok);
+    auto * routing = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, ntok);
+    auto * product = ggml_mul_mat_id(ctx, weight, input, routing);
+    auto * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, product);
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE_TRUE(buffer != nullptr);
+    ggml_backend_tensor_set(weight, wup.data(), 0, wup.size());
+    ggml_backend_tensor_set(input, xh.data(), 0, xh.size()*sizeof(float));
+    ggml_backend_tensor_set(routing, idsh.data(), 0, idsh.size()*sizeof(int32_t));
+    REQUIRE_TRUE(register_mix(weight->data, rows_bytes, n_experts, out, in, books_up.data(), modes_up.data()));
+    const int prior = ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(0);
+    {
+        luce::common::ScopedCudaGraphOverrides scope(true, 0, false, ntok);
+        REQUIRE_TRUE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    }
+    CHECK(ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(prior) == GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);
+    std::vector<float> graph_values(yn);
+    ggml_backend_tensor_get(product, graph_values.data(), 0, yn*sizeof(float));
+    CHECK(std::memcmp(graph_values.data(), hu.data(), yn*sizeof(float)) == 0);
+    unregister_mix(weight->data);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
 
     // The dots must be finite and non-trivial, or every assertion below passes vacuously.
     double mag = 0.0;
@@ -217,10 +292,45 @@ int main() {
     std::fprintf(stderr, "worst relative deviation from the host reference: %.3e\n", worst);
     CHECK(worst < 1e-5);
 
+    // Exercise width changes on the same allocations, including both sides of
+    // the gfx1151 one-pass/two-pass dispatch boundary.
+    for (int one_tok = 1; one_tok < ntok; ++one_tok) {
+        const size_t one_yn = (size_t) out * n_used * one_tok;
+        CHECK(mul_mat_id(d_up, d_x, d_ids, d_up_out,
+                                               in, out, n_used, one_tok, 1,
+                                               ids_s0, ids_s1, src1_s1, src1_s2,
+                                               dst_s1, dst_s2, nullptr));
+        CHECK(mul_mat_id(d_gate, d_x, d_ids, d_gate_out,
+                                               in, out, n_used, one_tok, 1,
+                                               ids_s0, ids_s1, src1_s1, src1_s2,
+                                               dst_s1, dst_s2, nullptr));
+        CHECK(mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+                                                   in, out, n_used, one_tok, 1,
+                                                   ids_s0, ids_s1, src1_s1, src1_s2,
+                                                   dst_s1, dst_s2, limit, nullptr));
+        HIP_OK(cudaDeviceSynchronize());
+        std::vector<float> one_u(one_yn), one_g(one_yn), one_f(one_yn);
+        HIP_OK(cudaMemcpy(one_u.data(), d_up_out, sizeof(float) * one_yn,
+                          cudaMemcpyDeviceToHost));
+        HIP_OK(cudaMemcpy(one_g.data(), d_gate_out, sizeof(float) * one_yn,
+                          cudaMemcpyDeviceToHost));
+        HIP_OK(cudaMemcpy(one_f.data(), d_fused, sizeof(float) * one_yn,
+                          cudaMemcpyDeviceToHost));
+        double one_worst = 0.0;
+        for (size_t i = 0; i < one_yn; ++i) {
+            CHECK(std::isfinite(one_u[i]) && std::isfinite(one_g[i]) && std::isfinite(one_f[i]));
+            const float ref = host_swiglu_ds4(one_g[i], one_u[i], limit);
+            const double denom = std::fmax(1e-6, std::fabs((double) ref));
+            one_worst = std::fmax(one_worst,
+                std::fabs((double) one_f[i] - (double) ref) / denom);
+        }
+        CHECK(one_worst < 1e-5);
+    }
+
     // ---- operand ORDER: swiglu_ds4 applies silu to GATE, so the two are not symmetric ----
     float * d_swapped = nullptr;
     HIP_OK(cudaMalloc(&d_swapped, sizeof(float) * yn));
-    CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_gate, d_up, d_x, d_ids, d_swapped,
+    CHECK(mul_mat_id_glu(d_gate, d_up, d_x, d_ids, d_swapped,
                                                in, out, n_used, ntok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                limit, nullptr));
@@ -234,7 +344,7 @@ int main() {
 
     // ---- determinism: same inputs, same bytes ------------------------------------------
     HIP_OK(cudaMemset(d_fused, 0, sizeof(float) * yn));
-    CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+    CHECK(mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                in, out, n_used, ntok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                limit, nullptr));
@@ -257,10 +367,10 @@ int main() {
         std::vector<float> poison(yn, 1.0e9f);
         HIP_OK(cudaMemcpy(d_up_out, poison.data(), sizeof(float) * yn, cudaMemcpyHostToDevice));
         HIP_OK(cudaMemcpy(d_fused, poison.data(), sizeof(float) * yn, cudaMemcpyHostToDevice));
-        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_up, d_x, d_ids, d_up_out, in, out, n_used,
+        CHECK(mul_mat_id(d_up, d_x, d_ids, d_up_out, in, out, n_used,
                                                ntok, 1, ids_s0, ids_s1, src1_s1, src1_s2,
                                                dst_s1, dst_s2, nullptr));
-        CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+        CHECK(mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                    in, out, n_used, ntok, 1,
                                                    ids_s0, ids_s1, src1_s1, src1_s2,
                                                    dst_s1, dst_s2, limit, nullptr));
@@ -277,29 +387,57 @@ int main() {
 
 
     // ---- REFUSALS: a half-registered or mismatched pair must NOT fuse ------------------
-    ggml_cuda_rocmfp2_mix_unregister(d_gate);
-    CHECK(!ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+    unregister_mix(d_gate);
+    CHECK(!mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                 in, out, n_used, ntok, 1,
                                                 ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                 limit, nullptr));
     // Re-register with a DIFFERENT out: a shape-mismatched pair must be refused too, because the
     // grid is sized from one half and would index past the other.
-    ggml_cuda_rocmfp2_mix_register_host(d_gate, rows_bytes, n_experts, out / 2, in,
-                                        books_gate.data(), modes_gate.data(), rots.data());
-    CHECK(!ggml_cuda_rocmfp2_mix_mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
+    CHECK(register_mix(
+              d_gate, rows_bytes, n_experts, out / 2, in,
+              books_gate.data(), modes_gate.data()));
+    CHECK(!mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_fused,
                                                 in, out, n_used, ntok, 1,
                                                 ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
                                                 limit, nullptr));
 
-    ggml_cuda_rocmfp2_mix_unregister(d_gate);
-    ggml_cuda_rocmfp2_mix_unregister(d_up);
+    unregister_mix(d_gate);
+    unregister_mix(d_up);
     HIP_OK(cudaFree(d_up));  HIP_OK(cudaFree(d_gate));
     HIP_OK(cudaFree(d_x));   HIP_OK(cudaFree(d_ids));
     HIP_OK(cudaFree(d_up_out)); HIP_OK(cudaFree(d_gate_out));
     HIP_OK(cudaFree(d_fused));  HIP_OK(cudaFree(d_swapped));
 
-    if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); return 1; }
+    if (g_fails) { std::fprintf(stderr, "%d FAILURE(S)\n", g_fails); REQUIRE_TRUE(false); }
     std::fprintf(stderr, "OK: fused gate/up GLU matches the unfused pair, order is respected, "
                          "half-registered/mismatched pairs are refused, and out-of-range ids zero\n");
-    return 0;
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, fp2_fused_gateup_glu_and_paged_dispatch) {
+    check_fused_gateup_glu(false);
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, fp3_fused_gateup_glu_and_paged_dispatch) {
+    check_fused_gateup_glu(true);
+}
+
+TEST_CASE(RocmfpMixGateupGluFixture, paged_dispatch_on_nonzero_device) {
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 2) {
+        SKIP("requires two visible GPUs");
+    }
+    int previous = 0;
+    HIP_OK(cudaGetDevice(&previous));
+    struct RestoreDevice {
+        int previous;
+        ~RestoreDevice() { (void) cudaSetDevice(previous); }
+    } restore{previous};
+    HIP_OK(cudaSetDevice(ndev - 1));
+    for (bool fp3 : {false, true}) {
+        check_fused_gateup_glu(fp3);
+        int current = 0;
+        HIP_OK(cudaGetDevice(&current));
+        REQUIRE_TRUE(current == ndev - 1);
+    }
 }

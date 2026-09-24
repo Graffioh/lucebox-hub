@@ -1,8 +1,8 @@
-// Internal-only shared header for dflash::common library sources.
+// Internal-only shared header for luce::common library sources.
 // Not installed, not exposed in the public API.
 
 #pragma once
-#define DFLASH_INTERNAL_H_INCLUDED
+#define LUCE_INTERNAL_H_INCLUDED
 
 #include <cstddef>
 #include <cstdint>
@@ -24,10 +24,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/paged_attention_config.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridStorage;
 
@@ -76,12 +76,42 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+    // Zero-copy stacked projections (set by the loader when the two source
+    // tensors share a type and were placed back to back in the weight buffer):
+    //   wqkv_z: rows [0, n_z) = wqkv_gate (z), rows [n_z, ...) = wqkv
+    //   ssm_ba: rows [0, dt_rank) = ssm_beta, rows [dt_rank, ...) = ssm_alpha
+    // One GEMV each instead of two; nullptr when stacking was not possible.
+    ggml_tensor * wqkv_z         = nullptr;
+    ggml_tensor * ssm_ba         = nullptr;
+    // Fused raw-gate GDN kernel parameters: f32 [2 * dt_rank] = [dt_bias | A],
+    // one small GPU tensor per DeltaNet layer (src[9] of the GDN op).
+    ggml_tensor * ssm_gate_ba    = nullptr;
+
+    // BailingMoE3 / Ling 3 KDA. Unlike Qwen3.5's fused projection and
+    // convolution, Ling projects and convolves Q, K, and V independently and
+    // uses a vector-valued decay gate (KDA) per head dimension.
+    ggml_tensor * ssm_conv1d_q   = nullptr;  // [conv, 1, d_inner, 1]
+    ggml_tensor * ssm_conv1d_k   = nullptr;  // [conv, 1, d_inner, 1]
+    ggml_tensor * ssm_conv1d_v   = nullptr;  // [conv, 1, d_inner, 1]
+    ggml_tensor * ssm_f_a        = nullptr;  // [hidden, d_inner]
+    ggml_tensor * ssm_g_a        = nullptr;  // [hidden, d_inner]
+
+    // BailingMoE3 / Ling 3 MLA. The latent K/V cache stores
+    // [kv_lora_rank + rope_dim] for K and [kv_lora_rank] for V.
+    ggml_tensor * attn_q_a       = nullptr;
+    ggml_tensor * attn_q_a_norm  = nullptr;
+    ggml_tensor * attn_q_b       = nullptr;
+    ggml_tensor * attn_kv_a_mqa  = nullptr;
+    ggml_tensor * attn_kv_a_norm = nullptr;
+    ggml_tensor * attn_k_b       = nullptr;
+    ggml_tensor * attn_v_b       = nullptr;
 
     // MoE FFN (qwen35moe only; nullptr on dense qwen35)
     ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
     ggml_tensor * ffn_gate_exps      = nullptr;  // [hidden, n_ff_exp, n_expert]
     ggml_tensor * ffn_up_exps        = nullptr;  // [hidden, n_ff_exp, n_expert]
     ggml_tensor * ffn_down_exps      = nullptr;  // [n_ff_exp, hidden, n_expert]
+    ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] router correction bias
     ggml_tensor * ffn_gate_up_exps   = nullptr;  // [hidden, 2*n_ff_exp, n_expert] optional fused gate/up
     ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [hidden] shared-expert scalar gate
     ggml_tensor * ffn_gate_shexp     = nullptr;  // [hidden, n_ff_shexp]
@@ -116,6 +146,11 @@ struct TargetLayer {
     float ffn_gate_shexp_s     = 1.0f;
     float ffn_up_shexp_s       = 1.0f;
     float ffn_down_shexp_s     = 1.0f;
+
+    // Optional per-layer activation limits used by late Ling 3 blocks.
+    // Zero means ordinary SwiGLU.
+    float ffn_swiglu_clamp_exp   = 0.0f;
+    float ffn_swiglu_clamp_shexp = 0.0f;
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -147,6 +182,9 @@ struct CpuEmbedder {
 
 struct TargetWeights {
     ggml_context *        ctx     = nullptr;
+    ggml_context *        stack_ctx = nullptr;  // owns the stacked alias tensors
+    ggml_context *        gate_ctx  = nullptr;  // owns the [dt_bias | A] gate tensors
+    ggml_backend_buffer_t gate_buf  = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 
@@ -173,13 +211,26 @@ struct TargetWeights {
     int n_ff_shexp              = 0;
     int n_expert                = 0;
     int n_expert_used           = 0;
-    int n_vocab                 = DFLASH27B_TARGET_VOCAB;
+    int n_expert_groups         = 1;
+    int n_expert_groups_used    = 1;
+    int n_vocab                 = LUCE_TARGET_VOCAB;
     int rope_dimension_count    = 64;
     float rope_theta            = 10000000.0f;
     float rms_eps               = 1e-6f;
     float expert_weights_scale  = 1.0f;
     int expert_gating_func      = 1;    // 1=softmax, 2=sigmoid (llama.cpp enum values)
     bool is_moe                 = false;
+    bool is_bailingmoe3         = false;
+    bool expert_weights_norm    = true;
+    int n_layer_dense_lead      = 0;
+
+    // BailingMoE3 / Ling 3 architecture parameters.
+    int kda_head_dim            = 0;
+    int mla_qk_head_dim         = 0;
+    int mla_v_head_dim          = 0;
+    int kv_lora_rank            = 0;
+    int q_lora_rank             = 0;
+    float kda_gate_lower_bound  = 0.0f;
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;
@@ -192,16 +243,19 @@ struct TargetWeights {
     // comparands with `>= 0` so the sentinel never matches a real token.
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
+    // Token the chat template repeats once per image token; -1 when the
+    // vocabulary has none (a model without image input).
+    int32_t image_pad_id = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
-    int32_t mask_token_id = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+    int32_t mask_token_id = LUCE_DRAFT_MASK_TOKEN_ID;
 
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
-    int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
-    int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
+    int n_capture_layers = LUCE_DRAFT_N_TARGET_LAYERS;
+    int capture_layer_ids[LUCE_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
 
 // Check if a token is an end-of-sequence marker for the given target weights.
@@ -217,6 +271,7 @@ struct TargetLoadPlan {
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
     bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
     bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
+    bool load_ds4_image_bias = false;
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
@@ -230,9 +285,27 @@ bool load_target_gguf_partial(const std::string & path,
                               const TargetLoadPlan & plan,
                               TargetWeights & out);
 
+// Load the autoregressive trunk of a BailingMoE3 GGUF (Ling 3.x). Embedded
+// NextN/MTP blocks are intentionally ignored by this baseline backend.
+bool load_bailingmoe3_gguf(const std::string & path,
+                           ggml_backend_t backend,
+                           TargetWeights & out);
+
 void free_target_weights(TargetWeights & w);
 
 // ─── Draft weights (z-lab DFlash, bf16) ───────────────────────────
+
+// DFlash 2 grouped dynamic causal conv (two taps over the draft block, one
+// instance before/after attention and one before/after the MLP):
+//   dyn      = proj @ x_norm                      [2*K*groups, q_len]
+//   prepare  = sum_k (base[0][k] + dyn[0][k]) * shift_k(x_norm)
+//   finish   = sum_k (base[1][k] + dyn[1][k]) * shift_k(sub_block_out)
+// base is per element, dyn per group of conv_group_size elements.
+struct DraftConvWeights {
+    ggml_tensor * base = nullptr;   // [hidden, K, 2] f32
+    ggml_tensor * proj = nullptr;   // [hidden, 2*K*groups]
+    bool present() const { return base != nullptr && proj != nullptr; }
+};
 
 struct DraftLayer {
     ggml_tensor * attn_norm;
@@ -247,6 +320,8 @@ struct DraftLayer {
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
+    DraftConvWeights attn_conv;         // optional DFlash 2 conv around attention
+    DraftConvWeights mlp_conv;          // optional DFlash 2 conv around the MLP
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
     bool attn_gate_per_head = false;
 };
@@ -280,6 +355,18 @@ struct DraftDSparkWeights {
     ggml_tensor * confidence_b = nullptr;  // [1] f32
 };
 
+// DFlash 2 candidate selector: top-k candidates per block position from the
+// target lm_head logits, then one path through them scored by a low-rank
+// bigram form  unary[c] + <pred[prev] * hproj(h), succ[c]>.
+struct DraftSelectorWeights {
+    bool enabled = false;
+    int  rank    = 0;
+    int  top_k   = 0;
+    ggml_tensor * hproj   = nullptr;   // [hidden, rank]
+    ggml_tensor * pred_cb = nullptr;   // [rank, vocab]  predecessor codebook
+    ggml_tensor * succ_cb = nullptr;   // [rank, vocab]  successor codebook
+};
+
 struct DraftWeights {
     ggml_context *    ctx = nullptr;
     ggml_backend_t    backend = nullptr;
@@ -293,13 +380,14 @@ struct DraftWeights {
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
 
     // Architecture metadata (populated by loader).
-    int n_layer   = DFLASH27B_DRAFT_LAYERS;           // 5
-    int n_head    = DFLASH27B_TARGET_N_HEADS;          // 32
-    int n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;       // 8
-    int head_dim  = DFLASH27B_TARGET_HEAD_DIM;         // 128
-    int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
-    int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
-    int swa_window = 0;  // sliding window size (0 = disabled)
+    int n_layer   = LUCE_DRAFT_LAYERS;           // 5
+    int n_head    = LUCE_TARGET_N_HEADS;          // 32
+    int n_head_kv = LUCE_TARGET_N_KV_HEADS;       // 8
+    int head_dim  = LUCE_TARGET_HEAD_DIM;         // 128
+    int n_embd    = LUCE_TARGET_HIDDEN;           // 5120
+    int n_ff      = LUCE_TARGET_INTERMEDIATE;     // 17408
+    int swa_window = 0;                 // sliding window size (0 = disabled)
+    bool swa_pattern_loaded = false;    // GGUF supplied sliding_window_pattern
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
 
     // YaRN rope scaling (populated by loader; 0 = disabled / plain RoPE).
@@ -311,10 +399,10 @@ struct DraftWeights {
     int   rope_n_ctx_orig = 0;      // original_max_position_embeddings
 
     // DFlash draft-specific config (populated by loader or set by caller).
-    int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
-    int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    int block_size      = LUCE_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
+    int n_target_layers = LUCE_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
     std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
-    int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+    int mask_token_id   = LUCE_DRAFT_MASK_TOKEN_ID;    // noise mask token
 
     // Optional Domino causal correction head. When present, greedy chain
     // speculative decode corrects each draft token with a lightweight GRU
@@ -324,6 +412,12 @@ struct DraftWeights {
     // Optional DSpark/DeepSpec-style Markov correction head. When present,
     // greedy chain decode adds a low-rank previous-token bias before argmax.
     DraftDSparkWeights dspark;
+
+    // Optional DFlash 2 pieces: dynamic convs live in the layers, the
+    // selector replaces argmax/markov projection for the drafted chain.
+    int conv_kernel_size = 0;   // 0 = no dynamic convs
+    int conv_group_size  = 0;
+    DraftSelectorWeights selector;
 };
 
 bool load_draft_safetensors(const std::string & path,
@@ -363,6 +457,11 @@ struct TargetCache {
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
 
+    // Concurrent-serving slot count (--max-concurrency). 1 = classic single-sequence
+    // cache. When > 1, ssm_state/conv_state carry a trailing slot axis and the
+    // paged metadata tensors widen to n_seq_slots columns.
+    int n_seq_slots = 1;
+
     // When true, K is FWHT-rotated in the graph before writing to the
     // standard-type cache (Q4_0/Q8_0/etc), and Q is rotated at attention
     // time. This gives TurboQuant-style outlier spreading with fast FA
@@ -375,9 +474,12 @@ struct TargetCache {
     std::vector<ggml_tensor *> attn_v;
 
     // Gated DeltaNet recurrent state: one per delta-net layer.
-    // ssm_state: [S_v, S_v, H_v] f32    (head_v_dim^2 × num_v_heads)
-    // conv_state: [(kernel-1), conv_channels] f32
-    // where conv_channels = d_inner + 2 * n_group * d_state
+    // ssm_state: [S_v, S_v, H_v, n_seq_slots] f32  (head_v_dim^2 × num_v_heads)
+    // conv_state: [(kernel-1), conv_channels, n_seq_slots] f32
+    // where conv_channels = d_inner + 2 * n_group * d_state.
+    // n_seq_slots is 1 for the classic single-sequence cache (identical
+    // layout to the historical 3D/2D tensors); slot s of a multi-slot cache
+    // is the contiguous slab at index s of the trailing axis.
     std::vector<ggml_tensor *> ssm_state;    // size = n_delta_layers (48)
     std::vector<ggml_tensor *> conv_state;
 
@@ -398,21 +500,59 @@ struct TargetCache {
     //     F32 for opt-in exact rollback), one per delta layer.
     //     Element t on axis 3 holds the DeltaNet recurrent state after
     //     processing verify token t. Spec decode commits t = commit_n - 1.
-    //   conv_input_cache: [(kernel-1) + max_q_len, conv_channels] f32, one per
-    //     delta layer. Holds the full concat(old_conv_state, qkv_new_tokens)
-    //     that was fed to ggml_ssm_conv. Spec decode slices
-    //     [commit_n..commit_n+kernel-2] along dim 0 for conv state rollback.
+    //   conv_input_cache: normally [(kernel-1) + max_q_len, conv_channels]
+    //     f32, one per delta layer, holding the full concat fed to
+    //     ggml_ssm_conv. In SpecLA mode these are [conv_channels, max_q_len]
+    //     strided views into conv_factor_all and hold raw current inputs.
     std::vector<ggml_tensor *> ssm_intermediate;    // size = n_delta (48)
     std::vector<ggml_tensor *> conv_input_cache;    // size = n_delta (48)
+    std::vector<ggml_tensor *> conv_input_cache_alt;// SpecLA factor bank 1
+    ggml_tensor * conv_factor_all = nullptr;
+    ggml_tensor * conv_factor_all_alt = nullptr;
+
+    // SpecLA factor buffers (allocated instead of ssm_intermediate on the
+    // single-target SpecLA path). Two token-major banks let a
+    // verify consume the preceding accepted path while writing its own raw
+    // factors without aliasing:
+    //   factor_k_all:     [S_k, H_v, n_delta, max_q_len] f32
+    //   factor_v_new_all: [S_v, H_v, n_delta, max_q_len] f32
+    //   factor_g_ps_all:  [H_v, n_delta, max_q_len] f32
+    //   conv_factor_all:  [conv_channels, n_delta, max_q_len] f32
+    // The per-layer vectors below are persistent VIEWS into these (created
+    // after buffer allocation), shaped like independent per-layer buffers so
+    // the capture path treats them exactly like other cache tensors.
+    ggml_tensor * factor_k_all = nullptr;
+    ggml_tensor * factor_v_new_all = nullptr;
+    ggml_tensor * factor_g_ps_all = nullptr;
+    ggml_tensor * factor_k_all_alt = nullptr;
+    ggml_tensor * factor_v_new_all_alt = nullptr;
+    ggml_tensor * factor_g_ps_all_alt = nullptr;
+    std::vector<ggml_tensor *> factor_k;            // view [S_k, H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_v_new;        // view [S_v, H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_g_ps;         // view [H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_k_alt;
+    std::vector<ggml_tensor *> factor_v_new_alt;
+    std::vector<ggml_tensor *> factor_g_ps_alt;
+    // Host-side bank state. pending_bank is read by the next verify; the
+    // opposite bank receives that verify's factors.
+    int specla_pending_bank = 0;
+    int specla_pending_count = 0;
+    // Device-side accepted-index scratch and uploaded pointer tables.
+    ggml_tensor * specla_idx = nullptr;             // i32 [max_q_len]
+    ggml_tensor * specla_state_ptrs = nullptr;      // i64 [n_delta]
+    ggml_tensor * specla_conv_state_ptrs = nullptr; // i64 [n_delta]
+    // i64 [8]: base pointers for bank0 {k,v,g,conv}, then bank1. HLD kernels
+    // write their compact factors here directly, avoiding four cpy nodes per
+    // delta layer. Consolidated layout is token-major [t, layer, head, dim].
+    ggml_tensor * specla_factor_ptrs = nullptr;
 
     // Rolling target layer features captured during target forward passes.
-    // Shape [5 * hidden, target_feat_cap] bf16. target_feat_cap is typically
-    // << max_ctx (e.g. 4096) so the buffer stays small at 128K context. The
-    // graph writes to slot `(kv_start + i) % target_feat_cap` so positions
-    // beyond the cap wrap and overwrite older entries. Readers (draft) only
-    // need the last DRAFT_CTX_MAX positions, so wrap is invisible in
-    // practice. Fed into the draft graph's fc projection after a bf16→f32
-    // cast (ggml_get_to_fp32_cuda).
+    // Single-sequence shape: [5 * hidden, target_feat_cap] bf16. A concurrent
+    // tree cache owns one ring per physical sequence slot and one final dead row:
+    // [5 * hidden, target_feat_cap * n_seq_slots + 1]. Live row P in slot S
+    // maps to S*target_feat_cap + P%target_feat_cap; bucket padding maps to the
+    // dead final row because ggml_set_rows does not accept a negative index.
+    // target_feat_cap remains the per-sequence ring width.
     ggml_tensor * target_feat = nullptr;
     int target_feat_cap = 0;
 
@@ -426,8 +566,10 @@ struct TargetCache {
     // gallocr-managed graph inputs lets decode steps update them append-only
     // — one table entry per new 16-token block plus a 4-byte length per step
     // — instead of re-uploading the whole live table before every compute.
-    ggml_tensor * paged_block_table = nullptr;   // I32 [max_blocks, 1]
-    ggml_tensor * paged_kv_seq_lens = nullptr;   // I32 [1]
+    // Column s of the block table (and entry s of the lens) belongs to
+    // sequence slot s; single-sequence caches have exactly one column.
+    ggml_tensor * paged_block_table = nullptr;   // I32 [max_blocks_per_seq, n_seq_slots]
+    ggml_tensor * paged_kv_seq_lens = nullptr;   // I32 [n_seq_slots]
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
@@ -475,11 +617,12 @@ struct PrefixSnapshot {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
-    // Phase B: thin-mode snapshots cover only a KV-position range.
-    bool is_thin  = false;
-    int  kv_start = 0;     // inclusive (only meaningful when is_thin)
-    int  kv_end   = 0;     // exclusive (only meaningful when is_thin)
-    // When is_thin == true:
+    // Snapshot payload shape; one value avoids impossible flag combinations.
+    enum class Layout { empty, dense, thin, paged };
+    Layout layout = Layout::empty;
+    int  kv_start = 0;  // inclusive (only meaningful for Layout::thin)
+    int  kv_end   = 0;  // exclusive (only meaningful for Layout::thin)
+    // For Layout::thin:
     //   - attn_k_snap[i] / attn_v_snap[i] are sized
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
@@ -505,6 +648,45 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
 
+// Exact CPU-buffer allocation size for the dense checkpoint layout used by
+// snapshot_paged_target_cache(). Returns zero when the cache topology or token
+// count is invalid. This lets the scheduler enforce a resident-memory budget
+// before allocating or copying a checkpoint.
+size_t estimate_paged_target_cache_snapshot_bytes(
+    const TargetCache & cache, int token_count);
+
+// Capture one live sequence from a multi-slot paged cache. Attention rows are
+// gathered through `block_table` into dense logical order in the copied
+// snapshot; recurrent state is copied only from `seq_slot`'s slab. The page
+// table itself is intentionally not retained: every restore owns fresh pages.
+bool snapshot_paged_target_cache(
+    const TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & snap);
+
+// Atomically replace a paged snapshot. The incumbent remains valid when
+// allocation, layout validation, or any staged copy fails.
+bool replace_paged_target_cache(
+    const TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & destination);
+
+// Restore a copied paged snapshot into fresh destination pages and one
+// recurrent-state slab. `block_table` describes the destination sequence and
+// must cover snap.cur_pos logical tokens.
+bool restore_paged_target_cache(
+    const PrefixSnapshot & snap,
+    TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size);
+
 // Thin snapshot: capture only KV slice [kv_start, kv_end).
 // SSM/conv/target_feat are not preserved (caller chains thin entries
 // onto a thick base via restore_target_cache_chain).
@@ -528,7 +710,7 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
                                  TargetCache & cache);
 
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
-// sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
+// sizes. Default is LUCE_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
 // mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
 // Pass 0 to use the default.
 // When prefill_only is true, rollback tensors (snapshots, intermediates) are
@@ -542,6 +724,14 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 // max_ctx rounded up to PAGED_BLOCK_SIZE so the last partial page has physical
 // rows. Non-paged callers retain the legacy rule that ctx_alloc cannot grow
 // the allocation beyond max_ctx.
+// `n_seq_slots` (concurrent serving): number of sequence slots the cache
+// serves at once. > 1 requires paged_attention; it adds a trailing slot axis
+// to the recurrent state, widens the paged metadata to one block-table column
+// per slot, and skips the legacy rollback tensors entirely. With
+// n_seq_slots > 1 the attention K/V tensors are sized by ctx_alloc (the shared
+// pool capacity plus one scratch block) rather than one sequence's max_ctx.
+// `concurrent_tree` declares that a paged multi-slot caller owns fixed tree
+// scratch and disjoint target-feature rings for GPU promotion.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
@@ -549,7 +739,11 @@ bool create_target_cache(const TargetWeights & w,
                          TargetCache & out,
                          bool prefill_only = false,
                          int ctx_alloc = 0,
-                         bool paged_attention = false);
+                         bool paged_attention = false,
+                         int n_seq_slots = 1,
+                         bool concurrent_tree = false,
+                         ggml_type cache_type_k = GGML_TYPE_COUNT,
+                         ggml_type cache_type_v = GGML_TYPE_COUNT);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -565,7 +759,11 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool allocate_target_feat,
                                  int ctx_alloc = 0,
                                  bool f32_ssm_intermediates = false,
-                                 bool paged_attention = false);
+                                 bool paged_attention = false,
+                                 int n_seq_slots = 1,
+                                 bool concurrent_tree = false,
+                         ggml_type cache_type_k = GGML_TYPE_COUNT,
+                         ggml_type cache_type_v = GGML_TYPE_COUNT);
 
 void free_target_cache(TargetCache & c);
 
@@ -580,13 +778,34 @@ void reset_target_cache(TargetCache & c);
 // stale delta-net state corrupting subsequent prefills.
 void reset_recurrent_state(TargetCache & c);
 
+// Zero one slot's recurrent state (SSM + conv slabs) in a multi-slot cache.
+// Called at admission: slots are recycled without a device-side reset, so the
+// slab may still hold the previous occupant's state, and the admitted
+// prompt's chunked prefill advances its state in this slab directly.
+void reset_recurrent_slot(TargetCache & c, int slot);
+
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
+// enable_specla is the caller's effective SpecLA decision (config-driven);
+// the factor buffers exist iff it is true, and downstream graph code keys
+// SpecLA off their presence.
 bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
-                           TargetCache & cache);
+                           TargetCache & cache,
+                           bool enable_specla);
+
+// Compatibility commit for the fully factorized §4.2 fallback. The production
+// HLD route instead keeps raw accepted factors pending and consumes them in
+// the next state-resident verify (§5.2). Commits the bank the just-run verify
+// wrote (1 - specla_pending_bank) into durable SSM and conv state, so it must
+// be called before the host-side bank rotation. accepted_idx is in path order.
+bool specla_commit_accepted(TargetCache & cache,
+                            ggml_backend_t backend,
+                            const int32_t * accepted_idx,
+                            int A);
+
 
 // ─── Target forward graph ─────────────────────────────────────────
 
@@ -602,12 +821,47 @@ bool migrate_prefill_cache(const TargetWeights & w,
 //   ssm_intermediate_states: [S_v, S_v, H_v, q_len] f32
 //       Element t on axis 3 holds the DeltaNet state after processing verify
 //       token t. Rollback reads offset (commit_n-1) * S_v*S_v*H*elt.
-//   conv_input: [(kernel-1) + q_len, conv_channels, 1] f32
-//       Full concat(old_conv_state, qkv_new_tokens) fed to ggml_ssm_conv.
-//       Rollback reads slice [commit_n..commit_n+kernel-2] along dim 0.
+//   conv_input: normally [(kernel-1) + q_len, conv_channels, 1] f32 with the
+//       full concat fed to ggml_ssm_conv. In SpecLA mode it is a strided
+//       [conv_channels, q_len, 1] view receiving raw current inputs.
 struct DeltaNetCapture {
     ggml_tensor * ssm_intermediate_states = nullptr;
     ggml_tensor * conv_input              = nullptr;
+    // Concurrent tree direct-commit data. The compact replay log plus the
+    // tree conv input can advance accepted recurrent prefixes without a
+    // second target-model forward. These are graph-owned outputs.
+    ggml_tensor * replay_log              = nullptr;
+
+    // SpecLA factor capture (docs/SPECLA.md). Persistent F32
+    // aliases into the bank written by this verify. In the HLD path the
+    // historical field names hold raw serial-recurrence terms:
+    //   factor_k:     [S_k, H_v, max_verify_tokens] — post-l2norm keys
+    //   factor_v_new: [S_v, H_v, max_verify_tokens] — raw Delta-rule delta
+    //   factor_g_ps:  [H_v, max_verify_tokens]      — raw log-decay g
+    // The factorized compatibility route uses corrected ṽ and cumulative g⁺
+    // in the same slots. ssm_intermediate_states stays null in SpecLA mode.
+    ggml_tensor * factor_k     = nullptr;
+    ggml_tensor * factor_v_new = nullptr;
+    ggml_tensor * factor_g_ps  = nullptr;
+    ggml_tensor * pending_factor_k     = nullptr;
+    ggml_tensor * pending_factor_v_new = nullptr;
+    ggml_tensor * pending_factor_g     = nullptr;
+    ggml_tensor * pending_conv_input   = nullptr;
+    ggml_tensor * factor_ptrs           = nullptr;
+    int factor_n_layers = 0;
+    int factor_layer = -1;
+    int pending_bank = 0;
+};
+
+// One contiguous prompt chunk on the flattened token axis of a concurrent
+// step. Several may be present, one per prefilling slot; segments are dense,
+// in order, and precede the decode rows. Full attention needs no per-segment
+// dispatch (the ragged read is row-driven); DeltaNet runs one independent
+// S=1 recurrence per segment on that slot's own state slab.
+struct QwenPrefillSegment {
+    int token_offset = 0;
+    int n_tokens = 0;
+    int seq_slot = 0;
 };
 
 struct QwenGraphInputs {
@@ -618,29 +872,113 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
+    bool          capture_tree_commit = false; // compact recurrent replay log + tree features
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
-    bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
-    ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
-    // [n_tokens,n_head_kv] i64 physical destination rows; non-null selects the
-    // step-invariant ggml_set_rows KV write.
+    int           logits_tail_rows = 0; // compute logits only for last n rows; 0 = all
+    ggml_tensor * parent_ids = nullptr; // tree: [tree_width,n_tree_seqs] i32
+    ggml_tensor * tree_sizes = nullptr; // tree: [n_tree_seqs] i32; 0 = padding tree
+    // [n_tokens,n_head_kv] i64 physical destination rows for the
+    // ggml_set_rows KV write; step-invariant.
     ggml_tensor * kv_write_rows = nullptr;
-    // Paged decode: attention reads cache.paged_block_table /
-    // cache.paged_kv_seq_lens instead of a dense KV view.
-    bool paged_attention = false;
+    ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
+    // [n_seqs] i32; valid cached K/V tokens per sequence.
+    ggml_tensor * paged_kv_seq_lens = nullptr;
+    // [n_seqs] i32 mapping compact decode rows to physical cache/state slots.
+    // A value of -1 denotes a graph-bucket padding row.
+    ggml_tensor * active_slot_ids = nullptr;
+    // [n_seqs] i32 gather-safe variant: padding maps to slot zero. Used only
+    // for reading the much smaller conv-state slabs; writes use active ids.
+    ggml_tensor * state_slot_ids = nullptr;
+    // [n_tokens] i32 per-row block-table column for the ragged paged
+    // attention read (prefill rows carry their slot, decode rows theirs,
+    // padding -1). Non-null exactly when n_prefill_tokens > 0.
+    ggml_tensor * paged_query_seq_ids = nullptr;
+    // [n_tokens] i32 per-row inclusive logical position; the kernel clamps
+    // each row's KV extent to position+1, which IS the causal mask. -1 on
+    // padding rows.
+    ggml_tensor * paged_query_positions = nullptr;
+    // Optional [n_rows] i32 gather of final-norm rows before the LM head:
+    // multi-prompt steps sample scattered rows (each committing segment's
+    // last row plus the decode rows), which a tail view cannot express.
+    // Non-null overrides logits_tail_rows.
+    ggml_tensor * logits_row_indices = nullptr;
+    // Optional replay-stable DFlash capture destinations. When present, all
+    // captured layers are concatenated once and written with ggml_set_rows.
+    // Multi-slot callers provide per-slot ring rows (padding uses dead row).
+    ggml_tensor * target_feat_rows = nullptr; // [n_tokens] i32
+    // Prefill segments on the leading token axis (see QwenPrefillSegment).
+    // n_prefill_tokens is their total row count. seq_slot is ignored when
+    // segments are present.
+    const QwenPrefillSegment * prefill_segments = nullptr;
+    int n_prefill_segments = 0;
+    // Concurrent-slot serving (paged only):
+    //   n_seqs > 1  — batched decode: the token axis is the SEQUENCE axis
+    //     (n_tokens == n_seqs, one token per slot). DeltaNet runs with
+    //     n_seq_tokens=1 over the full state slabs, and the paged attention
+    //     output is permuted from [D,n_seq,Hq] to the dense [D,Hq,n_tokens]
+    //     layout before the reshape.
+    //   seq_slot — the prefilling slot: its own conv/ssm slab carries the
+    //     prompt's chunk-to-chunk recurrent state (reset at admission), and
+    //     its block-table column resolves the chunk's paged K/V reads.
+    //   paged_max_kv_len — max kv_seq_len over live slots INCLUDING the
+    //     prefilling slot's rows written this step, used (256-padded) as the
+    //     kernel launch bound instead of kv_start + n_tokens, which is
+    //     meaningless across slots.
+    //   n_prefill_tokens — packed prefill+decode: the first n_prefill_tokens
+    //     rows are the dense concatenation of prefill_segments; optional
+    //     trailing n_seqs rows are the compact batched decode. All rows
+    //     read the paged pool through one ragged attention call driven by
+    //     paged_query_seq_ids/positions; this step's chunk rows are visible
+    //     to their own causal reads because the set_rows pool write precedes
+    //     attention in the graph. Projections, FFN, norms, and the LM head
+    //     run once over the whole batch; only the DeltaNet core splits.
+    //     Requires n_tokens == n_prefill_tokens + n_seqs when decode rows
+    //     are present. 0 = no prefill segment.
+    // Packed steps use logits_row_indices for scattered committing rows and
+    // compact decode rows; logits_tail_rows remains the dense-path fallback.
+    int  n_seqs = 1;
+    // Mixed direct-commit tree graphs place this many one-token mapped AR
+    // sequences before the fixed-width speculative tree segment. Their slot
+    // IDs share active_slot_ids/state_slot_ids with the tree lanes.
+    int  mapped_ar_seqs = 0;
+    int  seq_slot = 0;
+    int  paged_max_kv_len = 0;
+    int  n_prefill_tokens = 0;
+    // Packed paged-tree metadata. Tokens are flattened sequence-major:
+    // row = sequence*tree_width + node. tree_scratch_* describe the physical
+    // KV scratch slab owned by each physical sequence slot.
+    int  tree_width = 0;
+    int  tree_scratch_base = 0;
+    int  tree_scratch_stride = 0;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.
     bool q_capture = false;
+
+    // SpecLA topology masks for the fully factorized compatibility route.
+    ggml_tensor * specla_m_strict = nullptr;
+    ggml_tensor * specla_m_incl   = nullptr;
+    ggml_tensor * specla_m_eye    = nullptr;
+    // Packed heavy-light schedule for the state-resident SpecLA kernels.
+    ggml_tensor * specla_hld = nullptr;
+    int specla_n_chains = 0;
+    int specla_n_waves = 0;
+    int specla_n_boundaries = 0;
+    int specla_max_parallel_chains = 0;
 };
 
 struct QwenGraphOutputs {
-    ggml_tensor * logits;      // [vocab, n_tokens] f32
+    // [vocab, n_logits_rows] f32; row count is selected by the logits
+    // projection controls in QwenGraphInputs.
+    ggml_tensor * logits;
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after
     // graph_compute; the spec-decode loop reads them host-side for rollback.
     std::vector<DeltaNetCapture> delta_captures;
+    // BF16 [n_capture_layers*n_embd, n_tokens], packed-tree only.
+    ggml_tensor * tree_features = nullptr;
     // One entry per target layer. Populated only when capture_moe_router is
     // true; qwen35 dense layers and non-MoE models leave entries null.
     std::vector<ggml_tensor *> moe_selected;
@@ -716,7 +1054,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_tensor *         kv_write_rows = nullptr,
     bool                  skip_gdn_intermediate = true);
 
-} // namespace dflash::common
+} // namespace luce::common
 
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
 #include <cuda_runtime.h>

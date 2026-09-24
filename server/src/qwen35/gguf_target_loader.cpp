@@ -44,7 +44,9 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "qwen35_image_prompt.h"
 #include "common/derived_scalars.h"
+#include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
@@ -65,7 +67,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 // CpuEmbedder destructor + embed() method
 CpuEmbedder::~CpuEmbedder() {
@@ -112,6 +114,18 @@ int32_t get_i32_or(const gguf_context * g, const char * key, int32_t fallback) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0) return fallback;
     return gguf_get_val_i32(g, id);
+}
+
+// Id of the vocabulary entry spelled exactly `text`, or -1. Searched from the
+// end, where the added special tokens live.
+static int32_t find_token_id(const gguf_context * g, const char * text) {
+    const int64_t key = gguf_find_key(g, "tokenizer.ggml.tokens");
+    if (key < 0 || gguf_get_kv_type(g, key) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, key) != GGUF_TYPE_STRING) return -1;
+    for (size_t i = gguf_get_arr_n(g, key); i-- > 0;) {
+        if (std::strcmp(gguf_get_arr_str(g, key, i), text) == 0) return (int32_t) i;
+    }
+    return -1;
 }
 
 uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
@@ -173,6 +187,36 @@ static bool should_load_target_tensor(const char * name,
         return true;
     }
     return false;
+}
+
+static bool validate_embedded_nextn_blocks(const gguf_context * gctx,
+                                           uint32_t target_layer_count,
+                                           uint32_t block_count,
+                                           std::string & err) {
+    if (target_layer_count == block_count) return true;
+
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    for (uint32_t il = target_layer_count; il < block_count; ++il) {
+        const std::string prefix = "blk." + std::to_string(il) + ".nextn.";
+        bool found_nextn_tensor = false;
+        for (int64_t tid = 0; tid < n_tensors; ++tid) {
+            const char * name = gguf_get_tensor_name(gctx, tid);
+            if (name && std::strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+                found_nextn_tensor = true;
+                break;
+            }
+        }
+        if (!found_nextn_tensor) {
+            char buf[256];
+            std::snprintf(
+                buf, sizeof(buf),
+                "GGUF declares embedded NextN block %u but has no tensor with prefix '%s'",
+                il, prefix.c_str());
+            err = buf;
+            return false;
+        }
+    }
+    return true;
 }
 
 struct TargetTensorAlloc {
@@ -271,7 +315,7 @@ bool verify_target_derived_scalars(const TargetWeights & out, std::string & err)
     const int64_t exp_n_embd = (int64_t)out.n_embd;
     char tag[16];
     std::snprintf(tag, sizeof(tag), "blk.%d", fa_il);
-    return dflash::common::verify_derived_scalars(
+    return luce::common::verify_derived_scalars(
         fa.wq->ne[1], fa.wk->ne[1], fa.wq->ne[0],
         exp_q_dim, exp_kv_dim, exp_n_embd,
         tag, err);
@@ -329,7 +373,32 @@ bool load_target_gguf_partial(const std::string & path,
 
     const uint32_t n_embd  = get_u32_or(gctx, key("embedding_length").c_str(), 0);
     const uint32_t n_ff    = get_u32_or(gctx, key("feed_forward_length").c_str(), 0);
-    const uint32_t n_layer = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t block_count = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t nextn_predict_layers =
+        get_u32_or(gctx, key("nextn_predict_layers").c_str(), 0);
+    uint32_t n_layer = 0;
+    if (!derive_effective_target_layer_count(
+            arch_str, block_count, nextn_predict_layers, n_layer, err)) {
+        set_last_error("invalid target layer metadata: " + err);
+        ggml_free(meta_ctx);
+        gguf_free(gctx);
+        return false;
+    }
+    if (!validate_embedded_nextn_blocks(gctx, n_layer, block_count, err)) {
+        set_last_error(err);
+        ggml_free(meta_ctx);
+        gguf_free(gctx);
+        return false;
+    }
+    if (nextn_predict_layers > 0) {
+        std::fprintf(
+            stderr,
+            "[loader] ignoring %u embedded NextN/MTP block%s: "
+            "target_layers=%u total_blocks=%u\n",
+            nextn_predict_layers,
+            nextn_predict_layers == 1 ? "" : "s",
+            n_layer, block_count);
+    }
     const uint32_t n_head  = get_u32_or(gctx, key("attention.head_count").c_str(), 0);
     const uint32_t n_headkv= get_u32_or(gctx, key("attention.head_count_kv").c_str(), 0);
     const uint32_t kl      = get_u32_or(gctx, key("attention.key_length").c_str(), 0);
@@ -361,10 +430,12 @@ bool load_target_gguf_partial(const std::string & path,
     if (invalid_common || invalid_dense || invalid_moe) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "invalid %s hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "invalid %s hparams: n_embd=%u n_layer=%u block_count=%u "
+            "nextn=%u n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u n_ff_exp=%u n_ff_shexp=%u n_expert=%u used=%u "
             "fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
-            arch_str.c_str(), n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff,
+            arch_str.c_str(), n_embd, n_layer, block_count,
+            nextn_predict_layers, n_head, n_headkv, kl, vl, n_ff,
             n_ff_exp, n_ff_shexp, n_expert, n_expert_used,
             fai, ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
             set_last_error(buf);
@@ -379,7 +450,11 @@ bool load_target_gguf_partial(const std::string & path,
     }
     if (n_layer % fai != 0) {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        std::snprintf(
+            buf, sizeof(buf),
+            "target_layer_count=%u not divisible by full_attention_interval=%u "
+            "(block_count=%u nextn_predict_layers=%u)",
+            n_layer, fai, block_count, nextn_predict_layers);
         set_last_error(buf);
         gguf_free(gctx); return false;
     }
@@ -482,6 +557,7 @@ bool load_target_gguf_partial(const std::string & path,
         out.eos_chat_id = (raw_eos_chat == kEosKeyMissing) ? -1 : (int32_t)raw_eos_chat;
         std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
     }
+    out.image_pad_id = find_token_id(gctx, QWEN35_IMAGE_PAD_TOKEN);
 
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
@@ -618,14 +694,77 @@ bool load_target_gguf_partial(const std::string & path,
         if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
-        alloc_total = align_up_size(alloc_total, alignment);
         TargetTensorAlloc a;
         a.tensor = t;
         a.file_offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
         a.file_size = gguf_get_tensor_size(gctx, tid);
-        a.buffer_offset = alloc_total;
-        alloc_total += ggml_backend_buft_get_alloc_size(buft, t);
         allocs.push_back(a);
+    }
+
+    // Stacked projections: place each (first, second) pair back to back in the
+    // weight buffer so one alias tensor spanning both rows serves a single
+    // GEMV. Only for the plain single-buffer path (the TP meta allocator
+    // places tensors itself) and only when the pair shares type/ne0 and the
+    // first tensor's byte size keeps the second one aligned.
+    const bool can_stack = !plan.metadata_only && !ggml_backend_buft_is_meta(buft) &&
+                           std::getenv("LUCE_QWEN35_NO_STACK") == nullptr;
+    if (can_stack) {
+        auto find_alloc = [&](const std::string & name) -> int {
+            for (size_t i = 0; i < allocs.size(); i++) {
+                if (name == allocs[i].tensor->name) return (int)i;
+            }
+            return -1;
+        };
+        // (first, second) suffix pairs; the alias tensor stacks first's rows
+        // then second's, so they are emitted in that order whichever member
+        // the file lists first.
+        static const char * const kPairs[][2] = {
+            { ".attn_gate.weight", ".attn_qkv.weight"  },
+            { ".ssm_beta.weight",  ".ssm_alpha.weight" },
+        };
+        std::vector<TargetTensorAlloc> ordered;
+        ordered.reserve(allocs.size());
+        std::vector<bool> taken(allocs.size(), false);
+        for (size_t i = 0; i < allocs.size(); i++) {
+            if (taken[i]) continue;
+            const std::string name = allocs[i].tensor->name;
+            int first = -1, second = -1;
+            if (name.rfind("blk.", 0) == 0) {
+                for (const auto & pr : kPairs) {
+                    for (int m = 0; m < 2; m++) {
+                        // Exact-suffix match only: a suffix-superset name
+                        // (e.g. ".attn_qkv.weight.scale") must not trigger
+                        // the pair path, or the tensor would be dropped from
+                        // the ordering below.
+                        const size_t slen = std::strlen(pr[m]);
+                        if (name.size() <= slen ||
+                            name.compare(name.size() - slen, slen, pr[m]) != 0) {
+                            continue;
+                        }
+                        const std::string prefix = name.substr(0, name.size() - slen);
+                        first  = find_alloc(prefix + pr[0]);
+                        second = find_alloc(prefix + pr[1]);
+                        break;
+                    }
+                    if (first >= 0 || second >= 0) break;
+                }
+            }
+            if (first >= 0 && second >= 0 && !taken[(size_t)first] && !taken[(size_t)second] &&
+                ((size_t)first == i || (size_t)second == i)) {
+                taken[(size_t)first] = taken[(size_t)second] = true;
+                ordered.push_back(allocs[(size_t)first]);
+                ordered.push_back(allocs[(size_t)second]);
+                continue;
+            }
+            taken[i] = true;
+            ordered.push_back(allocs[i]);
+        }
+        allocs.swap(ordered);
+    }
+    for (TargetTensorAlloc & a : allocs) {
+        alloc_total = align_up_size(alloc_total, alignment);
+        a.buffer_offset = alloc_total;
+        alloc_total += ggml_backend_buft_get_alloc_size(buft, a.tensor);
     }
 
     // The generic meta buffer allocator must see all tensors together so it
@@ -729,6 +868,47 @@ bool load_target_gguf_partial(const std::string & path,
                 release_out_buffer();
                 gguf_free(gctx);
                 return false;
+            }
+        }
+        if (can_stack) {
+            // Alias tensors over adjacent pairs. They read the same bytes as
+            // the two source tensors (no copy, no extra VRAM).
+            ggml_init_params sip{};
+            sip.mem_size   = (2 * n_layer + 8) * ggml_tensor_overhead();
+            sip.mem_buffer = nullptr;
+            sip.no_alloc   = true;
+            out.stack_ctx = ggml_init(sip);
+            int n_stacked = 0;
+            auto make_stack = [&](ggml_tensor * first, ggml_tensor * second,
+                                  const char * name) -> ggml_tensor * {
+                if (!first || !second || !out.stack_ctx) return nullptr;
+                if (first->type != second->type || first->ne[0] != second->ne[0]) return nullptr;
+                if (!ggml_is_contiguous(first) || !ggml_is_contiguous(second)) return nullptr;
+                const char * f = (const char *)first->data;
+                const char * sd = (const char *)second->data;
+                if (!f || !sd || sd != f + ggml_nbytes(first)) return nullptr;
+                ggml_tensor * st = ggml_new_tensor_2d(out.stack_ctx, first->type,
+                                                      first->ne[0], first->ne[1] + second->ne[1]);
+                // The alias must not need padding the backend would want to
+                // clear past its end (that would scribble on the next tensor).
+                if (ggml_backend_buft_get_alloc_size(buft, st) != ggml_nbytes(st)) return nullptr;
+                ggml_set_name(st, name);
+                if (ggml_backend_tensor_alloc(out.buf, st, first->data) != GGML_STATUS_SUCCESS) {
+                    return nullptr;
+                }
+                n_stacked++;
+                return st;
+            };
+            for (int il = 0; il < (int)n_layer; il++) {
+                TargetLayer & L = out.layers[il];
+                char nm[96];
+                std::snprintf(nm, sizeof(nm), "blk.%d.attn_gate_qkv.stacked", il);
+                L.wqkv_z = make_stack(L.wqkv_gate, L.wqkv, nm);
+                std::snprintf(nm, sizeof(nm), "blk.%d.ssm_beta_alpha.stacked", il);
+                L.ssm_ba = make_stack(L.ssm_beta, L.ssm_alpha, nm);
+            }
+            if (n_stacked > 0) {
+                std::fprintf(stderr, "[loader] stacked %d projection pairs (zero-copy aliases)\n", n_stacked);
             }
         }
     }
@@ -858,6 +1038,62 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
 
+    // ── Fused raw-gate GDN parameters: per DeltaNet layer one f32 [2*H]
+    //    tensor holding [dt_bias | A] so the kernel can apply
+    //    sigmoid/softplus itself (src[9] of the GDN op). Skipped for
+    //    metadata-only / meta (TP) loads.
+    if (!plan.metadata_only && !ggml_backend_buft_is_meta(buft)) {
+        int n_gate = 0;
+        for (int il = 0; il < (int)n_layer; il++) {
+            const TargetLayer & L = out.layers[il];
+            if (L.ssm_dt_bias && L.ssm_a && L.ssm_dt_bias->data && L.ssm_a->data &&
+                L.ssm_dt_bias->type == GGML_TYPE_F32 && L.ssm_a->type == GGML_TYPE_F32 &&
+                ggml_nelements(L.ssm_dt_bias) == ggml_nelements(L.ssm_a)) {
+                n_gate++;
+            }
+        }
+        if (n_gate > 0) {
+            ggml_init_params gip{};
+            gip.mem_size   = (n_gate + 2) * ggml_tensor_overhead();
+            gip.mem_buffer = nullptr;
+            gip.no_alloc   = true;
+            out.gate_ctx = ggml_init(gip);
+            if (out.gate_ctx) {
+                for (int il = 0; il < (int)n_layer; il++) {
+                    TargetLayer & L = out.layers[il];
+                    if (!(L.ssm_dt_bias && L.ssm_a && L.ssm_dt_bias->data && L.ssm_a->data &&
+                          L.ssm_dt_bias->type == GGML_TYPE_F32 && L.ssm_a->type == GGML_TYPE_F32 &&
+                          ggml_nelements(L.ssm_dt_bias) == ggml_nelements(L.ssm_a))) {
+                        continue;
+                    }
+                    const int64_t h = ggml_nelements(L.ssm_a);
+                    L.ssm_gate_ba = ggml_new_tensor_1d(out.gate_ctx, GGML_TYPE_F32, 2*h);
+                    char nm[96];
+                    std::snprintf(nm, sizeof(nm), "blk.%d.ssm_gate_ba", il);
+                    ggml_set_name(L.ssm_gate_ba, nm);
+                }
+                out.gate_buf = ggml_backend_alloc_ctx_tensors(out.gate_ctx, backend);
+                if (out.gate_buf) {
+                    ggml_backend_buffer_set_usage(out.gate_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    std::vector<float> tmp;
+                    for (int il = 0; il < (int)n_layer; il++) {
+                        TargetLayer & L = out.layers[il];
+                        if (!L.ssm_gate_ba) continue;
+                        const int64_t h = ggml_nelements(L.ssm_a);
+                        tmp.resize((size_t)2*h);
+                        ggml_backend_tensor_get(L.ssm_dt_bias, tmp.data(), 0, (size_t)h*sizeof(float));
+                        ggml_backend_tensor_get(L.ssm_a, tmp.data() + h, 0, (size_t)h*sizeof(float));
+                        ggml_backend_tensor_set(L.ssm_gate_ba, tmp.data(), 0, (size_t)2*h*sizeof(float));
+                    }
+                } else {
+                    for (int il = 0; il < (int)n_layer; il++) out.layers[il].ssm_gate_ba = nullptr;
+                    ggml_free(out.gate_ctx);
+                    out.gate_ctx = nullptr;
+                }
+            }
+        }
+    }
+
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
         release_out_buffer();
@@ -896,6 +1132,9 @@ bool load_target_gguf_partial(const std::string & path,
 void free_target_weights(TargetWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
+    if (w.stack_ctx) { ggml_free(w.stack_ctx);    w.stack_ctx = nullptr; }
+    if (w.gate_buf)  { ggml_backend_buffer_free(w.gate_buf); w.gate_buf = nullptr; }
+    if (w.gate_ctx)  { ggml_free(w.gate_ctx);     w.gate_ctx = nullptr; }
     // CpuEmbedder destructor handles the mmap automatically.
     w.moe_hybrid.reset();
     w.layers.clear();
@@ -904,4 +1143,4 @@ void free_target_weights(TargetWeights & w) {
     w.output   = nullptr;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

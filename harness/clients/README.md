@@ -11,7 +11,7 @@ cd lucebox-hub
 harness/clients/run_codex.sh
 ```
 
-Each launcher starts `server/build/dflash_server`, runs the client, writes logs
+Each launcher starts `server/build/luce_server`, runs the client, writes logs
 under `.harness-work/runs`, then stops the server. Override `REPO_DIR`,
 `CLIENT_WORK_DIR`, or `RUN_DIR` for custom/shared locations.
 If a client CLI is missing, the launcher installs it automatically. Set
@@ -23,19 +23,19 @@ To preinstall real-client CLIs yourself:
 python3 harness/client_test_runner.py install --clients codex,hermes,omp,openwebui
 ```
 
-The launcher will start `server/build/dflash_server` by default, or the path in
-`DFLASH_SERVER_BIN`. The default model paths are
+The launcher will start `server/build/luce_server` by default, or the path in
+`LUCE_SERVER_BIN`. The default model paths are
 `server/models/Qwen3.6-27B-Q4_K_M.gguf` and
 `server/models/draft/dflash-draft-3.6-q4_k_m.gguf`; override them with
-`TARGET`/`DRAFT` or the standard `DFLASH_TARGET`/`DFLASH_DRAFT` env vars.
+`TARGET`/`DRAFT` or the standard `LUCE_TARGET`/`LUCE_DRAFT` env vars.
 When you set a custom target without setting a draft, the launcher does not
 attach the default Qwen draft. Use `DRAFT=none` explicitly for no-draft targets
 such as Gemma, Laguna, or standalone Qwen3.
 
 ```bash
-DFLASH_SERVER_BIN=server/build/dflash_server \
-DFLASH_TARGET=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
-DFLASH_DRAFT=/path/to/dflash-draft-3.6-q4_k_m.gguf \
+LUCE_SERVER_BIN=server/build/luce_server \
+LUCE_TARGET=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+LUCE_DRAFT=/path/to/dflash-draft-3.6-q4_k_m.gguf \
 MAX_CTX=32768 MAX_TOKENS=512 \
 BUDGET=22 VERIFY_MODE=ddtree \
 harness/clients/run_codex.sh
@@ -44,7 +44,7 @@ harness/clients/run_codex.sh
 Gemma example:
 
 ```bash
-DFLASH_TARGET=/path/to/gemma.gguf \
+LUCE_TARGET=/path/to/gemma.gguf \
 DRAFT=none \
 MAX_CTX=32768 MAX_TOKENS=512 \
 harness/clients/run_codex.sh
@@ -118,7 +118,7 @@ Claude-specific prompt boilerplate by default for local-model reliability. To
 test the raw prompt, set:
 
 ```bash
-DFLASH_ANTHROPIC_RAW_SYSTEM=1 DFLASH_ANTHROPIC_RAW_USER=1 \
+LUCE_ANTHROPIC_RAW_SYSTEM=1 LUCE_ANTHROPIC_RAW_USER=1 \
   harness/clients/run_claude_code.sh
 ```
 

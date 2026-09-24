@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct ScoreRange {
     int start; // inclusive
@@ -28,4 +28,4 @@ inline ScoreRange compute_score_range(int n_layer, int score_layers, int fwd_lay
     return { start, end };
 }
 
-} // namespace dflash::common
+} // namespace luce::common

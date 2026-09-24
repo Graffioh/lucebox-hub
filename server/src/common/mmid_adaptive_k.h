@@ -1,13 +1,13 @@
 #pragma once
 // [TAG_MMID_ADAPTIVE_K] per-token expert-count gating for small MUL_MAT_ID
 // batches (speculative-verify sized, 2..16 tokens). Contract with the grouped
-// MUL_MAT_ID path in ggml-cuda mmvq.cu (DFLASH_MMID_GROUPED=1): when a router
+// MUL_MAT_ID path in ggml-cuda mmvq.cu (LUCE_MMID_GROUPED=1): when a router
 // ids tensor's ->extra points at an mmid_gate_extra, the grouped prep kernel
 // keeps each token's leading experts until their cumulative combine weight
 // reaches tau, sentinels the rest of the token's ids to -1 (skipped, exact
 // zero contribution) and renormalizes the kept weights in place.
-//   DFLASH_ADAPTIVE_K_TAU=<0..1>   enables (0/unset = off)
-//   DFLASH_ADAPTIVE_K_DENSE=<csv>  layers kept at full top-k. DFlash capture
+//   LUCE_ADAPTIVE_K_TAU=<0..1>   enables (0/unset = off)
+//   LUCE_ADAPTIVE_K_DENSE=<csv>  layers kept at full top-k. DFlash capture
 //                                  layers MUST stay dense so drafter
 //                                  conditioning features are unchanged.
 #include "ggml.h"
@@ -30,12 +30,12 @@ struct mmid_gate_extra {
 inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weights,
                                    int n_tokens, int il, const char * dense_default) {
     static const float tau = []() {
-        const char * e = std::getenv("DFLASH_ADAPTIVE_K_TAU");
+        const char * e = std::getenv("LUCE_ADAPTIVE_K_TAU");
         if (!e) return 0.0f;
         char * end = nullptr;
         const float v = std::strtof(e, &end);
         if (end == e || *end != '\0' || v < 0.0f || v > 1.0f) {
-            std::fprintf(stderr, "[adaptive-k] ignoring DFLASH_ADAPTIVE_K_TAU=\"%s\""
+            std::fprintf(stderr, "[adaptive-k] ignoring LUCE_ADAPTIVE_K_TAU=\"%s\""
                                  " (want a float in [0,1])\n", e);
             return 0.0f;
         }
@@ -48,7 +48,7 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
         static const bool warned = []() {
             std::fprintf(stderr,
                 "[adaptive-k] WARNING: this model family does not thread layer "
-                "indices into the router yet, so DFLASH_ADAPTIVE_K_DENSE cannot "
+                "indices into the router yet, so LUCE_ADAPTIVE_K_DENSE cannot "
                 "be honored and ALL MoE layers are gated - including DFlash "
                 "capture layers, which can degrade drafter acceptance.\n");
             return true;
@@ -56,7 +56,7 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
         (void) warned;
     }
     if (il >= 0) {
-        const char * e = std::getenv("DFLASH_ADAPTIVE_K_DENSE");
+        const char * e = std::getenv("LUCE_ADAPTIVE_K_DENSE");
         const std::string str = e ? e : (dense_default ? dense_default : "");
         size_t pos = 0;
         while (pos < str.size()) {
@@ -70,7 +70,7 @@ inline void mmid_adaptive_k_attach(ggml_tensor * ids, const ggml_tensor * weight
                     if (!warned_bad_dense) {
                         warned_bad_dense = true;
                         std::fprintf(stderr, "[adaptive-k] ignoring malformed "
-                                             "DFLASH_ADAPTIVE_K_DENSE entry \"%s\"\n",
+                                             "LUCE_ADAPTIVE_K_DENSE entry \"%s\"\n",
                                      tok.c_str());
                     }
                 } else if ((int) v == il) {

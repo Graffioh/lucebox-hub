@@ -10,12 +10,12 @@
 
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     Qwen35Config cfg;
-    cfg.target_path        = args.target_path;
-    cfg.draft_path         = args.draft_path;
+    cfg.target_path        = args.target_path ? args.target_path : "";
+    if (args.draft_path) cfg.draft_path = args.draft_path;
     cfg.device             = args.device;
     cfg.draft_gpu          = args.draft_gpu;
     cfg.stream_fd          = args.stream_fd;
@@ -42,4 +42,4 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     return run_daemon(backend, dargs);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

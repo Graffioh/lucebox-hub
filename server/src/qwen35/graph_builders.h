@@ -17,11 +17,66 @@
 #include "step_graph.h"
 #include "attn_masks.h"       // align_up, KQ_MASK_PAD
 #include "internal.h"         // TargetWeights, TargetCache
+#include "delta_net_specla.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
-namespace dflash::common {
+namespace luce::common {
+
+namespace detail {
+
+// Qwen's recurrent graph duplicates one small subgraph per ragged sequence.
+// Return a graph capacity that covers every supported concurrent bucket while
+// keeping the legacy allocation for the common <= 8-sequence case.
+bool target_graph_capacity_for_parallel_segments(
+    int n_parallel_segments,
+    size_t & capacity);
+
+// Checked fixed-chain shape/capacity contract. DFlash2 uses widths 2..16, and
+// concurrent serving supports at most 64 slots.
+bool target_paged_tree_graph_capacity(
+    int tree_width,
+    int n_tree_seqs,
+    size_t & capacity);
+
+// Model-free validation shared by the packed-tree builder and its shape
+// tests. paged_max_kv_len is a logical launch bound and may exceed the
+// bounded physical K/V pool; only the per-slot scratch slabs must fit in the
+// physical tensor rows.
+bool validate_target_paged_tree_layout(
+    const TargetCache & cache,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride);
+
+// `active_slot_ids` is a topology marker in mapped-tree graphs. It may be
+// optimized out by gallocr because the actual recurrent and attention row
+// mappings are carried by state_slot_ids and paged_query_seq_ids. Every other
+// tensor listed here is read by a graph node and must have backend storage
+// before the engine uploads metadata.
+inline bool target_paged_tree_uploads_ready(const StepGraph & sg) {
+    const auto allocated = [](const ggml_tensor * tensor) {
+        return tensor && tensor->buffer;
+    };
+    return sg.active_slot_ids &&
+           allocated(sg.inp_embed) && allocated(sg.positions) &&
+           allocated(sg.parent_ids) && allocated(sg.tree_sizes) &&
+           allocated(sg.state_slot_ids) &&
+           allocated(sg.paged_query_seq_ids) &&
+           (!sg.paged_query_positions ||
+            allocated(sg.paged_query_positions)) &&
+           allocated(sg.kv_write_rows);
+}
+
+inline bool target_paged_tree_active_slots_need_upload(
+        const StepGraph & sg) {
+    return sg.active_slot_ids && sg.active_slot_ids->buffer;
+}
+
+}  // namespace detail
 
 // Layer-segmented prefill: process one target layer for chunk_start..chunk_start+n_tokens.
 bool build_layer_step(
@@ -79,6 +134,40 @@ bool build_hybrid_full_layer_step(
 // even though a mask is requested (the mask carries pool-slot validity and
 // must be re-uploaded by the caller before every compute). Used by both
 // single-token decode and multi-token spec verify; requires fa_window == 0.
+//
+// Concurrent-slot serving (multi-slot paged caches):
+//   `n_seqs` — compact decode graph-bucket width; the token axis is the
+//     sequence axis and n_tokens must equal n_seqs.
+//   `compact_slots` — explicit compact-row to physical-slot mapping. Required
+//     for concurrent and fused decode, including width-one buckets. n_seqs is
+//     in [1, 64] and may be wider than cache.n_seq_slots; active_slot_ids uses
+//     -1 for padding rows. Without it, paged attention is classic one-token,
+//     one-sequence decode only.
+//   `seq_slot` — the prefilling slot: its own recurrent-state slab carries
+//     the prompt's chunk-to-chunk state (reset at admission), and its
+//     block-table column resolves the chunk's paged K/V reads.
+//   `paged_max_kv_len` — batched decode: max kv_seq_len over live slots
+//     INCLUDING the prefilling slot's rows written this step (kernel launch
+//     bound).
+//   `n_prefill_tokens` — concurrent prefill: the leading n_prefill_tokens
+//     rows are prompt chunks, reading the pool through the ragged paged
+//     path (per-row seq ids and inclusive causal positions — no mask;
+//     kv_write_rows covers the WHOLE batch). `prefill_segments` (required
+//     when n_prefill_tokens > 0) describes the per-prompt split: dense,
+//     in order, totalling n_prefill_tokens; the array must stay alive
+//     through the call. Fused steps append n_seqs compact decode rows
+//     (n_tokens == n_prefill_tokens + n_seqs, requires compact_slots); a
+//     prefill-only step has n_tokens == n_prefill_tokens, n_seqs == 1 and
+//     no compact map. Requires paged_attention.
+//   `n_logits_rows` — allocate an i32 gather of this many final-norm rows
+//     for the LM head (sg.logits_row_indices, uploaded by the caller);
+//     overrides logits_tail_rows. Multi-prompt steps need it because
+//     committing rows are scattered. 0 keeps the tail-view behavior.
+//   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
+// When `capture && paged_attention`, sg.target_feat_rows is an I32 graph
+// input mapping every token to its slot-local feature-ring destination. This
+// keeps accepted-path replay graph-stable and leaves legacy offset capture
+// unchanged for callers that do not use paged serving.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -90,12 +179,20 @@ bool build_target_step(
     bool capture,
     bool capture_delta_intermediate = false,
     int fa_window = 0,
-    bool last_token_logits_only = false,
+    int logits_tail_rows = 0,
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
     bool kvflash_mask = false,
     bool capture_qk = false,
-    bool paged_attention = false);
+    bool paged_attention = false,
+    int n_seqs = 1,
+    int seq_slot = 0,
+    int paged_max_kv_len = 0,
+    int n_prefill_tokens = 0,
+    const QwenPrefillSegment * prefill_segments = nullptr,
+    int n_prefill_segments = 0,
+    int n_logits_rows = 0,
+    bool compact_slots = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
@@ -106,7 +203,29 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window = 0,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    const SpecLAHLDSchedule * specla_hld = nullptr);
+
+// Packed fixed-chain verify over a paged multi-slot cache. Tokens are
+// flattened after an optional compact one-token AR prefix as
+// [mapped_ar_seqs + tree_width*n_tree_seqs]. n_tree_seqs is a stable graph-
+// bucket width; inactive trees use tree_size=0 and dead/safe row mappings. In
+// particular, state_slot_ids padding must map to a valid harmless slot
+// (normally 0), while active/paged sequence IDs may use -1. Speculative K/V is
+// written into per-slot scratch slabs; recurrent transitions and target
+// features are exposed for post-verification promotion.
+bool build_target_step_paged_tree(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride,
+    int kq_stride_pad = KQ_MASK_PAD,
+    int mapped_ar_seqs = 0);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(
@@ -115,4 +234,4 @@ bool build_lm_head_projection_step(
     ggml_backend_t backend,
     int n_tokens);
 
-}  // namespace dflash::common
+}  // namespace luce::common

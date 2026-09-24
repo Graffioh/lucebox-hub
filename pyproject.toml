@@ -8,7 +8,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Lucebox" }]
 
 dependencies = [
-    "lucebox-dflash",
+    "luce",
     "pflash",
 ]
 
@@ -25,7 +25,7 @@ line-length = 100
 # up. Vendored deps stay excluded permanently (extend-exclude below).
 include = ["harness/**/*.py", "scripts/**/*.py"]
 extend-exclude = [
-    "dflash/deps",
+    "server/deps",
     "megakernel",
     "pflash",
 ]
@@ -46,7 +46,7 @@ package = false
 # (undefined symbol `_ZNR5torch7Library4_def...` on import). Skip
 # isolation here and require a two-pass install:
 #   1. `uv sync`                  → populates the main venv with cu128
-#                                    torch + setuptools (via dflash deps)
+#                                    torch + setuptools (via luce deps)
 #   2. `uv sync --extra megakernel` → compiles setup.py against that env
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
@@ -56,7 +56,7 @@ no-build-isolation-package = ["qwen35-megakernel-bf16"]
 members = ["server", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
-lucebox-dflash = { workspace = true }
+luce = { workspace = true }
 pflash = { workspace = true }
 qwen35-megakernel-bf16 = { workspace = true }
 torch = { index = "pytorch-cu128" }

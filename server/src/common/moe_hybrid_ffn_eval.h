@@ -12,7 +12,24 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
+
+// Choose the quarter-route main-owner quota that minimizes the slower owner's
+// estimated completion time. Returns zero for invalid inputs.
+int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate);
+
+// Select the phase-specific owner maps for ordinary routing, or the physical
+// residency maps required by dynamic route balancing. The peer physical map
+// must remain complete because it receives the exact complement of the
+// dynamically capped main-owner routes.
+struct MoeHybridOwnerMapView {
+    const std::vector<int32_t> * main = nullptr;
+    const std::vector<int32_t> * peer = nullptr;
+};
+
+MoeHybridOwnerMapView moe_hybrid_owner_maps(
+    const MoeHybridLayerStorage & storage,
+    bool dynamic_route_balance);
 
 // GPU-resident residual combine graph: output = residual + hot_out + cold_correction.
 struct ResidualCombineGraph {
@@ -114,6 +131,10 @@ struct MoeHybridFfnTelemetry {
 // map global router IDs to each backend's compact expert stack and mask the
 // slots owned by the other backend without a host-side routing round trip.
 struct MoeHybridGraphInputs {
+    // True only when this graph actually uses batch-wide owner balancing.
+    // The request can fall back to static ownership for unsupported maps or
+    // widths, so consumers must not infer this from the process environment.
+    bool dynamic_route_balance = false;
     ggml_tensor * router_weights = nullptr;
     std::vector<ggml_tensor *> router_nodes;
     // q>1 decomposes the six selected routes into a four-wide head and a
@@ -162,6 +183,11 @@ enum class MoeHybridJoinMode {
     CanonicalRouteOrder,
 };
 
+enum class MoeHybridRouteBalance {
+    Allowed,
+    Disabled,
+};
+
 // Process-wide graph policy parsed once from the model-neutral environment
 // variables. Legacy DS4 spellings remain accepted by the implementation, but
 // graph builders and scheduler setup consume this typed view instead of
@@ -203,7 +229,9 @@ bool build_moe_hybrid_ffn_graph(
     bool                           include_shared = true,
     bool                           allow_fused_combine = false,
     MoeHybridJoinMode              join_mode =
-                                       MoeHybridJoinMode::OwnerPartialSums);
+                                       MoeHybridJoinMode::OwnerPartialSums,
+    MoeHybridRouteBalance          route_balance =
+                                       MoeHybridRouteBalance::Allowed);
 
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
@@ -235,6 +263,17 @@ bool eval_moe_batched_prefill_ffn(
     int                             n_tokens,
     std::vector<float> &            out,
     std::string *                   err = nullptr);
+// Shared policy gate for paths that consume expert-major prefill outputs.
+inline constexpr int kMoeExpertMajorPrefillMinTokens = 64;
+inline constexpr bool moe_expert_major_prefill_policy_enabled(
+        int n_tokens, bool enabled, int min_tokens) {
+    return enabled && n_tokens >= min_tokens;
+}
+inline constexpr bool moe_cold_input_first_policy_enabled(
+        bool has_backend_input, bool enabled, bool batched_peer_copies) {
+    return has_backend_input && enabled && !batched_peer_copies;
+}
+bool moe_expert_major_prefill_enabled(int n_tokens);
 
 // Optional device-resident owner destinations for long heterogeneous prefill.
 // When present, the hot/shared and cold partials are copied directly into
@@ -310,6 +349,7 @@ struct CachedHotGraphOptions {
     float swiglu_clamp = 0.0f;
     bool gpu_remap = false;
     int n_expert = 0;
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
 };
 
 // Build/rebuild cached hot FFN graph.
@@ -345,7 +385,24 @@ bool build_cached_cold_graph(
     int n_embd,
     int n_ff_exp,
     int n_cold,
-    float swiglu_clamp = 0.0f);
+    float swiglu_clamp = 0.0f,
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT);
+
+// Shared expert only, batched [n_embd, n_tokens] on the GPU backend. Used by
+// the cluster expert-parallel path, which evaluates routed experts without
+// the shared term (MoeLayerDesc with shexp tensors cleared), all-reduces the
+// routed partial across ranks and adds this local result afterwards. Cached
+// per n_tokens in storage.shared_batched_graph. `out` is zero-filled when the
+// layer has no shared expert.
+bool eval_moe_shared_expert_batched(
+    ggml_backend_t                  gpu_backend,
+    const MoeHybridConfig &         cfg,
+    const MoeLayerDesc &            desc,
+    MoeHybridLayerStorage &         storage,
+    const float *                   cur_host,
+    int                             n_tokens,
+    std::vector<float> &            out,
+    std::string *                   err = nullptr);
 
 // Build cached hot-only batched graph for prefill (n_tokens=MMQ_SAFE_SUB_BATCH).
 bool build_cached_hot_batched_graph(
@@ -356,4 +413,4 @@ bool build_cached_hot_batched_graph(
     const MoeHybridConfig & cfg,
     int n_tokens);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -2,16 +2,20 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "rocmfp4.h"
+#include "rocmfpx.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string>
@@ -23,6 +27,56 @@
 #include <unistd.h>
 #endif
 
+// Both the child and its independent output/dispatch checks use this matrix.
+static constexpr ggml_type k_test_types[] = {
+    GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
+    GGML_TYPE_Q4_0_ROCMFP4_FAST,
+};
+static constexpr int k_test_widths[] = {2, 4, 8, 9, 16, 32, 48, 64};
+
+static int env_positive(const char * name, int fallback) {
+    const char * raw = std::getenv(name);
+    const int parsed = raw ? std::atoi(raw) : 0;
+    return parsed > 0 ? parsed : fallback;
+}
+
+template <typename Compute>
+static ggml_status run_benchmark_iterations(int requested, Compute compute, int & completed) {
+    completed = 0;
+    while (completed < requested) {
+        const ggml_status status = compute();
+        if (status != GGML_STATUS_SUCCESS) return status;
+        ++completed;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+// Exercise early failures without intentionally faulting a GPU context.
+static int test_benchmark_iterations() {
+    for (int fail_after : {-1, 0, 1, 2}) {
+        int calls = 0;
+        int completed = -1;
+        const ggml_status status = run_benchmark_iterations(3, [&] {
+            return calls++ == fail_after ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+        }, completed);
+        const int expected_completed = fail_after < 0 ? 3 : fail_after;
+        const int expected_calls = fail_after < 0 ? 3 : fail_after + 1;
+        const ggml_status expected_status = fail_after < 0
+            ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+        if (status != expected_status || completed != expected_completed || calls != expected_calls) {
+            std::fprintf(stderr, "benchmark accounting failed: fail_after=%d calls=%d completed=%d\n",
+                         fail_after, calls, completed);
+            return 1;
+        }
+    }
+    int completed = -1;
+    const auto status = run_benchmark_iterations(0, [] { return GGML_STATUS_FAILED; }, completed);
+    if (status != GGML_STATUS_SUCCESS || completed != 0) return 1;
+    std::printf("[mmid-grouped-test] benchmark iteration accounting: PASS (5 cases)\n");
+    return 0;
+}
+
 static bool run_case(
         ggml_backend_t backend,
         ggml_type type,
@@ -30,10 +84,22 @@ static bool run_case(
         bool fused_ds4,
         bool write_output,
         std::ofstream & output) {
-    constexpr int k_dim = 256;
-    constexpr int n_rows = 128;
-    constexpr int n_experts = 32;
-    constexpr int top_k = 8;
+    int k_dim = 256;
+    int n_rows = 128;
+    int n_experts = 32;
+    int top_k = 8;
+    const int benchmark_iterations = env_positive("LUCE_MMID_BENCH_ITERS", 0);
+    const bool benchmark = benchmark_iterations > 0;
+    if (benchmark) {
+        k_dim = env_positive("LUCE_MMID_BENCH_K", k_dim);
+        n_rows = env_positive("LUCE_MMID_BENCH_ROWS", n_rows);
+        n_experts = env_positive("LUCE_MMID_BENCH_EXPERTS", n_experts);
+        top_k = env_positive("LUCE_MMID_BENCH_TOP_K", top_k);
+    }
+    if (top_k > n_experts) {
+        std::fprintf(stderr, "top_k=%d exceeds n_experts=%d\n", top_k, n_experts);
+        return false;
+    }
 
     ggml_init_params params = {16 * 1024 * 1024, nullptr, true};
     ggml_context * ctx = ggml_init(params);
@@ -46,9 +112,14 @@ static bool run_case(
         fused_ds4 ? ggml_new_tensor_3d(ctx, type, k_dim, n_rows, n_experts) : nullptr;
     ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_dim, 1, width);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, width);
+    // Model weights stay live across fused operations and benchmark replays.
+    // INPUT alone lets gallocr recycle a weight after its unfused last use,
+    // so a later GLU output can alias a weight still read by the fused kernel.
     ggml_set_input(weights);
+    ggml_set_output(weights);
     if (gate_weights != nullptr) {
         ggml_set_input(gate_weights);
+        ggml_set_output(gate_weights);
     }
     ggml_set_input(input);
     ggml_set_input(ids);
@@ -71,7 +142,10 @@ static bool run_case(
 
     std::mt19937 rng(20260713u + (unsigned) type * 97u + (unsigned) width);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float> weights_f((size_t) k_dim * n_rows * n_experts);
+    std::vector<float> weights_f;
+    if (!benchmark) {
+        weights_f.resize((size_t) k_dim * n_rows * n_experts);
+    }
     std::vector<float> input_f((size_t) k_dim * width);
     for (float & value : weights_f) {
         value = dist(rng);
@@ -81,8 +155,26 @@ static bool run_case(
     }
 
     std::vector<uint8_t> weights_q(ggml_nbytes(weights));
-    const size_t quantized = ggml_quantize_chunk(
-        type, weights_f.data(), weights_q.data(), 0, n_rows * n_experts, k_dim, nullptr);
+    // A zero-filled quantized tensor is valid and exercises the identical GPU
+    // load/dequantize path without constructing multi-gigabyte F32 weights for
+    // realistic expert-count benchmarks. Correctness runs still use quantized
+    // randomized weights.
+    const size_t quantized = benchmark ? weights_q.size() :
+        type == GGML_TYPE_Q2_0_ROCMFP2
+            ? rocmfpx_quantize_fp2(
+                  weights_f.data(), weights_q.data(), n_rows * n_experts,
+                  k_dim, nullptr)
+        : type == GGML_TYPE_Q3_0_ROCMFPX
+            ? rocmfpx_quantize_fp3(
+                  weights_f.data(), weights_q.data(), n_rows * n_experts,
+                  k_dim, nullptr)
+        : type == GGML_TYPE_Q4_0_ROCMFP4_FAST
+            ? rocmfp4_quantize_q4_0_fast(
+                  weights_f.data(), weights_q.data(), n_rows * n_experts,
+                  k_dim, nullptr)
+            : ggml_quantize_chunk(
+                  type, weights_f.data(), weights_q.data(), 0,
+                  n_rows * n_experts, k_dim, nullptr);
     if (quantized != weights_q.size()) {
         std::fprintf(stderr, "quantize size mismatch type=%s got=%zu expected=%zu\n",
                      ggml_type_name(type), quantized, weights_q.size());
@@ -92,9 +184,26 @@ static bool run_case(
     }
 
     std::vector<int32_t> ids_h((size_t) top_k * width);
+    const bool masked_owner_routes =
+        width >= 32 &&
+        (type == GGML_TYPE_Q2_0_ROCMFP2 || type == GGML_TYPE_Q3_0_ROCMFPX);
+    int route_period = 0;
+    if (benchmark) {
+        route_period = env_positive(
+            "LUCE_MMID_BENCH_ROUTE_PERIOD", n_experts);
+        route_period = std::min(route_period, n_experts);
+    }
     for (int token = 0; token < width; ++token) {
         for (int slot = 0; slot < top_k; ++slot) {
-            ids_h[(size_t) token * top_k + slot] = (token * 3 + slot * 5) % n_experts;
+            // Exercise the owner-split contract as well as dense routing:
+            // negative IDs are masked routes and their output lanes must be
+            // exactly zero rather than stale allocator contents.
+            ids_h[(size_t) token * top_k + slot] =
+                masked_owner_routes && (token + slot) % 5 == 0
+                    ? -1
+                    : route_period > 0
+                        ? (token * top_k + slot) % route_period
+                        : (token * 3 + slot * 5) % n_experts;
         }
     }
 
@@ -106,11 +215,54 @@ static bool run_case(
     ggml_backend_tensor_set(ids, ids_h.data(), 0, ids_h.size() * sizeof(int32_t));
     ggml_backend_synchronize(backend);
 
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status == GGML_STATUS_SUCCESS && benchmark_iterations > 0) {
+        ggml_backend_synchronize(backend);
+        const auto start = std::chrono::steady_clock::now();
+        int completed = 0;
+        status = run_benchmark_iterations(benchmark_iterations, [&] {
+            return ggml_backend_graph_compute(backend, graph);
+        }, completed);
+        ggml_backend_synchronize(backend);
+        const auto end = std::chrono::steady_clock::now();
+        if (status == GGML_STATUS_SUCCESS) {
+            const double average_us = std::chrono::duration<double, std::micro>(
+                end - start).count() / completed;
+            std::printf(
+                "[mmid-grouped-test] benchmark type=%s width=%d experts=%d top_k=%d "
+                "k=%d rows=%d iterations=%d average_us=%.3f\n",
+                ggml_type_name(type), width, n_experts, top_k, k_dim, n_rows,
+                completed, average_us);
+        } else {
+            // The failed dispatch is included in elapsed time; do not report
+            // an average for an incomplete benchmark as a valid speed result.
+            std::fprintf(stderr, "[mmid-grouped-test] benchmark aborted: completed=%d requested=%d status=%d\n",
+                         completed, benchmark_iterations, (int) status);
+        }
+    }
     std::vector<float> result_h(ggml_nelements(result));
     if (status == GGML_STATUS_SUCCESS) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(result, result_h.data(), 0, result_h.size() * sizeof(float));
+        for (int token = 0; token < width; ++token) {
+            for (int slot = 0; slot < top_k; ++slot) {
+                if (ids_h[(size_t) token * top_k + slot] >= 0) {
+                    continue;
+                }
+                for (int row = 0; row < n_rows; ++row) {
+                    const size_t index =
+                        ((size_t) token * top_k + slot) * n_rows + row;
+                    if (result_h[index] != 0.0f || std::signbit(result_h[index])) {
+                        std::fprintf(stderr,
+                                     "masked route is not +0 token=%d slot=%d row=%d value=%g\n",
+                                     token, slot, row, result_h[index]);
+                        ggml_gallocr_free(alloc);
+                        ggml_free(ctx);
+                        return false;
+                    }
+                }
+            }
+        }
         if (write_output) {
             output.write(reinterpret_cast<const char *>(result_h.data()),
                          (std::streamsize) (result_h.size() * sizeof(float)));
@@ -125,22 +277,37 @@ static bool run_case(
     return status == GGML_STATUS_SUCCESS && output.good();
 }
 
+static bool grouped_supported_device();
+
 static int run_child(const char * mode, const char * output_path) {
     const bool grouped = std::strcmp(mode, "grouped") == 0;
-    if (!grouped && std::strcmp(mode, "legacy") != 0) {
+    const bool masked_fused = std::strcmp(mode, "masked-fused") == 0;
+    const bool direct = std::strcmp(mode, "direct") == 0;
+    if (!grouped && !masked_fused && !direct &&
+        std::strcmp(mode, "legacy") != 0) {
         return 2;
     }
+    if (!grouped_supported_device()) {
+        std::printf("[mmid-grouped-test] SKIP: no supported GPU for grouped MMID\n");
+        return 77;
+    }
 #if defined(_WIN32)
-    if (!grouped) {
+    if (!grouped && !masked_fused && !direct) {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
     } else {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "");
     }
+    if (direct) {
+        _putenv_s("LUCE_MMID_GROUPED", "0");
+    }
 #else
-    if (!grouped) {
+    if (!grouped && !masked_fused && !direct) {
         setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
     } else {
         unsetenv("GGML_CUDA_DISABLE_FUSION");
+    }
+    if (direct) {
+        setenv("LUCE_MMID_GROUPED", "0", 1);
     }
 #endif
 
@@ -151,16 +318,58 @@ static int run_child(const char * mode, const char * output_path) {
     }
 
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
-    const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
-    };
-    const int widths[] = {2, 4, 8, 9, 16};
-    bool ok = output.good();
-    for (ggml_type type : types) {
-        for (int width : widths) {
-            ok = run_case(backend, type, width, false, true, output) && ok;
-            ok = run_case(backend, type, width, true, true, output) && ok;
+    if (masked_fused) {
+        const bool ok = output.good() && run_case(
+            backend, GGML_TYPE_Q2_0_ROCMFP2, 32, true, true, output);
+        output.close();
+        ggml_backend_free(backend);
+        return ok ? 0 : 1;
+    }
+    int width_filter = 0;
+    if (const char * raw = std::getenv("LUCE_MMID_TEST_WIDTH")) {
+        width_filter = std::max(0, std::atoi(raw));
+    }
+    int type_filter = -1;
+    if (const char * raw = std::getenv("LUCE_MMID_TEST_TYPE")) {
+        type_filter = std::atoi(raw);
+        if (std::find(std::begin(k_test_types), std::end(k_test_types),
+                      (ggml_type) type_filter) == std::end(k_test_types)) {
+            std::fprintf(stderr,
+                         "LUCE_MMID_TEST_TYPE %d matches no test type\n",
+                         type_filter);
+            return 2;
         }
+    }
+    const std::vector<int> widths = width_filter > 0
+        ? std::vector<int>{width_filter}
+        : std::vector<int>(std::begin(k_test_widths), std::end(k_test_widths));
+    bool ok = output.good();
+    int cases_run = 0;
+    for (ggml_type type : k_test_types) {
+        if (type_filter >= 0 && (int) type != type_filter) {
+            continue;
+        }
+        for (int width : widths) {
+            if ((width_filter > 0 && width != width_filter) ||
+                (width >= 32 &&
+                type != GGML_TYPE_Q2_0_ROCMFP2 &&
+                type != GGML_TYPE_Q3_0_ROCMFPX &&
+                type != GGML_TYPE_Q4_0_ROCMFP4_FAST)) {
+                continue;
+            }
+            ++cases_run;
+            ok = run_case(backend, type, width, false, true, output) && ok;
+            const bool force_fused_width =
+                std::getenv("LUCE_MMID_TEST_FUSED_WIDTH") != nullptr;
+            if (width < 32 && (width_filter == 0 || force_fused_width)) {
+                ok = run_case(backend, type, width, true, true, output) && ok;
+            }
+        }
+    }
+    if ((type_filter >= 0 || width_filter > 0) && cases_run == 0) {
+        std::fprintf(stderr,
+                     "LUCE_MMID_TEST_TYPE/LUCE_MMID_TEST_WIDTH selected no runnable case\n");
+        ok = false;
     }
     output.close();
     ggml_backend_free(backend);
@@ -265,6 +474,204 @@ static bool grouped_supported_device() {
 #endif
 }
 
+struct CombineRun {
+    std::vector<float> output;
+    double average_us = 0.0;
+    bool ok = false;
+};
+
+static CombineRun run_combine_graph(
+        ggml_backend_t backend,
+        bool fused,
+        int n_embd,
+        int n_used,
+        int n_tokens,
+        const std::vector<float> & experts_h,
+        const std::vector<float> & weights_h,
+        int iterations) {
+    CombineRun run;
+    ggml_init_params params = {16 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return run;
+    }
+
+    ggml_tensor * experts = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, n_used, n_tokens);
+    ggml_set_input(experts);
+    ggml_set_input(weights);
+
+    ggml_tensor * result = nullptr;
+    if (fused) {
+        result = ggml_laguna_moe_combine(ctx, experts, weights);
+    } else {
+        ggml_tensor * weights_3d = ggml_reshape_3d(
+            ctx, weights, 1, n_used, n_tokens);
+        result = ggml_mul(ctx, experts, weights_3d);
+        result = ggml_cont(ctx, ggml_permute(ctx, result, 1, 0, 2, 3));
+        result = ggml_sum_rows(ctx, result);
+        result = ggml_reshape_2d(ctx, result, n_embd, n_tokens);
+    }
+    ggml_set_output(result);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!alloc || !ggml_gallocr_alloc_graph(alloc, graph)) {
+        if (alloc) ggml_gallocr_free(alloc);
+        ggml_free(ctx);
+        return run;
+    }
+
+    ggml_backend_tensor_set(
+        experts, experts_h.data(), 0, experts_h.size() * sizeof(float));
+    ggml_backend_tensor_set(
+        weights, weights_h.data(), 0, weights_h.size() * sizeof(float));
+    ggml_status status = ggml_backend_graph_compute(backend, graph);
+    ggml_backend_synchronize(backend);
+
+    const auto start = std::chrono::steady_clock::now();
+    int completed = 0;
+    if (status == GGML_STATUS_SUCCESS) {
+        status = run_benchmark_iterations(iterations, [&] {
+            return ggml_backend_graph_compute(backend, graph);
+        }, completed);
+    }
+    ggml_backend_synchronize(backend);
+    const auto end = std::chrono::steady_clock::now();
+
+    run.output.resize((size_t)n_embd * n_tokens);
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(
+            result, run.output.data(), 0, run.output.size() * sizeof(float));
+        run.average_us = std::chrono::duration<double, std::micro>(
+            end - start).count() / std::max(completed, 1);
+        run.ok = true;
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return run;
+}
+
+static bool run_combine_parity_and_benchmark(ggml_backend_t backend) {
+    const char * vec4 = std::getenv("LUCE_MOE_COMBINE_VEC4");
+    if (!vec4 || std::strcmp(vec4, "1") != 0) {
+        std::fprintf(stderr, "combine parity requires LUCE_MOE_COMBINE_VEC4=1\n");
+        return false;
+    }
+    const char * bench_raw = std::getenv("LUCE_MOE_COMBINE_BENCH");
+    const bool benchmark = bench_raw && *bench_raw && std::strcmp(bench_raw, "0") != 0;
+    const int n_embd = benchmark ? 4096 : 260;
+    const int n_used = 6;
+    int n_tokens = benchmark ? 3072 : 33;
+    if (const char * raw = std::getenv("LUCE_MOE_COMBINE_BENCH_TOKENS")) {
+        const int requested = std::atoi(raw);
+        if (requested > 0) n_tokens = requested;
+    }
+    const int iterations = benchmark ? 20 : 2;
+
+    std::vector<float> experts((size_t)n_embd * n_used * n_tokens);
+    std::vector<float> weights((size_t)n_used * n_tokens);
+    for (size_t i = 0; i < experts.size(); ++i) {
+        experts[i] = ((int)(i % 251) - 125) * (1.0f / 127.0f);
+    }
+    for (int t = 0; t < n_tokens; ++t) {
+        float total = 0.0f;
+        for (int e = 0; e < n_used; ++e) {
+            float value = (float)(e + 1 + t % 7);
+            if ((t + e) % 11 == 0) value = 0.0f;
+            weights[(size_t)t * n_used + e] = value;
+            total += value;
+        }
+        for (int e = 0; e < n_used; ++e) {
+            weights[(size_t)t * n_used + e] /= total;
+        }
+    }
+
+    std::vector<float> expected((size_t)n_embd * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int h = 0; h < n_embd; ++h) {
+            float sum = 0.0f;
+            for (int e = 0; e < n_used; ++e) {
+                const float weight = weights[(size_t)t * n_used + e];
+                if (weight == 0.0f) {
+                    if (e == 0) sum = 0.0f;
+                    continue;
+                }
+                const float product =
+                    experts[((size_t)t * n_used + e) * n_embd + h] * weight;
+                sum = e == 0 ? product : sum + product;
+            }
+            expected[(size_t)t * n_embd + h] = sum;
+        }
+    }
+
+    CombineRun legacy;
+    if (benchmark) {
+        legacy = run_combine_graph(
+            backend, false, n_embd, n_used, n_tokens,
+            experts, weights, iterations);
+    }
+    const CombineRun fused = run_combine_graph(
+        backend, true, n_embd, n_used, n_tokens,
+        experts, weights, iterations);
+    if (!fused.ok || fused.output.size() != expected.size() ||
+        (benchmark && (!legacy.ok || legacy.output.size() != expected.size()))) {
+        return false;
+    }
+
+    double fused_squared_error = 0.0;
+    double legacy_squared_error = 0.0;
+    double reference_power = 0.0;
+    float fused_max_abs_error = 0.0f;
+    size_t fused_exact = 0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (std::memcmp(&expected[i], &fused.output[i], sizeof(float)) == 0) {
+            ++fused_exact;
+        }
+        const float fused_error = fused.output[i] - expected[i];
+        fused_max_abs_error = std::max(
+            fused_max_abs_error, std::fabs(fused_error));
+        fused_squared_error += (double)fused_error * fused_error;
+        if (benchmark) {
+            const float legacy_error = legacy.output[i] - expected[i];
+            legacy_squared_error += (double)legacy_error * legacy_error;
+        }
+        reference_power += (double)expected[i] * expected[i];
+    }
+    const double fused_nmse =
+        fused_squared_error / std::max(reference_power, 1e-30);
+    const double legacy_nmse = benchmark
+        ? legacy_squared_error / std::max(reference_power, 1e-30) : 0.0;
+    const double speedup = benchmark && fused.average_us > 0.0
+        ? legacy.average_us / fused.average_us : 0.0;
+    if (!std::isfinite(fused_nmse) || fused_nmse > 1e-12) {
+        for (size_t i = 0; i < std::min<size_t>(expected.size(), 8); ++i) {
+            std::fprintf(stderr,
+                "combine mismatch[%zu] expected=%g fused=%g\n",
+                i, expected[i], fused.output[i]);
+        }
+    }
+    if (benchmark) {
+        std::printf(
+            "[mmid-grouped-test] combine n_embd=%d n_used=%d n_tokens=%d "
+            "legacy_us=%.3f fused_us=%.3f speedup=%.3fx "
+            "fused_max_abs=%g fused_nmse=%g legacy_nmse=%g\n",
+            n_embd, n_used, n_tokens, legacy.average_us, fused.average_us,
+            speedup, fused_max_abs_error, fused_nmse, legacy_nmse);
+    } else {
+        std::printf(
+            "[mmid-grouped-test] combine-vec4 exact=%zu/%zu "
+            "max_abs=%g nmse=%g\n",
+            fused_exact, expected.size(), fused_max_abs_error, fused_nmse);
+    }
+    return std::isfinite(fused_nmse) && fused_nmse <= 1e-12;
+}
+
 static std::string shell_quote(const std::string & value) {
 #if defined(_WIN32)
     std::string quoted = "\"";
@@ -294,13 +701,17 @@ static std::string child_command(
         const std::string & output_path,
         const std::string & log_path) {
 #if defined(_WIN32)
-    return "set \"DFLASH_MMID_TELEMETRY=1\" && set \"DFLASH_MMID_GROUPED_TYPES=7\" && "
-        "set \"DFLASH_MMID_GROUPED=" +
+    return "set \"LUCE_MMID_TELEMETRY=1\" && set \"LUCE_MMID_GROUPED_TYPES=15\" && "
+        "set \"LUCE_CUDA_MMVQ_MOE_FP2_PACKED32=1\" && "
+        "set \"LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1\" && "
+        "set \"LUCE_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + "\" && " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
 #else
-    return "DFLASH_MMID_TELEMETRY=1 DFLASH_MMID_GROUPED_TYPES=7 DFLASH_MMID_GROUPED=" +
+    return "LUCE_MMID_TELEMETRY=1 LUCE_MMID_GROUPED_TYPES=15 "
+        "LUCE_CUDA_MMVQ_MOE_FP2_PACKED32=1 LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1 "
+        "LUCE_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + " " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
@@ -308,17 +719,72 @@ static std::string child_command(
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--test-benchmark-iterations") == 0) {
+        return test_benchmark_iterations();
+    }
     if (argc == 4 && std::strcmp(argv[1], "--child") == 0) {
         return run_child(argv[2], argv[3]);
     }
-    if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--child legacy|grouped OUTPUT]\n", argv[0]);
+    const bool combine_only =
+        argc == 2 && std::strcmp(argv[1], "--combine-only") == 0;
+    const bool mmid_only =
+        argc == 2 && std::strcmp(argv[1], "--mmid-only") == 0;
+    if (argc != 1 && !combine_only && !mmid_only) {
+        std::fprintf(stderr,
+                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused|direct OUTPUT]\n",
+                     argv[0]);
+        return 2;
+    }
+    const char * width_filter = std::getenv("LUCE_MMID_TEST_WIDTH");
+    if (!combine_only && width_filter && std::atoi(width_filter) > 0) {
+        std::fprintf(stderr,
+                     "LUCE_MMID_TEST_WIDTH is supported only with --child; "
+                     "the parent validates the complete dispatch matrix\n");
+        return 2;
+    }
+    if (!combine_only && std::getenv("LUCE_MMID_TEST_TYPE")) {
+        std::fprintf(stderr,
+                     "LUCE_MMID_TEST_TYPE is supported only with --child; "
+                     "the parent validates the complete dispatch matrix\n");
+        return 2;
+    }
+    if (!combine_only && env_positive("LUCE_MMID_BENCH_ITERS", 0) > 0) {
+        std::fprintf(stderr,
+                     "LUCE_MMID_BENCH_ITERS is supported only with --child; "
+                     "the parent validates randomized weights at fixed dimensions\n");
         return 2;
     }
 
     if (!grouped_supported_device()) {
         std::printf("[mmid-grouped-test] SKIP: grouped MMID requires NVIDIA Turing+ or AMD RDNA3/RDNA4\n");
         return 77;
+    }
+
+#if defined(_WIN32)
+    const int vec4_status = _putenv_s("LUCE_MOE_COMBINE_VEC4", "1");
+#else
+    const int vec4_status = setenv("LUCE_MOE_COMBINE_VEC4", "1", 1);
+#endif
+    if (vec4_status != 0) {
+        std::fprintf(stderr, "failed to enable LUCE_MOE_COMBINE_VEC4 for parity test\n");
+        return 1;
+    }
+
+    if (!mmid_only) {
+        ggml_backend_t combine_backend = ggml_backend_cuda_init(0);
+        if (combine_backend == nullptr) {
+            std::fprintf(stderr, "GPU backend unavailable for combine parity\n");
+            return 1;
+        }
+        const bool combine_parity = run_combine_parity_and_benchmark(combine_backend);
+        ggml_backend_free(combine_backend);
+        if (!combine_parity) {
+            std::fprintf(stderr, "grouped MoE fused-combine parity failed\n");
+            return 1;
+        }
+    }
+    if (combine_only) {
+        return 0;
     }
 
 #if defined(_WIN32)
@@ -331,25 +797,27 @@ int main(int argc, char ** argv) {
     const std::string grouped_path = prefix + "_enabled.bin";
     const std::string legacy_log_path = prefix + "_legacy.log";
     const std::string grouped_log_path = prefix + "_enabled.log";
+    const std::string masked_fused_path = prefix + "_masked_fused.bin";
+    const std::string masked_fused_log_path = prefix + "_masked_fused.log";
     const std::string executable = argv[0];
     const std::string legacy_cmd =
         child_command(executable, "legacy", legacy_path, legacy_log_path);
     const std::string grouped_cmd =
         child_command(executable, "grouped", grouped_path, grouped_log_path);
+    const std::string masked_fused_cmd = child_command(
+        executable, "masked-fused", masked_fused_path, masked_fused_log_path);
 
     const int legacy_status = std::system(legacy_cmd.c_str());
     const int grouped_status = std::system(grouped_cmd.c_str());
+    const int masked_fused_status = std::system(masked_fused_cmd.c_str());
     const std::vector<char> legacy = read_file(legacy_path.c_str());
     const std::vector<char> grouped = read_file(grouped_path.c_str());
+    const std::vector<char> masked_fused = read_file(masked_fused_path.c_str());
     const std::vector<char> legacy_log = read_file(legacy_log_path.c_str());
     const std::vector<char> grouped_log = read_file(grouped_log_path.c_str());
     const size_t legacy_grouped = count_records(legacy_log, "variant=grouped");
     const size_t grouped_grouped = count_records(grouped_log, "variant=grouped");
 
-    const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
-    };
-    const int widths[] = {2, 4, 8, 9, 16};
     size_t offset = 0;
     size_t compared_bytes = 0;
     int compared_cases = 0;
@@ -357,14 +825,31 @@ int main(int argc, char ** argv) {
     int tolerant_cases = 0;
     bool output_parity = legacy.size() == grouped.size() && !legacy.empty();
     bool grouped_dispatch = true;
-    for (ggml_type type : types) {
-        for (int width : widths) {
+    for (ggml_type type : k_test_types) {
+        for (int width : k_test_widths) {
+            if (width >= 32 &&
+                type != GGML_TYPE_Q2_0_ROCMFP2 &&
+                type != GGML_TYPE_Q3_0_ROCMFPX &&
+                type != GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                continue;
+            }
             const bool legacy_mmvq = has_mmvq_record(legacy_log, type, width);
             for (bool fused_ds4 : {false, true}) {
+                if (width >= 32 && fused_ds4) {
+                    continue;
+                }
                 const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
                 const bool require_exact = legacy_mmvq && !fused_ds4;
-                grouped_dispatch =
-                    has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
+                if (type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    // FAST is not admitted by the grouped-type mask. Verify
+                    // its numerical fallback without widening kernel policy.
+                    grouped_dispatch = !has_mmvq_record(
+                        grouped_log, type, width, "grouped") && grouped_dispatch;
+                } else if (width <= 16) {
+                    grouped_dispatch =
+                        has_mmvq_record(grouped_log, type, width, "grouped") &&
+                        grouped_dispatch;
+                }
                 if (output_parity) {
                     output_parity = compare_case_outputs(
                         legacy, grouped, offset, case_bytes, require_exact);
@@ -383,21 +868,29 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 50;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 89;
+    const size_t masked_case_bytes = (size_t) 128 * 8 * 32 * sizeof(float);
+    const bool masked_fused_zero = masked_fused.size() == masked_case_bytes;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
-        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 75;
+        masked_fused_status == 0 && masked_fused_zero &&
+        output_parity && grouped_dispatch && legacy_grouped == 0 &&
+        grouped_grouped == 105;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());
         std::remove(legacy_log_path.c_str());
         std::remove(grouped_log_path.c_str());
+        std::remove(masked_fused_path.c_str());
+        std::remove(masked_fused_log_path.c_str());
     }
     std::printf("[mmid-grouped-test] legacy_status=%d grouped_status=%d bytes=%zu "
                 "compared_cases=%d exact_cases=%d tolerant_cases=%d compared_bytes=%zu "
                 "legacy_grouped=%zu grouped_grouped=%zu "
+                "masked_fused_zero=%s "
                 "parity=%s\n",
                 legacy_status, grouped_status, legacy.size(), compared_cases, exact_cases,
                 tolerant_cases, compared_bytes, legacy_grouped, grouped_grouped,
+                masked_fused_zero ? "PASS" : "FAIL",
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

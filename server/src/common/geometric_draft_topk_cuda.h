@@ -16,14 +16,18 @@
 // unavailable, the pointer is not device memory, K is out of range, or any
 // device call fails. Compiled on both CUDA and HIP/ROCm builds — this same .cu
 // is compiled directly with LANGUAGE HIP on ROCm, the cuda_runtime.h spellings
-// mapped by the hip_compat shim; guarded by DFLASH27B_HAVE_DRAFT_TOPK. See
+// mapped by the hip_compat shim; guarded by LUCE_HAVE_DRAFT_TOPK. See
 // CMakeLists.txt.
 
 #pragma once
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
+
+inline constexpr bool geometric_draft_topk_cuda_supports_k(int K) noexcept {
+    return (K >= 1 && K <= 8) || K == 12 || K == 16;
+}
 
 // d_logits: device pointer to row-major [n_positions][vocab] f32 logits (the
 //           position stride is `vocab` floats — pass an offset pointer to skip
@@ -34,4 +38,4 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              int32_t * out_token_ids,
                              float temperature);
 
-}  // namespace dflash::common
+}  // namespace luce::common

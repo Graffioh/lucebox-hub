@@ -7,6 +7,8 @@
 #include "../common/kvflash_placement.h"
 #include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
+#include "common/adaptive_spec_width.h"
+#include "common/spec_acceptance.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
 #include "dflash_feature_ring.h"
@@ -22,9 +24,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include "common/gguf_mmap.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -54,19 +57,19 @@ static int env_int_or_default(const char * name, int fallback) {
 
 static float hybrid_spec_min_accept_rate() {
     static const float value = env_float_or_default(
-        "DFLASH_QWEN35MOE_HYBRID_SPEC_MIN_ACCEPT_RATE", 0.50f);
+        "LUCE_QWEN35MOE_HYBRID_SPEC_MIN_ACCEPT_RATE", 0.50f);
     return value;
 }
 
 static int hybrid_spec_min_steps_before_ar() {
     static const int value = env_int_or_default(
-        "DFLASH_QWEN35MOE_HYBRID_SPEC_MIN_STEPS_BEFORE_AR", 1);
+        "LUCE_QWEN35MOE_HYBRID_SPEC_MIN_STEPS_BEFORE_AR", 1);
     return value;
 }
 
 static int qwen35moe_prefill_chunk_limit(int prompt_len) {
     static const int value = []() -> int {
-        const int raw = env_int_or_default("DFLASH_QWEN35MOE_PREFILL_CHUNK", 512);
+        const int raw = env_int_or_default("LUCE_QWEN35MOE_PREFILL_CHUNK", 512);
         return raw > 0 ? raw : 512;
     }();
     return std::min(value, prompt_len);
@@ -74,8 +77,8 @@ static int qwen35moe_prefill_chunk_limit(int prompt_len) {
 
 } // namespace
 
-Qwen35MoeBackend::Qwen35MoeBackend(const Qwen35Config & cfg)
-    : Qwen35Backend(cfg) {}
+Qwen35MoeBackend::Qwen35MoeBackend(Qwen35Config cfg)
+    : Qwen35Backend(std::move(cfg)) {}
 
 bool Qwen35MoeBackend::init() {
     if (!Qwen35Backend::init()) {
@@ -87,7 +90,7 @@ bool Qwen35MoeBackend::init() {
     if (!pipe_state_) {
         pipe_state_ = std::make_unique<PipelinedDecodeState>();
     }
-    pipe_state_->expert_compute = (std::getenv("DFLASH_DROP_COLD") == nullptr);
+    pipe_state_->expert_compute = (std::getenv("LUCE_DROP_COLD") == nullptr);
     if (!ensure_pipelined_moe_expert_compute(*pipe_state_, target_weights(),
                                            cfg_.target_path,
                                            *target_weights().moe_hybrid)) {
@@ -106,7 +109,7 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         return false;
     }
 
-    if (const char * stats_path = std::getenv("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT")) {
+    if (const char * stats_path = std::getenv("LUCE_QWEN35MOE_RUNTIME_STATS_OUT")) {
         routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
         if (!routing_stats_->init(out.n_layer, out.n_expert, out.n_expert_used)) {
             set_last_error("qwen35moe runtime stats init failed");
@@ -121,7 +124,7 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     std::string placement_source;
     std::string err;
 
-    const char * hotness_path = std::getenv("DFLASH_QWEN35MOE_HOTNESS");
+    const char * hotness_path = std::getenv("LUCE_QWEN35MOE_HOTNESS");
 
     if (!load_dynamic_placement(hotness_path, backend, out, placement, &err)) {
         set_last_error(std::string("qwen35moe dynamic placement failed: ") + err);
@@ -142,7 +145,7 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         return load_target_gguf(cfg_.target_path, backend, out);
     }
 
-    if (const char * telemetry = std::getenv("DFLASH_QWEN35MOE_TELEMETRY")) {
+    if (const char * telemetry = std::getenv("LUCE_QWEN35MOE_TELEMETRY")) {
         hybrid_telemetry_ = std::atoi(telemetry) != 0;
     }
 
@@ -153,7 +156,8 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         gguf_init_params gip{};
         gip.no_alloc = true;
         gip.ctx = &expert_meta;
-        gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
+        gguf_context * gctx =
+            gguf_init_from_file(cfg_.target_path.c_str(), gip);
         if (!gctx) {
             set_last_error("failed to re-open GGUF for expert loading");
             return false;
@@ -212,7 +216,7 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
             layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
         }
         int cache_slots = 0;
-    if (const char * cs = std::getenv("DFLASH_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
+    if (const char * cs = std::getenv("LUCE_QWEN35MOE_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
     if (!build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend, placement, layer_descs, layer_file_data, mmap_addr, file_size, *hybrid, &err, cache_slots)) {
 #if defined(_WIN32)
@@ -274,13 +278,13 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
                 placement_source.c_str());
     std::printf("[qwen35moe] pipelined decode path active (hot=%d cold=%d)\n",
                 out.moe_hybrid->placement.total_hot, total_cold);
-    if (const char * out_path = std::getenv("DFLASH_QWEN35MOE_NEXT_PLACEMENT_OUT")) {
+    if (const char * out_path = std::getenv("LUCE_QWEN35MOE_NEXT_PLACEMENT_OUT")) {
         placement_out_path_ = out_path;
     }
-    if (const char * swap_max = std::getenv("DFLASH_QWEN35MOE_SWAP_MAX")) {
+    if (const char * swap_max = std::getenv("LUCE_QWEN35MOE_SWAP_MAX")) {
         swap_policy_.max_swaps_total = std::max(0, std::atoi(swap_max));
     }
-    if (const char * swap_gain = std::getenv("DFLASH_QWEN35MOE_SWAP_MIN_GAIN")) {
+    if (const char * swap_gain = std::getenv("LUCE_QWEN35MOE_SWAP_MIN_GAIN")) {
         swap_policy_.min_promote_gain = (uint64_t)std::max(1, std::atoi(swap_gain));
     }
     return true;
@@ -320,7 +324,8 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
     ggml_backend_t backend = target_backend();
 
     gguf_init_params gip{};
-    gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
+    gguf_context * gctx =
+        gguf_init_from_file(cfg_.target_path.c_str(), gip);
     if (!gctx) { err = "gguf reinit failed"; return false; }
     GgufMmap _mf;
     std::string _mferr;
@@ -797,7 +802,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     if (!pipe_state_) {
         pipe_state_ = std::make_unique<PipelinedDecodeState>();
     }
-    pipe_state_->expert_compute = (std::getenv("DFLASH_DROP_COLD") == nullptr);
+    pipe_state_->expert_compute = (std::getenv("LUCE_DROP_COLD") == nullptr);
     if (!ensure_pipelined_moe_expert_compute(*pipe_state_, target_weights(),
                                            cfg_.target_path,
                                            *target_weights().moe_hybrid)) {
@@ -862,7 +867,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
         std::fprintf(stderr,
             "[kvflash] hybrid prompt (%d) exceeds pool %d; raise --kvflash "
             "or enable pflash compression\n", prompt_len, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         cleanup_graphs();
         return result;
     }
@@ -1508,6 +1513,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
     const int snap_pos = snapshot_cur_pos(slot);
     int committed = snap_pos;
     target_cache().cur_pos = committed;
+    result.restored_prefix_tokens = snap_pos;
 
     const int prompt_len = (int)req.prompt.size();
     if (prompt_len > 0 && prompt_len < snap_pos) {
@@ -1525,7 +1531,7 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         std::fprintf(stderr,
             "[kvflash] hybrid restore prompt (%d) exceeds pool %d; raise "
             "--kvflash\n", prompt_len, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         out_io.emit(-1);
         return result;
     }
@@ -1863,7 +1869,7 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
         const int n_route_slots = n_tokens * n_expert_used;
         if (storage.cache_slots > 0 && !storage.cold_expert_ids.empty()) {
             for (int i = 0; i < n_route_slots; ++i)
-                dflash::common::moe_hybrid_cache_swap_in(storage, chunk_selected[(size_t)i], target_backend());
+                luce::common::moe_hybrid_cache_swap_in(storage, chunk_selected[(size_t)i], target_backend());
         }
         const bool routed_all_hot = storage.cold_expert_ids.empty()
             || storage.all_routed_are_hot(chunk_selected.data(), n_route_slots);
@@ -1986,14 +1992,20 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
     // cold experts). Tokens past the realized accept length are wasted, so
     // capping the verify to a width above the typical accept length cuts that
     // waste at no acceptance cost. Default = full draft block; tune via env.
-    // Verify-width control (see note above). DFLASH_VERIFY_WIDTH pins a fixed
+    // Verify-width control (see note above). LUCE_VERIFY_WIDTH pins a fixed
     // width; otherwise the width adapts to the realized accept length so chain
     // decoding (low AL) verifies just a few tokens (cheap, especially under
     // expert offload) while a high-AL draft still gets enough width.
     const int forced_verify_width = [&]{
-        const char * e = std::getenv("DFLASH_VERIFY_WIDTH");
+        const char * e = std::getenv("LUCE_VERIFY_WIDTH");
         return e ? std::max(1, std::min(q_len, std::atoi(e))) : 0;
     }();
+    const bool shared_feedback_width =
+        forced_verify_width == 0 && adaptive_spec_width_globally_enabled();
+    // The opt-in feedback policy can back off to seed + one candidate.
+    // Keep the legacy six-row floor below when shared feedback is disabled.
+    AdaptiveSpecWidth width_controller(
+        q_len, 2, shared_feedback_width);
     int observed_max_accept = 1;
 
     int32_t last_tok = target_cache().last_tok;
@@ -2010,7 +2022,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     int n_generated = 0;
     int n_draft_steps = 0;
-    int n_accept_sum = 0;
+    SpecAcceptanceStats acceptance;
 
     // Allocate DeltaNet rollback snapshot tensors (no-op if already present).
     // Without these, snapshot_ssm_state/restore_ssm_state silently do nothing
@@ -2027,7 +2039,9 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         const int need_commit_budget = n_gen - n_generated;
         const int verify_width = forced_verify_width > 0
             ? forced_verify_width
-            : std::min(q_len, std::max(6, observed_max_accept + 2));
+            : shared_feedback_width
+                  ? width_controller.next_width(q_len)
+                  : std::min(q_len, std::max(6, observed_max_accept + 2));
 
         // 1. Build noise input for draft
         noise_ids[0] = last_tok;
@@ -2136,8 +2150,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
         }
+        if (shared_feedback_width) {
+            width_controller.observe(accept_n, verify_width);
+        } else {
+            observed_max_accept = std::max(observed_max_accept, accept_n);
+        }
         int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
-        observed_max_accept = std::max(observed_max_accept, accept_n);
         int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -2193,14 +2211,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             kvflash_maybe_reselect((int)out_tokens.size());
         }
         n_generated += emitted;
-        n_accept_sum += std::min(accept_n, emitted);
+        acceptance.record_chain(accept_n, verify_width, emitted, need_commit_budget);
         n_draft_steps++;
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
         if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
             n_draft_steps >= fallback_steps && n_generated < n_gen) {
-            const int total_draft_pos_so_far = std::max(1, n_draft_steps * q_len);
-            const float accept_rate_value =
-                (float)((double)n_accept_sum / (double)total_draft_pos_so_far);
+            const float accept_rate_value = acceptance.rate();
             const float min_accept = hybrid_spec_min_accept_rate();
             if (accept_rate_value < min_accept) {
                 const int ar_n_gen = n_gen - n_generated;
@@ -2212,6 +2228,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
                 target_cache().last_tok = last_tok;
                 const bool ok = run_pipelined_decode_path(
                     committed, ar_n_gen, out_tokens, io);
+                if (accept_rate_out) *accept_rate_out = acceptance.rate();
                 io.emit(-1);
                 return ok;
             }
@@ -2224,19 +2241,17 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
+    const double accept_pct = 100.0 * acceptance.rate();
     if (accept_rate_out) {
-        *accept_rate_out = total_draft_pos > 0
-            ? (float)((double)n_accept_sum / (double)total_draft_pos) : 0.0f;
+        *accept_rate_out = acceptance.rate();
     }
     std::fprintf(stderr, "[hybrid-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f AL=%.2f\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
-                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
+                 n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0,
-                 n_draft_steps > 0 ? (double)n_accept_sum / (double)n_draft_steps : 0.0);
+                 n_draft_steps > 0 ? (double)acceptance.accepted() / (double)n_draft_steps : 0.0);
 
     io.emit(-1);
     return true;
@@ -2315,8 +2330,8 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     }
 
     // KV cache size estimate — use config max_ctx (from --max-ctx flag),
-    // env var DFLASH_MAX_CONTEXT as override, fallback to DevicePlacement default.
-    const char * ctx_env = std::getenv("DFLASH_MAX_CONTEXT");
+    // env var LUCE_MAX_CONTEXT as override, fallback to DevicePlacement default.
+    const char * ctx_env = std::getenv("LUCE_MAX_CONTEXT");
     int max_context = ctx_env ? std::atoi(ctx_env) : cfg_.device.max_ctx;
     if (max_context <= 0) max_context = 8192;
 
@@ -2326,8 +2341,8 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     // experts cold → the slow hybrid spec path. Shared helper / single source of
     // truth with the dense backend — see kv_quant.h.
     ggml_type kv_k_t = GGML_TYPE_Q8_0, kv_v_t = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k_t, kv_v_t);
-    const uint64_t kv_bytes_per_tok = dflash::kv_reservation_bytes_per_token(
+    luce::resolve_kv_types(kv_k_t, kv_v_t);
+    const uint64_t kv_bytes_per_tok = luce::kv_reservation_bytes_per_token(
         w.n_layer, w.full_attention_interval, w.n_head_kv,
         kv_k_t, w.n_embd_head_k, kv_v_t, w.n_embd_head_v);
     // Size the reservation with the SAME inputs runtime uses (scorer policy +
@@ -2357,7 +2372,7 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     // experts stay hot (decouples max_ctx from the expert-placement cliff).  The
     // rule is centralised in kvflash_placement_decision() so future MoE backends
     // (DeepSeek-V4, ...) inherit it instead of re-deriving the byte math.
-    const auto kvf_dec = dflash::common::kvflash_placement_decision(
+    const auto kvf_dec = luce::common::kvflash_placement_decision(
         kv_bytes_per_tok, max_context, kvf_pool,
         gpu_total, core_bytes, total_expert_bytes,
         warm_cache_bytes, safety_bytes, draft_reserve_bytes);
@@ -2381,20 +2396,20 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     }
 
     // Allow manual budget cap via env var (for profiling/testing hybrid mode)
-    if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
+    if (const char * cap_env = std::getenv("LUCE_EXPERT_BUDGET_MB")) {
         uint64_t cap_bytes = (uint64_t)std::atoi(cap_env) * 1024ULL * 1024ULL;
         if (cap_bytes > 0 && cap_bytes < expert_budget) {
-            std::printf("[qwen35moe] capping expert budget from %.2f GiB to %d MB (DFLASH_EXPERT_BUDGET_MB)\n",
+            std::printf("[qwen35moe] capping expert budget from %.2f GiB to %d MB (LUCE_EXPERT_BUDGET_MB)\n",
                         expert_budget / 1024.0 / 1024.0 / 1024.0, std::atoi(cap_env));
             expert_budget = cap_bytes;
         }
     }
 
     // Spark: clamp experts to the --spark-vram target and auto-size the cache ring.
-    if (std::getenv("DFLASH_SPARK")) {
+    if (std::getenv("LUCE_SPARK")) {
         uint64_t target = 0;
-        if (const char * t = std::getenv("DFLASH_SPARK_VRAM_MB")) target = (uint64_t)std::atoll(t) << 20;
-        auto sb = dflash::common::spark_budget_split(expert_budget, total_expert_bytes, w.n_expert,
+        if (const char * t = std::getenv("LUCE_SPARK_VRAM_MB")) target = (uint64_t)std::atoll(t) << 20;
+        auto sb = luce::common::spark_budget_split(expert_budget, total_expert_bytes, w.n_expert,
                                                      core_bytes + kv_total + safety_bytes, target);
         expert_budget = sb.hot_bytes;
         cache_slots_ = sb.cache_slots;
@@ -2437,4 +2452,4 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

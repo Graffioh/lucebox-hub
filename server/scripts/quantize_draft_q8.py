@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deps" / "llama.
 import gguf
 
 # ──────────────────────────────────────────────────────────────────────
-# DFlash 27B draft architecture constants (must match dflash27b.h)
+# DFlash 27B draft architecture constants (must match luce.h)
 # ──────────────────────────────────────────────────────────────────────
 
 ARCH                = "qwen35-dflash-draft"

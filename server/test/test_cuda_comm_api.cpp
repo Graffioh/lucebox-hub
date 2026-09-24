@@ -1,6 +1,8 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "CppUnitTestFramework.hpp"
+using CppUnitTestFramework::CommonFixture;
 
 #include <array>
 #include <cmath>
@@ -18,7 +20,7 @@ static bool run_allreduce_test(int first, int second) {
     if (first < 0 || second < 0 || first >= device_count ||
         second >= device_count || first == second) {
         std::fprintf(stderr,
-            "DFLASH_TP_TEST_DEVICES must name two distinct visible CUDA devices "
+            "LUCE_TP_TEST_DEVICES must name two distinct visible CUDA devices "
             "(got %d,%d; visible=%d)\n",
             first, second, device_count);
         return false;
@@ -100,16 +102,21 @@ static bool run_allreduce_test(int first, int second) {
     return ok;
 }
 
-int main() {
+namespace {
+struct CudaCommApiFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(CudaCommApiFixture, cuda_communicator_api) {
     if (ggml_backend_cuda_get_device_count() == 0) {
-        std::puts("CUDA device unavailable; skipping communicator API test");
-        return 0;
+        SKIP("CUDA device unavailable");
     }
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (backend == nullptr) {
         std::fputs("failed to initialize CUDA backend 0\n", stderr);
-        return 1;
+        REQUIRE_TRUE(false);
     }
 
     // Calling the public wrapper keeps its declaration and exported symbol
@@ -124,28 +131,31 @@ int main() {
 
     if (result) {
         std::fputs("duplicate CUDA devices unexpectedly initialized a communicator\n", stderr);
-        return 1;
+        REQUIRE_TRUE(false);
     }
 
     std::puts("CUDA communicator API compatibility test passed");
+}
 
-    const char * selected = std::getenv("DFLASH_TP_TEST_DEVICES");
+TEST_CASE(CudaCommApiFixture, selected_device_nccl_allreduce) {
+    if (ggml_backend_cuda_get_device_count() == 0) {
+        SKIP("CUDA device unavailable");
+    }
+
+    const char * selected = std::getenv("LUCE_TP_TEST_DEVICES");
     if (!selected || !selected[0]) {
-        std::puts(
-            "DFLASH_TP_TEST_DEVICES is unset; skipping two-GPU NCCL all-reduce");
-        return 0;
+        SKIP("LUCE_TP_TEST_DEVICES is unset");
     }
 
     int first = -1;
     int second = -1;
     if (!parse_test_devices(selected, first, second)) {
         std::fprintf(stderr,
-            "bad DFLASH_TP_TEST_DEVICES=%s (expected e.g. 1,2)\n", selected);
-        return 1;
+            "bad LUCE_TP_TEST_DEVICES=%s (expected e.g. 1,2)\n", selected);
+        REQUIRE_TRUE(false);
     }
-    if (!run_allreduce_test(first, second)) return 1;
+    REQUIRE_TRUE(run_allreduce_test(first, second));
 
     std::printf("selected-device NCCL all-reduce passed on CUDA%d,CUDA%d\n",
                 first, second);
-    return 0;
 }

@@ -1,12 +1,14 @@
-// Smoke test: load Laguna-XS.2 GGUF via dflash's hand-rolled loader
+// Smoke test: load Laguna-XS.2 GGUF via luce's hand-rolled loader
 // (load_target_gguf with arch dispatch to Laguna), validate hparams + tensor
 // counts, exit. NO forward yet — forward graph is Phase 2.
 //
 // Usage: smoke_load_target_laguna <laguna-xs2-Q4_K_M.gguf>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "laguna_internal.h"
+#include "CppUnitTestFramework.hpp"
+#include "model_test_paths.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,23 +17,24 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-using namespace dflash::common;
+using namespace luce::common;
+using namespace CppUnitTestFramework;
 
-int main(int argc, char ** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <laguna-xs2-Q4_K_M.gguf>\n", argv[0]);
-        return 2;
-    }
-    const std::string path = argv[1];
+struct SmokeLoadLagunaTarget : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+TEST_CASE(SmokeLoadLagunaTarget, LoadsConfiguredModel) {
+    const std::string path = luce_test::require_model(luce_test::kLagunaModelEnv).string();
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) { std::fprintf(stderr, "[smoke-laguna] cuda init failed\n"); return 1; }
+    REQUIRE_NOT_NULL(backend);
 
     LagunaTargetWeights w;
-    if (!load_target_gguf_laguna(path, backend, w)) {
-        std::fprintf(stderr, "[smoke-laguna] load_target_gguf_laguna failed: %s\n", dflash27b_last_error());
+    const bool loaded = load_target_gguf_laguna(path, backend, w);
+    if (!loaded) {
+        std::fprintf(stderr, "[smoke-laguna] load_target_gguf_laguna failed: %s\n", luce_last_error());
         ggml_backend_free(backend);
-        return 1;
+        REQUIRE(loaded);
     }
 
     std::printf("[smoke-laguna] loaded %s\n", path.c_str());
@@ -47,8 +50,10 @@ int main(int argc, char ** argv) {
                 w.expert_weights_scale, (int)w.expert_gating_sigmoid, w.n_layer_dense_lead);
     std::printf("  eos_ids=[%d, %d]  pad=%d\n", w.eos_id, w.eos_chat_id, w.pad_id);
 
+    CHECK(w.n_layer > 0);
+    CHECK(w.n_embd > 0);
+
     free_laguna_target_weights(w);
     ggml_backend_free(backend);
     std::printf("[smoke-laguna] OK\n");
-    return 0;
 }

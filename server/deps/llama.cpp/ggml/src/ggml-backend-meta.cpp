@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-meta-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
@@ -817,10 +818,31 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         for (int i = 0; i < 5; i++) {
             GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
+        GGML_ASSERT(tensor->src[5] == nullptr ||
+                    src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[6] == nullptr ||
+                    src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return src_ss[0];
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Step / SpecLA variants (ggml_ssm_conv_step, ggml_ssm_conv_specla):
+        // x [C,T,S] -> out [C,T,S]; the channel axis stays axis 0, while the
+        // weight [K,C] and conv_state [K-1,C,S] carry the same channel
+        // partition on axis 1. The axis layout (not the op_params flag, whose
+        // encoding differs between the step and SpecLA variants) determines
+        // the split. The mode is asserted after the layout match so a future
+        // tree/dynamic-conv layout collision fails loudly instead of being
+        // silently treated as Step/SpecLA.
+        if (tensor->src[2] != nullptr &&
+            src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            const int mode = ggml_get_op_params_i32(tensor, 0);
+            GGML_ASSERT(mode == 1 || mode == 2);
+            GGML_ASSERT(tensor->src[2]->type == GGML_TYPE_F32);
+            return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1, {1}};
+        }
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
                 return {GGML_BACKEND_SPLIT_AXIS_1, {0}, 1, {1}};
@@ -835,7 +857,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                (tensor->src[8] == nullptr || src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
             return src_ss[0];
         }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
@@ -846,7 +869,50 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // state shape is (S_v*S_v*H, K, n_seqs); the heads dim is nested inside axis 0,
         // so a head-aligned split on the input cache reshapes to axis 0 here (not axis 2).
         GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(tensor->src[8] == nullptr ||
+                    src_ss[8].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1, {1}};
+    };
+
+    auto handle_ds4_moe_combine = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[2] == nullptr ||
+                        src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return src_ss[0];
+        }
+
+        // Splitting embeddings is safe when the optional shared branch uses
+        // the identical embedding partition. Route weights remain mirrored.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(tensor->src[2] == nullptr ||
+                        (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                         ggml_backend_meta_split_layout_equal(src_ss[0], src_ss[2], n_bufs)));
+            // Each local embedding slice must preserve the float4 layout
+            // required by the GPU combine kernel.
+            for (size_t s = 0; s < src_ss[0].n_segments; ++s) {
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    GGML_ASSERT(src_ss[0].ne[s*n_bufs + j] % 4 == 0);
+                }
+            }
+            return src_ss[0];
+        }
+
+        // Splitting experts partitions the reduced dimension. Each device
+        // produces a partial sum, so a following meta-backend synchronization
+        // must reduce those sums. A shared result cannot be added locally here
+        // because it would then be counted once per device.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0);
+            GGML_ASSERT(ggml_backend_meta_split_layout_equal(src_ss[0], src_ss[1], n_bufs));
+            GGML_ASSERT(tensor->src[2] == nullptr);
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED :
+                                  GGML_BACKEND_SPLIT_AXIS_PARTIAL,
+                    {0}, 1, {1}};
+        }
+
+        GGML_ABORT("unsupported DS4 MoE combine split");
     };
 
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
@@ -1087,6 +1153,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // SCORE includes ReLU, and MASK consumes its nonlinear result;
                 // neither may run on unreduced dot-product shards.
                 split_state = handle_mirrored(src_ss);
+            } break;
+            case GGML_OP_DS4_MOE_COMBINE: {
+                split_state = handle_ds4_moe_combine(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);

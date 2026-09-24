@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridRoutingStats;
 
@@ -36,4 +36,4 @@ bool build_moe_hybrid_swap_plan(const MoeHybridPlacement & current,
                                 MoeHybridSwapPlan & out,
                                 std::string * err = nullptr);
 
-}  // namespace dflash::common
+}  // namespace luce::common

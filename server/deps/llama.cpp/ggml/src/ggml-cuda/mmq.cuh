@@ -1,11 +1,13 @@
 #pragma once
 
 #include "common.cuh"
+#include "mmq-tile-selection.h"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "mmq-streamk-schedule.h"
 
-#include <climits>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace ggml_cuda_mma;
 
@@ -67,11 +69,16 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-        case GGML_TYPE_Q2_0_ROCMFP2:
         case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+#ifdef ROCMFP2_AFFINE
+            return MMQ_Q8_1_DS_LAYOUT_DS4;
+#else
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+#endif
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
@@ -107,9 +114,18 @@ struct tile_x_sizes {
     int sc;
 };
 
-// RDNA uses 128x128, eight-warp MMQ tiles by default. ROCmFPX template
-// instances use 64x64, four-warp tiles: their unpacking pressure makes the
-// smaller tile faster on gfx1151 without changing other quant formats.
+// RDNA uses 128x128, eight-warp MMQ tiles by default. Template instances
+// compiled with GGML_CUDA_MMQ_SMALL_TILE use 64x64, four-warp tiles. Instances
+// that additionally define GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY take the small
+// tile on RDNA4 only and keep the stock shape on RDNA3:
+//  - ROCmFPX formats: their unpacking pressure makes the smaller tile faster
+//    on gfx1151;
+//  - IQ4_XS / Q5_K / Q6_K / Q8_0 (dense hybrid targets): at spec-decode
+//    verify widths (N<=16) the 128-row tile leaves a 5120-row projection
+//    with only 40 blocks on a 64-CU gfx1201; the small tile measured
+//    +12-23% there (mmq_probe) at the cost of ~8% prefill throughput.
+// Q4_K instead narrows only the row dimension to 128x64 (LUCEBOX_RDNA_MMQ_Y),
+// the shape measured best for packed concurrent prefill on gfx1151.
 #ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
 #define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
 #endif
@@ -122,8 +138,17 @@ struct tile_x_sizes {
 
 static int get_mmq_x_max_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
+        // Dense hybrid targets: the 64-wide tile is a gfx1201 (RDNA4)
+        // measurement and its 128x128 big-tile twin dispatch is RDNA4-only,
+        // so RDNA3 keeps the stock shape.
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? 64 : 128;
+#else
+        // ROCmFPX: unpacking pressure makes the small tile faster on gfx1151
+        // as well, which is the shape those instances were tuned with.
         return 64;
+#endif
 #else
         return 128;
 #endif
@@ -139,7 +164,7 @@ static int get_mmq_x_max_host(const int cc) {
 
 static constexpr __device__ int get_mmq_x_max_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
     return 64;
 #else
     return 128;
@@ -169,8 +194,14 @@ static constexpr __device__ int get_mmq_x_max_device() {
 
 static int get_mmq_y_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? 64 : 128;
+#else
         return 64;
+#endif
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
+        return LUCEBOX_RDNA_MMQ_Y;
 #else
         return 128;
 #endif
@@ -189,8 +220,10 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 
 static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
     return 64;
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
+    return LUCEBOX_RDNA_MMQ_Y;
 #else
     return 128;
 #endif
@@ -238,7 +271,12 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_DP4A_TXS_Q8_0_16;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+#ifdef ROCMFP2_AFFINE
+            return MMQ_DP4A_TXS_Q8_1;
+#else
+            return MMQ_DP4A_TXS_Q8_0_16;
+#endif
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_DP4A_TXS_Q8_0_16;
@@ -287,7 +325,12 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST: return MMQ_MMA_TILE_X_K_Q8_0;
-        case GGML_TYPE_Q2_0_ROCMFP2: return MMQ_MMA_TILE_X_K_Q3_K;
+        case GGML_TYPE_Q2_0_ROCMFP2:
+#ifdef ROCMFP2_AFFINE
+            return MMQ_MMA_TILE_X_K_Q8_1;
+#else
+            return MMQ_MMA_TILE_X_K_Q3_K;
+#endif
         case GGML_TYPE_Q2_1_ROCMFP2_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_0_ROCMFPX: return MMQ_MMA_TILE_X_K_Q3_K;
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: return MMQ_MMA_TILE_X_K_Q3_K;
@@ -342,7 +385,13 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? 4 : 8;
+#else
+        return 4;
+#endif
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
         return 4;
 #else
         return 8;
@@ -358,7 +407,9 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
+    return 4;
+#elif defined(LUCEBOX_RDNA_MMQ_Y)
     return 4;
 #else
     return 8;
@@ -1011,17 +1062,53 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
         }
 
         const block_t * block = (const block_t *) x + kbx0 + i*stride + kbx;
-        const int k0 = kbx*groups_per_block + group;
-        const int q0 = traits::pack4(block, 4*group);
-        const int q1 = traits::pack4(
-            block, 4*(group + groups_per_block/2));
+        int k0;
+        int q0;
+        int q1;
+        int q1_offset;
+        if constexpr (type == GGML_TYPE_Q3_0_ROCMFPX) {
+            // Eight FP3 weights occupy exactly three bytes. Assign adjacent
+            // four-value groups to one lane so the wave reads every packed
+            // byte once instead of overlapping the two-byte group windows.
+            const int byte = 3*group;
+#if defined(GGML_USE_HIP)
+            uint32_t packed32;
+            __builtin_memcpy(&packed32, block->qs + byte, sizeof(packed32));
+            const uint32_t bits24 = packed32 & 0x00ffffffu;
+#else
+            const uint32_t bits24 =
+                (uint32_t) block->qs[byte + 0] |
+                ((uint32_t) block->qs[byte + 1] << 8) |
+                ((uint32_t) block->qs[byte + 2] << 16);
+#endif
+            k0 = kbx*groups_per_block + 2*group;
+            q0 = rocmfpx_pack4_fp3_bits12_vec_cuda(bits24 & 0x0fffu);
+            q1 = rocmfpx_pack4_fp3_bits12_vec_cuda((bits24 >> 12) & 0x0fffu);
+            q1_offset = 1;
+        } else {
+            // FP2 stores each four-value group in one byte. Pair adjacent
+            // groups so HIP can issue one aligned 16-bit load per lane.
+            const int byte = 2*group;
+#if defined(GGML_USE_HIP)
+            uint16_t bits16;
+            __builtin_memcpy(&bits16, block->qs + byte, sizeof(bits16));
+#else
+            const uint16_t bits16 =
+                (uint16_t) block->qs[byte + 0] |
+                ((uint16_t) block->qs[byte + 1] << 8);
+#endif
+            k0 = kbx*groups_per_block + 2*group;
+            q0 = rocmfpx_pack4_fp2_bits8_vec_cuda(bits16 & 0x00ffu);
+            q1 = rocmfpx_pack4_fp2_bits8_vec_cuda((bits16 >> 8) & 0x00ffu);
+            q1_offset = 1;
+        }
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0]                      = q0;
-        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + groups_per_block/2] = q1;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + k0 + q1_offset]          = q1;
 #else
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0]                      = q0;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + q1_offset]          = q1;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     }
@@ -1052,8 +1139,9 @@ static __device__ __forceinline__ void load_tiles_rocmfpx_dual(
 // qtype-107, but each expert supplies two learned four-level codebooks.  MMQ
 // needs int8 tiles, so quantize those tiny codebooks once per K tile, then fold
 // the codebook scale into the block's ordinary UE4M3 scale.  The additional
-// error is bounded to half an int8 step (measured below 0.4% of codebook range)
-// and this path is opt-in because sparse prefill is already approximate.
+// error is bounded to half an int8 step (measured below 0.4% of codebook range).
+// Backend policy selects this path only for prefill modes that are already
+// approximate; exact prefill retains the dequantize-to-F16 fallback.
 struct rocmfp2_mix_mmq_lut {
     int   packed[2];
     float scale[2];
@@ -1380,6 +1468,95 @@ static __device__ __forceinline__ void load_tiles_rocmfp3_mix(
 #endif
     }
 }
+
+#ifdef ROCMFP2_AFFINE
+// Affine FP2 is a Q8_1-style integer tile: raw codes c in [0,3] plus
+// dm=(scale,-offset). The ordinary Q8_1 dot then evaluates
+//   scale*d*dot(c,q) - offset*(d*sum(q))
+// exactly, using the activation block's stored sum for the affine correction.
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_rocmfp2_affine(
+    const char * __restrict__ x, int * __restrict__ x_tile,
+    const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int groups_per_block = QK_ROCMFP2 / 4;
+    constexpr int blocks_per_tile = MMQ_ITER_K / QK_ROCMFP2;
+    constexpr int threads_per_row =
+        blocks_per_tile * groups_per_block / 2;
+    static_assert(threads_per_row == 32,
+                  "affine ROCmFP2 MMQ loader expects 32 lanes per row");
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int *) x_tile;
+    half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs =
+        mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_0_ROCMFP2, mmq_y);
+    int   * x_qs = (int *) x_tile;
+    half2 * x_dm = (half2 *) (x_qs + txs.qs);
+#endif
+
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row
+        ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx = txi / (groups_per_block / 2);
+    const int group = txi % (groups_per_block / 2);
+
+    auto pack_raw4 = [](const block_rocmfp2 * block, int base) {
+        const uint32_t bits = block->qs[base >> 2];
+        return (int) (((bits >> 0) & 3u) |
+                      (((bits >> 2) & 3u) << 8) |
+                      (((bits >> 4) & 3u) << 16) |
+                      (((bits >> 6) & 3u) << 24));
+    };
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1
+            ? threadIdx.y
+            : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (need_check) i = min(i, i_max);
+
+        const block_rocmfp2 * block =
+            (const block_rocmfp2 *) x + kbx0 + i*stride + kbx;
+        const int k0 = kbx*groups_per_block + group;
+        const int q0 = pack_raw4(block, 4*group);
+        const int q1 = pack_raw4(
+            block, 4*(group + groups_per_block/2));
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + k0] = q0;
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_1 + k0 + groups_per_block/2] = q1;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0] = q0;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + groups_per_block/2] = q1;
+#endif
+    }
+
+    constexpr int scale_rows_per_warp = warp_size / blocks_per_tile;
+    const int kscale = threadIdx.x % blocks_per_tile;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y;
+         i0 += nwarps*scale_rows_per_warp) {
+        int i = i0 + threadIdx.y*scale_rows_per_warp +
+                threadIdx.x/blocks_per_tile;
+        if (need_check) i = min(i, i_max);
+
+        const block_rocmfp2 * block =
+            (const block_rocmfp2 *) x + kbx0 + i*stride + kscale;
+        const float scale =
+            rocmfpx_ue4m3_to_fp32_finite(block->e[0]);
+        const float offset =
+            rocmfpx_ue4m3_to_fp32_finite(block->e[1]);
+        const half2 dm = make_half2(scale, -offset);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_dm[i*MMQ_MMA_TILE_X_K_Q8_1 + kscale] = dm;
+#else
+        x_dm[i*(2*MMQ_TILE_NE_K/QI8_1) +
+             i/(QI8_1/2) + kscale] = dm;
+#endif
+    }
+}
+#endif
 
 template <int mmq_y, bool need_check>
 static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restrict__ x,
@@ -3939,9 +4116,15 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q4_0_ROCMFP4_FAST> {
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_0_ROCMFP2> {
     static constexpr int              vdr          = VDR_ROCMFP2_Q8_1_MMQ;
+#ifdef ROCMFP2_AFFINE
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfp2_affine<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_1_q8_1_mma<mmq_x, mmq_y>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_1_q8_1_dp4a<mmq_x, mmq_y>;
+#else
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_rocmfpx_dual<GGML_TYPE_Q2_0_ROCMFP2, mmq_y, need_check>;
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_16_q8_1_mma<mmq_x, mmq_y>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_16_q8_1_dp4a<mmq_x, mmq_y>;
+#endif
 };
 
 template <int mmq_x, int mmq_y, bool need_check>
@@ -4215,7 +4398,7 @@ template <ggml_type type, int mmq_x, bool need_check>
 #if defined(GGML_USE_HIP)
 // RDNA4 is compute-bound on MMQ (WMMA path); allow compiler to use more VGPRs
 // (minBlocks=1 matches NVIDIA Volta+ behavior and reduces register spilling).
-#if defined(RDNA4) && !defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(RDNA4) && !defined(GGML_CUDA_MMQ_SMALL_TILE)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
 #elif defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -4476,6 +4659,112 @@ static __global__ void mul_mat_q(
          mix_codebooks, mix_modes, fastdiv(zt, channel_ratio));
 }
 
+#if defined(GGML_USE_HIP)
+template <int mmq_x>
+static __global__ void mul_mat_q_moe_build_tasks(
+        const int32_t * __restrict__ expert_bounds,
+        int2 * __restrict__ tasks,
+        int * __restrict__ task_count,
+        int n_experts) {
+    const int expert = blockIdx.x*blockDim.x + threadIdx.x;
+    if (expert >= n_experts) {
+        return;
+    }
+    const int route_count =
+        expert_bounds[expert + 1] - expert_bounds[expert];
+    const int tile_count = (route_count + mmq_x - 1)/mmq_x;
+    if (tile_count == 0) {
+        return;
+    }
+    const int task_begin = atomicAdd(task_count, tile_count);
+    for (int tile = 0; tile < tile_count; ++tile) {
+        tasks[task_begin + tile] = make_int2(tile, expert);
+    }
+}
+
+// Sparse grouped MoE has a deliberately wide upper-bound grid: every expert
+// receives enough Y tiles for the full token batch even though only top-k
+// routes are live. Build a compact device-side task list, then keep a bounded
+// set of workgroups resident to consume only non-empty expert tiles. No host
+// count readback or synchronization is required.
+template <ggml_type type, int mmq_x, bool need_check>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+static __global__ void mul_mat_q_moe_persistent(
+        const char * __restrict__ x,
+        const int * __restrict__ y,
+        const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds,
+        const nv_bfloat16 * __restrict__ mix_codebooks,
+        const uint8_t * __restrict__ mix_modes,
+        float * __restrict__ dst,
+        const int2 * __restrict__ tasks,
+        const int * __restrict__ task_count,
+        const uint3 blocks_per_ne00,
+        const int nrows_x,
+        const int stride_row_x,
+        const int ncols_y,
+        const int stride_col_dst,
+        const uint3 channel_ratio,
+        const int stride_channel_x) {
+    if (mmq_x > get_mmq_x_max_device() ||
+        mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int mmq_y = get_mmq_y_device();
+
+    extern __shared__ int ids_dst_shared[];
+    const int it = blockIdx.x;
+    const int total_tasks = *task_count;
+
+    for (int task_index = blockIdx.y; task_index < total_tasks;
+         task_index += gridDim.y) {
+        const int2 task = tasks[task_index];
+        const int jt = task.x;
+        const int zt = task.y;
+
+        const int col_low = expert_bounds[zt + 0];
+        const int col_high = expert_bounds[zt + 1];
+        const int col_diff = col_high - col_low;
+        if (jt*mmq_x >= col_diff) {
+            continue;
+        }
+
+        __syncthreads();
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+            if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+                break;
+            }
+            ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+        }
+        __syncthreads();
+
+        const int offset_y =
+            (col_low + jt*mmq_x)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = it*mmq_y;
+        const int offset_x =
+            fastdiv(zt, channel_ratio)*stride_channel_x +
+            it*mmq_y*stride_row_x;
+        const int tile_x_max_i = nrows_x - it*mmq_y - 1;
+        const int tile_y_max_j = col_diff - jt*mmq_x - 1;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>(
+            x, offset_x, y + offset_y, ids_dst_shared,
+            dst + offset_dst, nullptr, stride_row_x, ncols_y,
+            stride_col_dst, tile_x_max_i, tile_y_max_j,
+            0, blocks_per_ne00.z, mix_codebooks, mix_modes,
+            fastdiv(zt, channel_ratio));
+        __syncthreads();
+    }
+}
+#endif
+
 template <ggml_type type, int mmq_x, bool need_check>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -4673,6 +4962,76 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+#if defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_Q2_0_ROCMFP2 ||
+                  type == GGML_TYPE_Q3_0_ROCMFPX ||
+                  type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+        const char * persistent_env =
+            std::getenv("GGML_CUDA_MMQ_MOE_PERSISTENT");
+        const bool persistent_enabled = persistent_env && *persistent_env &&
+            !(persistent_env[0] == '0' && persistent_env[1] == '\0');
+        // The compact queue amortizes its builder and bounded-worker launch at
+        // prefill widths. Below 256 source columns the ordinary grouped grid is
+        // already efficient, and is marginally faster for some formats.
+        if (persistent_enabled && args.ncols_max >= 256 && !args.use_stream_k &&
+            args.ids_dst != nullptr && args.expert_bounds != nullptr &&
+            args.nsamples_y == 1 &&
+            cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151) {
+            int blocks_per_cu = 32;
+            if (const char * raw =
+                    std::getenv("GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU")) {
+                const int parsed = std::atoi(raw);
+                if (parsed >= 1 && parsed <= 32) {
+                    blocks_per_cu = parsed;
+                }
+            }
+            ggml_cuda_pool_alloc<int2> tasks(ctx.pool(), args.ncols_y);
+            ggml_cuda_pool_alloc<int> task_count(ctx.pool(), 1);
+            CUDA_CHECK(cudaMemsetAsync(
+                task_count.get(), 0, sizeof(int), stream));
+            constexpr int task_builder_threads = 256;
+            const int task_builder_blocks =
+                (args.nchannels_y + task_builder_threads - 1)/
+                task_builder_threads;
+            mul_mat_q_moe_build_tasks<mmq_x>
+                <<<task_builder_blocks, task_builder_threads, 0, stream>>>(
+                    args.expert_bounds, tasks.get(), task_count.get(),
+                    args.nchannels_y);
+
+            const int workers = std::max(
+                1, std::min((int) args.ncols_y, nsm*blocks_per_cu));
+            const dim3 persistent_grid(nty, workers, 1);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q_moe_persistent<type, mmq_x, false>),
+                nbytes_shared);
+            CUDA_SET_SHARED_MEMORY_LIMIT(
+                (mul_mat_q_moe_persistent<type, mmq_x, true>),
+                nbytes_shared);
+            if (args.nrows_x % mmq_y == 0) {
+                mul_mat_q_moe_persistent<type, mmq_x, false>
+                    <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds,
+                        args.mix_codebooks, args.mix_modes, args.dst,
+                        tasks.get(), task_count.get(),
+                        blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd,
+                        args.stride_channel_x);
+            } else {
+                mul_mat_q_moe_persistent<type, mmq_x, true>
+                    <<<persistent_grid, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds,
+                        args.mix_codebooks, args.mix_modes, args.dst,
+                        tasks.get(), task_count.get(),
+                        blocks_per_ne00_fd, args.nrows_x, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd,
+                        args.stride_channel_x);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+#endif
+
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;
@@ -4698,14 +5057,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+    // On the validated SM86 path, also avoid launching more CTAs than useful MMQ iteration chunks.
     const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    // SM86 always uses the regular MMQ iteration width. MXFP4 only switches
+    // to MMQ_ITER_K_MXFP4_FP4 in the Blackwell device path.
+    const int iter_k = MMQ_ITER_K;
+    const bool enable_useful_chunk_cap = (cc == 860); // NVIDIA SM86 only; fail closed elsewhere.
+    const int stream_k_blocks = mmq_stream_k_nblocks(
+        ntiles_dst, nsm, args.ncols_x, iter_k, GGML_CUDA_CC_IS_NVIDIA(cc), enable_useful_chunk_cap);
+    const dim3 block_nums_stream_k(stream_k_blocks, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
-    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    const bool fixup_needed = mmq_stream_k_fixup_needed(ntiles_dst, stream_k_blocks);
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -4768,23 +5132,60 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
 
-    int mmq_x_best  = 0;
-    int ntiles_x_best = INT_MAX;
-
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
-        const int granularity = mmq_get_granularity_host(mmq_x, cc);
-
-        if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
-            continue;
-        }
-
-        const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
-
-        if (ntiles_x < ntiles_x_best) {
-            mmq_x_best = mmq_x;
-            ntiles_x_best = ntiles_x;
+    static const int forced_mmq_x = []() {
+        const char * raw = std::getenv("GGML_CUDA_MMQ_X");
+        if (!raw || !*raw) return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        return end && end != raw && *end == '\0' && parsed >= 8 &&
+                parsed <= 128 && parsed % 8 == 0
+            ? (int)parsed : 0;
+    }();
+    static const bool adaptive_moe_x_enabled = []() {
+        const char * raw = std::getenv("GGML_CUDA_MMQ_MOE_ADAPTIVE_X");
+        return raw && *raw && !(raw[0] == '0' && raw[1] == '\0');
+    }();
+    int requested_mmq_x = forced_mmq_x;
+    if (requested_mmq_x == 0 && adaptive_moe_x_enabled &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        args.expert_bounds != nullptr && args.nchannels_x > 0) {
+        // Grouped MoE routes are sparse across experts. Sizing the X tile from
+        // the full token width makes almost every workgroup carry padding. Use
+        // the mean live-route density as a model-neutral trigger, then select
+        // the measured gfx1151 tile for each unpack format. The grid still
+        // spans ncols_max, so skewed experts remain fully covered.
+        const int64_t routes_per_expert =
+            (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
+        if (routes_per_expert <= 16) {
+            switch (type) {
+                case GGML_TYPE_Q2_0_ROCMFP2:      requested_mmq_x = 32; break;
+                case GGML_TYPE_Q3_0_ROCMFPX:      requested_mmq_x = 48; break;
+                case GGML_TYPE_Q4_0_ROCMFP4_FAST: requested_mmq_x = 16; break;
+                default: break;
+            }
         }
     }
+    const auto supported_tile = [&](int mmq_x) {
+        const int granularity = mmq_get_granularity_host(mmq_x, cc);
+        return mmq_x % granularity == 0 &&
+            mmq_get_nbytes_shared<type>(
+                mmq_x, mmq_y, cc, warp_size, nwarps) <= smpbo;
+    };
+    const auto skip_automatic_tile = [&](int mmq_x) {
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+        // The 64-row/4-warp tile is pathological at mmq_x == 32 on gfx1201
+        // (17408x5120 IQ4_XS: N=16 443 GB/s, N=24..32 180 GB/s, N=48 315 GB/s
+        // in mmq_probe); a wider tile with more padding is still faster.
+        if (LUCEBOX_RDNA_TILE_HOST(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && mmq_x == 32) {
+            return true;
+        }
+#endif
+        (void) mmq_x;
+        return false;
+    };
+    const int mmq_x_best = ggml_cuda_mmq_select_x(
+        args.ncols_max, mmq_x_max, requested_mmq_x,
+        supported_tile, skip_automatic_tile);
 
     switch (mmq_x_best) {
         case   8:
@@ -4895,4 +5296,5 @@ void ggml_cuda_op_mul_mat_q(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+bool ggml_cuda_mixed_mmq_enabled(const ggml_tensor * op, bool default_enabled = false);
+bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int64_t n_experts);

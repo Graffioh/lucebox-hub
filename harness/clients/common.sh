@@ -16,16 +16,16 @@ DEFAULT_DRAFT="$REPO_DIR/server/models/draft/dflash-draft-3.6-q4_k_m.gguf"
 TARGET_WAS_EXPLICIT=0
 if [[ -n "${TARGET+x}" ]]; then
   TARGET_WAS_EXPLICIT=1
-elif [[ -n "${DFLASH_TARGET+x}" ]]; then
-  TARGET="$DFLASH_TARGET"
+elif [[ -n "${LUCE_TARGET+x}" ]]; then
+  TARGET="$LUCE_TARGET"
   TARGET_WAS_EXPLICIT=1
 else
   TARGET="$DEFAULT_TARGET"
 fi
 if [[ -n "${DRAFT+x}" ]]; then
   :
-elif [[ -n "${DFLASH_DRAFT+x}" ]]; then
-  DRAFT="$DFLASH_DRAFT"
+elif [[ -n "${LUCE_DRAFT+x}" ]]; then
+  DRAFT="$LUCE_DRAFT"
 elif [[ "$TARGET_WAS_EXPLICIT" == "1" ]]; then
   # A custom target may be Gemma/Laguna/Qwen3 or another model without a
   # matching DFlash draft. Avoid attaching the default Qwen draft silently.
@@ -34,7 +34,7 @@ else
   DRAFT="$DEFAULT_DRAFT"
 fi
 MODEL_SERVER="${MODEL_SERVER:-lucebox}"
-DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
+LUCE_SERVER_BIN="${LUCE_SERVER_BIN:-$REPO_DIR/server/build/luce_server}"
 LLAMA_BUILD_DIR="${LLAMA_BUILD_DIR:-$CLIENT_WORK_DIR/llama-cpp-server-build}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$LLAMA_BUILD_DIR/bin/llama-server}"
 LLAMA_N_GPU_LAYERS="${LLAMA_N_GPU_LAYERS:-999}"
@@ -138,26 +138,26 @@ start_lucebox_server() {
     echo "unknown MODEL_SERVER=$MODEL_SERVER; expected lucebox or llamacpp" >&2
     return 1
   fi
-  start_dflash_native_server
+  start_luce_native_server
 }
 
-start_dflash_native_server() {
-  if [[ ! -x "$DFLASH_SERVER_BIN" ]]; then
-    echo "dflash_server not found or not executable: $DFLASH_SERVER_BIN" >&2
+start_luce_native_server() {
+  if [[ ! -x "$LUCE_SERVER_BIN" ]]; then
+    echo "luce_server not found or not executable: $LUCE_SERVER_BIN" >&2
     echo "Build it first, for example:" >&2
-    echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/server/build -DGGML_CUDA=ON" >&2
-    echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
+    echo "  cmake -S $REPO_DIR/server -B $REPO_DIR/server/build -DGGML_CUDA=ON" >&2
+    echo "  cmake --build $REPO_DIR/server/build --target luce_server -j\$(nproc)" >&2
     return 1
   fi
   if [[ ! -f "$TARGET" ]]; then
     echo "target GGUF not found: $TARGET" >&2
-    echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
+    echo "Set TARGET=/path/to/model.gguf or LUCE_TARGET=/path/to/model.gguf, or download the default:" >&2
     echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi
   if draft_enabled && [[ ! -f "$DRAFT" ]]; then
     echo "DFlash draft not found: $DRAFT" >&2
-    echo "Set DRAFT=/path/to/dflash-draft.gguf or DFLASH_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
+    echo "Set DRAFT=/path/to/dflash-draft.gguf or LUCE_DRAFT=/path/to/dflash-draft.gguf, or download the default:" >&2
     echo "  hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir $REPO_DIR/server/models/draft/" >&2
     return 1
   fi
@@ -179,9 +179,9 @@ start_dflash_native_server() {
   fi
   # Export KV cache type env vars for the C++ server to pick up (only when
   # explicitly requested: the per-axis envs override family defaults).
-  if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
-  if [[ -n "$CACHE_TYPE_V" ]]; then export DFLASH27B_KV_V="$CACHE_TYPE_V"; fi
-  "$DFLASH_SERVER_BIN" "$TARGET" \
+  if [[ -n "$CACHE_TYPE_K" ]]; then export LUCE_KV_K="$CACHE_TYPE_K"; fi
+  if [[ -n "$CACHE_TYPE_V" ]]; then export LUCE_KV_V="$CACHE_TYPE_V"; fi
+  "$LUCE_SERVER_BIN" "$TARGET" \
     "${draft_args[@]}" \
     --host "$HOST" \
     --port "$PORT" \
@@ -206,7 +206,7 @@ start_llamacpp_server() {
   fi
   if [[ ! -f "$TARGET" ]]; then
     echo "target GGUF not found: $TARGET" >&2
-    echo "Set TARGET=/path/to/model.gguf or DFLASH_TARGET=/path/to/model.gguf, or download the default:" >&2
+    echo "Set TARGET=/path/to/model.gguf or LUCE_TARGET=/path/to/model.gguf, or download the default:" >&2
     echo "  hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir $REPO_DIR/server/models/" >&2
     return 1
   fi

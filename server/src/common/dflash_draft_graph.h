@@ -15,7 +15,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Draft forward: speculative next-token prediction using target features.
 //   lm_head: optional target lm_head tensor for fused projection. When
@@ -34,4 +34,4 @@ bool build_draft_step(
     int ctx_len_max = 0,
     bool pad_ctx = false);
 
-}  // namespace dflash::common
+}  // namespace luce::common

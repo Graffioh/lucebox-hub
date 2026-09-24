@@ -1,16 +1,17 @@
-// Chat template renderer for dflash::common native server.
+// Chat template renderer for luce::common native server.
 //
 // Renders chat messages (system/user/assistant/tool) into the model-specific
 // token format. Hard-coded for supported architectures:
 //   - Qwen3/3.5: <|im_start|>role\ncontent<|im_end|>\n
-//   - Laguna: XML-style <|begin_of_sentence|><|User|>...<|Assistant|>
+//   - BailingMoE3: <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
+//   - Laguna: XML-style role blocks
 
 #pragma once
 
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // A single message in a chat conversation.
 struct ChatMessage {
@@ -23,6 +24,7 @@ struct ChatMessage {
 // Chat template format.
 enum class ChatFormat {
     QWEN3,     // <|im_start|>role\n...<|im_end|>\n
+    BAILINGMOE3, // <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
     LAGUNA,    // <|begin_of_sentence|><|User|>...<|Assistant|>
     GEMMA4,    // <bos><|turn>role\n...<turn|>\n
     DEEPSEEK4, // <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜>
@@ -41,12 +43,16 @@ enum class ChatFormat {
 // `tools_json` is an optional JSON string containing the tool definitions
 // array. When non-empty, the Qwen3/3.5 template injects a tool preamble
 // into the system message instructing the model how to emit <tool_call> tags.
+//
+// `reasoning_effort` is the normalized model-facing effort. DeepSeek V4 uses
+// low, high, and max; high and max prepend the official encoding prefixes.
 std::string render_chat_template(
     const std::vector<ChatMessage> & messages,
     ChatFormat format,
     bool add_generation_prompt = true,
     bool enable_thinking = false,
-    const std::string & tools_json = "");
+    const std::string & tools_json = "",
+    const std::string & reasoning_effort = "");
 
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);
@@ -77,4 +83,4 @@ std::string render_chat_template_jinja(
     bool enable_thinking = false,
     const std::string & tools_json = "");
 
-}  // namespace dflash::common
+}  // namespace luce::common

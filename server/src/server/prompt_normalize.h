@@ -7,7 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -25,4 +25,4 @@ using json = nlohmann::json;
 // so that two requests differing only in the header value hash identically.
 std::string normalize_system_for_cache(const json & system_or_messages);
 
-}  // namespace dflash::common
+}  // namespace luce::common

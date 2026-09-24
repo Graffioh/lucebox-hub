@@ -716,8 +716,137 @@ static uint8_t rocmfpx_choose_scale_fp8_weighted_mse(const float * x, int n, con
     return best_e;
 }
 
+#ifdef ROCMFP2_AFFINE
+static uint8_t rocmfpx_quantize_fp2_affine_code(
+        float x, float scale, float offset) {
+    if (!(scale > 0.0f)) {
+        return 0;
+    }
+    if (!isfinite(x)) {
+        x = 0.0f;
+    }
+    const float q = floorf((x + offset) / scale + 0.5f);
+    return (uint8_t) fminf(3.0f, fmaxf(0.0f, q));
+}
+
+static float rocmfpx_fp2_affine_block_mse(
+        const float * x, int n, const float * mse_weights,
+        uint8_t scale_e, uint8_t offset_e, float best_err) {
+    const float scale = rocmfpx_ue4m3_to_fp32(scale_e);
+    const float offset = rocmfpx_ue4m3_to_fp32(offset_e);
+    float err = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (!isfinite(x[i])) continue;
+        const float weight = mse_weights ? mse_weights[i] : 1.0f;
+        if (!(weight > 0.0f)) continue;
+        const uint8_t code =
+            rocmfpx_quantize_fp2_affine_code(x[i], scale, offset);
+        const float delta = x[i] - ((float) code * scale - offset);
+        err += weight * delta * delta;
+        if (err > best_err) return err;
+    }
+    return err;
+}
+
+static void rocmfpx_choose_fp2_affine_params(
+        const float * x, int n, const float * mse_weights,
+        uint8_t * scale_e, uint8_t * offset_e) {
+    float min_value = INFINITY;
+    float max_value = -INFINITY;
+    for (int pass = 0; pass < 2 && min_value == INFINITY; ++pass) {
+        for (int i = 0; i < n; ++i) {
+            if (!isfinite(x[i])) continue;
+            if (pass == 0 && mse_weights && !(mse_weights[i] > 0.0f)) {
+                continue;
+            }
+            min_value = fminf(min_value, x[i]);
+            max_value = fmaxf(max_value, x[i]);
+        }
+        if (!mse_weights) break;
+    }
+    if (min_value == INFINITY ||
+        (min_value == 0.0f && max_value == 0.0f)) {
+        *scale_e = 0;
+        *offset_e = 0;
+        return;
+    }
+
+    const float initial_offset = fmaxf(0.0f, -min_value);
+    const float initial_scale =
+        fmaxf((max_value + initial_offset) / 3.0f,
+              rocmfpx_ue4m3_to_fp32(1));
+    uint8_t best_scale = rocmfpx_nearest_scale_ue4m3(initial_scale);
+    uint8_t best_offset = rocmfpx_nearest_scale_ue4m3(initial_offset);
+    float best_err = rocmfpx_fp2_affine_block_mse(
+        x, n, mse_weights, best_scale, best_offset, INFINITY);
+
+    for (int e = 1; e <= 0x7e; ++e) {
+        const float err = rocmfpx_fp2_affine_block_mse(
+            x, n, mse_weights, (uint8_t) e, best_offset, best_err);
+        if (err < best_err || (err == best_err && e < best_scale)) {
+            best_err = err;
+            best_scale = (uint8_t) e;
+        }
+    }
+    for (int e = 0; e <= 0x7e; ++e) {
+        const float err = rocmfpx_fp2_affine_block_mse(
+            x, n, mse_weights, best_scale, (uint8_t) e, best_err);
+        if (err < best_err || (err == best_err && e < best_offset)) {
+            best_err = err;
+            best_offset = (uint8_t) e;
+        }
+    }
+    for (int e = 1; e <= 0x7e; ++e) {
+        const float err = rocmfpx_fp2_affine_block_mse(
+            x, n, mse_weights, (uint8_t) e, best_offset, best_err);
+        if (err < best_err || (err == best_err && e < best_scale)) {
+            best_err = err;
+            best_scale = (uint8_t) e;
+        }
+    }
+    *scale_e = best_scale;
+    *offset_e = best_offset;
+}
+
+static void rocmfpx_quantize_row_fp2_affine(
+        const float * GGML_RESTRICT x,
+        block_rocmfp2 * GGML_RESTRICT y, int64_t k,
+        const float * GGML_RESTRICT quant_weights, float sigma2) {
+    const int64_t nb = k / QK_ROCMFP2;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*QK_ROCMFP2;
+        block_rocmfp2 * yb = y + ib;
+        float mse_weights[QK_ROCMFP2];
+        const float * block_weights = NULL;
+        if (quant_weights) {
+            float max_abs;
+            float max_abs_weight;
+            rocmfpx_prepare_mse_weights(
+                mse_weights, xb, QK_ROCMFP2,
+                quant_weights + ib*QK_ROCMFP2, sigma2,
+                &max_abs, &max_abs_weight);
+            block_weights = mse_weights;
+        }
+        rocmfpx_choose_fp2_affine_params(
+            xb, QK_ROCMFP2, block_weights, &yb->e[0], &yb->e[1]);
+        const float scale = rocmfpx_ue4m3_to_fp32(yb->e[0]);
+        const float offset = rocmfpx_ue4m3_to_fp32(yb->e[1]);
+        memset(yb->qs, 0, sizeof(yb->qs));
+        for (int i = 0; i < QK_ROCMFP2; ++i) {
+            const uint8_t code =
+                rocmfpx_quantize_fp2_affine_code(xb[i], scale, offset);
+            yb->qs[i >> 2] |= (uint8_t) (code << (2*(i & 3)));
+        }
+    }
+}
+#endif
+
 void rocmfpx_quantize_row_fp2_ref(const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_ROCMFP2 == 0);
+#ifdef ROCMFP2_AFFINE
+    rocmfpx_quantize_row_fp2_affine(x, y, k, NULL, 0.0f);
+    return;
+#endif
 
     const int64_t nb = k / QK_ROCMFP2;
     for (int64_t ib = 0; ib < nb; ++ib) {
@@ -745,6 +874,11 @@ void rocmfpx_quantize_row_fp2_ref(const float * GGML_RESTRICT x, block_rocmfp2 *
 static void rocmfpx_quantize_row_fp2_weighted(
         const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y, int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_ROCMFP2 == 0);
+#ifdef ROCMFP2_AFFINE
+    rocmfpx_quantize_row_fp2_affine(
+        x, y, k, quant_weights, rocmfpx_row_sigma2(x, k));
+    return;
+#endif
 
     const float sigma2 = rocmfpx_row_sigma2(x, k);
 
@@ -785,9 +919,17 @@ void rocmfpx_dequantize_row_fp2(const block_rocmfp2 * GGML_RESTRICT x, float * G
         float * yb = y + ib*QK_ROCMFP2;
 
         for (int i = 0; i < QK_ROCMFP2; ++i) {
+#ifdef ROCMFP2_AFFINE
+            // affine type-107: value = code*scale - offset, e[0]=scale, e[1]=offset
+            const float scale  = rocmfpx_ue4m3_to_fp32(xb->e[0]);
+            const float offset = rocmfpx_ue4m3_to_fp32(xb->e[1]);
+            const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
+            yb[i] = (float) code * scale - offset;
+#else
             const float scale = rocmfpx_ue4m3_to_fp32(xb->e[i >= QK_ROCMFP2/2]);
             const uint8_t code = (uint8_t) ((xb->qs[i >> 2] >> (2*(i & 3))) & 3u);
             yb[i] = kvalues_rocmfp2[code] * scale;
+#endif
         }
     }
 }
@@ -1149,4 +1291,249 @@ bool rocmfpx_validate_row_data_fp8(const void * data, size_t nbytes) {
     }
 
     return true;
+}
+
+static float rocmfpx_bf16_to_fp32(uint16_t v) {
+    uint32_t bits = (uint32_t) v << 16;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static int rocmfpx_mix_nearest_level(float value, const float * levels, int nlevels) {
+    int lo = 0;
+    int hi = nlevels - 1;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        const float split = 0.5f * (levels[mid] + levels[mid + 1]);
+        if (value <= split) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+static bool rocmfpx_mix_prepare_books(
+        const uint16_t * codebooks_bf16, int k, float books[2][8]) {
+    if (!codebooks_bf16 || k <= 0 || k > 8) {
+        return false;
+    }
+    for (int b = 0; b < 2; ++b) {
+        for (int i = 0; i < k; ++i) {
+            const float value = rocmfpx_bf16_to_fp32(codebooks_bf16[b*k + i]);
+            if (!isfinite(value) || (i > 0 && !(value > books[b][i - 1]))) {
+                return false;
+            }
+            books[b][i] = value;
+        }
+    }
+    return true;
+}
+
+static float rocmfpx_mix_half_error(
+        const float * x, const float * imatrix, const float * book, int k,
+        uint8_t e, float best) {
+    const float scale = rocmfpx_ue4m3_to_fp32(e);
+    if (!(scale > 0.0f)) {
+        return INFINITY;
+    }
+    const float inv_scale = 1.0f / scale;
+    float error = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        if (!isfinite(x[i])) {
+            return INFINITY;
+        }
+        const int code = rocmfpx_mix_nearest_level(x[i] * inv_scale, book, k);
+        const float delta = x[i] - scale * book[code];
+        float weight = 1.0f;
+        if (imatrix) {
+            if (!isfinite(imatrix[i]) || imatrix[i] < 0.0f) {
+                return INFINITY;
+            }
+            weight = imatrix[i];
+        }
+        error += weight * delta * delta;
+        if (error > best) {
+            break;
+        }
+    }
+    return error;
+}
+
+static bool rocmfpx_mix_choose_half(
+        const float * x, const float * imatrix, float books[2][8], int k,
+        int * out_book, uint8_t * out_e) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        if (!isfinite(x[i])) {
+            return false;
+        }
+        const float ax = fabsf(x[i]);
+        if (ax > max_abs) {
+            max_abs = ax;
+        }
+    }
+    if (max_abs == 0.0f) {
+        *out_book = 0;
+        *out_e = 0;
+        return true;
+    }
+
+    float best_error = INFINITY;
+    int best_book = 0;
+    uint8_t best_e = 1;
+    for (int book = 0; book < 2; ++book) {
+        float max_level = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            const float a = fabsf(books[book][i]);
+            if (a > max_level) {
+                max_level = a;
+            }
+        }
+        if (!(max_level > 0.0f)) {
+            continue;
+        }
+        const uint8_t center = rocmfpx_nearest_scale_ue4m3(max_abs / max_level);
+        for (int delta = -2; delta <= 2; ++delta) {
+            const int candidate = (int) center + delta;
+            if (candidate < 1 || candidate > 0x7e) {
+                continue;
+            }
+            const float error = rocmfpx_mix_half_error(
+                x, imatrix, books[book], k, (uint8_t) candidate, best_error);
+            if (error < best_error ||
+                (error == best_error && (book < best_book ||
+                 (book == best_book && candidate < best_e)))) {
+                best_error = error;
+                best_book = book;
+                best_e = (uint8_t) candidate;
+            }
+        }
+    }
+    if (!isfinite(best_error)) {
+        return false;
+    }
+    *out_book = best_book;
+    *out_e = best_e;
+    return true;
+}
+
+bool rocmfpx_quantize_row_fp2_mix_ref(
+        const float * GGML_RESTRICT x, block_rocmfp2 * GGML_RESTRICT y,
+        int64_t k, const uint16_t codebooks_bf16[8],
+        const float * GGML_RESTRICT imatrix) {
+    if (!x || !y || k < 0 || k % QK_ROCMFP2 != 0) {
+        return false;
+    }
+    float books[2][8] = {{0}};
+    if (!rocmfpx_mix_prepare_books(codebooks_bf16, 4, books)) {
+        return false;
+    }
+    const int64_t nb = k / QK_ROCMFP2;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*QK_ROCMFP2;
+        block_rocmfp2 * yb = y + ib;
+        memset(yb, 0, sizeof(*yb));
+        for (int half = 0; half < 2; ++half) {
+            const int off = half*16;
+            int book = 0;
+            uint8_t e = 0;
+            if (!rocmfpx_mix_choose_half(
+                    xb + off, imatrix ? imatrix + ib*QK_ROCMFP2 + off : NULL,
+                    books, 4, &book, &e)) {
+                return false;
+            }
+            yb->e[half] = (uint8_t) (e | (book << 7));
+            const float scale = rocmfpx_ue4m3_to_fp32(e);
+            const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                const int i = off + j;
+                const int code = scale > 0.0f
+                    ? rocmfpx_mix_nearest_level(xb[i]*inv_scale, books[book], 4)
+                    : rocmfpx_mix_nearest_level(0.0f, books[book], 4);
+                yb->qs[i >> 2] |= (uint8_t) (code << (2*(i & 3)));
+            }
+        }
+    }
+    return true;
+}
+
+void rocmfpx_dequantize_row_fp2_mix(
+        const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y,
+        int64_t k, const uint16_t codebooks_bf16[8]) {
+    assert(x && y && k % QK_ROCMFP2 == 0);
+    float books[2][8] = {{0}};
+    const bool valid_books = rocmfpx_mix_prepare_books(codebooks_bf16, 4, books);
+    assert(valid_books);
+    if (!valid_books) return;
+    for (int64_t ib = 0; ib < k/QK_ROCMFP2; ++ib) {
+        for (int i = 0; i < QK_ROCMFP2; ++i) {
+            const uint8_t meta = x[ib].e[i >= 16];
+            const int book = meta >> 7;
+            const float scale = rocmfpx_ue4m3_to_fp32(meta & 0x7f);
+            const int code = (x[ib].qs[i >> 2] >> (2*(i & 3))) & 3;
+            y[ib*QK_ROCMFP2 + i] = scale * books[book][code];
+        }
+    }
+}
+
+bool rocmfpx_quantize_row_fp3_mix_ref(
+        const float * GGML_RESTRICT x, block_rocmfp3 * GGML_RESTRICT y,
+        int64_t k, const uint16_t codebooks_bf16[16],
+        const float * GGML_RESTRICT imatrix) {
+    if (!x || !y || k < 0 || k % QK_ROCMFP3 != 0) {
+        return false;
+    }
+    float books[2][8] = {{0}};
+    if (!rocmfpx_mix_prepare_books(codebooks_bf16, 8, books)) {
+        return false;
+    }
+    const int64_t nb = k / QK_ROCMFP3;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + ib*QK_ROCMFP3;
+        block_rocmfp3 * yb = y + ib;
+        memset(yb, 0, sizeof(*yb));
+        for (int half = 0; half < 2; ++half) {
+            const int off = half*16;
+            int book = 0;
+            uint8_t e = 0;
+            if (!rocmfpx_mix_choose_half(
+                    xb + off, imatrix ? imatrix + ib*QK_ROCMFP3 + off : NULL,
+                    books, 8, &book, &e)) {
+                return false;
+            }
+            yb->e[half] = (uint8_t) (e | (book << 7));
+            const float scale = rocmfpx_ue4m3_to_fp32(e);
+            const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                const int i = off + j;
+                const int code = scale > 0.0f
+                    ? rocmfpx_mix_nearest_level(xb[i]*inv_scale, books[book], 8)
+                    : rocmfpx_mix_nearest_level(0.0f, books[book], 8);
+                rocmfpx_set_bits(yb->qs, i*3, 3, (uint32_t) code);
+            }
+        }
+    }
+    return true;
+}
+
+void rocmfpx_dequantize_row_fp3_mix(
+        const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y,
+        int64_t k, const uint16_t codebooks_bf16[16]) {
+    assert(x && y && k % QK_ROCMFP3 == 0);
+    float books[2][8] = {{0}};
+    const bool valid_books = rocmfpx_mix_prepare_books(codebooks_bf16, 8, books);
+    assert(valid_books);
+    if (!valid_books) return;
+    for (int64_t ib = 0; ib < k/QK_ROCMFP3; ++ib) {
+        for (int i = 0; i < QK_ROCMFP3; ++i) {
+            const uint8_t meta = x[ib].e[i >= 16];
+            const int book = meta >> 7;
+            const float scale = rocmfpx_ue4m3_to_fp32(meta & 0x7f);
+            const int code = (int) rocmfpx_get_bits(x[ib].qs, i*3, 3);
+            y[ib*QK_ROCMFP3 + i] = scale * books[book][code];
+        }
+    }
 }

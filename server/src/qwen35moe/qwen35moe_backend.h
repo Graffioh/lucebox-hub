@@ -15,11 +15,11 @@
 #include <memory>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35MoeBackend : public Qwen35Backend {
 public:
-    explicit Qwen35MoeBackend(const Qwen35Config & cfg);
+    explicit Qwen35MoeBackend(Qwen35Config cfg);
     ~Qwen35MoeBackend() override = default;
 
     bool init() override;
@@ -103,4 +103,4 @@ private:
     bool ensure_pipe_state(int kv_start);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

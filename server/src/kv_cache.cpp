@@ -19,8 +19,8 @@
 
 #include "internal.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Placeholder; real impl lives with the spec_loop driver.
 
-} // namespace dflash::common
+} // namespace luce::common

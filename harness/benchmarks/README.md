@@ -4,6 +4,10 @@ These checks are separate from the client harness launchers. They compare Lucebo
 generation against a llama.cpp baseline on the same target GGUF, using small
 deterministic prompts.
 
+For the paired ragged C1/C4/C8/C16 serving benchmark and the concurrent
+HumanEval/GSM8K/Math500/agent suite runner, see
+[`concurrency/`](concurrency/README.md).
+
 Use this when you want to know whether a server change affects output quality or
 decode speed. Use `harness/clients/` when you want to know whether Codex,
 OpenCode, OMP, Open WebUI, Pi, and the other clients still work.
@@ -103,3 +107,16 @@ Each run writes:
 Prompt files are JSONL. Each line needs `id` and either `prompt` or `messages`.
 Optional `expect_contains` and `expect_regex` fields define lightweight accuracy
 checks.
+
+---
+
+## DeepSeek 4 exact-context benchmark
+
+`deepseek4/ds4_publication_decode_client.py` runs a deterministic streaming
+decode workload and records timing, token counts, and response hashes.
+`deepseek4/ds4_context_sweep.py` uses the target model's tokenizer to run the
+same workload at exact context lengths.
+
+The AMD q=5 hardware launcher is kept separately under
+`harness/qualification/deepseek4/` because it changes GPU performance settings
+and assumes a specific two-GPU layout.

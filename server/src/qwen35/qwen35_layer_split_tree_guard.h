@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 using Qwen35SplitPureChainHook = bool (*)(void * context);
 
@@ -30,4 +30,4 @@ inline bool qwen35_split_run_if_root_inclusive_pure_chain(
     return hook == nullptr || hook(hook_context);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

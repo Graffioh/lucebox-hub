@@ -10999,6 +10999,7 @@ static uint32_t ggml_vk_rms_partials_size(ggml_backend_vk_context * ctx, const g
 static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *dst, const ggml_tensor *src0, const bool has_ff, bool backprop, const uint32_t set_rows_stride) {
     const int n_dims        = ((const int32_t *) dst->op_params)[1];
     const int mode          = ((const int32_t *) dst->op_params)[2];
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_TAIL) == 0);
     // const int n_ctx         = ((const int32_t *) dst->op_params)[3];
     const int n_ctx_orig    = ((const int32_t *) dst->op_params)[4];
     const float freq_base   = ((const float *)   dst->op_params)[5];
@@ -13141,6 +13142,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_SET_ROWS:
+        GGML_ASSERT(ggml_get_op_params_i32(node, 0) == 0);
         ggml_vk_set_rows(ctx, compute_ctx, src0, src1, node);
 
         break;
@@ -15303,6 +15305,11 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+        (op->op_params[2] & GGML_ROPE_TYPE_TAIL)) {
+        return false;
+    }
+
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
 
@@ -15537,6 +15544,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_get_op_params_i32(op, 0) != 0) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -15718,7 +15728,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DIAG_MASK_INF:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
+            // Sink-column mode requires per-row sinks and an unscaled sink logit.
+            return ggml_get_op_params_i32(op, 2) == 0 && ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
                 && (!op->src[1] || (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16));
         case GGML_OP_SOFT_MAX_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
@@ -15776,6 +15787,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return true; // all inputs are contiguous, see ggml.c
         case GGML_OP_GATED_DELTA_NET:
             {
+                // The Vulkan kernel consumes only src[0..5] and writes final
+                // state into the result tensor. Reject tree, persistent,
+                // active-slot, raw-gate, in-place, intermediate-output, and
+                // journal variants.
+                if (op->src[6] != nullptr || op->src[7] != nullptr ||
+                    op->src[8] != nullptr || op->src[9] != nullptr ||
+                    ggml_get_op_params_i32(op, 0) != 1 ||
+                    ggml_get_op_params_i32(op, 1) != 0 ||
+                    ggml_get_op_params_i32(op, 2) == 1 ||
+                    ggml_get_op_params_i32(op, 3) != 0 ||
+                    ggml_get_op_params_i32(op, 10) == 1) {
+                    return false;
+                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
@@ -15826,7 +15850,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
         case GGML_OP_SSM_CONV:
-            return op->src[0]->type == GGML_TYPE_F32;
+            // Fused step/SpecLA/dyn-conv variants are CUDA/HIP only.
+            return op->op_params[0] == 0 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:

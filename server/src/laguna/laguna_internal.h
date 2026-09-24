@@ -1,4 +1,4 @@
-// Laguna-XS.2 (Poolside) target structs for dflash daemon. Mirrors the qwen35
+// Laguna-XS.2 (Poolside) target structs for luce daemon. Mirrors the qwen35
 // abstractions in internal.h but for an iSWA + MoE arch with no SSM/delta-net
 // and per-layer-varying head count.
 //
@@ -20,7 +20,7 @@
 //   - Vocab = 100352. BOS = 2. EOS = {2, 24}. Pad = 9.
 
 #pragma once
-#define DFLASH_LAGUNA_INTERNAL_H_INCLUDED
+#define LUCE_LAGUNA_INTERNAL_H_INCLUDED
 
 #include <cstdint>
 #include <string>
@@ -33,7 +33,7 @@
 #include "common/layer_split_utils.h"
 #include "internal.h"  // for CpuEmbedder
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LagunaTargetLayer {
     // Pre-attn + pre-ffn norms (Laguna has only these two; no post norms).
@@ -72,7 +72,7 @@ struct LagunaTargetLayer {
     // Fused views over ADJACENT weight pairs (the loader lays q|k and
     // gate_shexp|up_shexp out back-to-back and binds one tensor over both
     // regions; zero extra VRAM). Null when the pair could not be fused
-    // (type mismatch / DFLASH_LAGUNA_FUSED_QK=0). Same data as wq/wk etc.
+    // (type mismatch / LUCE_LAGUNA_FUSED_QK=0). Same data as wq/wk etc.
     ggml_tensor * wqk       = nullptr;  // [n_embd, (n_head+n_head_kv)*head_dim]
     ggml_tensor * shexp_gu  = nullptr;  // [n_embd, 2*n_ff_shexp]  gate rows then up rows
     ggml_tensor * qk_norm_f = nullptr;  // [head_dim, n_head+n_head_kv] f32, q_norm|k_norm per head
@@ -145,7 +145,7 @@ inline bool laguna_is_full_attn_layer(const LagunaTargetWeights & w, int il) {
 }
 
 // Loader. Validates arch == "laguna", reads all hparams, mmaps GGUF, copies
-// tensors to backend buffer. Returns false + sets dflash27b_last_error on failure.
+// tensors to backend buffer. Returns false + sets luce_last_error on failure.
 bool load_target_gguf_laguna(const std::string & path,
                               ggml_backend_t       backend,
                               LagunaTargetWeights & out);
@@ -177,7 +177,7 @@ struct LagunaTargetCache {
 
     // Per-layer KV cache. ALL 40 layers have KV (both full + swa).
     // Default layout: [head_dim, max_ctx, n_head_kv].
-    // With DFLASH_LAGUNA_KV_HEAD_MAJOR=1: [head_dim*n_head_kv, max_ctx],
+    // With LUCE_LAGUNA_KV_HEAD_MAJOR=1: [head_dim*n_head_kv, max_ctx],
     // viewed as [head_dim, n_head_kv, max_ctx] for attention.
     bool kv_head_major = false;
     std::vector<ggml_tensor *> attn_k;   // size = n_layer
@@ -447,4 +447,4 @@ bool compute_laguna_split_projection(
     std::vector<int32_t> * out_argmax,
     std::vector<float> * out_logits);
 
-} // namespace dflash::common
+} // namespace luce::common

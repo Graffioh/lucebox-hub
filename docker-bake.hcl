@@ -9,8 +9,8 @@
 #                                 # Arches: sm_75;80;86;89;90;120
 #
 # Pre-Turing arches (Pascal sm_60/61, Volta sm_70) are intentionally
-# excluded — dflash's kernels assume sm_75+ with no fallback below
-# (dflash/CMakeLists.txt:276).
+# excluded — luce's kernels assume sm_75+ with no fallback below
+# (server/CMakeLists.txt:276).
 #
 # The CI `cuda12` target takes tags from docker/metadata-action. The local
 # `cuda12-local` target tags `lucebox-hub:cuda12` (moving) and, when
@@ -37,22 +37,22 @@ variable "TAG"      { default = "" }
 # dev builds can narrow this to the host's compute capability to skip the
 # 5-6× CUDA template recompile cost:
 #
-#   DFLASH_CUDA_ARCHES=120 docker buildx bake cuda12-local --load
+#   LUCE_CUDA_ARCHES=120 docker buildx bake cuda12-local --load
 #
 # (RTX 5090 / 5090 Laptop = 120, RTX 4090 = 89, RTX 3090 = 86, H100 = 90,
 # A100 = 80, RTX 2080 Ti = 75.) Use a semicolon-separated list to include
 # multiple arches.
-variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
+variable "LUCE_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
 
 # Fat-binary HIP/gfx arch list for the rocm variant (semicolon-separated).
 # Default is gfx1151 (Strix Halo, the lucebox appliance iGPU) only, to keep the
 # build tractable. Widen for a broadly-runnable released image, e.g.:
-#   DFLASH_HIP_ARCHES="gfx1151;gfx1100;gfx1200;gfx1201;gfx942;gfx90a" docker buildx bake rocm
+#   LUCE_HIP_ARCHES="gfx1151;gfx1100;gfx1200;gfx1201;gfx942;gfx90a" docker buildx bake rocm
 # (gfx1151 Strix Halo, gfx1100 RX7900/RDNA3, gfx1200 RDNA4 RX9060,
 # gfx1201 RDNA4 RX9070/Radeon AI PRO R9700, gfx942 MI300, gfx90a MI200.)
 # Note: gfx1200 and gfx1201 are NOT code-object compatible — the R9700 needs
 # gfx1201 explicitly.
-variable "DFLASH_HIP_ARCHES" { default = "gfx1151" }
+variable "LUCE_HIP_ARCHES" { default = "gfx1151" }
 
 # ROCm base-image tag for the rocm variant. gfx1151 needs >= 6.4.1. Default
 # stays 6.4.1 (7.2.x has shown intermittent problems on Strix Halo), but on a
@@ -113,7 +113,7 @@ target "_cuda12-base" {
     args = {
         CUDA_VERSION        = "12.8.1"
         UBUNTU_VERSION      = "22.04"
-        DFLASH_CUDA_ARCHES  = DFLASH_CUDA_ARCHES
+        LUCE_CUDA_ARCHES  = LUCE_CUDA_ARCHES
         # /props.build identity. CI passes these as env vars from the
         # workflow context; local builds rely on the variables' defaults
         # (empty strings → JSON null at /props.build.*).
@@ -134,7 +134,7 @@ target "cuda12-local" {
 
 # ── ROCm / HIP ───────────────────────────────────────────────────────────────
 # AMD GPU build from Dockerfile.rocm: gfx1151 (Strix Halo) by default, widen via
-# DFLASH_HIP_ARCHES for a broadly-runnable image. Block-Sparse-Attention is
+# LUCE_HIP_ARCHES for a broadly-runnable image. Block-Sparse-Attention is
 # CUDA-only and disabled in this variant (see Dockerfile.rocm).
 target "_rocm-base" {
     context    = "."
@@ -142,7 +142,7 @@ target "_rocm-base" {
     args = {
         ROCM_VERSION      = ROCM_VERSION
         UBUNTU_VERSION    = "22.04"
-        DFLASH_HIP_ARCHES = DFLASH_HIP_ARCHES
+        LUCE_HIP_ARCHES = LUCE_HIP_ARCHES
         GIT_SHA           = GIT_SHA
         IMAGE_TAG         = IMAGE_TAG
         BUILD_TIME        = BUILD_TIME

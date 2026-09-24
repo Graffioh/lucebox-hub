@@ -1,11 +1,97 @@
 #include "graph_builders.h"
 
+#include "delta_net_specla.h"
+
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <cstdlib>
+#include <memory>
+#include <vector>
 
-namespace dflash::common {
+namespace luce::common {
+
+bool detail::target_graph_capacity_for_parallel_segments(
+        int n_parallel_segments,
+        size_t & capacity) {
+    static constexpr int k_max_parallel_segments = 64;
+    static constexpr size_t k_base_capacity = 16384;
+    static constexpr int k_segments_per_capacity = 8;
+    static constexpr size_t k_max_capacity =
+        k_base_capacity *
+        (k_max_parallel_segments / k_segments_per_capacity);
+
+    if (n_parallel_segments < 0 ||
+        n_parallel_segments > k_max_parallel_segments) {
+        return false;
+    }
+    const int64_t scale = std::max<int64_t>(
+        1, ((int64_t)n_parallel_segments +
+            k_segments_per_capacity - 1) /
+               k_segments_per_capacity);
+    if ((uint64_t)scale >
+        std::numeric_limits<size_t>::max() / k_base_capacity) {
+        return false;
+    }
+    const size_t computed = k_base_capacity * (size_t)scale;
+    if (computed > k_max_capacity) return false;
+    capacity = computed;
+    return true;
+}
+
+bool detail::target_paged_tree_graph_capacity(
+        int tree_width,
+        int n_tree_seqs,
+        size_t & capacity) {
+    static constexpr int tree_buckets[] = {
+        1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+    };
+    if (tree_width < 2 || tree_width > 16 ||
+        std::find(std::begin(tree_buckets), std::end(tree_buckets),
+                  n_tree_seqs) == std::end(tree_buckets) ||
+        (int64_t)tree_width * n_tree_seqs > INT32_MAX) {
+        return false;
+    }
+    return target_graph_capacity_for_parallel_segments(
+        n_tree_seqs, capacity);
+}
+
+bool detail::validate_target_paged_tree_layout(
+    const TargetCache & cache,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride) {
+    size_t graph_capacity = 0;
+    if (!target_paged_tree_graph_capacity(
+            tree_width, n_tree_seqs, graph_capacity) ||
+        cache.n_seq_slots <= 1 || !cache.paged_block_table ||
+        !cache.paged_kv_seq_lens || paged_max_kv_len < 1 ||
+        tree_scratch_base <= 0 ||
+        tree_scratch_base % PAGED_BLOCK_SIZE != 0 ||
+        tree_scratch_stride < tree_width) {
+        return false;
+    }
+
+    int physical_kv_rows = 0;
+    for (ggml_tensor * tensor : cache.attn_k) {
+        if (tensor) {
+            physical_kv_rows = (int)tensor->ne[1];
+            break;
+        }
+    }
+    if (physical_kv_rows < 1) return false;
+
+    const int64_t scratch_end =
+        (int64_t)tree_scratch_base +
+        (int64_t)(cache.n_seq_slots - 1) * tree_scratch_stride +
+        tree_width;
+    return scratch_end <= physical_kv_rows;
+}
 
 // ── build_layer_step ────────────────────────────────────────────
 
@@ -81,7 +167,10 @@ bool build_layer_step(
         ggml_set_input(sg.parent_ids);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     ggml_tensor * layer_out = build_qwen35_layer(
         sg.ctx, sg.gf, w, cache, layer_idx,
@@ -157,7 +246,10 @@ bool build_layer_prefn_step(
         }
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
     QwenLayerPrefnOutputs go = build_qwen35_layer_prefn(
         sg.ctx, sg.gf, w, cache, layer_idx,
         sg.inp_embed, sg.positions, sg.attn_mask,
@@ -233,7 +325,10 @@ bool build_hybrid_full_layer_step(
         }
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net graph (CS = 32) reaches ~17k nodes at
+    // a 512-token ubatch, and these per-layer builders construct the same
+    // blocks for layer-split / tensor-parallel placements.
+    sg.gf = ggml_new_graph_custom(sg.ctx, 32768, false);
 
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * layer_out = build_qwen35_layer(
@@ -275,14 +370,66 @@ bool build_target_step(
     bool capture,
     bool capture_delta_intermediate,
     int fa_window,
-    bool last_token_logits_only,
+    int logits_tail_rows,
     int kq_stride_pad,
     bool capture_moe_router,
     bool kvflash_mask,
     bool capture_qk,
-    bool paged_attention) {
+    bool paged_attention,
+    int n_seqs,
+    int seq_slot,
+    int paged_max_kv_len,
+    int n_prefill_tokens,
+    const QwenPrefillSegment * prefill_segments,
+    int n_prefill_segments,
+    int n_logits_rows,
+    bool compact_slots) {
     step_graph_free(sg);
 
+    // Compact n_seqs is a decode graph bucket width, not the physical
+    // slot count. active_slot_ids maps live rows to cache columns and uses -1
+    // for padding, so a valid bucket may be wider than cache.n_seq_slots.
+    const bool invalid_compact_width = n_seqs < 1 || n_seqs > 64;
+
+    // Concurrent prefill rows read the pool through the ragged paged path
+    // (per-row seq ids and causal positions, no mask). Fused steps put the
+    // chunk rows first and the compact decode rows after; a prefill-only
+    // step has no decode rows.
+    if (n_prefill_tokens > n_tokens) return false;
+    const bool fused = n_prefill_tokens > 0 && n_tokens > n_prefill_tokens;
+    const bool prefill_only =
+        n_prefill_tokens > 0 && n_tokens == n_prefill_tokens;
+    if (fused && (!paged_attention ||
+                  n_tokens != n_prefill_tokens + n_seqs ||
+                  !compact_slots || invalid_compact_width)) {
+        return false;
+    }
+    if (prefill_only &&
+        (!paged_attention || compact_slots || n_seqs != 1 || with_mask)) {
+        return false;
+    }
+    // Prefill rows always arrive split into per-prompt segments: dense, in
+    // order, totalling n_prefill_tokens.
+    if ((n_prefill_tokens > 0) !=
+        (prefill_segments != nullptr && n_prefill_segments > 0)) {
+        return false;
+    }
+    int segment_total = 0;
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        const QwenPrefillSegment & pf = prefill_segments[i];
+        if (pf.n_tokens < 1 || pf.token_offset != segment_total ||
+            pf.seq_slot < 0 || pf.seq_slot >= cache.n_seq_slots) {
+            return false;
+        }
+        segment_total += pf.n_tokens;
+    }
+    if (segment_total != n_prefill_tokens) return false;
+    if (n_logits_rows > 0 && n_prefill_tokens == 0) return false;
+    size_t graph_capacity = 0;
+    if (!detail::target_graph_capacity_for_parallel_segments(
+            n_prefill_segments, graph_capacity)) {
+        return false;
+    }
     // Persistent thread_local arena: rebuilt step graphs land at identical
     // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and
     // every node property stable across AR decode steps -> captured graph
@@ -290,12 +437,73 @@ bool build_target_step(
     // step-invariant set_rows KV write (kv_write_rows) below.
     ggml_init_params ip{};
     ip.mem_size   = 512 * 1024 * 1024;
-    static thread_local std::vector<uint8_t> g_step_arena;
-    if (g_step_arena.size() < ip.mem_size) g_step_arena.resize(ip.mem_size);
-    ip.mem_buffer = g_step_arena.data();
+    static thread_local std::unique_ptr<uint8_t[]> g_step_arena;
+    static thread_local size_t g_step_arena_size = 0;
+    if (g_step_arena_size < ip.mem_size) {
+        g_step_arena.reset(new uint8_t[ip.mem_size]);
+        g_step_arena_size = ip.mem_size;
+    }
+    ip.mem_buffer = g_step_arena.get();
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
+
+    // ggml-cuda keys its graph cache by nodes[0]. Salting the metadata
+    // allocation shifts node addresses deterministically so each complete
+    // graph shape keeps an independent captured graph while sharing this
+    // single 512 MiB metadata arena.
+    int decode_key = 0;
+    if (compact_slots) {
+        static constexpr int decode_buckets[] = {
+            1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+        };
+        bool found = false;
+        for (int i = 0; i < (int)(sizeof(decode_buckets) /
+                                  sizeof(decode_buckets[0])); ++i) {
+            if (decode_buckets[i] == n_seqs) {
+                decode_key = i + 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    int graph_key_slot = decode_key;
+    if (paged_attention && paged_max_kv_len > 0) {
+        // Paged graphs differ by their padded launch bound. Packed recurrent
+        // graphs also differ by total width and every ragged segment length.
+        // Hash complete shapes into a fixed slot set: ggml-cuda still checks
+        // node properties on a collision, while host and captured-graph cache
+        // growth remain bounded for long-running ragged workloads.
+        if (n_prefill_tokens > 0) {
+            const int prefill_logit_rows = compact_slots
+                ? n_logits_rows - n_seqs
+                : n_logits_rows;
+            if (prefill_logit_rows < 0 ||
+                prefill_logit_rows > n_prefill_segments) {
+                return false;
+            }
+        }
+        std::vector<int> shape{
+            decode_key, n_tokens, n_prefill_tokens, n_prefill_segments,
+            n_logits_rows, compact_slots ? 1 : 0,
+            (paged_max_kv_len + 255) / 256,
+        };
+        shape.reserve(shape.size() + (size_t)n_prefill_segments);
+        for (int i = 0; i < n_prefill_segments; ++i) {
+            shape.push_back(prefill_segments[i].n_tokens);
+        }
+        uint64_t hash = 1469598103934665603ull;
+        for (int value : shape) {
+            hash ^= (uint32_t)value;
+            hash *= 1099511628211ull;
+        }
+        static constexpr int kPagedGraphSlots = 64;
+        graph_key_slot = 32 + (int)(hash % kPagedGraphSlots);
+    }
+    for (int i = 0; i < graph_key_slot; ++i) {
+        (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+    }
 
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
@@ -324,17 +532,81 @@ bool build_target_step(
         ggml_set_input(sg.attn_mask);
     }
 
+    ggml_tensor * paged_block_table = nullptr;
+    ggml_tensor * paged_kv_seq_lens = nullptr;
     if (paged_attention) {
-        if (n_tokens != 1 || with_mask || fa_window != 0) return false;
+        if (n_prefill_tokens == 0) {
+            // Classic paged decode is one physical sequence and one token.
+            // Concurrent decode always carries an explicit row-to-slot map.
+            if (compact_slots) {
+                if (n_tokens != n_seqs || invalid_compact_width) return false;
+            } else if (n_tokens != 1 || n_seqs != 1) {
+                return false;
+            }
+            if (with_mask) return false;
+        } else if (with_mask) {
+            // Causality for prefill rows comes from the kernel's per-row
+            // position clamp, never from a mask.
+            return false;
+        }
+        if (fa_window != 0) return false;
+        // The paging metadata lives in the persistent target cache (next to
+        // the K/V pool), not as gallocr graph inputs: contents survive graph
+        // execution and rebuilds, so the backend uploads only what changed
+        // between decode steps.
         if (!cache.paged_block_table || !cache.paged_kv_seq_lens) return false;
+        if ((int)cache.paged_block_table->ne[1] != cache.n_seq_slots ||
+            (int)cache.paged_kv_seq_lens->ne[0] != cache.n_seq_slots) {
+            return false;
+        }
+        paged_block_table = cache.paged_block_table;
+        paged_kv_seq_lens = cache.paged_kv_seq_lens;
+    }
+    if (paged_attention && compact_slots) {
+        sg.active_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+        sg.state_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(sg.active_slot_ids, "active_slot_ids");
+        ggml_set_name(sg.state_slot_ids, "state_slot_ids");
+        ggml_set_input(sg.active_slot_ids);
+        ggml_set_input(sg.state_slot_ids);
+    }
+    if (paged_attention && n_prefill_tokens > 0) {
+        // Ragged read metadata: every row of the batch (chunk rows and
+        // decode rows alike) names its block-table column and its inclusive
+        // logical position.
+        sg.paged_query_seq_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        sg.paged_query_positions =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.paged_query_seq_ids, "paged_query_seq_ids");
+        ggml_set_name(sg.paged_query_positions, "paged_query_positions");
+        ggml_set_input(sg.paged_query_seq_ids);
+        ggml_set_input(sg.paged_query_positions);
+    }
+    if (n_logits_rows > 0) {
+        sg.logits_row_indices =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_logits_rows);
+        ggml_set_name(sg.logits_row_indices, "logits_row_indices");
+        ggml_set_input(sg.logits_row_indices);
+    }
+    if (capture && paged_attention && cache.target_feat) {
+        sg.target_feat_rows =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.target_feat_rows, "target_feat_rows");
+        ggml_set_input(sg.target_feat_rows);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    // 32k nodes: the chunked delta-net prefill graph (CS = 32) reaches ~17k
+    // nodes at a 512-token ubatch.
+    graph_capacity = std::max<size_t>(graph_capacity, 32768);
+    sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
-    // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
+    // LUCE_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
     // FA span (per-step node properties -> no CUDA-graph replay).
-    static const bool g_no_kvpad = (std::getenv("DFLASH_QWEN35_NO_KVPAD") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_QWEN35_NO_KVPAD") != nullptr);
     // kvflash_mask: kvflash mode. The mask carries pool slot validity
     // (uploaded by the caller before EVERY compute — the input's buffer
     // region is reused by graph execution) and set_rows carries per-token
@@ -353,6 +625,21 @@ bool build_target_step(
         ggml_set_input(sg.kv_write_rows);
     }
 
+    SpecLAHLDSchedule hld_schedule;
+    // factor_k exists only when SpecLA state was allocated at cache
+    // migration — its presence is the mode check.
+    if (capture_delta_intermediate && !cache.factor_k.empty()) {
+        std::vector<int32_t> parents((size_t)n_tokens);
+        for (int t = 0; t < n_tokens; ++t) parents[(size_t)t] = t - 1;
+        hld_schedule = make_specla_hld_schedule(
+            parents.data(), n_tokens, cache.specla_pending_count);
+        if (hld_schedule.packed.empty()) return false;
+        sg.specla_hld = ggml_new_tensor_1d(
+            sg.ctx, GGML_TYPE_I32, hld_schedule.packed.size());
+        ggml_set_name(sg.specla_hld, "specla_hld");
+        ggml_set_input(sg.specla_hld);
+    }
+
     QwenGraphInputs gi{};
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
@@ -363,10 +650,31 @@ bool build_target_step(
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.capture_moe_router         = capture_moe_router;
     gi.fa_window                  = fa_window;
-    gi.last_token_logits_only     = last_token_logits_only;
+    gi.logits_tail_rows           = logits_tail_rows;
     gi.kv_write_rows              = sg.kv_write_rows;
-    gi.paged_attention            = paged_attention;
+    gi.paged_block_table          = paged_block_table;
+    gi.paged_kv_seq_lens          = paged_kv_seq_lens;
+    gi.active_slot_ids            = sg.active_slot_ids;
+    gi.state_slot_ids             = sg.state_slot_ids;
     gi.q_capture                  = capture_qk;
+    gi.n_seqs                     = n_seqs;
+    gi.seq_slot                   = seq_slot;
+    gi.paged_max_kv_len           = paged_max_kv_len;
+    gi.n_prefill_tokens           = n_prefill_tokens;
+    gi.paged_query_seq_ids        = sg.paged_query_seq_ids;
+    gi.paged_query_positions      = sg.paged_query_positions;
+    gi.logits_row_indices         = sg.logits_row_indices;
+    gi.target_feat_rows           = sg.target_feat_rows;
+    gi.prefill_segments           = prefill_segments;
+    gi.n_prefill_segments         = n_prefill_segments;
+    gi.specla_m_strict            = sg.specla_m_strict;
+    gi.specla_m_incl              = sg.specla_m_incl;
+    gi.specla_m_eye               = sg.specla_m_eye;
+    gi.specla_hld                 = sg.specla_hld;
+    gi.specla_n_chains            = hld_schedule.n_chains;
+    gi.specla_n_waves             = hld_schedule.n_waves;
+    gi.specla_n_boundaries        = hld_schedule.n_boundaries;
+    gi.specla_max_parallel_chains = hld_schedule.max_parallel_chains;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -383,7 +691,12 @@ bool build_target_step(
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+    if (sg.specla_hld) {
+        ggml_backend_tensor_set(sg.specla_hld, hld_schedule.packed.data(), 0,
+            hld_schedule.packed.size()*sizeof(int32_t));
+    }
+    return true;
 }
 
 // ── build_target_step_tree ──────────────────────────────────────
@@ -396,7 +709,8 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    const SpecLAHLDSchedule * hld_schedule) {
     step_graph_free(sg);
 
     ggml_init_params ip{};
@@ -426,6 +740,29 @@ bool build_target_step_tree(
     ggml_set_name(sg.parent_ids, "parent_ids");
     ggml_set_input(sg.parent_ids);
 
+    // SpecLA tree verify: ancestor masks over the DFS-ordered nodes replace
+    // the sequential kernel's parent_ids state fanout (parent_ids still
+    // steers the tree conv). Host-filled by verify_tree from tree.parents.
+    if (!cache.factor_k.empty() && hld_schedule) {
+        if (hld_schedule->n_nodes != n_tokens || hld_schedule->packed.empty()) {
+            return false;
+        }
+        sg.specla_hld = ggml_new_tensor_1d(
+            sg.ctx, GGML_TYPE_I32, hld_schedule->packed.size());
+        ggml_set_name(sg.specla_hld, "specla_hld");
+        ggml_set_input(sg.specla_hld);
+    } else if (!cache.factor_k.empty()) {
+        sg.specla_m_strict = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_incl   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_eye    = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        ggml_set_name(sg.specla_m_strict, "specla_m_strict");
+        ggml_set_name(sg.specla_m_incl,   "specla_m_incl");
+        ggml_set_name(sg.specla_m_eye,    "specla_m_eye");
+        ggml_set_input(sg.specla_m_strict);
+        ggml_set_input(sg.specla_m_incl);
+        ggml_set_input(sg.specla_m_eye);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     QwenGraphInputs gi{};
@@ -438,6 +775,14 @@ bool build_target_step_tree(
     gi.capture_layers             = true;
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
+    gi.specla_m_strict            = sg.specla_m_strict;
+    gi.specla_m_incl              = sg.specla_m_incl;
+    gi.specla_m_eye               = sg.specla_m_eye;
+    gi.specla_hld                 = sg.specla_hld;
+    gi.specla_n_chains            = hld_schedule ? hld_schedule->n_chains : 0;
+    gi.specla_n_waves             = hld_schedule ? hld_schedule->n_waves : 0;
+    gi.specla_n_boundaries        = hld_schedule ? hld_schedule->n_boundaries : 0;
+    gi.specla_max_parallel_chains = hld_schedule ? hld_schedule->max_parallel_chains : 0;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -453,7 +798,197 @@ bool build_target_step_tree(
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+    if (sg.specla_hld) {
+        ggml_backend_tensor_set(sg.specla_hld, hld_schedule->packed.data(), 0,
+            hld_schedule->packed.size()*sizeof(int32_t));
+    }
+    return true;
+}
+
+bool build_target_step_paged_tree(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride,
+    int kq_stride_pad,
+    int mapped_ar_seqs) {
+    (void)kq_stride_pad;
+
+    if (mapped_ar_seqs < 0 || mapped_ar_seqs > cache.n_seq_slots) {
+        step_graph_free(sg);
+        return false;
+    }
+    if (!detail::validate_target_paged_tree_layout(
+            cache, tree_width, n_tree_seqs, paged_max_kv_len,
+            tree_scratch_base, tree_scratch_stride)) {
+        step_graph_free(sg);
+        return false;
+    }
+    const int64_t table_capacity =
+        cache.paged_block_table->ne[0] * PAGED_BLOCK_SIZE;
+    const int64_t logical_capacity =
+        std::min<int64_t>(cache.max_ctx, table_capacity);
+    if (logical_capacity < 1 || logical_capacity > INT32_MAX) {
+        step_graph_free(sg);
+        return false;
+    }
+    const int64_t requested = std::min<int64_t>(
+        std::max<int64_t>(1, paged_max_kv_len), logical_capacity);
+    const int paged_launch_kv_len = static_cast<int>(
+        std::min<int64_t>(((requested + 255) / 256) * 256,
+                          logical_capacity));
+    const TargetPagedTreeGraphKey graph_key{
+        &w, &cache, backend, tree_width, n_tree_seqs,
+        paged_launch_kv_len, tree_scratch_base, tree_scratch_stride,
+        mapped_ar_seqs,
+    };
+    if (sg.paged_tree_key && *sg.paged_tree_key == graph_key) {
+        return true;
+    }
+    step_graph_free(sg);
+
+    size_t graph_capacity = 0;
+    if (!detail::target_paged_tree_graph_capacity(
+            tree_width, n_tree_seqs, graph_capacity)) {
+        return false;
+    }
+    const int n_tokens = mapped_ar_seqs + tree_width * n_tree_seqs;
+    const int n_mapped_seqs = mapped_ar_seqs + n_tree_seqs;
+
+    ggml_init_params ip{};
+    ip.mem_size = 512 * 1024 * 1024;
+    if (!sg.paged_tree_meta_arena) {
+        sg.paged_tree_meta_arena.reset(
+            new uint8_t[ip.mem_size], std::default_delete<uint8_t[]>());
+    }
+    ip.mem_buffer = sg.paged_tree_meta_arena.get();
+    ip.no_alloc = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    // Salt graph addresses by the stable bucket shape so captured graphs for
+    // different T/S buckets never alias in ggml-cuda's topology cache.
+    for (int i = 0; i < tree_width + n_tree_seqs +
+                        mapped_ar_seqs + n_tokens; ++i) {
+        (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+    }
+
+    sg.inp_embed = ggml_new_tensor_3d(
+        sg.ctx, GGML_TYPE_F32, w.n_embd, n_tokens, 1);
+    sg.positions =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+    sg.parent_ids = ggml_new_tensor_2d(
+        sg.ctx, GGML_TYPE_I32, tree_width, n_tree_seqs);
+    sg.tree_sizes =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tree_seqs);
+    sg.active_slot_ids =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_mapped_seqs);
+    sg.state_slot_ids =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_mapped_seqs);
+    sg.paged_query_seq_ids =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    if (mapped_ar_seqs > 0) {
+        sg.paged_query_positions =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    }
+    sg.kv_write_rows = ggml_new_tensor_2d(
+        sg.ctx, GGML_TYPE_I64, n_tokens, w.n_head_kv);
+
+    const struct NamedInput {
+        ggml_tensor * tensor;
+        const char * name;
+    } inputs[] = {
+        {sg.inp_embed, "inp_embed"},
+        {sg.positions, "positions"},
+        {sg.parent_ids, "parent_ids"},
+        {sg.tree_sizes, "tree_sizes"},
+        {sg.active_slot_ids, "active_slot_ids"},
+        {sg.state_slot_ids, "state_slot_ids"},
+        {sg.paged_query_seq_ids, "paged_query_seq_ids"},
+        {sg.paged_query_positions, "paged_query_positions"},
+        {sg.kv_write_rows, "kv_write_rows"},
+    };
+    for (const NamedInput & input : inputs) {
+        if (!input.tensor) continue;
+        ggml_set_name(input.tensor, input.name);
+        ggml_set_input(input.tensor);
+    }
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
+    QwenGraphInputs gi{};
+    gi.inp_embed = sg.inp_embed;
+    gi.positions = sg.positions;
+    gi.n_tokens = n_tokens;
+    gi.kv_start = 0;
+    gi.capture_layers = true;
+    gi.capture_delta_intermediate = false;
+    gi.capture_tree_commit = true;
+    gi.parent_ids = sg.parent_ids;
+    gi.tree_sizes = sg.tree_sizes;
+    gi.kv_write_rows = sg.kv_write_rows;
+    gi.paged_block_table = cache.paged_block_table;
+    gi.paged_kv_seq_lens = cache.paged_kv_seq_lens;
+    gi.active_slot_ids = sg.active_slot_ids;
+    gi.state_slot_ids = sg.state_slot_ids;
+    gi.paged_query_seq_ids = sg.paged_query_seq_ids;
+    gi.paged_query_positions = sg.paged_query_positions;
+    gi.n_seqs = n_tree_seqs;
+    gi.mapped_ar_seqs = mapped_ar_seqs;
+    gi.paged_max_kv_len = paged_launch_kv_len;
+    gi.tree_width = tree_width;
+    gi.tree_scratch_base = tree_scratch_base;
+    gi.tree_scratch_stride = tree_scratch_stride;
+
+    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    if (!go.logits) return false;
+    sg.logits = go.logits;
+    sg.delta_captures = std::move(go.delta_captures);
+    sg.tree_features = go.tree_features;
+    if (!sg.tree_features || sg.delta_captures.empty()) {
+        return false;
+    }
+    ggml_set_output(sg.logits);
+    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+    ggml_set_name(sg.argmax_tokens, "paged_tree_verify_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf) ||
+        !detail::target_paged_tree_uploads_ready(sg)) {
+        return false;
+    }
+    ggml_init_params commit_params{};
+    commit_params.mem_size = 16 * ggml_tensor_overhead();
+    commit_params.no_alloc = true;
+    sg.commit_ctx = ggml_init(commit_params);
+    if (!sg.commit_ctx) return false;
+    sg.accepted_prefixes = ggml_new_tensor_1d(
+        sg.commit_ctx, GGML_TYPE_I32, n_tree_seqs);
+    sg.commit_slot_ids = ggml_new_tensor_1d(
+        sg.commit_ctx, GGML_TYPE_I32, n_tree_seqs);
+    sg.commit_rows = ggml_new_tensor_2d(
+        sg.commit_ctx, GGML_TYPE_I64, tree_width, n_tree_seqs);
+    sg.feature_commit_rows = ggml_new_tensor_1d(
+        sg.commit_ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(sg.accepted_prefixes, "accepted_prefixes");
+    ggml_set_name(sg.commit_slot_ids, "commit_slot_ids");
+    ggml_set_name(sg.commit_rows, "commit_rows");
+    ggml_set_name(sg.feature_commit_rows, "feature_commit_rows");
+    sg.commit_buffer = ggml_backend_alloc_ctx_tensors(
+        sg.commit_ctx, backend);
+    if (!sg.commit_buffer) return false;
+    sg.paged_tree_key = graph_key;
+    return true;
 }
 
 
@@ -493,4 +1028,4 @@ bool build_lm_head_projection_step(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -11,10 +11,10 @@
 #include <string>
 #include <vector>
 
-using dflash::common::PlacementBackend;
-using dflash::common::backend_pair_capabilities;
-using dflash::common::init_placement_backend;
-using dflash::common::placement_backend_of;
+using luce::common::PlacementBackend;
+using luce::common::backend_pair_capabilities;
+using luce::common::init_placement_backend;
+using luce::common::placement_backend_of;
 
 namespace {
 
@@ -278,7 +278,7 @@ bool run_noncontiguous_cross_graph(ggml_backend_t first,
 bool reject_invalid_compiled_device() {
     std::string error;
     ggml_backend_t backend = init_placement_backend(
-        dflash::common::compiled_placement_backend(),
+        luce::common::compiled_placement_backend(),
         std::numeric_limits<int>::max(), &error);
     const bool ok = backend == nullptr &&
         error.find("is out of range (found ") != std::string::npos;

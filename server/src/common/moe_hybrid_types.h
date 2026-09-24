@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── GPU SM version query ───────────────────────────────────────────────
 // Returns the compute capability as major*10+minor (e.g. 86 for sm_86).
@@ -21,11 +21,21 @@ int query_gpu_compute_sm();
 enum class MoeHybridColdBackend {
     Cpu,
     Gpu,
+    // No cold owner: non-resident routes contribute zero and are never
+    // materialized; the caller reduces the owners' partials outside this
+    // process (e.g. with ggml_cluster_allreduce). Storage allocates no cold
+    // buffers, evaluators build no cold graph, never fall back to CPU or
+    // streamed evaluation for non-resident routes and never swap experts.
+    // The routed partial never carries the shared expert, which is replicated
+    // on every owner: pass a MoeLayerDesc without shexp tensors and add
+    // eval_moe_shared_expert_batched() once, after the reduction.
+    None,
 };
 
 // ─── MoE architecture config (model-agnostic) ──────────────────────────
 
 struct MoeHybridConfig {
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     int n_embd        = 0;   // hidden dimension
     int n_expert      = 0;   // total experts per layer
     int n_expert_used = 0;   // top-k selected per token
@@ -37,6 +47,13 @@ struct MoeHybridConfig {
     MoeHybridColdBackend cold_expert_backend = MoeHybridColdBackend::Cpu;
     bool materialize_hot_experts = true;
     bool materialize_cold_experts = true;
+
+    // Cold owner None has no cold experts, so nothing to materialize whatever
+    // materialize_cold_experts says.
+    bool materializes_cold_experts() const {
+        return materialize_cold_experts &&
+               cold_expert_backend != MoeHybridColdBackend::None;
+    }
 
     // When true, MMQ mul_mat_id works correctly with reduced hot stacks
     // (n_hot < n_expert). Safe on sm_80+ (Ampere/Ada/Hopper/Blackwell).
@@ -79,4 +96,4 @@ struct MoeLayerDesc {
     bool has_shared_expert() const { return ffn_up_shexp != nullptr; }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

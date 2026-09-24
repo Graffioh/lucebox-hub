@@ -1,5 +1,11 @@
 #include "qwen35_backend.h"
+#include "qwen35_image_request.h"
+#include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
+#include "common/adaptive_spec_width.h"
+#include "common/spec_acceptance.h"
+#include "common/draft_block_size.h"
+#include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -8,29 +14,38 @@
 #include "common/dflash_draft_graph.h"
 #include "peer_access.h"
 #include "attn_masks.h"
+#include "prefill_helpers.h"
 #include "common/sampler.h"
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#ifdef LUCE_HAVE_GPU_SAMPLER
 #include "common/geometric_sampler_cuda.h"
 #include <random>
 #endif
+#include "common/dspark_head.h"
+#include "common/dflash2_head.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
+#include "common/specla_mode.h"
 #include "qwen35_tensor_parallel.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 
 #include "ggml-cuda.h"
+#include "ggml-backend-impl.h"
 #include "common/snapshot_backend.h"
 #include "pflash_ggml_adapter.h"
 #include "flashprefill.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -39,7 +54,7 @@
 
 #include "kv_quant.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 static float bf16_bits_to_f32(uint16_t bits) {
@@ -89,8 +104,37 @@ static int env_int_or_default(const char * name, int fallback) {
     return fallback;
 }
 
+static void configure_concurrent_hipblaslt_default(
+        const Qwen35Config & cfg) {
+#if (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)) && !defined(_WIN32)
+    if (!cfg.paged_attention || cfg.max_concurrency <= 1 ||
+        std::getenv("ROCBLAS_USE_HIPBLASLT") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, cfg.device.gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return;
+    }
+
+    // The concurrent Qwen workload spends most of its time in wide Q4_K
+    // dequantize + GEMM steps. ROCm 7.2's hipBLASLt route is consistently
+    // faster for those gfx1151 shapes. Preserve an explicit environment value
+    // so ROCBLAS_USE_HIPBLASLT=0 remains an opt-out.
+    if (::setenv("ROCBLAS_USE_HIPBLASLT", "1", 0) == 0) {
+        std::fprintf(
+            stderr,
+            "[qwen35] gfx1151 concurrent mode: enabled rocBLAS hipBLASLt "
+            "(set ROCBLAS_USE_HIPBLASLT=0 to disable)\n");
+    }
+#else
+    (void)cfg;
+#endif
+}
+
 static int dflash_min_tokens_floor() {
-    static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
+    static const int value = env_int_or_default("LUCE_MIN_TOKENS", 0);
     return value;
 }
 
@@ -99,7 +143,7 @@ static FILE * open_dflash_floor_log() {
     // Simple append-mode log on Windows (no file size check).
     return std::fopen("dflash_floor.log", "a");
 #else
-    static constexpr const char * kPath = "/tmp/dflash_floor.log";
+    static constexpr const char * kPath = "/tmp/luce_floor.log";
     static constexpr off_t kMaxBytes = 1024 * 1024;
 
     int flags = O_WRONLY | O_CREAT | O_APPEND;
@@ -134,6 +178,45 @@ static FILE * open_dflash_floor_log() {
     return out;
 #endif
 }
+
+// Persistent concurrent-cache bytes that do not scale with the physical
+// paged pool. The estimate mirrors create_target_cache_partial(): recurrent
+// state for N slots, target features, paged metadata, Q capture, and the
+// dead-row scratch block. Prefill reads the pool directly, so there is no
+// staging K/V or staging recurrent slab to reserve.
+static int64_t concurrent_fixed_cache_bytes(
+        const TargetWeights & w, int max_ctx, int n_slots,
+        int64_t kv_bytes_per_token, int64_t scratch_tokens,
+        bool fixed_chain) {
+    const int64_t n_full_attn =
+        w.n_layer / w.full_attention_interval;
+    const int64_t n_delta = w.n_layer - n_full_attn;
+    const int64_t head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;
+    const int64_t conv_ch =
+        w.ssm_d_inner + 2LL * w.ssm_n_group * w.ssm_d_state;
+    const int64_t state_per_layer =
+        (head_v_dim * head_v_dim * w.ssm_dt_rank +
+         (int64_t)(w.ssm_d_conv - 1) * conv_ch) *
+        (int64_t)sizeof(float);
+    const int64_t recurrent =
+        state_per_layer * n_delta * (int64_t)n_slots;
+    const int64_t target_feat =
+        (int64_t)w.n_capture_layers * w.n_embd *
+        (fixed_chain
+             ? (int64_t)std::min(max_ctx, 4096) * n_slots + 1
+             : (int64_t)std::min(max_ctx, 4096)) *
+        (int64_t)sizeof(uint16_t);
+    const int64_t q_capture =
+        (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
+        (int64_t)sizeof(float);
+    const int64_t paged_metadata =
+        ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
+        (int64_t)sizeof(int32_t);
+    const int64_t scratch =
+        kv_bytes_per_token * scratch_tokens;
+    return recurrent + target_feat + q_capture +
+           paged_metadata + scratch;
+}
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
@@ -149,9 +232,36 @@ static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
     return true;
 }
 
+// Drafters trained on explicit target layers (GGUF dflash.target_layer_ids)
+// override the evenly-spaced derivation: capturing different layers than the
+// drafter was trained on silently destroys acceptance.
+static void apply_drafter_capture_layer_ids(const DraftWeights & dw, TargetWeights & w) {
+    if (dw.capture_layer_ids.empty()) return;
+    const int n = (int)dw.capture_layer_ids.size();
+    bool ok = (n == w.n_capture_layers);
+    for (int k = 0; ok && k < n; k++)
+        ok = dw.capture_layer_ids[k] >= 0 && dw.capture_layer_ids[k] < w.n_layer;
+    if (!ok) {
+        std::fprintf(stderr,
+            "[draft]  drafter target_layer_ids invalid (n=%d, slots=%d); "
+            "keeping derived capture layers\n", n, w.n_capture_layers);
+        return;
+    }
+    bool changed = false;
+    for (int k = 0; k < n; k++) {
+        changed |= w.capture_layer_ids[k] != dw.capture_layer_ids[k];
+        w.capture_layer_ids[k] = dw.capture_layer_ids[k];
+    }
+    if (changed) {
+        std::printf("[draft]  target capture layers from drafter GGUF:");
+        for (int k = 0; k < n; k++) std::printf(" %d", w.capture_layer_ids[k]);
+        std::printf("\n");
+    }
+}
+
 // ── Construction / destruction ──────────────────────────────────────────
 
-Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
+Qwen35Backend::Qwen35Backend(Qwen35Config cfg) : cfg_(std::move(cfg)) {}
 
 Qwen35Backend::~Qwen35Backend() { shutdown(); }
 
@@ -161,11 +271,11 @@ Qwen35Backend::~Qwen35Backend() { shutdown(); }
 KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
                                                      int64_t gpu_free) const {
     ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k, kv_v);
+    luce::resolve_kv_types(kv_k, kv_v, cfg_.cache_type_k, cfg_.cache_type_v);
     KvFlashAutoBudget b;
     b.free_bytes      = gpu_free;
     // Single source of truth with the qwen35moe placement path — see kv_quant.h.
-    b.bytes_per_token = (int64_t)dflash::kv_reservation_bytes_per_token(
+    b.bytes_per_token = (int64_t)luce::kv_reservation_bytes_per_token(
         w.n_layer, w.full_attention_interval, w.n_head_kv,
         kv_k, w.n_embd_head_k, kv_v, w.n_embd_head_v);
     b.reserve_bytes   = (int64_t)(1.5 * 1073741824.0) +
@@ -176,6 +286,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
+    configure_concurrent_hipblaslt_default(cfg_);
+
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     const bool tensor_parallel = cfg_.device.is_tensor_parallel();
     split_gpus_ = !use_remote_draft && cfg_.draft_path &&
@@ -213,10 +325,11 @@ bool Qwen35Backend::init() {
 
     // Load target
     if (!load_target_model(target_backend_, w_)) {
-        std::fprintf(stderr, "target load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "target load: %s\n", luce_last_error());
         return false;
     }
-    std::printf("[target] %s\n", dflash27b_last_error());
+    std::printf("[target] %s\n", luce_last_error());
+    if (!load_vision()) return false;
     if (cfg_.paged_attention &&
         (w_.n_embd_head_k != 256 || w_.n_embd_head_v != 256)) {
         std::fprintf(stderr,
@@ -232,34 +345,70 @@ bool Qwen35Backend::init() {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
             : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
             std::fprintf(stderr, "remote draft start failed\n");
             return false;
         }
-        dw_.n_embd = DFLASH27B_TARGET_HIDDEN;
-        dw_.block_size = DFLASH27B_DRAFT_BLOCK_SIZE;
-        dw_.n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        dw_.n_embd = LUCE_TARGET_HIDDEN;
+        dw_.block_size = LUCE_DRAFT_BLOCK_SIZE;
+        dw_.n_target_layers = LUCE_DRAFT_N_TARGET_LAYERS;
         std::printf("[draft]  remote ipc ready gpu=%d cap=%d\n",
                     cfg_.draft_gpu, cap);
     } else if (cfg_.draft_path) {
-        std::string dp(cfg_.draft_path);
+        const std::string & dp = *cfg_.draft_path;
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+            ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+            : load_draft_safetensors(*cfg_.draft_path, draft_backend_, dw_, &w_);
         if (!draft_ok) {
-            std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "draft load: %s\n", luce_last_error());
             return false;
         }
         std::printf("[draft]  loaded\n");
+        apply_drafter_capture_layer_ids(dw_, w_);
 
         if (cfg_.draft_swa_window > 0) {
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+            const DraftSwaOverrideResult swa =
+                apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                        dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
+                        swa.swa_layers, swa.total_layers, swa.effective_window);
+        }
+
+        // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
+        // unpark() so the rotary encoding cannot flip mid-process (it used
+        // to switch from plain RoPE to YaRN on the first park/unpark).
+        if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
+            float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
+            dw_.rope_freq_scale = 1.0f / yf;
+            dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
+            dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
+            dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
+            dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
+        }
+
+        // The checkpoint metadata is the drafter's published proposal
+        // horizon. Greedy chain verification keeps output byte-identical to
+        // plain decode at any width, so widening only risks acceptance
+        // depth; it is allowed up to 2x the horizon (measured on Qwen3.8
+        // DFlash2: byte-identical completions across widths 8-24, commits
+        // grow through 16, step time cliffs past 16 with no commit gain).
+        if (cfg_.draft_block_size != 0) {
+            const int checkpoint_block_size = dw_.block_size;
+            if (!draft_block_size_override_supported(
+                    cfg_.draft_block_size, checkpoint_block_size)) {
+                std::fprintf(stderr,
+                    "[draft] --draft-block-size must be in [2, %d] for this "
+                    "drafter (up to 2x the checkpoint horizon); got %d\n",
+                    2 * checkpoint_block_size, cfg_.draft_block_size);
+                return false;
+            }
+            std::printf("[draft]  block size override: %d -> %d%s\n",
+                        checkpoint_block_size, cfg_.draft_block_size,
+                        cfg_.draft_block_size > checkpoint_block_size
+                            ? " (beyond the published horizon; exact greedy verify)"
+                            : "");
+            dw_.block_size = cfg_.draft_block_size;
         }
     }
 
@@ -275,8 +424,9 @@ bool Qwen35Backend::init() {
     // model (Spark's pattern). LRU is the fallback when nothing is found
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
-    if (std::getenv("DFLASH_KVFLASH") && !kvflash_qk_policy_) {
-        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+    if (std::getenv("LUCE_KVFLASH") && !kvflash_qk_policy_) {
+        kvflash_drafter_path_ = kvflash_find_drafter(
+            cfg_.target_path.c_str());
     }
     // "auto" sizes the pool from the GPU: weights are resident at this
     // point and the cache is not yet allocated, so device-free minus a
@@ -291,7 +441,7 @@ bool Qwen35Backend::init() {
                                             kvflash_scorer_expected(),
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
-        kvflash_tau_ = std::max(1, env_int_or_default("DFLASH_KVFLASH_TAU", 64));
+        kvflash_tau_ = std::max(1, env_int_or_default("LUCE_KVFLASH_TAU", 64));
     }
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
@@ -307,13 +457,110 @@ bool Qwen35Backend::init() {
     }
     // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
     // decides the allocation (0 = full max_ctx).
-    const int ctx_alloc = cfg_.paged_attention
-        ? paged_token_capacity(cfg_.device.max_ctx)
-        : kvflash_tokens_;
+    const int n_slots = concurrent_slots();
+    const int max_concurrent_prefills = n_slots > 1
+        ? std::clamp(
+              env_int_or_default("LUCE_MAX_CONCURRENT_PREFILLS", 8),
+              1, std::min(n_slots, 8))
+        : 1;
+    const int mixed_prefill_tokens = std::max(
+        1, env_int_or_default("LUCE_MIXED_PREFILL_TOKENS", 2048));
+    const int long_mixed_prefill_tokens = std::max(
+        1, env_int_or_default("LUCE_LONG_MIXED_PREFILL_TOKENS", 4096));
+    const int long_prefill_threshold = std::max(
+        1, env_int_or_default("LUCE_LONG_PREFILL_THRESHOLD", 768));
+    const int idle_prefill_tokens = std::max(
+        1, env_int_or_default("LUCE_IDLE_PREFILL_TOKENS", 4096));
+    const int prefill_quantum = std::max(
+        1, env_int_or_default("LUCE_PREFILL_ALLOCATION_QUANTUM", 512));
+    if (n_slots > 1 && !cfg_.paged_attention) {
+        set_last_error("--max-concurrency requires --paged-attention");
+        return false;
+    }
+    FixedChainConfig fixed_chain;
+    fixed_chain.enabled =
+        n_slots > 1 && cfg_.paged_attention && cfg_.fa_window == 0 &&
+        cfg_.draft_path && !cfg_.ddtree_mode && !use_remote_draft &&
+        !tensor_parallel && !split_gpus_ &&
+        target_backend_ == draft_backend_ &&
+        cfg_.device.gpu == cfg_.draft_gpu &&
+        dw_.selector.enabled && dw_.block_size > 1 &&
+        dw_.block_size <= 16 && w_.output;
+    if (fixed_chain.enabled) {
+        fixed_chain.width = dw_.block_size;
+        fixed_chain.scratch_stride = paged_token_capacity(fixed_chain.width);
+    }
+    if (n_slots > 1 && cfg_.draft_path && !fixed_chain.enabled) {
+        set_last_error(
+            "concurrent paged DFlash2 requires a selector-enabled local "
+            "same-device draft with block size in [2, 16] and a target "
+            "lm_head");
+        return false;
+    }
+    const int64_t scratch_tokens = PAGED_BLOCK_SIZE +
+        (int64_t)n_slots * fixed_chain.scratch_stride;
+    // Concurrent slots share one physical pool. An explicit
+    // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
+    // derived from device-free memory after subtracting fixed concurrent cache
+    // state and a runtime graph reserve. This decouples max-concurrency from
+    // startup K/V allocation while retaining at least one full logical context.
+    // One extra scratch block is appended to the K/V tensors (outside the
+    // pool's index space) as the write target of dead decode-batch rows.
+    int64_t pool_tokens = 0;
+    if (n_slots > 1) {
+        if (cfg_.kv_pool_tokens > 0) {
+            const int64_t max_pool_tokens =
+                ((int64_t)INT32_MAX - scratch_tokens) /
+                PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+            pool_tokens = (int64_t)paged_token_capacity(
+                (int)std::min<int64_t>(
+                    cfg_.kv_pool_tokens, max_pool_tokens));
+        } else {
+            PagedKvAutoBudget budget;
+            // TODO: Size tensor-parallel pools from each device's free memory
+            // and account for fixed cache tensors mirrored by the meta backend.
+            budget.free_bytes = (int64_t)gpu_free;
+            budget.bytes_per_token = kvf_budget.bytes_per_token;
+            budget.reserve_bytes = kvf_budget.reserve_bytes;
+            budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+                scratch_tokens, fixed_chain.enabled);
+            pool_tokens = paged_kv_auto_pool_tokens(
+                cfg_.device.max_ctx, n_slots, budget);
+            const int64_t one_context =
+                paged_token_capacity(cfg_.device.max_ctx);
+            std::fprintf(stderr,
+                "[parallel] auto KV pool: %lld tokens "
+                "(free %.2f GiB - fixed %.2f GiB - reserve %.2f GiB, "
+                "%.2f KiB/token; logical cap %lld)\n",
+                (long long)pool_tokens,
+                budget.free_bytes / 1073741824.0,
+                budget.fixed_cache_bytes / 1073741824.0,
+                budget.reserve_bytes / 1073741824.0,
+                budget.bytes_per_token / 1024.0,
+                (long long)n_slots * one_context);
+            if (pool_tokens < one_context) {
+                set_last_error(
+                    "not enough device memory for one max_ctx paged sequence; "
+                    "lower --max-ctx or set --kv-pool-tokens explicitly");
+                return false;
+            }
+        }
+        if (pool_tokens + scratch_tokens > INT32_MAX) {
+            set_last_error("paged KV pool exceeds INT32_MAX tokens");
+            return false;
+        }
+    }
+    const int ctx_alloc = n_slots > 1
+        ? (int)(pool_tokens + scratch_tokens)
+        : (cfg_.paged_attention
+               ? paged_token_capacity(cfg_.device.max_ctx)
+               : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention)) {
-        std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
+                             cfg_.paged_attention, n_slots,
+                             fixed_chain.enabled, cfg_.cache_type_k, cfg_.cache_type_v)) {
+        std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return false;
     }
     if (cfg_.paged_attention) {
@@ -332,18 +579,52 @@ bool Qwen35Backend::init() {
             return false;
         }
         try {
+            const uint32_t pool_blocks = n_slots > 1
+                ? (uint32_t)(pool_tokens / PAGED_BLOCK_SIZE)
+                : (uint32_t)paged_block_count(cfg_.device.max_ctx);
             paged_kv_pool_ = std::make_unique<PagedKvPool>(
-                (uint32_t)paged_block_count(cfg_.device.max_ctx),
-                /*max_sequences=*/1, PAGED_BLOCK_SIZE);
+                pool_blocks, /*max_sequences=*/(uint32_t)n_slots,
+                PAGED_BLOCK_SIZE);
         } catch (const std::exception & e) {
             std::fprintf(stderr, "[paged-attention] pool init failed: %s\n",
                          e.what());
             return false;
         }
+        if (n_slots > 1) {
+            fixed_chain.scratch_base = (int)pool_tokens;
+            const int64_t dead_scratch_row = pool_tokens +
+                (int64_t)n_slots * fixed_chain.scratch_stride;
+            seq_engine_ = std::make_unique<Qwen35SeqEngine>(
+                *this, *paged_kv_pool_, cfg_.device.max_ctx,
+                dead_scratch_row, fixed_chain,
+                max_concurrent_prefills, mixed_prefill_tokens,
+                long_mixed_prefill_tokens, long_prefill_threshold,
+                idle_prefill_tokens, prefill_quantum);
+            if (fixed_chain.enabled) {
+                std::fprintf(stderr,
+                    "[parallel-chain] fixed DFlash2 width=%d, "
+                    "same-device paged full-attention greedy lanes\n",
+                    fixed_chain.width);
+            }
+            std::printf("[parallel] %d decode slots, up to %d packed prefills "
+                        "(mixed short/long %d/%d at >=%d tokens, "
+                        "idle %d, quantum %d), "
+                        "pool %u blocks x %u tokens"
+                        " (%lld shared tokens, per-seq max_ctx %d)\n",
+                        n_slots, max_concurrent_prefills,
+                        mixed_prefill_tokens, long_mixed_prefill_tokens,
+                        long_prefill_threshold, idle_prefill_tokens, prefill_quantum,
+                        paged_kv_pool_->physical_block_count(),
+                        paged_kv_pool_->block_size(),
+                        (long long)pool_tokens, cfg_.device.max_ctx);
+        }
         std::printf("[paged-attention] %u physical blocks x %u tokens "
-                    "(%d logical tokens)\n",
+                    "(%llu pool tokens, per-sequence max_ctx %d)\n",
                     paged_kv_pool_->physical_block_count(),
-                    paged_kv_pool_->block_size(), cfg_.device.max_ctx);
+                    paged_kv_pool_->block_size(),
+                    (unsigned long long)paged_kv_pool_->physical_block_count() *
+                        paged_kv_pool_->block_size(),
+                    cfg_.device.max_ctx);
         std::fflush(stdout);
     }
     if (kvflash_active()) {
@@ -377,7 +658,8 @@ bool Qwen35Backend::init() {
 
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
-    if (cfg_.draft_path && !use_remote_draft) {
+    if (cfg_.draft_path && !use_remote_draft &&
+        !fixed_chain.enabled) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -540,6 +822,49 @@ void Qwen35Backend::end_paged_sequence() {
     paged_sequence_.reset();
 }
 
+// ── Concurrent slot serving (--max-concurrency N) ──────────────────────
+//
+// The engine lives in concurrency/qwen35_seq_engine.cpp; what stays here is the
+// model-level policy it borrows — EOS identity and the min-tokens floor,
+// both shared with the AR decode path.
+
+bool Qwen35Backend::token_is_eos(int32_t token) const {
+    return IS_EOS_TOK(token, w_);
+}
+
+int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
+                                              size_t logits_row_offset) {
+    // MIN_TOKENS_BEFORE_EOS (env LUCE_MIN_TOKENS, default off): same
+    // policy as do_ar_decode — if the slot would stop before emitting the
+    // floor, substitute the best non-EOS token. The logits row is fetched
+    // on demand so the (common) GPU-argmax path pays nothing when the
+    // floor is off or not triggered.
+    const int floor = dflash_min_tokens_floor();
+    if (floor <= 0 || generated >= floor || !IS_EOS_TOK(tok, w_)) return tok;
+    const int vocab = w_.n_vocab;
+    std::vector<float> buf((size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, buf.data(), logits_row_offset,
+                            sizeof(float) * (size_t)vocab);
+    int alt = -1;
+    float best = -1e30f;
+    for (int v = 0; v < vocab; v++) {
+        if (IS_EOS_TOK(v, w_)) continue;
+        if (buf[(size_t)v] > best) { best = buf[(size_t)v]; alt = v; }
+    }
+    if (alt < 0) return tok;
+    FILE * log = open_dflash_floor_log();
+    if (log) {
+        std::fprintf(log, "[floor] eos@%d -> alt=%d\n", generated, alt);
+        std::fclose(log);
+    }
+    return alt;
+}
+
+SeqEngine * Qwen35Backend::seq_engine() {
+    return seq_engine_.get();
+}
+
+
 // ── print_ready_banner ──────────────────────────────────────────────────
 
 void Qwen35Backend::print_ready_banner() const {
@@ -559,14 +884,19 @@ bool Qwen35Backend::park(ParkTarget target) {
             remote_draft_.close();
         } else {
             step_graph_destroy(draft_sg_);
+            if (seq_engine_) seq_engine_->release_draft_graphs();
+            draft_kv_free(draft_kv_);
             free_draft_weights(dw_);
         }
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
     if (want_target_model && !target_parked_) {
+        step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
+        dflash2_selector_graph_invalidate();
         free_target_weights(w_);
+        vision_.reset();
         target_parked_ = true;
         std::printf("[park] target released\n"); std::fflush(stdout);
     }
@@ -580,7 +910,12 @@ bool Qwen35Backend::unpark(ParkTarget target) {
 
     if (want_target_model && target_parked_) {
         if (!load_target_model(target_backend_, w_)) {
-            std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "[unpark] target: %s\n", luce_last_error());
+            return false;
+        }
+        if (!load_vision()) {
+            // Stay parked, so a retry starts from released weights.
+            free_target_weights(w_);
             return false;
         }
         kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
@@ -592,21 +927,24 @@ bool Qwen35Backend::unpark(ParkTarget target) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
                 : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-            if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+            if (!remote_draft_.start(
+                    cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                      cfg_.draft_gpu, cap,
                                      cfg_.remote_draft.work_dir)) {
                 std::fprintf(stderr, "[unpark] remote draft failed\n");
                 return false;
             }
         } else {
-            std::string dp(cfg_.draft_path);
+            const std::string & dp = *cfg_.draft_path;
             bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-                ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-                : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+                ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+                : load_draft_safetensors(
+                      *cfg_.draft_path, draft_backend_, dw_, &w_);
             if (!draft_ok) {
-                std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
+                std::fprintf(stderr, "[unpark] draft: %s\n", luce_last_error());
                 return false;
             }
+            apply_drafter_capture_layer_ids(dw_, w_);
             // Re-apply rope overrides after reload.
             if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f)
                 dw_.rope_theta = w_.rope_theta;
@@ -619,11 +957,24 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
-                dw_.swa_window = cfg_.draft_swa_window;
-                for (int il = 0; il < dw_.n_layer - 1; il++)
-                    dw_.layers[il].is_swa = true;
+                const DraftSwaOverrideResult swa =
+                    apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
+                std::printf("[unpark] draft SWA layers: %d/%d (window=%d)\n",
+                            swa.swa_layers, swa.total_layers, swa.effective_window);
+            }
+            // Re-apply the runtime block-size override: without this a
+            // park/unpark cycle silently reverts to checkpoint metadata
+            // (out-of-bounds rollback windows when narrowing, a silent
+            // no-op when widening).
+            if (cfg_.draft_block_size != 0 &&
+                draft_block_size_override_supported(cfg_.draft_block_size,
+                                                    dw_.block_size)) {
+                dw_.block_size = cfg_.draft_block_size;
             }
         }
+        // A reloaded drafter can select different target capture layers.
+        // Rebuild any retained target graph against the refreshed mapping.
+        step_graph_free(sg_);
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
     }
@@ -637,8 +988,9 @@ bool Qwen35Backend::snapshot_save(int slot) {
         static bool warned = false;
         if (!warned) {
             std::fprintf(stderr,
-                "[paged-attention] prefix snapshots are disabled until the "
-                "snapshot format stores block tables\n");
+                "[paged-attention] the classic single-sequence snapshot API "
+                "is unavailable; continuous batching uses copied paged "
+                "checkpoints\n");
             warned = true;
         }
         return false;
@@ -769,14 +1121,41 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
 // ── Compress (pflash) ───────────────────────────────────────────────────
 
 ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req) {
-    CompressResult result;
-    if (req.input_ids.empty() || req.drafter_path.empty()) return result;
+    const auto results = compress_batch({req});
+    return results.empty() ? CompressResult{} : results.front();
+}
+
+std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
+        const std::vector<CompressRequest> & requests) {
+    std::vector<CompressResult> results(requests.size());
+    if (requests.empty()) return results;
+
+    const CompressRequest * load_request = nullptr;
+    for (const auto & request : requests) {
+        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
+        if (load_request == nullptr) {
+            load_request = &request;
+        } else if (request.drafter_path != load_request->drafter_path ||
+                   request.drafter_gpu != load_request->drafter_gpu ||
+                   request.skip_park != load_request->skip_park ||
+                   request.residency_action != load_request->residency_action) {
+            // A residency window can host only one drafter. Preserve the base
+            // API's per-request behavior for heterogeneous batches.
+            return ModelBackend::compress_batch(requests);
+        }
+    }
+    if (load_request == nullptr) return results;
+    const bool should_park = !load_request->skip_park;
+    const bool release_after_use =
+        load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
-    // Also destroy the main target step graph allocator to release its CUDA buffer.
+    // A FlowKV request may contain many aged messages. Keep this residency
+    // window around the whole batch so those messages do not reload all three
+    // models independently.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
-    if (!req.skip_park) {
+    if (should_park) {
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
@@ -796,16 +1175,16 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
-                     req.drafter_path.c_str());
-        if (!load_drafter(req.drafter_path, /*gpu_layers=*/999,
-                          req.drafter_gpu, drafter_ctx_)) {
+                     load_request->drafter_path.c_str());
+        if (!load_drafter(load_request->drafter_path, /*gpu_layers=*/999,
+                          load_request->drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
-            if (!req.skip_park) {
+                         luce_last_error());
+            if (should_park) {
                 if (!was_target_parked) unpark(ParkTarget::TargetModel);
                 if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
-            return result;
+            return results;
         }
         drafter_loaded_ = true;
         std::fprintf(stderr, "[compress] drafter ready\n");
@@ -818,25 +1197,33 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
         }
     }
 
-    result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio);
-    result.ok = !result.compressed_ids.empty();
-    if (result.ok) {
-        std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
-                     req.input_ids.size(), result.compressed_ids.size());
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const auto & request = requests[index];
+        if (request.input_ids.empty() || request.drafter_path.empty()) continue;
+
+        auto & result = results[index];
+        result.compressed_ids = drafter_score_and_compress(
+            drafter_ctx_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
+            request.score_query_end);
+        result.ok = !result.compressed_ids.empty();
+        if (result.ok) {
+            std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
+                         request.input_ids.size(), result.compressed_ids.size());
+        }
     }
 
-    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+    if (release_after_use) {
         free_drafter();
     }
 
     // Restore park state
-    if (!req.skip_park) {
+    if (should_park) {
         if (!was_target_parked) unpark(ParkTarget::TargetModel);
         if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }
 
-    return result;
+    return results;
 }
 
 bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & io) {
@@ -869,7 +1256,7 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
             total_vram = prop.totalGlobalMem;
-        const bool allowed = dflash::common::skip_park_allowed(
+        const bool allowed = luce::common::skip_park_allowed(
             skip_park, total_vram, cfg_.device.max_ctx);
         if (skip_park && !allowed) {
             std::fprintf(stderr,
@@ -891,7 +1278,7 @@ void Qwen35Backend::free_drafter() {
         // The target-QK scorer is drafter-independent and survives.
         if (!kvflash_qk_scorer_) kvflash_scorer_.reset();
         // Drafter has its own backend — do a full free (weights + backend)
-        dflash::common::free_drafter(drafter_ctx_);
+        luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
         std::printf("[drafter] freed\n"); std::fflush(stdout);
     }
@@ -945,6 +1332,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    seq_engine_.reset();
     end_paged_sequence();
     free_drafter();
     step_graph_destroy(sg_);
@@ -957,6 +1345,7 @@ void Qwen35Backend::shutdown() {
         free_prefix_snapshot(prefix_snapshots_[i]);
     }
     if (!target_parked_) free_target_weights(w_);
+    vision_.reset();  // its buffers belong to target_backend_, freed below
     if (!use_remote_draft && !draft_parked_) free_draft_weights(dw_);
     free_target_cache(cache_);
     if (split_gpus_ && draft_backend_) {
@@ -993,11 +1382,21 @@ void Qwen35Backend::release_scratch() {
     step_graph_free(proj_sg_);
 
     // BSA persistent CUDA buffers (blockmask, head_mask_type, softmax_lse).
-#ifdef DFLASH27B_HAVE_BSA
+#ifdef LUCE_HAVE_BSA
     flashprefill::dflash_bsa_free_persistent();
 #endif
 
-    std::fprintf(stderr, "[vram] released scratch buffers\n");
+    // Gallocr teardown does not release operator temporaries cached by the
+    // legacy CUDA/HIP pools. On non-VMM devices a long prefill can otherwise
+    // leave nearly all VRAM reserved and make the next differently shaped
+    // request fail despite having no live scratch tensors.
+    size_t trimmed = ggml_backend_cuda_trim_pool(target_backend_);
+    if (draft_backend_ && draft_backend_ != target_backend_) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+
+    std::fprintf(stderr, "[vram] released scratch buffers; trimmed %.1f MiB from device pools\n",
+                 trimmed / (1024.0 * 1024.0));
 }
 
 // ── Generate (speculative decode) ───────────────────────────────────────
@@ -1006,6 +1405,14 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (concurrent_slots() > 1) {
+        // begin_paged_sequence would reset the shared pool under every live
+        // slot; the scheduler must use the seq_* API instead.
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "generate() is unavailable with --max-concurrency; "
+                    "use the concurrent slot API");
+        return result;
+    }
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -1039,7 +1446,19 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 
     // Prefill
     auto t_prefill_start = std::chrono::steady_clock::now();
-    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+    Qwen35ImageRows image_rows;
+    if (req.images) {
+        const auto * prompt = dynamic_cast<const Qwen35ImagePrompt *>(req.images.get());
+        std::string image_error = "image binding does not match the prompt";
+        if (!prompt || !prompt->matches(req.prompt) ||
+            !encode_images(*prompt, image_rows, image_error)) {
+            result.fail(GenerateErrorCode::BackendSpecific, image_error);
+            return result;
+        }
+    }
+    const bool has_images = image_rows.prompt != nullptr;
+    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
+                                     /*kv_offset=*/0, has_images ? &image_rows : nullptr);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
@@ -1089,19 +1508,27 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                     req.n_gen, ar_n_gen, committed, cfg_.device.max_ctx);
             }
         }
-        if (cfg_.paged_attention || req.force_ar_decode) {
+        // Speculative decoding takes rotary positions from KV positions, which
+        // an image prompt pulls apart, so image requests decode one by one.
+        if (cfg_.paged_attention || req.force_ar_decode || has_images) {
             decode_ok = do_ar_decode(committed, ar_n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
         } else {
+            const auto * hint_tokens =
+                req.hint_tokens.empty() ? nullptr : &req.hint_tokens;
+            const auto * stall_prefix = req.stall_tool_prefix_tokens.empty()
+                ? nullptr : &req.stall_tool_prefix_tokens;
+            const auto * stall_suffix = req.stall_action_suffix_tokens.empty()
+                ? nullptr : &req.stall_action_suffix_tokens;
+            const auto * stall_skip = req.stall_skip_tokens.empty()
+                ? nullptr : &req.stall_skip_tokens;
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens,
-                                       req.stall_tool_prefix_tokens,
-                                       req.stall_action_suffix_tokens,
-                                       req.stall_skip_tokens,
+                                       hint_tokens, stall_prefix, stall_suffix,
+                                       stall_skip,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
@@ -1135,6 +1562,16 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         out_io.emit(-1);
         return result;
     }
+    if (req.images) {
+        // A snapshot is keyed by tokens, and pad tokens do not identify an image.
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "image requests cannot resume from a snapshot");
+        out_io.emit(-1);
+        return result;
+    }
+    // An exact snapshot hit decodes without a prefill, so the offset a
+    // previous image request left behind must not survive into this one.
+    rope_delta_ = 0;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
@@ -1157,6 +1594,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 
     const int snap_pos = prefix_snapshots_[slot].cur_pos;
     cache_.cur_pos = snap_pos;
+    result.restored_prefix_tokens = snap_pos;
 
     // FIX(prefix-cache + spec-decode): restore_target_cache brings back KV /
     // recurrent state / target_feat, but the draft-side feature mirror is left
@@ -1208,6 +1646,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             "fresh prefill fallback\n", snap_pos, prompt_len);
         reset_recurrent_state(cache_);
         cache_.cur_pos = 0;
+        result.restored_prefix_tokens = 0;
         auto t_prefill_start = std::chrono::steady_clock::now();
         committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
         if (committed < 0) {
@@ -1226,10 +1665,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         const bool pool = kvflash_active();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
-                               /*last_token_logits_only=*/false,
+                               /*logits_tail_rows=*/0,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
@@ -1261,12 +1701,18 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
         } else {
+            const auto * hint_tokens =
+                req.hint_tokens.empty() ? nullptr : &req.hint_tokens;
+            const auto * stall_prefix = req.stall_tool_prefix_tokens.empty()
+                ? nullptr : &req.stall_tool_prefix_tokens;
+            const auto * stall_suffix = req.stall_action_suffix_tokens.empty()
+                ? nullptr : &req.stall_action_suffix_tokens;
+            const auto * stall_skip = req.stall_skip_tokens.empty()
+                ? nullptr : &req.stall_skip_tokens;
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens,
-                                       req.stall_tool_prefix_tokens,
-                                       req.stall_action_suffix_tokens,
-                                       req.stall_skip_tokens,
+                                       hint_tokens, stall_prefix, stall_suffix,
+                                       stall_skip,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
@@ -1296,15 +1742,65 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
-                               int kv_offset) {
+                               int kv_offset,
+                               const Qwen35ImageRows * images) {
+    if (images && kv_offset != 0) {
+        std::fprintf(stderr, "prefill: an image prompt must start at position 0\n");
+        return -1;
+    }
+    if (images) {
+        // Snapshots are found again by their tokens, and pads say nothing
+        // about which image they stood for.
+        snap_pos = -1;
+        snap_slot = -1;
+    }
+    rope_delta_ = images ? images->prompt->positions.next - (int)tokens.size() : 0;
+    // A finite --fa-window caps the full-attention layers to a sliding
+    // window, so anything earlier than the window is invisible to them. That
+    // is silent: the model still answers, it just cannot see the head of a
+    // long prompt, which reads as a model quality problem rather than a
+    // configuration one. Say so once, the first time a prompt actually
+    // outgrows the window.
+    if (cfg_.fa_window > 0 &&
+        (int)tokens.size() + kv_offset > cfg_.fa_window) {
+        static std::atomic<bool> s_fa_window_warned{false};
+        if (!s_fa_window_warned.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35] WARNING: prompt is %d tokens but --fa-window is %d: "
+                "full-attention layers see only the last %d tokens, so content "
+                "before that cannot be retrieved. Drop --fa-window for "
+                "long-context work.\n",
+                (int)tokens.size() + kv_offset, cfg_.fa_window, cfg_.fa_window);
+        }
+    }
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
-    int prefill_ubatch = 512;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        prefill_ubatch = std::max(1, std::atoi(s));
-    }
+    int prefill_ubatch = qwen35_prefill_ubatch(512);
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
+
+    // The HIP legacy pool retains freed graph temporaries. During a long,
+    // shape-changing prefill those cached blocks can fragment VRAM until the
+    // next allocation fails even though a large part of the pool is idle.
+    // Trimming is deliberately opt-in and performed only between completed
+    // chunks: ggml_backend_cuda_trim_pool() synchronizes the backend and
+    // retires captured graphs before returning cached blocks to the driver.
+    static const int prefill_pool_trim_tokens = []() {
+        const char * value = std::getenv("LUCE_PREFILL_POOL_TRIM_TOKENS");
+        if (value == nullptr || value[0] == '\0') return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+            std::fprintf(stderr,
+                "[vram] ignoring invalid LUCE_PREFILL_POOL_TRIM_TOKENS=%s\n",
+                value);
+            return 0;
+        }
+        return (int)parsed;
+    }();
+    int64_t next_prefill_pool_trim = prefill_pool_trim_tokens > 0
+        ? ((int64_t)kv_offset / prefill_pool_trim_tokens + 1) * prefill_pool_trim_tokens
+        : INT64_MAX;
 
     // kvflash: a prompt that fits the pool prefills contiguously (identity
     // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
@@ -1324,15 +1820,17 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         return -1;
     }
     if (kvf_paged) {
-        prefill_ubatch = kvflash_pager_.chunk_tokens();
+        // Chunk-aligned but not one-chunk ubatches; see kvflash_pooled_ubatch.
+        const int kvf_chunk = kvflash_pager_.chunk_tokens();
+        prefill_ubatch = kvflash_pooled_ubatch(prefill_ubatch, kvf_chunk, kvflash_tokens_);
         kvflash_pager_.reset();
         if (kvflash_qk_policy_) {
             kvflash_qk_pool_.reset(kvflash_qk_pool_.dims());
             kvflash_qk_pooled_upto_ = 0;
         }
         std::printf("[kvflash] pooled prefill: %d tokens through a %d-token pool "
-                    "(%d-token chunks, evicting)\n",
-                    prompt_len, kvflash_tokens_, prefill_ubatch);
+                    "(%d-token chunks, ubatch=%d, evicting)\n",
+                    prompt_len, kvflash_tokens_, kvf_chunk, prefill_ubatch);
         std::fflush(stdout);
     }
 
@@ -1343,11 +1841,13 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
+        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
+            !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
-                                   target_backend_, cache_)) {
+                                   target_backend_, cache_, enable_specla)) {
             std::fprintf(stderr, "prefill: rollback cache migration failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             return -1;
         }
     }
@@ -1411,12 +1911,15 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // positions encode the complete context — critical for tool
         // definitions at prompt start to propagate into KV values that
         // decode-time windowed attention will later read.
+        static const bool prefill_timing = std::getenv("LUCE_PREFILL_TIMING") != nullptr;
+        const auto t_build0 = std::chrono::steady_clock::now();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
-                               /*last_token_logits_only=*/(start + n_tokens < prompt_len),
+                               /*logits_tail_rows=*/
+                                   (start + n_tokens < prompt_len ? 1 : 0),
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/kvf_paged)) {
@@ -1443,17 +1946,16 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!w_.embedder.embed(tokens.data() + start, n_tokens, embed_buf.data())) {
             return -1;
         }
+        if (images) images->overwrite(embed_buf.data(), start, n_tokens, hidden);
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * (size_t)hidden * n_tokens);
 
         // Positions (M-RoPE)
         std::vector<int32_t> pos_buf((size_t)4 * n_tokens, 0);
-        for (int i = 0; i < n_tokens; i++) {
-            const int p = kv_pos + i;
-            pos_buf[4 * i + 0] = p;
-            pos_buf[4 * i + 1] = p;
-            pos_buf[4 * i + 2] = p;
-            pos_buf[4 * i + 3] = 0;
+        if (images) {
+            images->prompt->positions.fill(pos_buf.data(), start, n_tokens);
+        } else {
+            fill_qwen35_mrope_positions(pos_buf.data(), kv_pos, n_tokens);
         }
         ggml_backend_tensor_set(sg_.positions, pos_buf.data(), 0,
                                 sizeof(int32_t) * pos_buf.size());
@@ -1487,17 +1989,22 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
         } else if (sg_.attn_mask) {
-            const int win_start = 0;
-            const int kv_len = kv_pos + n_tokens - win_start;
-            std::vector<uint16_t> mask_buf;
-            const int kv_pad_override = (int)sg_.attn_mask->ne[0];
-            build_causal_mask(mask_buf, kv_len, n_tokens, kv_pos, cfg_.kq_stride_pad, win_start, kv_pad_override);
-            ggml_backend_tensor_set(sg_.attn_mask, mask_buf.data(), 0,
-                                    sizeof(uint16_t) * mask_buf.size());
+            upload_qwen35_causal_mask(
+                sg_.attn_mask, kv_pos, n_tokens, cfg_.kq_stride_pad);
         }
 
         // Compute
+        const auto t_comp0 = std::chrono::steady_clock::now();
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        if (prefill_timing) {
+            ggml_backend_synchronize(target_backend_);
+            const auto t_comp1 = std::chrono::steady_clock::now();
+            std::fprintf(stderr,
+                "[prefill-timing] tokens=%d nodes=%d build+alloc=%.1fms compute=%.1fms\n",
+                n_tokens, ggml_graph_n_nodes(sg_.gf),
+                std::chrono::duration<double, std::milli>(t_comp0 - t_build0).count(),
+                std::chrono::duration<double, std::milli>(t_comp1 - t_comp0).count());
+        }
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
@@ -1530,6 +2037,22 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         start += n_tokens;
+
+        if (prefill_pool_trim_tokens > 0 && start < prompt_len &&
+            (int64_t)committed >= next_prefill_pool_trim &&
+            ggml_backend_cuda_has_legacy_pool(target_backend_)) {
+            const size_t freed = ggml_backend_cuda_trim_pool(target_backend_);
+            std::fprintf(stderr,
+                "[vram] prefill pool trim at token %d: freed %.1f MiB\n",
+                committed, (double)freed / (1024.0 * 1024.0));
+            while (next_prefill_pool_trim <= (int64_t)committed) {
+                if (next_prefill_pool_trim > INT64_MAX - prefill_pool_trim_tokens) {
+                    next_prefill_pool_trim = INT64_MAX;
+                    break;
+                }
+                next_prefill_pool_trim += prefill_pool_trim_tokens;
+            }
+        }
     }
 
     if (kvflash_active()) {
@@ -1643,7 +2166,7 @@ void Qwen35Backend::kvflash_ensure_scorer() {
         if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
                           cfg_.device.gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
-                                 "LRU residency\n", dflash27b_last_error());
+                                 "LRU residency\n", luce_last_error());
             kvflash_drafter_failed_ = true;
             return;
         }
@@ -1784,10 +2307,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     if (n_gen <= 0) return true;
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
-    const int _min_floor = dflash_min_tokens_floor();
     static const int _repeat_guard = []{
         const int explicit_guard =
-            env_int_or_default("DFLASH_DEGENERATE_RUN_TOKENS", -1);
+            env_int_or_default("LUCE_DEGENERATE_RUN_TOKENS", -1);
         if (explicit_guard >= 0) return explicit_guard;
         return dflash_min_tokens_floor() > 0 ? 32 : 0;
     }();
@@ -1838,7 +2360,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
+        const int32_t rope_pos = committed + rope_delta_;
+        int32_t pos4[4] = {rope_pos, rope_pos, rope_pos, 0};
         ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
         // kvflash: graph carries a slot-validity mask alongside the
@@ -1847,10 +2370,11 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         const bool paged = cfg_.paged_attention;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
-                               /*last_token_logits_only=*/false,
+                               /*logits_tail_rows=*/0,
                                cfg_.kq_stride_pad,
                                should_capture_moe_router(),
                                /*kvflash_mask=*/pool,
@@ -1883,23 +2407,28 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
                                     sizeof(int64_t) * n_head_kv);
         }
-        if (pool) kvflash_upload_mask();
+        if (pool) {
+            kvflash_upload_mask();
+        } else if (w_.is_bailingmoe3) {
+            upload_qwen35_causal_mask(
+                sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
+        }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
 
         after_target_compute(sg_, committed, 1);
 
-        // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: DFLASH_GPU_ARGMAX=0.
+        // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: LUCE_GPU_ARGMAX=0.
         static const bool kGpuArgmaxAR = []() {
-            const char * v = std::getenv("DFLASH_GPU_ARGMAX");
+            const char * v = std::getenv("LUCE_GPU_ARGMAX");
             return v == nullptr || v[0] != '0';
         }();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#ifdef LUCE_HAVE_GPU_SAMPLER
             // GPU sample straight from the device logits tensor, skipping the
-            // full ~vocab-wide D2H copy (the same payoff DFLASH_GPU_ARGMAX gets
+            // full ~vocab-wide D2H copy (the same payoff LUCE_GPU_ARGMAX gets
             // for greedy). Falls back to the CPU chain on -1.
             int g_tok = -1;
             if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
@@ -1951,29 +2480,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             }
         }
 
-        // MIN_TOKENS_BEFORE_EOS (env DFLASH_MIN_TOKENS, default 0=off): if the
-        // model tries to stop before producing N tokens in this decode call,
-        // suppress EOS and take the best NON-eos token instead. Targets the Q4
-        // 'preamble then stop, no tool_call' agentic stall. Env-gated so the
-        // default production lane is byte-for-byte unchanged.
-        {
-            if (_min_floor > 0 && (int)out_tokens.size() < _min_floor && IS_EOS_TOK(next_tok, w_)) {
-                int alt = -1; float altbest = -1e30f;
-                for (int v = 0; v < vocab; v++) {
-                    if (IS_EOS_TOK(v, w_)) continue;
-                    if (logits_buf[v] > altbest) { altbest = logits_buf[v]; alt = v; }
-                }
-                if (alt >= 0) {
-                    // Debug-only diagnostic: writes happen exclusively when the
-                    // operator opts into DFLASH_MIN_TOKENS, so the default
-                    // production lane never touches /tmp/dflash_floor.log.
-                    // Bound the local evidence file before appending.
-                    FILE* _d = open_dflash_floor_log();
-                    if (_d) { std::fprintf(_d, "[floor] eos@%d -> alt=%d\n", (int)out_tokens.size(), alt); std::fclose(_d); }
-                    next_tok = alt;
-                }
-            }
-        }
+        next_tok = apply_min_tokens_floor(
+            next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
         maybe_force_close(next_tok);
 
@@ -2106,6 +2614,112 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
 
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
+static bool qwen35_dspark_enabled() {
+    static const bool kEnabled = []() {
+        const char * e = std::getenv("LUCE_QWEN35_DSPARK");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return kEnabled;
+}
+
+// Confidence-gate threshold for adaptive block length (0 = gate off, verify
+// the full drafted block). The drafter's AcceptRatePredictor scores each
+// draft position; the chain is truncated at the first position below the
+// threshold and only the confident prefix is verified.
+static float qwen35_dspark_confidence_threshold() {
+    static const float kThreshold = []() {
+        const char * e = std::getenv("LUCE_QWEN35_DSPARK_CONFIDENCE_THRESHOLD");
+        if (!e) return 0.0f;
+        float threshold = (float)std::atof(e);
+        if (threshold < 0.0f) threshold = 0.0f;
+        if (threshold > 1.0f) threshold = 1.0f;
+        return threshold;
+    }();
+    return kThreshold;
+}
+
+// Resolve the target lm_head to a tensor whose data is readable on the
+// draft backend. In tensor-parallel mode the lm_head is a meta tensor whose
+// data pointer is a placeholder; the real data is mirrored (a full copy) on
+// every rank. Return the simple tensor of the rank that matches the draft
+// GPU (a local read on the draft backend), else nullptr so the caller falls
+// back to the host chain.
+static ggml_tensor * resolve_fused_lm_head(ggml_tensor * lm_head,
+                                           const DevicePlacement & device,
+                                           int draft_gpu) {
+    if (!lm_head || !lm_head->buffer) return nullptr;
+    const ggml_backend_buffer_type_t lm_head_buft =
+        ggml_backend_buffer_get_type(lm_head->buffer);
+    if (!ggml_backend_buft_is_meta(lm_head_buft)) {
+        // A simple tensor is safe only when it is local to the draft backend,
+        // or when peer access was successfully enabled for the actual target
+        // and draft GPU pair. The configuration flag alone is not proof that
+        // the hardware/driver accepted peer access.
+        const ggml_backend_dev_t tensor_dev =
+            ggml_backend_buft_get_device(lm_head_buft);
+        const ggml_backend_dev_t draft_dev =
+            ggml_backend_buft_get_device(
+                ggml_backend_cuda_buffer_type(draft_gpu));
+        if (tensor_dev != draft_dev) {
+            const ggml_backend_dev_t target_dev =
+                ggml_backend_buft_get_device(
+                    ggml_backend_cuda_buffer_type(device.gpu));
+            if (tensor_dev != target_dev ||
+                !cross_device_peer_memcpy_ok(device.gpu, draft_gpu)) {
+                return nullptr;
+            }
+        }
+        return lm_head;
+    }
+    // Meta tensor: the lm_head is mirrored (full copy) on every rank. Read
+    // it from the rank that matches the draft GPU so the fused graph does a
+    // local read on the draft backend.
+    for (size_t j = 0; j < device.layer_split_gpus.size(); ++j) {
+        if (device.layer_split_gpus[j] == draft_gpu) {
+            ggml_tensor * simple = ggml_backend_meta_simple_tensor(lm_head, j);
+            if (!simple || !simple->data) return nullptr;
+            GGML_ASSERT(ggml_are_same_shape(simple, lm_head));
+            return simple;
+        }
+    }
+    // Draft GPU is not a target rank; fall back to the host chain.
+    return nullptr;
+}
+
+// Adaptive speculation policy: a spec step (draft + heads + width-q verify)
+// costs about LUCE_QWEN35_SPEC_STEP_RATIO plain-decode steps, so it only
+// pays off while the drafter gets more than (ratio - 1) of its tokens
+// accepted per step. Below that (low-acceptance prose) the loop runs
+// LUCE_QWEN35_AR_BURST plain-decode steps inside the spec loop (target
+// forward on the seed token only, features still captured for the drafter),
+// then probes with one spec step. Set LUCE_QWEN35_SPEC_STEP_RATIO=0 to
+// disable the policy.
+struct Qwen35AdaptiveSpecPolicy {
+    float step_ratio = 1.9f;   // spec/plain step cost used until both step kinds have been timed
+                               // (measured 54-55 vs 28.6 ms on gfx1201 for width-8 and width-16 verify)
+    int   burst      = 40;     // plain-decode steps per burst (each burst ends with one spec probe step)
+    float ema_alpha  = 0.1f;   // slow EMA: ~10-step memory so bursty acceptance does not flap
+    bool  enabled() const { return step_ratio > 1.0f && burst > 0; }
+    // Enter a burst only clearly below break-even (hysteresis against noise).
+    // `ratio` is the live spec/plain step-time ratio once measured.
+    float accept_threshold(float ratio) const { return 0.8f * (ratio - 1.0f); }
+    float accept_threshold() const { return accept_threshold(step_ratio); }
+};
+
+static Qwen35AdaptiveSpecPolicy qwen35_adaptive_spec_policy() {
+    static const Qwen35AdaptiveSpecPolicy kPolicy = []() {
+        Qwen35AdaptiveSpecPolicy p;
+        if (const char * e = std::getenv("LUCE_QWEN35_SPEC_STEP_RATIO")) {
+            p.step_ratio = (float)std::atof(e);
+        }
+        if (const char * e = std::getenv("LUCE_QWEN35_AR_BURST")) {
+            p.burst = std::atoi(e);
+        }
+        return p;
+    }();
+    return kPolicy;
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -2139,10 +2753,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // sampler chain instead of its argmax, so every committed token is an
     // exact target sample — the output distribution is identical to AR
     // sampling. Acceptance drops vs greedy but stays far above the AR
-    // floor. Opt in with DFLASH_SAMPLED_VERIFY=1; without it, sampling
+    // floor. Opt in with LUCE_SAMPLED_VERIFY=1; without it, sampling
     // requests fall back to AR decode (zero behavior change by default).
     static const bool kSampledVerify = []() {
-        const char * e = std::getenv("DFLASH_SAMPLED_VERIFY");
+        const char * e = std::getenv("LUCE_SAMPLED_VERIFY");
         return e != nullptr && std::string(e) == "1";
     }();
     // Sampled-verify additionally requires full attention in the verify
@@ -2197,7 +2811,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         ggml_backend_tensor_get(sg_.logits, first_logits.data(),
                                 prefill_last_logits_offset_,
                                 sizeof(float) * (size_t)w_.n_vocab);
-        if (std::getenv("DFLASH_SV_DEBUG")) {
+        if (std::getenv("LUCE_SV_DEBUG")) {
             int am = 0; float best = first_logits[0];
             for (int v = 1; v < w_.n_vocab; v++)
                 if (first_logits[v] > best) { best = first_logits[v]; am = v; }
@@ -2213,20 +2827,91 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     const int _min_floor = dflash_min_tokens_floor();
 
+    // A mid-emit override (stall-floor tool injection or budget force-close)
+    // restores the pre-step snapshot and replays the overridden prefix. When
+    // either hook is armed, plain-decode burst steps must take the snapshot
+    // too: their rollback-free fast path otherwise skips it, and the restore
+    // would copy back state up to a whole burst stale.
+    const bool replay_hooks_armed =
+        (budget_hook && !budget_hook->close_token_ids.empty()) ||
+        (_min_floor > 0 &&
+         stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
+         stall_action_suffix_tokens && !stall_action_suffix_tokens->empty());
+
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
+    auto finish_speculative_state = [&]() {
+        if (target->finish_speculative_state()) return true;
+        std::fprintf(stderr, "spec-decode: final SpecLA state flush failed\n");
+        return false;
+    };
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
-    const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    // Long-context draft width. Verify attention runs through ggml's tile
+    // kernel (the vector kernel only covers a single query row), and that
+    // kernel's cost scales with the number of query rows AND with KV length.
+    // So a wide draft block, which is a clear win on short prompts, turns
+    // into a liability once the KV is large: the extra rows multiply a term
+    // that is itself growing.
+    //
+    // Measured on one R9700 with Qwen3.8-27B IQ4_XS + DFlash2 (decode tok/s):
+    //     prompt   verify 16   verify 8
+    //      6,208         63.2           71.1
+    //     13,148         51.9           54.9
+    //     26,728         43.4           46.9
+    //     39,861         32.7           45.5
+    // Narrowing inside a block-16 drafter also holds acceptance better than
+    // configuring the drafter at block 8 outright (0.414 vs 0.375 at 27K).
+    // Below the crossover the wide block still wins by a lot (HumanEval-10
+    // 204 vs 143.6 decode), so narrow only past it. Halving also raises
+    // commit depth there (0.462*8+1 = 4.70 vs 0.200*16+1 = 4.20): fewer rows
+    // and deeper commits at the same time.
+    //
+    // The rule is a function of context length only. It deliberately does not
+    // look at the observed acceptance rate, so the width for a given prompt
+    // is reproducible and does not chase a moving target.
+    // 8192 is deliberately above every prompt in the short-context benchmarks
+    // this engine is tuned for, so high-acceptance completion workloads, where
+    // the wide block earns its keep, are untouched.
+    constexpr int kLongCtxNarrowTokens = 8192;
+    // Narrowing floor, chosen to match the shipped DFlash2 checkpoint's
+    // published block of 8 (clamped to q_len below for narrower checkpoints).
+    constexpr int kLongCtxMinVerify = 8;
+    const int q_len = dw_.block_size > 0 ? dw_.block_size : LUCE_DRAFT_BLOCK_SIZE;
+    // This caps the VERIFY batch only; the drafter still proposes a full q_len
+    // block. Narrowing the draft instead would leave the tail rows of the
+    // drafter's non-causal block unwritten while its mask still makes them
+    // visible to the rows we keep, and would break the fixed block_size
+    // contract the IPC drafter validates against.
+    // Clamped to q_len: a checkpoint whose published block is below the
+    // narrowing floor never widens past its own block. Acceptance accounting
+    // uses the actual offered width, including confidence-trimmed drafts.
+    const int verify_cap = committed >= kLongCtxNarrowTokens
+                               ? std::min(q_len, std::max(kLongCtxMinVerify, q_len / 2))
+                               : q_len;
+    const bool shared_feedback_width =
+        !cfg_.ddtree_mode && adaptive_spec_width_globally_enabled();
+    AdaptiveSpecWidth width_controller(q_len, 2, shared_feedback_width);
+    if (verify_cap != q_len) {
+        static std::atomic<bool> s_narrowed_logged{false};
+        if (!s_narrowed_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35-spec] context %d >= %d: capping verify width %d -> %d "
+                "(wide blocks lose to verify-attention cost at long context)\n",
+                committed, kLongCtxNarrowTokens, q_len, verify_cap);
+        }
+    }
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
     if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
+        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
+            !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
-                                   target_backend_, cache_)) {
+                                   target_backend_, cache_, enable_specla)) {
             std::fprintf(stderr, "spec-decode: rollback cache migration failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             return false;
         }
     }
@@ -2245,17 +2930,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
-    int n_accept_sum    = 0;
+    SpecAcceptanceStats acceptance;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
     const ChainRollbackPolicy rollback_policy =
-        resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
+        resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel(),
+                                      target->exact_fast_rollback());
     const int fast_rollback_threshold =
         rollback_policy.fast_rollback_threshold;
     RollbackDiag rollback_diag;
 
-    const char * tp_profile_env = std::getenv("DFLASH_TP_PROFILE");
+    const char * tp_profile_env = std::getenv("LUCE_TP_PROFILE");
     const bool tp_profile = tp_profile_env && std::strcmp(tp_profile_env, "0") != 0;
     double profile_draft_s = 0.0;
     double profile_project_s = 0.0;
@@ -2296,8 +2982,43 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
+    // Adaptive speculation state (see Qwen35AdaptiveSpecPolicy).
+    const Qwen35AdaptiveSpecPolicy adaptive = qwen35_adaptive_spec_policy();
+    // Start well above the burst threshold so an unlucky opening does not
+    // park a predictable stream in plain decode. The probe step that ends a
+    // burst updates the EMA with a fast alpha (see below) so a stream that
+    // turned predictable leaves plain decode quickly.
+    float accepted_ema = 2.0f * adaptive.accept_threshold();
+    int   ar_burst_left = 0;
+    int   n_ar_burst_steps = 0;
+    bool  probe_step = false;   // first spec step after a burst
+    // Live step-time EMAs (seconds) for the break-even ratio; 0 = not yet measured.
+    double t_spec_step_ema = 0.0;
+    double t_ar_step_ema   = 0.0;
+    auto live_step_ratio = [&]() {
+        return (t_spec_step_ema > 0.0 && t_ar_step_ema > 0.0)
+            ? (float)(t_spec_step_ema / t_ar_step_ema) : adaptive.step_ratio;
+    };
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
+        // Plain-decode step inside the spec loop: no drafter forward, verify
+        // the seed token only. Features are still captured, so the drafter
+        // resumes cleanly on the next probe step.
+        bool ar_step = adaptive.enabled() && ar_burst_left > 0;
+        // Pending tool-call hints verify at near-100% acceptance; a plain
+        // decode burst would ignore them for up to `burst` tokens, so end
+        // the burst as soon as hints are available.
+        if (ar_step && hint_tokens && n_generated < (int)hint_tokens->size()) {
+            ar_burst_left = 0;
+            ar_step = false;
+        }
+        if (ar_step) {
+            ar_burst_left--;
+            n_ar_burst_steps++;
+            probe_step = (ar_burst_left == 0);
+        }
+        const auto t_step_start = std::chrono::steady_clock::now();
 
         // Budget hook: no tail-off here. The close-token injection fires
         // during the emit phase (step 8) after acceptance+replay, mirroring
@@ -2313,10 +3034,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.last_tok = out_tokens.back();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
+            if (!finish_speculative_state()) return false;
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
@@ -2326,9 +3049,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return ok;
         }
 
-        // 1. Build noise input for draft
+        // 1. Build noise input for draft. The drafter GGUF's own MASK id
+        // wins over the target-side default (the loader resolved the
+        // precedence into dw_); remote drafters keep the target default
+        // because dw_ is not populated for them.
+        const int32_t noise_mask_id =
+            (!use_remote_draft && dw_.mask_token_id >= 0)
+                ? dw_.mask_token_id : target->mask_token_id();
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = target->mask_token_id();
+        for (int i = 1; i < q_len; i++) noise_ids[i] = noise_mask_id;
         if (!target->embed_tokens(noise_ids.data(), q_len, noise_embed.data())) {
             std::fprintf(stderr, "spec-decode: noise embed failed (last_tok=%d mask=%d q_len=%d)\n",
                          last_tok, target->mask_token_id(), q_len);
@@ -2336,105 +3065,109 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
 
-        // 2. Draft compute
+        // 2. Draft compute (skipped on plain-decode burst steps)
         constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
-        const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
-        const int draft_ctx = std::min(committed,
-            std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
-        const int draft_start = committed - draft_ctx;
-        int mirror_slot0 = 0;
-        const bool use_mirror_view =
-            !use_remote_draft &&
-            draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
+        bool used_draft_kv = false;
+        if (!ar_step) {
+            const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;
+            const int draft_ctx = std::min(committed,
+                std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+            const int draft_start = committed - draft_ctx;
+            int mirror_slot0 = 0;
+            const bool use_mirror_view =
+                !use_remote_draft &&
+                draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
-        const auto profile_draft_start = profile_start();
-        if (use_remote_draft) {
-            local_hidden.clear();
-            if (!remote_draft_.propose(committed, draft_ctx, noise_embed, local_hidden)) {
-                std::fprintf(stderr, "spec-decode: remote draft propose failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
-            }
-        } else {
-            // [TAG_DRAFT_KV] ring-cached drafter context KV: append newly
-            // committed rows instead of re-encoding the whole feature window.
-            static const bool draft_kv_on = []() {
-                const char * e = std::getenv("DFLASH_DRAFT_KV");
-                return !(e && e[0] == '0' && e[1] == '\0');
-            }();
-            bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
-            if (use_draft_kv && draft_kv_.gf &&
-                draft_kv_.built_for != (const void *)&dw_) {
-                draft_kv_free(draft_kv_);
-            }
-            if (use_draft_kv && !draft_kv_.gf) {
-                const int kv_cap = std::min(ring_cap,
-                    std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
-                if (!draft_kv_init(draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
-                    draft_kv_free(draft_kv_);
-                    use_draft_kv = false;
-                    std::fprintf(stderr,
-                        "spec-decode: draft-kv init failed; using legacy draft path\n");
-                }
-            }
-            if (use_draft_kv) {
-                if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
-                                         feature_mirror_, committed)) {
-                    std::fprintf(stderr, "spec-decode: draft-kv step prep failed\n");
+            const auto profile_draft_start = profile_start();
+            if (use_remote_draft) {
+                local_hidden.clear();
+                if (!remote_draft_.propose(committed, draft_ctx, noise_embed, local_hidden)) {
+                    std::fprintf(stderr, "spec-decode: remote draft propose failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
                 }
-                ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
-                                        sizeof(float) * noise_embed.size());
-                if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
-                    GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "spec-decode: draft-kv compute failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
-                local_hidden.resize((size_t)hidden * q_len);
-                ggml_backend_tensor_get(draft_kv_.hidden_states, local_hidden.data(), 0,
-                                        sizeof(float) * local_hidden.size());
             } else {
-                if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
-                                      draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
-                                      committed,
-                                      /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
-                    std::fprintf(stderr, "spec-decode: draft build failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
+                // [TAG_DRAFT_KV] ring-cached drafter context KV: append newly
+                // committed rows instead of re-encoding the whole feature window.
+                static const bool draft_kv_on = []() {
+                    const char * e = std::getenv("LUCE_DRAFT_KV");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+                if (use_draft_kv && draft_kv_.gf &&
+                    draft_kv_.built_for != (const void *)&dw_) {
+                    draft_kv_free(draft_kv_);
                 }
-                if (!use_mirror_view &&
-                    !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
-                                                       draft_start, draft_ctx)) {
-                    std::fprintf(stderr, "spec-decode: feature copy failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
+                if (use_draft_kv && !draft_kv_.gf) {
+                    const int kv_cap = std::min(ring_cap,
+                        std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
+                    if (!draft_kv_init(draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
+                        draft_kv_free(draft_kv_);
+                        use_draft_kv = false;
+                        std::fprintf(stderr,
+                            "spec-decode: draft-kv init failed; using legacy draft path\n");
+                    }
                 }
-                ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                        sizeof(float) * noise_embed.size());
-                pos_k.resize((size_t)draft_ctx + q_len);
-                for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-                for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-                ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                        sizeof(int32_t) * pos_q.size());
-                ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                        sizeof(int32_t) * pos_k.size());
+                if (use_draft_kv) {
+                    used_draft_kv = true;
+                    if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
+                                             feature_mirror_, committed)) {
+                        std::fprintf(stderr, "spec-decode: draft-kv step prep failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
+                                            sizeof(float) * noise_embed.size());
+                    if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
+                        GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "spec-decode: draft-kv compute failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    local_hidden.resize((size_t)hidden * q_len);
+                    ggml_backend_tensor_get(draft_kv_.hidden_states, local_hidden.data(), 0,
+                                            sizeof(float) * local_hidden.size());
+                } else {
+                    if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                                          draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                                          committed,
+                                          /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+                        std::fprintf(stderr, "spec-decode: draft build failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    if (!use_mirror_view &&
+                        !copy_feature_ring_range_to_tensor(feature_mirror_, draft_sg.target_hidden_cat,
+                                                           draft_start, draft_ctx)) {
+                        std::fprintf(stderr, "spec-decode: feature copy failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
+                                            sizeof(float) * noise_embed.size());
+                    pos_k.resize((size_t)draft_ctx + q_len);
+                    for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
+                    for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
+                    ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
+                                            sizeof(int32_t) * pos_q.size());
+                    ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
+                                            sizeof(int32_t) * pos_k.size());
 
-                auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
-                if (st != GGML_STATUS_SUCCESS) {
-                    std::fprintf(stderr, "spec-decode: draft compute failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
+                    auto st = ggml_backend_graph_compute(draft_backend_, draft_sg.gf);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "spec-decode: draft compute failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
 
-                // Read draft hidden states to host for LM-head projection.
-                local_hidden.resize((size_t)hidden * q_len);
-                ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
-                                        sizeof(float) * local_hidden.size());
+                    // Read draft hidden states to host for LM-head projection.
+                    local_hidden.resize((size_t)hidden * q_len);
+                    ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
+                                            sizeof(float) * local_hidden.size());
+                }
             }
-        }
-        profile_add(profile_draft_s, profile_draft_start);
+            profile_add(profile_draft_s, profile_draft_start);
+        }  // !ar_step
 
         // ── DDTree tree-structured verify ────────────────────────────────
         // When --ddtree is on and the target supports tree verify, build a
@@ -2466,39 +3199,303 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
              kvflash_pager_.identity_prefix_covers(committed));
         const bool use_tree_verify =
             cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
-            !use_remote_draft && q_len > 1 && tree_special_inactive;
+            !use_remote_draft && q_len > 1 && tree_special_inactive && !ar_step;
 
+        // Chain-verify length for this step. The DSpark confidence gate may
+        // truncate the drafted block (adaptive block length); q_len stays the
+        // buffer-sizing upper bound.
+        int v_len = q_len;
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
-        if (!use_tree_verify) {
-            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
-                std::fprintf(stderr, "spec-decode: projection failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+        if (ar_step) {
+            draft_tok.assign(1, last_tok);
+            v_len = 1;
+        } else if (!use_tree_verify) {
+            const auto profile_project_start = profile_start();
+            // DFlash 2 selector (top-k candidates + low-rank path score) when
+            // the drafter ships it.
+            bool used_dspark = false;
+            if (dw_.selector.enabled && q_len > 1 && !sampled_verify && !use_remote_draft) {
+                static std::atomic<bool> s_sel_logged{false};
+                if (!s_sel_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DFlash 2 selector active for greedy chain decode "
+                        "(rank=%d top_k=%d)\n", dw_.selector.rank, dw_.selector.top_k);
+                }
+                if (dflash2_select_chain(dw_, draft_backend_, *target,
+                                         local_hidden.data(), q_len, last_tok, draft_tok)) {
+                    used_dspark = true;
+                    v_len = std::max(1, (int)draft_tok.size());
+                } else {
+                    static std::atomic<bool> s_sel_warned{false};
+                    if (!s_sel_warned.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DFlash 2 selector failed; falling back to "
+                            "base DFlash projection\n");
+                    }
+                }
             }
-            draft_tok[0] = last_tok;
+            // DSpark heads (markov bigram correction + optional confidence
+            // gate) when the drafter ships them; mirrors the laguna hook.
+            if (!used_dspark && qwen35_dspark_enabled() && dw_.dspark.enabled &&
+                q_len > 1 && !sampled_verify && !use_remote_draft) {
+                static std::atomic<bool> s_dspark_logged{false};
+                if (!s_dspark_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DSpark Markov head active for greedy chain decode "
+                        "(rank=%d vocab=%d confidence_dim=%d)\n",
+                        dw_.dspark.markov_rank, dw_.dspark.vocab_size,
+                        dw_.dspark.confidence_dim);
+                }
+                static const bool fused_dspark = []() {
+                    const char * e = std::getenv("LUCE_QWEN35_FUSED_DSPARK");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool ds_ok = false;
+                const float conf_threshold = qwen35_dspark_confidence_threshold();
+                if (fused_dspark) {
+                    // One graph for every candidate: markov-corrected tokens
+                    // plus (when gated) the confidence score per position.
+                    // The lm_head must be readable on the draft backend; in
+                    // tensor-parallel mode that is the simple tensor of the
+                    // rank matching the draft GPU (lm_head is mirrored on
+                    // every rank).
+                    std::vector<float> conf_scores;
+                    ggml_tensor * fused_lm_head =
+                        resolve_fused_lm_head(target->lm_head_tensor(),
+                                              cfg_.device, cfg_.draft_gpu);
+                    if (fused_lm_head) {
+                        ds_ok = dspark_markov_correct_greedy_chain_fused(
+                            dw_, draft_backend_, fused_lm_head,
+                            local_hidden.data(), q_len, last_tok, draft_tok,
+                            conf_threshold > 0.0f ? &conf_scores : nullptr);
+                    }
+                    if (ds_ok && conf_threshold > 0.0f) {
+                        // Truncate the chain at the first low-confidence
+                        // position: draft_tok[0] is the seed, candidate i
+                        // scores conf_scores[i-1].
+                        size_t keep = 1;
+                        while (keep < draft_tok.size() &&
+                               keep - 1 < conf_scores.size() &&
+                               conf_scores[keep - 1] >= conf_threshold) {
+                            ++keep;
+                        }
+                        static const bool conf_debug = []() {
+                            const char * e = std::getenv("LUCE_QWEN35_DSPARK_CONF_DEBUG");
+                            return e && e[0] == '1';
+                        }();
+                        if (conf_debug) {
+                            std::fprintf(stderr, "[dspark-conf] keep=%zu/%zu:", keep, draft_tok.size());
+                            for (float c : conf_scores) std::fprintf(stderr, " %.3f", c);
+                            std::fprintf(stderr, "\n");
+                        }
+                        draft_tok.resize(keep);
+                    }
+                }
+                if (!ds_ok) {
+                    ds_ok = dspark_markov_correct_greedy_chain(dw_, draft_backend_, *target,
+                                                       local_hidden.data(), q_len,
+                                                       last_tok, conf_threshold,
+                                                       draft_tok);
+                }
+                if (ds_ok) {
+                    used_dspark = true;
+                    // Confidence gate truncates the drafted chain: verify
+                    // only the confident prefix this step.
+                    v_len = std::max(1, (int)draft_tok.size());
+                } else {
+                    static std::atomic<bool> s_dspark_warned{false};
+                    if (!s_dspark_warned.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DSpark Markov head failed; falling back to "
+                            "base DFlash projection\n");
+                    }
+                }
+            }
+            if (!used_dspark) {
+                if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+                    std::fprintf(stderr, "spec-decode: projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                draft_tok[0] = last_tok;
+            }
+            profile_add(profile_project_s, profile_project_start);
         }
 
         if (use_tree_verify) {
             const int L = q_len - 1;
-            const int K = (cfg_.ddtree_budget > L) ? 8 : 1;
-            std::vector<float>   top_lp;
-            std::vector<int32_t> top_ids;
-            const auto profile_project_start = profile_start();
-            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
-                                                cfg_.ddtree_temp, top_lp, top_ids)) {
-                std::fprintf(stderr, "spec-decode: ddtree topk projection failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // The paper's end-to-end tree route uses top-k=4.  Wider top-k
+            // spends projection and scheduling work on low-ranked siblings;
+            // keep the legacy width only outside SpecLA.
+            const int K = (cfg_.ddtree_budget > L)
+                ? (target->exact_fast_rollback()
+                    ? std::min(cfg_.specla_top_k, w_.n_vocab)
+                    : 8)
+                : 1;
+            DDTree tree;
+            if (target->exact_fast_rollback() && K > 1 &&
+                specla_conditional_draft_enabled()) {
+                // SpecLA §6.2: every expanded branch is proposed from that
+                // branch's exact token prefix, avoiding the old one-spine
+                // approximation. This is experimental for the current
+                // five-layer drafter because every prefix requires a rerun.
+                bool conditional_ok = true;
+                std::vector<float> row_hidden((size_t)hidden);
+                DDTreeConditionalTopK conditional_topk =
+                    [&](const std::vector<int32_t> & prefix, int next_depth,
+                        std::vector<float> & top_lp,
+                        std::vector<int32_t> & top_ids) -> bool {
+                    if (!conditional_ok || next_depth < 1 || next_depth > L ||
+                        (int)prefix.size() != next_depth - 1) {
+                        conditional_ok = false;
+                        return false;
+                    }
+
+                    if (prefix.empty()) {
+                        std::memcpy(row_hidden.data(),
+                                    local_hidden.data() + (size_t)hidden,
+                                    sizeof(float) * (size_t)hidden);
+                    } else {
+                        noise_ids[0] = last_tok;
+                        for (int i = 1; i < q_len; ++i) {
+                            noise_ids[(size_t)i] = i <= (int)prefix.size()
+                                ? prefix[(size_t)i - 1]
+                                : noise_mask_id;
+                        }
+                        if (!target->embed_tokens(noise_ids.data(), q_len,
+                                                  noise_embed.data())) {
+                            conditional_ok = false;
+                            return false;
+                        }
+                        const auto branch_draft_start = profile_start();
+                        ggml_tensor * branch_input = used_draft_kv
+                            ? draft_kv_.inp_embed : draft_sg.inp_embed;
+                        ggml_cgraph * branch_graph = used_draft_kv
+                            ? draft_kv_.gf : draft_sg.gf;
+                        ggml_tensor * branch_hidden = used_draft_kv
+                            ? draft_kv_.hidden_states : draft_sg.hidden_states;
+                        if (!branch_input || !branch_graph || !branch_hidden) {
+                            conditional_ok = false;
+                            return false;
+                        }
+                        ggml_backend_tensor_set(branch_input, noise_embed.data(), 0,
+                                                sizeof(float) * noise_embed.size());
+                        if (ggml_backend_graph_compute(draft_backend_, branch_graph) !=
+                            GGML_STATUS_SUCCESS) {
+                            conditional_ok = false;
+                            return false;
+                        }
+                        ggml_backend_tensor_get(
+                            branch_hidden, row_hidden.data(),
+                            (size_t)next_depth * hidden * sizeof(float),
+                            sizeof(float) * (size_t)hidden);
+                        profile_add(profile_draft_s, branch_draft_start);
+                    }
+
+                    const auto branch_project_start = profile_start();
+                    const bool ok = target->project_hidden_to_topk(
+                        row_hidden.data(), 1, K, cfg_.ddtree_temp,
+                        top_lp, top_ids);
+                    profile_add(profile_project_s, branch_project_start);
+                    conditional_ok = conditional_ok && ok;
+                    return ok;
+                };
+                tree = build_ddtree_conditional(
+                    conditional_topk, L, K, cfg_.ddtree_budget,
+                    cfg_.ddtree_chain_seed, cfg_.ddtree_tau);
+                if (!conditional_ok || tree.n_nodes == 0) {
+                    std::fprintf(stderr,
+                        "spec-decode: conditioned ddtree proposal failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            } else {
+                // DFlash2 selector-scored tree (DARTree-style): branch scores
+                // are logp + selector compatibility with the branch's actual
+                // parent, so the tree at worst degenerates to the selector
+                // chain. LUCE_QWEN35_DFLASH2_TREE=0 falls back to raw top-k.
+                static const bool dflash2_tree = []() {
+                    const char * e = std::getenv("LUCE_QWEN35_DFLASH2_TREE");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool selector_tree_ok = false;
+                if (dflash2_tree && dw_.selector.enabled && !use_remote_draft) {
+                    Dflash2TreeScores sc;
+                    const auto profile_project_start = profile_start();
+                    if (dflash2_score_candidates(dw_, draft_backend_, *target,
+                                                 local_hidden.data(), q_len, last_tok,
+                                                 cfg_.ddtree_temp, sc)) {
+                        static std::atomic<bool> s_seltree_logged{false};
+                        if (!s_seltree_logged.exchange(true)) {
+                            std::fprintf(stderr,
+                                "[qwen35-spec] DFlash2 selector scores active for DDTree candidates\n");
+                        }
+                        DDTreeConditionalTopK selector_topk =
+                            [&](const std::vector<int32_t> & prefix, int next_depth,
+                                std::vector<float> & lp, std::vector<int32_t> & ids) -> bool {
+                            if (!sc.topk(prefix, next_depth, lp, ids)) return false;
+                            if ((int)lp.size() > K) { lp.resize((size_t)K); ids.resize((size_t)K); }
+                            return true;
+                        };
+                        tree = build_ddtree_conditional(
+                            selector_topk, L, K, cfg_.ddtree_budget,
+                            cfg_.ddtree_chain_seed, cfg_.ddtree_tau);
+                        selector_tree_ok = tree.n_nodes > 0;
+                    }
+                    profile_add(profile_project_s, profile_project_start);
+                }
+                if (!selector_tree_ok) {
+                std::vector<float>   top_lp;
+                std::vector<int32_t> top_ids;
+                const auto profile_project_start = profile_start();
+                static const bool dspark_tree = []() {
+                    const char * e = std::getenv("LUCE_QWEN35_DSPARK_TREE");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool topk_ok = false;
+                if (dspark_tree && qwen35_dspark_enabled() && dw_.dspark.enabled) {
+                    static std::atomic<bool> s_dstree_logged{false};
+                    if (!s_dstree_logged.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DSpark Markov head active for DDTree candidates\n");
+                    }
+                    ggml_tensor * fused_lm_head =
+                        resolve_fused_lm_head(target->lm_head_tensor(),
+                                              cfg_.device, cfg_.draft_gpu);
+                    if (fused_lm_head) {
+                        topk_ok = dspark_markov_project_topk(dw_, draft_backend_,
+                                                             fused_lm_head,
+                                                             local_hidden.data(), q_len, K,
+                                                             cfg_.ddtree_temp, last_tok,
+                                                             top_lp, top_ids);
+                    }
+                }
+                if (!topk_ok &&
+                    !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                                                    cfg_.ddtree_temp,
+                                                    top_lp, top_ids)) {
+                    std::fprintf(stderr,
+                        "spec-decode: ddtree topk projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                profile_add(profile_project_s, profile_project_start);
+                tree = build_ddtree(
+                    top_lp.data() + (size_t)K,
+                    top_ids.data() + (size_t)K,
+                    L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed,
+                    cfg_.ddtree_tau);
+                }
             }
-            profile_add(profile_project_s, profile_project_start);
-            // Tree depth L draws from draft rows 1..q_len-1 (row 0 = the seed).
-            // Known limitation: branch descendants beyond depth 1 still come
-            // from one spine-conditioned block-draft forward, so a confident
-            // draft may not beat the chain.
-            DDTree tree = build_ddtree(top_lp.data() + (size_t)K, top_ids.data() + (size_t)K,
-                                       L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed);
-            const int N = cfg_.ddtree_budget + 1;   // fixed alloc width
+            // SpecLA schedules the retained topology directly. Never execute
+            // fake padding nodes: confidence pruning must reduce target work,
+            // and this loop already rebuilds the topology-dependent graph.
+            const int N = target->exact_fast_rollback()
+                ? 1 + tree.n_nodes
+                : (std::isfinite(cfg_.ddtree_tau)
+                    ? 1 + tree.n_nodes
+                    : cfg_.ddtree_budget + 1);
 
             std::vector<int32_t> flat_tokens((size_t)N, 0);
             flat_tokens[0] = last_tok;
@@ -2569,8 +3566,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
 
-            // Telemetry: accepted children (exclude the always-committed root).
-            n_accept_sum += std::max(0, accepted_emitted - 1);
+            // Seed-inclusive, like chain telemetry; exclude graph padding.
+            acceptance.record_tree(accepted_emitted, tree.n_nodes, need_commit_budget);
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
@@ -2693,7 +3690,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (can_commit_bonus) {
                 const int bonus_pos = committed + total_emitted;
                 std::vector<int32_t> bonus_vec(1, next_token);
-                if (!target->verify_batch(bonus_vec, bonus_pos, bonus_last_tok, nullptr)) {
+                // A delayed-state target must consume the accepted tree path
+                // inside this verify and capture the committed bonus as the
+                // next pending factor. A normal target has already materialized
+                // the tree rollback and may keep the ordinary writeback path.
+                const bool delayed_bonus = target->exact_fast_rollback();
+                if (!target->verify_batch(bonus_vec, bonus_pos, bonus_last_tok,
+                                          nullptr, delayed_bonus)) {
                     std::fprintf(stderr, "spec-decode: tree bonus replay failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
@@ -2706,6 +3709,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 if (bonus_logits.empty()) {
                     std::fprintf(stderr, "spec-decode: tree bonus logits empty\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                if (delayed_bonus && !target->rollback_to(bonus_pos, 1)) {
+                    std::fprintf(stderr,
+                        "spec-decode: tree bonus factor commit failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
                 }
@@ -2744,12 +3753,29 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             continue;
         }
 
+        // 3a-ter. Long-context verify cap. Drafting is done; trim the block
+        // we actually check. Hint injection below fills draft_tok[1..v_len-1],
+        // so it sees the capped width and stays consistent.
+        if (!ar_step && v_len > verify_cap) {
+            v_len = verify_cap;
+            if ((int)draft_tok.size() > verify_cap) {
+                draft_tok.resize((size_t)verify_cap);
+            }
+        }
+        if (!ar_step) {
+            const int feedback_width = width_controller.next_width(v_len);
+            if (feedback_width < v_len) {
+                v_len = feedback_width;
+                draft_tok.resize((size_t)v_len);
+            }
+        }
+
         // 3b. Tool call hint injection: override draft tokens with pre-known
         // structural tokens for near-100% acceptance.
         int hint_fill = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            hint_fill = std::min(hint_avail, q_len - 1);
+            hint_fill = std::min(hint_avail, v_len - 1);
             for (int i = 0; i < hint_fill; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }
@@ -2760,20 +3786,30 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("draft", draft_tok);
         }
 
-        // 4. Verify: snapshot KV, run target forward over draft tokens
-        if (!target->snapshot_kv()) {
+        // 4. Verify: snapshot KV, run target forward over draft tokens.
+        //    A plain-decode step verifies only the (always accepted) seed, so
+        //    it never rolls back: skip the snapshot copy — unless an armed
+        //    emit-phase hook could still force a restore+replay this step.
+        const bool step_has_snapshot = !ar_step || replay_hooks_armed;
+        const auto profile_snapshot_start = profile_start();
+        if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
             return false;
         }
+        profile_add(profile_snapshot_s, profile_snapshot_start);
 
         int verify_last_tok = -1;
+        const auto profile_verify_start = profile_start();
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
                                    /*capture_ssm_intermediates=*/true)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
-            target->restore_kv();
+            // Only restore when this step actually took the snapshot;
+            // otherwise the copy-back would be up to a whole burst stale.
+            if (step_has_snapshot) target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
+        profile_add(profile_verify_s, profile_verify_start);
         target_forwards++;
 
         // 5. Acceptance. Greedy: longest matching prefix between draft and
@@ -2784,22 +3820,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         int accept_n = 1;
         int bonus_tok = -1;
         if (sampled_verify) {
-            if (!target->read_verify_logits(q_len, verify_logits)) {
+            if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                target->restore_kv();
+                if (step_has_snapshot) target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            const int vocab_v = (int)(verify_logits.size() / (size_t)q_len);
+            const int vocab_v = (int)(verify_logits.size() / (size_t)v_len);
             static const bool kSvDebug = []() {
-                const char * e = std::getenv("DFLASH_SV_DEBUG");
+                const char * e = std::getenv("LUCE_SV_DEBUG");
                 return e != nullptr && std::string(e) == "1";
             }();
             if (kSvDebug) {
                 // Row-alignment check: CPU argmax over each bulk-read row must
                 // equal the GPU argmax (target_tok). Divergence = misaligned
                 // or stale bulk read.
-                for (int i = 0; i < q_len; i++) {
+                for (int i = 0; i < v_len; i++) {
                     const float * row = verify_logits.data() + (size_t)i * vocab_v;
                     int am = 0; float best = row[0];
                     for (int v = 1; v < vocab_v; v++)
@@ -2824,7 +3860,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             verify_history = out_tokens;
             verify_history.push_back(draft_tok[0]);
             bool mismatched = false;
-            for (int i = 0; i < q_len - 1; i++) {
+            for (int i = 0; i < v_len - 1; i++) {
                 const int s = sample_logits(
                     verify_logits.data() + (size_t)i * vocab_v, vocab_v,
                     sampler_, verify_history, sampler_rng_);
@@ -2845,11 +3881,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             (void)mismatched;
         } else {
-            for (int i = 0; i < q_len - 1; i++) {
+            for (int i = 0; i < v_len - 1; i++) {
                 if (draft_tok[i + 1] == target_tok[i]) accept_n++;
                 else break;
             }
-            bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+            bonus_tok = (accept_n < v_len) ? target_tok[accept_n - 1] : -1;
+        }
+        if (!ar_step) {
+            width_controller.observe(accept_n, v_len);
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
@@ -2874,7 +3913,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         int replay_last_tok = -1;
         bool fast_rolled_back = false;
-        if (use_fast_rollback) {
+        if (ar_step) {
+            // Seed-only verify: the recurrent state already sits after the
+            // one committed token; nothing to restore.
+            bonus_tok = -1;
+            commit_n = std::min(accept_n, need_commit_budget);
+            replay_last_tok = target_tok[commit_n - 1];
+            fast_rolled_back = true;
+        } else if (use_fast_rollback) {
             // Fast rollback: restore SSM from captured intermediates, skip replay.
             // Implicit bonus: target_tok[commit_n-1] seeds next draft as draft_tok[0],
             // always accepted on next step.
@@ -2883,14 +3929,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // budget (need_commit_budget), so committing accept_n would emit
             // more tokens than requested. commit_n was already clamped above.
             commit_n = std::min(accept_n, need_commit_budget);
-            if (target->rollback_to(committed, commit_n)) {
+            const auto profile_rollback_start = profile_start();
+            const bool rolled = target->rollback_to(committed, commit_n);
+            profile_add(profile_rollback_s, profile_rollback_start);
+            if (rolled) {
                 replay_last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
                 rollback_diag.record_fast_rollback(accept_n);
             } else {
-                // Rollback failed (CUDA error / unsupported state type). The
-                // pre-verify snapshot is still valid, so degrade to the legacy
-                // restore+replay path below instead of aborting the request.
+                if (!target->rollback_failure_is_recoverable()) {
+                    std::fprintf(stderr, "spec-decode: rollback_to failed after "
+                                         "an in-place commit attempt; aborting\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                // The pre-verify snapshot is still valid, so degrade to the
+                // legacy restore+replay path below.
                 std::fprintf(stderr, "spec-decode: rollback_to failed; "
                                      "falling back to restore+replay\n");
                 rollback_diag.record_failed_fallback();
@@ -2909,11 +3963,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             for (int i = 0; i < commit_n; i++) {
                 replay_batch[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
             }
+            const auto profile_replay_start = profile_start();
             if (!target->verify_batch(replay_batch, committed, replay_last_tok, nullptr)) {
                 std::fprintf(stderr, "spec-decode: replay failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            profile_add(profile_replay_s, profile_replay_start);
             target_forwards++;
         }
 
@@ -2930,10 +3986,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else if (feature_mirror_.target_feat && cache_.target_feat) {
+            const auto profile_feature_start = profile_start();
             if (!sync_local_draft_features(committed, commit_n)) {
                 step_graph_destroy(draft_sg);
                 return false;
             }
+            profile_add(profile_feature_s, profile_feature_start);
         }
 
         // 8. Emit committed tokens (stop at EOS)
@@ -2961,7 +4019,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                                      *stall_skip_tokens,
                                                      kSkipSequenceLookback));
                 if (can_inject_tool) {
-                    // Debug-only diagnostic, same DFLASH_MIN_TOKENS gating as the
+                    // Debug-only diagnostic, same LUCE_MIN_TOKENS gating as the
                     // AR-path floor log above; silent in the default lane.
                     FILE* _d = open_dflash_floor_log();
                     if (_d) {
@@ -3074,8 +4132,38 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
-        n_accept_sum += std::min(accept_n, emitted);
+        // Only speculative steps enter the accept-rate
+        // accounting; 1-token burst steps would otherwise dilute the rate
+        // that steers the PFlash residency bandit.
+        if (!ar_step) {
+            acceptance.record_chain(accept_n, v_len, emitted, need_commit_budget);
+        }
         n_draft_steps++;
+
+        // Adaptive policy update on real spec steps: EMA of accepted draft
+        // tokens (the seed is always accepted); a low EMA schedules a burst
+        // of plain-decode steps, the step after the burst is a spec probe.
+        if (adaptive.enabled()) {
+            const double t_step = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_step_start).count();
+            double & t_ema = ar_step ? t_ar_step_ema : t_spec_step_ema;
+            t_ema = (t_ema > 0.0) ? 0.9 * t_ema + 0.1 * t_step : t_step;
+        }
+        if (adaptive.enabled() && !ar_step) {
+            const float accepted_drafts = (float)std::max(0, accept_n - 1);
+            // A probe (first spec step after a burst) weighs its result
+            // heavily: it is the only evidence about the current text.
+            const float alpha = probe_step ? 0.5f : adaptive.ema_alpha;
+            accepted_ema = (1.0f - alpha) * accepted_ema + alpha * accepted_drafts;
+            probe_step = false;
+            // A plain-decode burst commits greedy argmax tokens without
+            // passing through the sampler chain, so bursts stay off under
+            // sampled-verify to keep its output-distribution guarantee.
+            if (!sampled_verify &&
+                accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
+                ar_burst_left = adaptive.burst;
+            }
+        }
 
         // Notify observer with accepted tokens for this step.
         if (io.observer) {
@@ -3086,15 +4174,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
+            if (!finish_speculative_state()) return false;
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
@@ -3129,15 +4217,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
+                if (!finish_speculative_state()) return false;
                 log_target_forward_stats();
                 io.emit(-1);
                 return true;
             }
+            if (!finish_speculative_state()) return false;
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
             tail_hook.close_token_ids.clear();
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
@@ -3150,19 +4238,28 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (hit_eos) break;
     }
 
+    if (!finish_speculative_state()) {
+        step_graph_destroy(draft_sg);
+        return false;
+    }
     step_graph_destroy(draft_sg);
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-    out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
+    const double accept_pct = 100.0 * acceptance.rate();
+    out_accept_rate = acceptance.rate();
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
-                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
+                 n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
+    if (n_ar_burst_steps > 0) {
+        std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "
+                             "(step ratio %.2f, accept threshold %.2f drafts/step, burst %d)\n",
+                     n_ar_burst_steps, n_draft_steps, live_step_ratio(),
+                     adaptive.accept_threshold(live_step_ratio()), adaptive.burst);
+    }
     if (tp_profile) {
         std::fprintf(stderr,
             "[spec-profile] draft=%.3fs project=%.3fs snapshot=%.3fs "
@@ -3193,4 +4290,4 @@ int Qwen35Backend::verify_tree(int committed, const DDTree & tree) {
     return 0;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

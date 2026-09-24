@@ -1,5 +1,7 @@
 #include "moe_hybrid_storage.h"
 #include "moe_hybrid_types.h"
+#include "moe_source_page_range.h"
+#include "copied_source_reclaim.h"
 
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
@@ -9,8 +11,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <cerrno>
+#include <cstdio>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
@@ -26,18 +33,51 @@
 #include <windows.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
+
+namespace {
+
+void advise_copied_source(const void * mapping, size_t mapping_size,
+                          const ExpertTensorFileData & tensor, int layer, int source_fd) {
+    reclaim_copied_file_source(mapping, mapping_size, tensor.data, tensor.size,
+                               source_fd, "expert", layer);
+}
+
+void unregister_mix_tensor(ggml_tensor * tensor) {
+    if (!tensor || !tensor->data) return;
+
+    if (tensor->type == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        ggml_cuda_rocmfp3_mix_unregister(tensor->data);
+    } else if (tensor->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+        ggml_cuda_rocmfp2_mix_unregister(tensor->data);
+    }
+}
+
+}  // namespace
+
+void MoeHybridStorage::unregister_mix_tensors() {
+    for (MoeHybridLayerStorage & layer : layers) {
+        unregister_mix_tensor(layer.gate_hot);
+        unregister_mix_tensor(layer.up_hot);
+        unregister_mix_tensor(layer.down_hot);
+        unregister_mix_tensor(layer.gate_up_hot);
+        unregister_mix_tensor(layer.gate_cold);
+        unregister_mix_tensor(layer.up_cold);
+        unregister_mix_tensor(layer.down_cold);
+        unregister_mix_tensor(layer.gate_up_cold);
+    }
+}
 
 static bool duplicate_hot_experts_on_cold_gpu() {
     static const bool enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_DUPLICATE_HOT_ON_COLD");
+        const char * raw = std::getenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
 }
 
 int query_gpu_compute_sm() {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) return 0;
     cudaDeviceProp prop{};
@@ -148,7 +188,25 @@ static ggml_tensor * new_like_with_expert_count(ggml_context * ctx, ggml_tensor 
 
 } // namespace
 
+void MoeHybridStorage::release_graph_caches() {
+    for (auto & layer : layers) {
+        layer.hot_graph.free();
+        layer.cold_graph.free();
+        for (auto & graph : layer.hot_graph_by_width) graph.free();
+        for (auto & graph : layer.cold_graph_by_width) graph.free();
+        layer.hot_graph_by_width.clear();
+        layer.cold_graph_by_width.clear();
+        layer.hot_batched_graph.free();
+        for (auto & graph : layer.hot_batched_mixed) graph.free();
+        for (auto & graph : layer.cold_batched_mixed) graph.free();
+        layer.shared_batched_graph.free();
+    }
+}
+
 MoeHybridStorage::~MoeHybridStorage() {
+    // Registry entries point into the owner buffers, so remove them before the
+    // buffers can be released or their addresses reused.
+    unregister_mix_tensors();
     if (prefill_route_alloc) {
         ggml_gallocr_free(prefill_route_alloc);
         prefill_route_alloc = nullptr;
@@ -161,17 +219,8 @@ MoeHybridStorage::~MoeHybridStorage() {
         ggml_gallocr_free(prefill_cold_alloc);
         prefill_cold_alloc = nullptr;
     }
+    release_graph_caches();
     for (auto & layer : layers) {
-        layer.hot_graph.free();
-        layer.cold_graph.free();
-        for (auto & graph : layer.hot_graph_by_width) graph.free();
-        for (auto & graph : layer.cold_graph_by_width) graph.free();
-        layer.hot_graph_by_width.clear();
-        layer.cold_graph_by_width.clear();
-        layer.hot_batched_graph.free();
-        for (auto & g : layer.hot_batched_mixed) g.free();
-        for (auto & g : layer.cold_batched_mixed) g.free();
-        layer.shared_batched_graph.free();
         if (layer.hot_buf) {
             ggml_backend_buffer_free(layer.hot_buf);
             layer.hot_buf = nullptr;
@@ -219,7 +268,8 @@ bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
            (int)layers.size() == cfg.n_layer &&
            cold_backend_kind == cfg.cold_expert_backend &&
            materialized_hot_experts == cfg.materialize_hot_experts &&
-           materialized_cold_experts == cfg.materialize_cold_experts;
+           materialized_cold_experts == cfg.materializes_cold_experts() &&
+           mixed_mmq_policy == cfg.mixed_mmq_policy;
 }
 
 bool MoeHybridStorage::empty() const {
@@ -252,11 +302,18 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
-    out.materialized_cold_experts = cfg.materialize_cold_experts;
-    out.cold_backend = cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
-        ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
-        : out.cpu_backend;
-    if (!out.cold_backend) {
+    out.mixed_mmq_policy = cfg.mixed_mmq_policy;
+    out.materialized_cold_experts = cfg.materializes_cold_experts();
+    // Cold owner None (cluster expert-parallel): non-resident routes are
+    // reduced by another process, so there is no cold backend, no cold
+    // buffer and no cold expert map on this side.
+    const bool no_cold_owner =
+        cfg.cold_expert_backend == MoeHybridColdBackend::None;
+    out.cold_backend = no_cold_owner ? nullptr
+        : cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
+            ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
+            : out.cpu_backend;
+    if (!out.cold_backend && !no_cold_owner) {
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
@@ -294,12 +351,16 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
-        for (int expert = 0; expert < cfg.n_expert; ++expert) {
-            if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
-                dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
-                dst.cold_expert_ids.push_back((int32_t)expert);
+        dst.decode_hot_local_by_global = dst.hot_local_by_global;
+        if (!no_cold_owner) {
+            for (int expert = 0; expert < cfg.n_expert; ++expert) {
+                if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
+                    dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
+                    dst.cold_expert_ids.push_back((int32_t)expert);
+                }
             }
         }
+        dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
         // Populate the model-sized VRAM bitmask from hot expert IDs.
         dst.reset_expert_vram_mask(cfg.n_expert);
@@ -370,7 +431,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (cold_count > 0 && cfg.materialize_cold_experts) {
+        if (cold_count > 0 && cfg.materializes_cold_experts()) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -443,7 +504,10 @@ bool build_moe_hybrid_storage_from_file(
     std::string * err,
     int cache_slots,
     bool allocate_cold,
-    ggml_backend_t cold_gpu_backend) {
+    ggml_backend_t cold_gpu_backend,
+    const void * readonly_file_mmap,
+    size_t readonly_file_mmap_size,
+    int readonly_file_fd) {
 
     if (!placement.matches(cfg)) {
         if (err) *err = "placement does not match config";
@@ -464,11 +528,18 @@ bool build_moe_hybrid_storage_from_file(
     ggml_backend_cpu_set_n_threads(out.cpu_backend, std::max(1, std::min(cfg.n_expert_used, 8)));
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
-    out.materialized_cold_experts = cfg.materialize_cold_experts;
-    out.cold_backend = cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
-        ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
-        : out.cpu_backend;
-    if (!out.cold_backend) {
+    out.mixed_mmq_policy = cfg.mixed_mmq_policy;
+    out.materialized_cold_experts = cfg.materializes_cold_experts();
+    // Cold owner None (cluster expert-parallel): non-resident routes are
+    // reduced by another process, so there is no cold backend, no cold
+    // buffer and no cold expert map on this side.
+    const bool no_cold_owner =
+        cfg.cold_expert_backend == MoeHybridColdBackend::None;
+    out.cold_backend = no_cold_owner ? nullptr
+        : cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
+            ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
+            : out.cpu_backend;
+    if (!out.cold_backend && !no_cold_owner) {
         if (err) *err = "failed to select cold expert backend";
         return false;
     }
@@ -507,7 +578,8 @@ bool build_moe_hybrid_storage_from_file(
             dst.hot_local_by_global[(size_t)expert] = (int32_t)i;
             is_hot[(size_t)expert] = 1;
         }
-        if (allocate_cold) {
+        dst.decode_hot_local_by_global = dst.hot_local_by_global;
+        if (allocate_cold && !no_cold_owner) {
             for (int expert = 0; expert < cfg.n_expert; ++expert) {
                 if (duplicate_hot_on_cold || !is_hot[(size_t)expert]) {
                     dst.cold_local_by_global[(size_t)expert] = (int32_t)dst.cold_expert_ids.size();
@@ -515,6 +587,7 @@ bool build_moe_hybrid_storage_from_file(
                 }
             }
         }
+        dst.decode_cold_local_by_global = dst.cold_local_by_global;
 
         // Populate the model-sized VRAM bitmask from hot expert IDs.
         dst.reset_expert_vram_mask(cfg.n_expert);
@@ -595,7 +668,7 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (allocate_cold && cold_count > 0 && cfg.materialize_cold_experts) {
+        if (allocate_cold && cold_count > 0 && cfg.materializes_cold_experts()) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -647,6 +720,21 @@ bool build_moe_hybrid_storage_from_file(
                     return false;
                 ggml_backend_tensor_set(dst.down_cold, slice_buf.data(), 0, slice_buf.size());
             }
+        }
+        // Only the mmap-retaining wrapper supplies proven file-mapping bounds.
+        // All synchronous hot/cold uploads have returned, and both temporary
+        // slice buffers are gone. Retain the mapping for future streaming reads.
+        if (readonly_file_mmap && readonly_file_fd >= 0 && moe_source_pageout_eligible(
+                out.cold_backend_kind == MoeHybridColdBackend::Gpu,
+                cfg.materialize_hot_experts, cfg.materializes_cold_experts(),
+                allocate_cold && cold_count > 0 && dst.cold_buf != nullptr)) {
+            if (dst.fused_gate_up) {
+                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_up_exps, il, readonly_file_fd);
+            } else {
+                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_exps, il, readonly_file_fd);
+                advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.up_exps, il, readonly_file_fd);
+            }
+            advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.down_exps, il, readonly_file_fd);
         }
     }
 
@@ -745,12 +833,13 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     MoeHybridStorage & out,
     std::string * err,
     int cache_slots,
-    ggml_backend_t cold_gpu_backend) {
+    ggml_backend_t cold_gpu_backend,
+    int readonly_file_fd) {
 
     // First build storage normally (hot GPU + cold CPU buffers).
     if (!build_moe_hybrid_storage_from_file(
             cfg, gpu_backend, placement, layer_descs, file_data,
-            out, err, cache_slots, true, cold_gpu_backend)) {
+            out, err, cache_slots, true, cold_gpu_backend, mmap_base, mmap_total_size, readonly_file_fd)) {
         return false;
     }
 
@@ -794,4 +883,4 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

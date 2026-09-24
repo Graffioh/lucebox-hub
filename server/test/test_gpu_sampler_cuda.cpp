@@ -1,9 +1,9 @@
 // Correctness tests for geometric_sample_logits_cuda (src/common/geometric_sampler_cuda.cu)
 // vs the CPU sample_logits chain (src/common/sampler.h/.cpp). CUDA only — the GPU
-// sampler is compiled into dflash_common solely on the cuda backend (DFLASH_GPU_SAMPLER,
+// sampler is compiled into luce_common solely on the cuda backend (LUCE_GPU_SAMPLER,
 // default ON). All tests self-skip at runtime when no CUDA device is present.
 //
-// Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS (CUDA only).
+// Build: registered in server/CMakeLists.txt under LUCE_TESTS (CUDA only).
 // Run:   ./test_gpu_sampler_cuda   (exit 0 = pass, non-zero = fail)
 
 #include "CppUnitTestFramework.hpp"
@@ -12,6 +12,8 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <thread>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -21,7 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct GpuSamplerCudaFixture {};
@@ -271,7 +273,7 @@ TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_modal_token_matches_cpu) {
     TEST_ASSERT_MSG(modal(true) == modal(false), "GPU and CPU agree on the modal token");
 }
 
-// Per-call latency microbench (gated by env DFLASH_SAMPLER_BENCH=1). Isolates
+// Per-call latency microbench (gated by env LUCE_SAMPLER_BENCH=1). Isolates
 // the three regimes that explain the end-to-end numbers: the CPU chain, the GPU
 // path fed host logits (pays a full-vocab H2D every call), and the GPU path fed
 // a device pointer (the integrated path that skips the copy).
@@ -331,8 +333,48 @@ static void gpu_sampler_microbench() {
 }
 
 TEST_CASE(GpuSamplerCudaFixture, gpu_sampler_microbench_when_enabled) {
-    if (const char * b = std::getenv("DFLASH_SAMPLER_BENCH"); b && b[0] == '1') {
+    if (const char * b = std::getenv("LUCE_SAMPLER_BENCH"); b && b[0] == '1') {
         gpu_sampler_microbench();
     }
     CHECK(true);
+}
+
+TEST_CASE(GpuSamplerCudaFixture, independent_workers_sample_distinct_logits) {
+    if (!gpu_sampler_test_available()) return;
+    int devices = 0;
+    CHECK(cudaGetDeviceCount(&devices) == cudaSuccess);
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    bool ok[2] = {true, true};
+    auto worker = [&](int id) {
+        ++ready;
+        while (!go.load()) std::this_thread::yield();
+        for (int i = 0; i < 32; ++i) {
+            const int device = (i + id) % (devices > 1 ? 2 : 1);
+            if (cudaSetDevice(device) != cudaSuccess) { ok[id] = false; break; }
+            const int vocab = 1024 + (i % 3) * 1024;
+            const int expected = id * 100 + i;
+            std::vector<float> logits(vocab, -100.0f);
+            logits[expected] = 100.0f;
+            SamplerCfg cfg;
+            cfg.temp = 0.0f;
+            cfg.top_k = 0;
+            cfg.top_p = 1.0f;
+            const int token = geometric_sample_logits_cuda(
+                logits.data(), vocab, cfg, {}, 0.5, false);
+            if (token != expected) ok[id] = false;
+            cfg.temp = 1.0f;
+            std::vector<float> probs(vocab);
+            if (!geometric_compute_probs_cuda(logits.data(), vocab, cfg, {},
+                                              probs.data(), false) || probs[expected] < 0.999f)
+                ok[id] = false;
+        }
+    };
+    std::thread a(worker, 0), b(worker, 1);
+    while (ready.load() != 2) std::this_thread::yield();
+    go = true;
+    a.join();
+    b.join();
+    CHECK(ok[0]);
+    CHECK(ok[1]);
 }

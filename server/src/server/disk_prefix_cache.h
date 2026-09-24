@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
@@ -45,8 +45,8 @@ struct DiskPrefixCachePolicy {
     DiskPrefixCacheMode mode = DiskPrefixCacheMode::Full;
     int fixed_tokens = 0;
     int auto_window = 30;
-    // When true: compose with FlowKV aged-history compression.
-    // compress=false (default) → byte-identical to pr364-base behaviour.
+    // When true, clamp FlowKV disk snapshots to its stable system prefix.
+    // False preserves the operator-selected disk-cache scope.
     bool compress = false;
 };
 
@@ -62,6 +62,14 @@ bool parse_disk_prefix_cache_policy(const std::string & value,
 bool apply_request_scope_override(DiskPrefixCachePolicy & server_policy,
                                   const std::string & scope_str);
 
+// Prefix lengths a "full" policy lookup probes: the whole prompt, then every
+// chat boundary deepest first. Those are the only lengths this policy ever
+// persists (exact prompts, inline snapshots, cold prefixes).
+std::vector<int> disk_prefix_cache_full_lookup_lengths(
+    int prompt_len,
+    const std::vector<int> & boundaries,
+    int min_tokens);
+
 int disk_prefix_cache_fixed_boundary(const DiskPrefixCachePolicy & policy,
                                      int full_len,
                                      int min_tokens = 1);
@@ -76,7 +84,7 @@ int disk_prefix_cache_auto_boundary(
 
 struct DiskCacheHeader {
     char     magic[4];          // "DKVC"
-    uint32_t version;           // 1
+    uint32_t version;           // DISK_CACHE_VERSION
     uint8_t  layout_id[16];    // SHA-1 truncated: tensor structure fingerprint
     uint32_t cur_pos;
     uint32_t n_tensors;
@@ -92,7 +100,7 @@ struct DiskCacheHeader {
 // to avoid alignment/packing issues. The on-disk size is exactly 80 bytes.
 
 static constexpr size_t DISK_CACHE_HEADER_SIZE = 80;
-static constexpr uint32_t DISK_CACHE_VERSION = 1;
+static constexpr uint32_t DISK_CACHE_VERSION = 2;
 
 // ─── Tensor table entry (on-disk) ──────────────────────────────────────
 
@@ -222,4 +230,4 @@ private:
     static bool read_header(FILE * f, DiskCacheHeader & hdr);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

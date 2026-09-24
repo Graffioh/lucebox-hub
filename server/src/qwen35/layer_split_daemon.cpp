@@ -5,6 +5,7 @@
 #include "internal.h"
 #include "io_utils.h"
 #include "qwen35_layer_split_dflash_target.h"
+#include "prefill_helpers.h"
 #include "common/dflash_spec_decode.h"
 
 #include <algorithm>
@@ -12,7 +13,7 @@
 #include <cstdlib>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool run_qwen35_layer_split_request(
         std::vector<Qwen35LayerSplitShard> & shards,
@@ -36,10 +37,8 @@ bool run_qwen35_layer_split_request(
         return false;
     }
 
-    int ubatch = (prompt.size() > 2048) ? 384 : 16;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        ubatch = std::max(1, std::atoi(s));
-    }
+    const int ubatch = qwen35_prefill_ubatch(
+        (prompt.size() > 2048) ? 384 : 16);
     int last_tok = -1;
     if (!run_qwen35_layer_split_forward(shards, shards.front().weights,
                                         prompt, 0, ubatch, last_tok,
@@ -87,4 +86,4 @@ bool run_qwen35_layer_split_request(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

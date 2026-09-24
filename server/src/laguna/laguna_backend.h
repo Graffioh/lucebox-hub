@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LagunaBackendArgs {
     std::string target_path;
@@ -56,7 +56,7 @@ struct LagunaDraftVariant {
 
 class LagunaBackend : public ModelBackend {
 public:
-    explicit LagunaBackend(const LagunaBackendArgs & args);
+    explicit LagunaBackend(LagunaBackendArgs args);
     ~LagunaBackend() override;
 
     // Initialise CUDA backend, load weights, create cache.
@@ -111,13 +111,13 @@ private:
     std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init on first spec
-    // decode; kill with DFLASH_DRAFT_KV=0). Replaces the per-step full-window
+    // decode; kill with LUCE_DRAFT_KV=0). Replaces the per-step full-window
     // K/V recompute once the feature window fills.
     DraftKvState                                draft_kv_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
     bool                                        draft_parked_ = false;
-    // [TAG_LAGUNA_VERIFY_WIDTH] EWMA of the accepted block length, persisted
-    // across requests. Drives the AUTO chain verify width (seeded for width 3).
+    // [TAG_LAGUNA_VERIFY_WIDTH] Legacy accepted-length EWMA. Keep this as the
+    // default AUTO policy; the shared per-step controller is explicitly opt-in.
     double                                      spec_ewma_accept_ = 1.5;
 
     // PFlash drafter (lazy-loaded on first compress command).
@@ -168,7 +168,7 @@ private:
     void kvflash_resolve_drafter();
     bool kvflash_scorer_expected() const { return !kvflash_drafter_path_.empty(); }
     KvFlashAutoBudget make_kvflash_budget(int64_t gpu_free) const;
-    // Read DFLASH_KVFLASH and round/clamp; call before cache creation.
+    // Read LUCE_KVFLASH and round/clamp; call before cache creation.
     void kvflash_read_config();
     // Attach the pager to the freshly created cache (init / unpark).
     bool kvflash_attach();
@@ -188,7 +188,8 @@ private:
     GenerateResult generate_hybrid(const GenerateRequest & req, const DaemonIO & io);
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,
-                                  int32_t & argmax_out);
+                                  int32_t & argmax_out,
+                                  std::vector<float> * out_logits = nullptr);
     void maybe_post_request_swap();
 
     bool load_decode_draft();
@@ -203,4 +204,4 @@ private:
                         const std::vector<int32_t> * sample_history_prefix = nullptr);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

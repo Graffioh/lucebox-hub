@@ -252,6 +252,10 @@
 #define GGML_ROPE_TYPE_MROPE  8
 #define GGML_ROPE_TYPE_VISION 24
 #define GGML_ROPE_TYPE_IMROPE 40 // binary: 101000
+// Lucebox: rotate the LAST n_dims of each row (NORMAL pairing) and pass the
+// leading ne0 - n_dims through unchanged, so a tail-rotary head (DeepSeek4)
+// is one launch instead of split, rotate, and concat. Combine with NORMAL only.
+#define GGML_ROPE_TYPE_TAIL   64
 
 #define GGML_MROPE_SECTIONS   4
 
@@ -616,6 +620,12 @@ extern "C" {
         GGML_OP_MUL_MAT_GROUPED_SRC,
 
         GGML_OP_PAGED_ATTN,
+
+        GGML_OP_MUL_MAT_BIAS_BF16, // explicit HIP-only DS4V fused bias
+        GGML_OP_RMS_NORM_VISION_F32, // inference-only HIP source-order DS4V normalization
+        GGML_OP_SOFT_MAX_VISION_F32, // inference-only HIP source-order DS4V softmax
+        GGML_OP_MUL_MAT_VISION_AV_F32, // inference-only HIP source-layout DS4V AV
+        GGML_OP_DS4_MOE_COMBINE,
 
         GGML_OP_COUNT,
     };
@@ -1418,6 +1428,28 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    // HIP wave32 only: contiguous F32 [1024, rows], 16 <= rows <= INT_MAX/1024.
+    // Input values must be BF16-representable. Returns normalized F32 before
+    // weight multiplication and BF16 rounding; preserves the DS4V source order.
+    GGML_API struct ggml_tensor * ggml_rms_norm_vision_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 eps);
+
+    // Inference-only HIP wave32 operations; no CPU/RPC/backward implementation.
+    // scores: contiguous F32, width 16..4096, positive rows, total bytes <= INT_MAX.
+    GGML_API struct ggml_tensor * ggml_soft_max_vision_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * scores);
+
+    // v: contiguous F32 [64,16,N,1], probabilities: contiguous F32 [N,N,16,1].
+    // N is 16..4096; result is F32 [64,N,16,1].
+    GGML_API struct ggml_tensor * ggml_mul_mat_vision_av_f32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * probabilities);
+
+
     // group normalize along ne0*ne1*n_groups
     // used in stable-diffusion
     GGML_API struct ggml_tensor * ggml_group_norm(
@@ -1455,6 +1487,14 @@ extern "C" {
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
+    // Explicit inference-only BF16 W[k,m], X[k,n], optional bias[m] -> BF16 Y[m,n].
+    // Null bias selects the default Lt epilogue without a bias pointer. A present
+    // bias, including an all-zero vector, selects the fused bias epilogue.
+    // Contiguous 2D operands only; HIP Lt capability required, no fallback.
+    GGML_API struct ggml_tensor * ggml_mul_mat_bias_bf16(
+            struct ggml_context * ctx, struct ggml_tensor * weight,
+            struct ggml_tensor * input, struct ggml_tensor * bias);
+
     GGML_API struct ggml_tensor * ggml_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1482,6 +1522,21 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // Per-operation policy for learned mixed-ROCmFP MMQ. DEFAULT preserves
+    // backend/user policy; ENABLED and DISABLED are graph-local overrides.
+    // Other qtypes and non-MMQ backends are unaffected. Stored in op_params
+    // so scheduler copies and graph replay retain the model's decision.
+    enum ggml_mixed_mmq_policy {
+        GGML_MIXED_MMQ_DEFAULT = 0,
+        GGML_MIXED_MMQ_DISABLED = 1,
+        GGML_MIXED_MMQ_ENABLED = 2,
+    };
+
+    GGML_API void ggml_mul_mat_set_mixed_mmq(
+            struct ggml_tensor * op, enum ggml_mixed_mmq_policy policy);
+    GGML_API enum ggml_mixed_mmq_policy ggml_mul_mat_get_mixed_mmq(
+            const struct ggml_tensor * op);
 
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
@@ -1738,6 +1793,15 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // As ggml_set_rows, but negative row ids are ignored. Intended for
+    // fixed-shape graph buckets whose padding rows must not update state.
+    // Backends that do not implement masking must report this op unsupported.
+    GGML_API struct ggml_tensor * ggml_set_rows_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -1797,6 +1861,16 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale,
             float                 max_bias);
+
+    // Lucebox: softmax over [a | sink] per row with the sink as a virtual last
+    // column, scale folded in (a*scale), no mask. sinks holds one value per row
+    // of a (ne[0] == ggml_nrows(a)). Bit-identical to scale -> concat(sink) ->
+    // soft_max -> view, in one launch with a contiguous result of a's shape.
+    GGML_API struct ggml_tensor * ggml_soft_max_ext_sink_col(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * sinks,
+            float                 scale);
 
     GGML_API void ggml_soft_max_add_sinks(
             struct ggml_tensor * a,
@@ -2420,6 +2494,37 @@ extern "C" {
             int                  keep_rows,
             int                  block_size);
 
+    // Attach the exact DS4 compressed-row selection directly to flash
+    // attention. selected is I32 [keep_rows,n_batch] and indexes the
+    // compressed span (that is, rows after raw_rows). The DS4 HIP kernel sorts
+    // these score-ordered indices into physical-row order before reduction so
+    // the numerical topology stays identical to the mask-derived path.
+    GGML_API void ggml_flash_attn_ext_set_ds4_indexer_topk(
+            struct ggml_tensor * a,
+            struct ggml_tensor * selected);
+
+    // Present a logical DS4 KV sequence as three contiguous row segments
+    // without materializing their concatenation. Requires K and V to be the
+    // same tensor (MLA latent KV); only the split-KV decode kernel consumes it. `a` keeps the raw segment in
+    // src[1]/src[2]; `compressed` and `preserved_tail` (K's type and D,
+    // contiguous [D, rows]) are appended in that order and stored in
+    // src[7]/src[8]. Row indices, the mask width and the raw-row count in
+    // op_params address the concatenated sequence. Only the native D=512
+    // CUDA/HIP split-KV decode kernel (indexed mask, n_tokens <= 8) consumes
+    // the segments; no other backend or shape implements them.
+    GGML_API void ggml_flash_attn_ext_set_ds4_kv_segments(
+            struct ggml_tensor * a,
+            struct ggml_tensor * compressed,
+            struct ggml_tensor * preserved_tail);
+
+    // Mark a maskless DS4 layer-major attention op whose raw and compressed
+    // rows have monotonic causal frontiers. A value of 1 denotes raw-only
+    // sliding-window attention; values greater than 1 are the compression
+    // ratio of the contiguous compressed interval.
+    GGML_API void ggml_flash_attn_ext_set_ds4_causal_ratio(
+            struct ggml_tensor * a,
+            int                  ratio);
+
     // Fuse DS4's inverse 64-d tail RoPE into the D=512 flash-attention
     // writeback. q_unrotated additionally asks the kernel to apply the forward
     // tail RoPE to Q from shared F32. This is exact-only plumbing: both paths
@@ -2436,6 +2541,13 @@ extern "C" {
             float                beta_slow,
             int                  n_ctx_orig,
             bool                 q_unrotated);
+
+    // Optional runtime positions for both fused RoPE directions. I32 [n_query]
+    // replaces kv_start + query_index, allowing a cached graph to advance
+    // without rebuilding its topology or retaining stale position constants.
+    GGML_API void ggml_flash_attn_ext_set_ds4_rope_positions(
+            struct ggml_tensor * a,
+            struct ggml_tensor * positions);
 
     // True when flash_attn_ext carries the DS4 sparse-layout or fused-RoPE
     // contract. Backends must implement that complete contract or reject it.
@@ -2475,16 +2587,61 @@ extern "C" {
     // block_table[t/block_size, seq]*block_size + t%block_size.
     // The initial CUDA/HIP implementation supports D=256 and independently
     // typed F16, Q4_0, or Q8_0 K/V pools.
-    GGML_API struct ggml_tensor * ggml_paged_attn(
+    // active_slot_ids optionally maps compact query rows to physical block-
+    // table columns / length entries. A negative id is a padding row and
+    // produces a zero attention output. NULL selects row identity.
+    // query_positions optionally carries per-row inclusive causal positions
+    // (I32 [n_query], requires active_slot_ids): row i attends the first
+    // min(kv_seq_len, positions[i]+1) cached tokens of its sequence, so
+    // prefill chunks can attend the paged pool causally. A negative position
+    // marks a padding row. NULL keeps the decode semantics (full cached
+    // length per row).
+    //
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
             struct ggml_tensor  * block_table,
             struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
             int                   max_kv_seq_len);
+
+    // Packed tree verification over the same paged K/V pool.
+    // In a pure-tree batch, queries are flattened sequence-major and tree
+    // sequence s occupies rows [s*tree_width, (s+1)*tree_width). In a mixed
+    // AR/tree batch, the compact AR rows come first. Tree sequence s starts at
+    // ar_rows + s*tree_width, where
+    // ar_rows = q_rows - n_tree_seq*tree_width. parent_ids is tree-local,
+    // contiguous I32 [tree_width, n_tree_seq] (root parent -1), and tree_sizes
+    // is contiguous I32 [n_tree_seq]. active_slot_ids is required per query row;
+    // it selects the physical block-table column and scratch slab. Each live
+    // query attends its complete committed prefix from the block table plus
+    // its own candidate node and ancestors from physical K/V rows
+    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
+    // at or beyond tree_sizes[s] are excluded. query_positions may describe
+    // compact autoregressive rows in a mixed AR/tree batch; tree rows ignore
+    // it and read the full committed prefix. Pure tree batches pass NULL.
+    // tree_width is derived from parent_ids.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * tree_sizes,
+            int                   tree_scratch_base,
+            int                   tree_scratch_stride);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
@@ -2504,7 +2661,24 @@ extern "C" {
         GGML_MOE_FUSED_DEFERRED_PEER_COPY = -3,
         GGML_MOE_FUSED_OWNER_SPLIT        = -4,
         GGML_MOE_FUSED_ALIGN_IDS          = -5,
+        GGML_MOE_FUSED_BALANCED_OWNER_IDS = -6,
+        GGML_MOE_FUSED_CLUSTER_ALLREDUCE  = -7,
     };
+
+    // Word offsets in ggml_tensor::op_params for the in-graph collective.
+    // Both pointers start at naturally aligned 64-bit boundaries.
+    enum ggml_moe_fused_cluster_allreduce_param {
+        GGML_MOE_FUSED_CLUSTER_ALLREDUCE_FN_WORD   = 2,
+        GGML_MOE_FUSED_CLUSTER_ALLREDUCE_USER_WORD = 4,
+    };
+
+    // Sums `n` float elements at `data` element-wise across the caller's
+    // process group, in place, enqueued on `stream` (cudaStream_t /
+    // hipStream_t as an opaque pointer). ggml deliberately does not know how
+    // the sum is produced: the caller registers this callback, so no
+    // collective library becomes a ggml dependency.
+    typedef void (*ggml_cluster_allreduce_fn)(void * user, void * data,
+                                              size_t n, void * stream);
 
     // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
     // Both pointers start at naturally aligned 64-bit boundaries.
@@ -2529,6 +2703,18 @@ extern "C" {
             int64_t               n_embd,
             int64_t               ff_dim,
             int64_t               n_expert_used);
+
+    // In-graph collective: `a` is summed element-wise across the process
+    // group and the sum becomes this node's value. The collective is enqueued
+    // on the executing backend's own stream, so it is ordered after the
+    // kernels that produced `a` and before the kernels that consume the
+    // result, without a host synchronization. GPU backends only; `a` must be
+    // contiguous F32.
+    GGML_API struct ggml_tensor * ggml_cluster_allreduce(
+            struct ggml_context     * ctx,
+            struct ggml_tensor      * a,
+            ggml_cluster_allreduce_fn fn,
+            void                    * user);
 
     GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
             struct ggml_context * ctx,
@@ -2573,6 +2759,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * expert_ids);
 
+    // Map global route IDs directly to one owner's compact expert stack while
+    // assigning a batch-wide main-resident quota encoded as four times the
+    // desired routes per token. The peer owner receives the exact complement.
+    // This fuses the former repeated-LUT lookup and route masking chain into
+    // one small device-local operation.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_balanced_owner_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * global_ids,
+            struct ggml_tensor  * router_weights,
+            struct ggml_tensor  * local_id_lut,
+            struct ggml_tensor  * main_candidate_lut,
+            int                   main_slots_x4,
+            bool                  main_owner);
+
     // Copy an F32 peer-GPU tensor only after a scheduler-provided device event
     // has completed. The scheduler writes the native event handle into the op
     // parameters and deliberately leaves src on its owner backend.
@@ -2608,7 +2808,8 @@ extern "C" {
 
     // Exact mode-1 variant for heterogeneous MoE verification. It computes
     // block_out[d] = peer_block[d] + main_block[d] inside the HC-post kernel,
-    // eliminating the standalone reduction and tokenwise CONT copies.
+    // eliminating the standalone reduction and tokenwise CONT copies. All
+    // non-base tensors may carry the same n_tokens second dimension.
     GGML_API struct ggml_tensor * ggml_ds4_hc_post_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * residual_hc,
@@ -2668,6 +2869,14 @@ extern "C" {
             struct ggml_tensor  * selected,
             int                   raw_rows);
 
+    // Direct AST Fused MoE Combine Epilogue: down_e[n_embd, n_used, n_tokens] +
+    // weights[n_used, n_tokens] + shared_out[n_embd, n_tokens] -> dst[n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down_e,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * shared_out);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2695,6 +2904,78 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
+
+    // dflash extension: fused causal-conv step for recurrent decode/verify.
+    // Replaces transpose + concat(state, x) + ssm_conv + silu + state
+    // write-back with one kernel.
+    //   x:              [C, T, S] f32, rows contiguous (token stride may be
+    //                   larger than C, e.g. a row-slice of a stacked GEMV)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, S] f32 history; READ, then OVERWRITTEN in
+    //                   place with the last K-1 conv inputs
+    //   conv_input_out: optional [>= K-1+T, C, S] f32; receives the full
+    //                   conv window (history rows then x rows) per channel,
+    //                   for speculative-decode rollback. May be a view.
+    // Returns silu(conv(x)) as [C, T, S]. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * conv_input_out);
+
+    // dflash extension: tree-window conv step for concurrent speculative
+    // verify. Replaces gather(conv_state) + transpose + concat + tree conv
+    // with one kernel that leaves the persistent history untouched.
+    //   x:              [C, T, S] f32, rows contiguous (strided token axis ok)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, n_slots] f32 persistent history, READ ONLY
+    //   state_slot_ids: [S] i32, the slab each sequence starts from
+    //                   (negative ids read a zero history)
+    //   parent_ids:     [T, S] i32 tree parents, as ggml_ssm_conv_tree
+    // The packed f32 result holds silu(conv) as [C, T, S] at offset 0 and
+    // the assembled window [K-1+T, C, S] (history rows then x rows, the
+    // layout the replay-log commit reads) at element offset C*T*S; view both
+    // out of it. Bit-identical to the op-by-op form. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tree_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * state_slot_ids,
+            struct ggml_tensor  * parent_ids);
+
+    // dflash2 grouped dynamic block conv (draft graph), one fused node for
+    //   out[c,l] = sum_k (dyn[(site*K+k)*G + c/gs, l] + base[c, site*K+k]) * x[c, l-k]
+    // x [C, T] f32 contiguous, base [C, >= (site+1)*K] f32, dyn [>= 2K*G, T]
+    // f32 contiguous; x is zero-padded below l < k. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_dflash_dyn_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * dyn,
+            int                   site,
+            int                   kernel,
+            int                   group_size);
+    // SpecLA heavy-light convolution. Applies compact accepted inputs to the
+    // durable conv state, then verifies the current tree without committing
+    // speculative inputs. Current input factors are written directly to the
+    // persistent double-buffer selected by factor_ptrs/layer/bank; the result
+    // packs [conv output | boundary windows] and already includes SiLU.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_specla(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hld,
+            struct ggml_tensor  * factor_ptrs,
+            int                   n_layers,
+            int                   layer,
+            int                   pending_bank,
+            int                   n_boundaries,
+            int                   n_chains,
+            int                   n_waves,
+            int                   max_parallel_chains);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
@@ -2825,9 +3106,64 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // Compact-batch in-place recurrence. active_slot_ids maps the compact
+    // sequence axis to physical state slabs; negative or out-of-range ids
+    // use zero state and do not write back.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_active_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * active_slot_ids);
+
+    // dflash extension: speculative verify against mapped base states.
+    // `state` is the full persistent [S_v, S_v, H, n_slots] tensor and
+    // `state_slot_ids` [n_seqs] names the slab each compact sequence starts
+    // from (negative ids start from zero). The kernel reads the base state in
+    // place and writes neither a final state nor per-token intermediates: the
+    // result holds only the attention output (plus the replay log once
+    // captured), and accepted prefixes are committed later from that log.
+    // g and beta may be strided [1, H, T, S] views sharing one layout, so raw
+    // gates (ggml_gated_delta_net_set_raw_gates) can read the stacked
+    // projection directly. Non-KDA, non-tree. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_mapped_verify(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_slot_ids);
+
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
+
+    // CUDA/HIP fixed-chain replay log in compact F32 [J,H,T,B] layout:
+    // scalar gate J=2*S_v+1 stores [g | k | delta], while KDA J=3*S_v
+    // stores [g[S_v] | k | delta]. Delta is captured after the
+    // state-dependent reduction. The returned tensor owns a compact copy so
+    // graph allocation can release the much larger GDN result after capture.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_replay_log(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tensor);
+
+    // dflash extension: let the kernel derive the gates from the raw
+    // projections instead of graph-side sigmoid/softplus ops:
+    //   beta_val = sigmoid(beta_raw)
+    //   g_val    = exp(softplus(alpha_raw + dt_bias[h]) * A[h])
+    // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
+    // gate_ba is a contiguous f32 [2*H] tensor holding [dt_bias | A]
+    // (src[9], op_params[10] = 1). Only for the non-tree, non-KDA,
+    // non-SpecLA CUDA/HIP path; the compact-decode variant is excluded,
+    // the mapped-verify variant is allowed.
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor * tensor,
+            struct ggml_tensor * gate_ba);
 
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape
@@ -2865,6 +3201,28 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * parent_ids,
             struct ggml_tensor  * persist_inter);
+
+    // SpecLA state-resident heavy-light verify. The kernel applies the compact
+    // factors accepted in the preceding step, writes only that committed base
+    // state, then verifies the current HLD chains while writing raw
+    // (k, delta, log-gate) factors directly to the opposite persistent bank.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_specla(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * hld,
+            struct ggml_tensor  * factor_ptrs,
+            int                   n_layers,
+            int                   layer,
+            int                   pending_bank,
+            int                   n_boundaries,
+            int                   n_chains,
+            int                   n_waves,
+            int                   max_parallel_chains);
 
     // custom operators
 

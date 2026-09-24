@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class KvFlashPager;
 
@@ -122,4 +122,4 @@ bool run_qwen35_mixed_layer_split_forward(
 // Free all shards (weights, cache, backend).
 void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards);
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -3,8 +3,10 @@
 //
 // Usage: smoke_load_target <path/to/qwen35.gguf>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
+#include "CppUnitTestFramework.hpp"
+#include "model_test_paths.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -16,24 +18,26 @@
 #include <cstring>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
+using namespace CppUnitTestFramework;
 
-int main(int argc, char ** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <qwen35.gguf>\n", argv[0]);
-        return 2;
-    }
-
+struct SmokeLoadTarget : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+TEST_CASE(SmokeLoadTarget, LoadsConfiguredModel) {
+    const auto path = luce_test::require_model(luce_test::kQwen35ModelEnv);
     ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
+    REQUIRE_NOT_NULL(backend);
 
     TargetWeights w;
-    if (!load_target_gguf(argv[1], backend, w)) {
-        std::fprintf(stderr, "load_target_gguf failed: %s\n", dflash27b_last_error());
-        return 1;
+    const bool loaded = load_target_gguf(path.c_str(), backend, w);
+    if (!loaded) {
+        std::fprintf(stderr, "load_target_gguf failed: %s\n", luce_last_error());
+        ggml_backend_free(backend);
+        REQUIRE(loaded);
     }
     // load_target_gguf stashes a summary string in last_error on success (hack)
-    std::printf("%s\n", dflash27b_last_error());
+    std::printf("%s\n", luce_last_error());
 
     // Count layer types
     int n_attn = 0, n_delta = 0;
@@ -101,8 +105,12 @@ int main(int argc, char ** argv) {
     if (w.n_layer > 31) print_layer(31);
     if (w.n_layer > 63) print_layer(63);
 
+    CHECK(w.n_layer > 0);
+    CHECK_NOT_NULL(w.tok_embd);
+    CHECK_NOT_NULL(w.output);
+    CHECK_NOT_NULL(w.out_norm);
+
     free_target_weights(w);
     ggml_backend_free(backend);
     std::printf("OK\n");
-    return 0;
 }

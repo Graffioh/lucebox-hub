@@ -25,7 +25,7 @@
 #include <unistd.h>
 #endif
 
-using namespace dflash::common;
+using namespace luce::common;
 using Clock = std::chrono::high_resolution_clock;
 
 namespace {

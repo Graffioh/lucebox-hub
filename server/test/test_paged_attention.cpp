@@ -2,6 +2,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +12,8 @@
 #include <cstring>
 #include <set>
 #include <vector>
+
+using namespace CppUnitTestFramework;
 
 namespace {
 
@@ -24,6 +28,14 @@ struct TestCase {
     int max_blocks;
     std::vector<int32_t> kv_seq_lens;
     bool corrupt_blocks;
+};
+
+struct TreeMetadata {
+    int width;
+    int scratch_stride;
+    std::vector<int32_t> parent_ids;
+    std::vector<int32_t> tree_sizes;
+    int ar_rows = 0;
 };
 
 int clamped_seq_len(const TestCase & test_case, int seq) {
@@ -47,6 +59,40 @@ bool block_is_valid(int32_t block, int physical_blocks) {
     return block >= 0 && block < physical_blocks;
 }
 
+bool tree_visible(
+        const TreeMetadata & tree,
+        int tree_seq,
+        int query_node,
+        int candidate) {
+    const int tree_size = tree.tree_sizes[tree_seq];
+    if (tree_size < 0 || tree_size > tree.width ||
+        query_node < 0 || query_node >= tree_size ||
+        candidate < 0 || candidate >= tree_size) {
+        return false;
+    }
+
+    bool visible = false;
+    int current = query_node;
+    for (int depth = 0; depth < tree_size; ++depth) {
+        if (current == candidate) {
+            visible = true;
+        }
+        if (current < 0 || current >= tree_size) {
+            return false;
+        }
+        const int parent =
+            tree.parent_ids[tree_seq * tree.width + current];
+        if (parent == -1) {
+            return visible;
+        }
+        if (parent < 0 || parent >= current) {
+            return false;
+        }
+        current = parent;
+    }
+    return false;
+}
+
 std::vector<int32_t> make_block_table(
         const TestCase & test_case,
         int physical_blocks) {
@@ -54,7 +100,7 @@ std::vector<int32_t> make_block_table(
     std::vector<int32_t> result(
         static_cast<size_t>(test_case.max_blocks) * n_seq, -1);
 
-    // 37 is coprime with both cases' live-block counts, so this maps every
+    // 37 is coprime with the test cases' live-block counts, so this maps every
     // logical page to a unique shuffled physical page.
     int ordinal = 0;
     for (int seq = 0; seq < n_seq; ++seq) {
@@ -121,58 +167,106 @@ std::vector<float> reference_attention(
         int physical_blocks,
         const std::vector<float> & q,
         const std::vector<float> & k,
-        const std::vector<float> & v) {
+        const std::vector<float> & v,
+        const std::vector<int32_t> * active_slot_ids = nullptr,
+        const std::vector<int32_t> * query_positions = nullptr,
+        const TreeMetadata * tree = nullptr,
+        int tree_scratch_base = 0) {
     std::vector<float> output(q.size(), 0.0f);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int q_per_kv = N_HEAD / N_HEAD_KV;
-    const int n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    const int n_seq = active_slot_ids
+        ? static_cast<int>(active_slot_ids->size())
+        : physical_n_seq;
 
     for (int seq = 0; seq < n_seq; ++seq) {
-        const int kv_seq_len = clamped_seq_len(test_case, seq);
+        const int physical_seq = active_slot_ids ? (*active_slot_ids)[seq] : seq;
+        // Mirrors the kernel: out-of-range slot ids and negative positions
+        // are padding rows and leave zero output.
+        if (physical_seq < 0 || physical_seq >= physical_n_seq) continue;
+        const bool tree_query = tree && seq >= tree->ar_rows;
+        const int tree_seq = tree_query
+            ? (seq - tree->ar_rows) / tree->width : 0;
+        const int query_node = tree_query
+            ? (seq - tree->ar_rows) % tree->width : -1;
+        int kv_seq_len = clamped_seq_len(test_case, physical_seq);
+        if (query_positions && !tree_query) {
+            const int32_t query_position = (*query_positions)[seq];
+            if (query_position < 0) continue;
+            // The inclusive causal clamp: row seq attends its sequence's
+            // cached tokens [0, position].
+            if (query_position < kv_seq_len) {
+                kv_seq_len = query_position + 1;
+            }
+        }
+        const int tree_size = tree_query ? tree->tree_sizes[tree_seq] : 0;
+        if (tree_query &&
+            (tree_size < 0 || tree_size > tree->width ||
+             query_node >= tree_size)) {
+            continue;
+        }
+
+        std::vector<int32_t> physical_rows;
+        physical_rows.reserve(
+            kv_seq_len + (tree_query ? tree->width : 0));
+        for (int token = 0; token < kv_seq_len; ++token) {
+            const int block =
+                block_table[
+                    physical_seq * test_case.max_blocks +
+                    token / BLOCK_SIZE];
+            physical_rows.push_back(
+                block_is_valid(block, physical_blocks)
+                    ? block * BLOCK_SIZE + token % BLOCK_SIZE
+                    : -1);
+        }
+        if (tree_query) {
+            for (int candidate = 0; candidate < tree->width; ++candidate) {
+                physical_rows.push_back(
+                    tree_visible(*tree, tree_seq, query_node, candidate)
+                        ? tree_scratch_base +
+                              physical_seq * tree->scratch_stride + candidate
+                        : -1);
+            }
+        }
         for (int head = 0; head < N_HEAD; ++head) {
             const int kv_head = head / q_per_kv;
             const float * q_row =
                 q.data() + (static_cast<size_t>(head) * n_seq + seq) * D;
 
-            std::vector<float> scores(kv_seq_len);
+            std::vector<float> scores(physical_rows.size(), -INFINITY);
             float max_score = -INFINITY;
-            for (int token = 0; token < kv_seq_len; ++token) {
-                const int block =
-                    block_table[
-                        seq * test_case.max_blocks + token / BLOCK_SIZE];
-                if (!block_is_valid(block, physical_blocks)) {
-                    // Mirrors the kernel: invalid blocks contribute nothing.
-                    scores[token] = -INFINITY;
-                    continue;
-                }
-                const int physical = block * BLOCK_SIZE + token % BLOCK_SIZE;
+            for (size_t row = 0; row < physical_rows.size(); ++row) {
+                const int physical = physical_rows[row];
+                if (physical < 0) continue;
                 const float * k_row =
                     k.data() +
                     (static_cast<size_t>(kv_head) * pool_tokens + physical) * D;
                 float dot = 0.0f;
                 for (int d = 0; d < D; ++d) dot += q_row[d] * k_row[d];
-                scores[token] = dot * scale;
-                max_score = std::max(max_score, scores[token]);
+                scores[row] = dot * scale;
+                max_score = std::max(max_score, scores[row]);
             }
 
             float denominator = 0.0f;
             for (float & score : scores) {
+                if (!std::isfinite(score)) {
+                    score = 0.0f;
+                    continue;
+                }
                 score = std::exp(score - max_score);
                 denominator += score;
             }
 
             float * out_row =
                 output.data() + (static_cast<size_t>(head) * n_seq + seq) * D;
-            for (int token = 0; token < kv_seq_len; ++token) {
-                const int block =
-                    block_table[
-                        seq * test_case.max_blocks + token / BLOCK_SIZE];
-                if (!block_is_valid(block, physical_blocks)) continue;
-                const int physical = block * BLOCK_SIZE + token % BLOCK_SIZE;
+            for (size_t row = 0; row < physical_rows.size(); ++row) {
+                const int physical = physical_rows[row];
+                if (physical < 0 || denominator == 0.0f) continue;
                 const float * v_row =
                     v.data() +
                     (static_cast<size_t>(kv_head) * pool_tokens + physical) * D;
-                const float probability = scores[token] / denominator;
+                const float probability = scores[row] / denominator;
                 for (int d = 0; d < D; ++d) {
                     out_row[d] += probability * v_row[d];
                 }
@@ -185,10 +279,37 @@ std::vector<float> reference_attention(
 bool run_case(ggml_backend_t backend,
               const TestCase & test_case,
               ggml_type k_type,
-              ggml_type v_type) {
-    const int n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+              ggml_type v_type,
+              const std::vector<int32_t> * active_slot_ids = nullptr,
+              const std::vector<int32_t> * query_positions = nullptr,
+              const TreeMetadata * tree = nullptr) {
+    const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    const int n_seq = active_slot_ids
+        ? static_cast<int>(active_slot_ids->size())
+        : physical_n_seq;
+    // Ragged causal positions ride on the compact row -> slot mapping.
+    GGML_ASSERT(!query_positions ||
+                (active_slot_ids &&
+                 query_positions->size() == active_slot_ids->size()));
+    GGML_ASSERT(!tree || active_slot_ids);
+    if (tree) {
+        GGML_ASSERT(tree->width > 0);
+        GGML_ASSERT(tree->scratch_stride >= tree->width);
+        GGML_ASSERT(tree->ar_rows >= 0);
+        GGML_ASSERT(tree->ar_rows == 0 || query_positions);
+        GGML_ASSERT(
+            tree->parent_ids.size() ==
+            static_cast<size_t>(tree->width) * tree->tree_sizes.size());
+        GGML_ASSERT(
+            n_seq == tree->ar_rows +
+            tree->width * static_cast<int>(tree->tree_sizes.size()));
+    }
     const int physical_blocks = count_physical_blocks(test_case);
-    const int pool_tokens = physical_blocks * BLOCK_SIZE;
+    const int tree_scratch_base = physical_blocks * BLOCK_SIZE;
+    const int pool_tokens = tree
+        ? tree_scratch_base + physical_n_seq * tree->scratch_stride
+        : tree_scratch_base;
+    GGML_ASSERT(pool_tokens % BLOCK_SIZE == 0);
     const std::vector<int32_t> block_table =
         make_block_table(test_case, physical_blocks);
 
@@ -206,18 +327,45 @@ bool run_case(ggml_backend_t backend,
         ggml_new_tensor_3d(ctx, v_type, D, pool_tokens, N_HEAD_KV);
     ggml_tensor * table =
         ggml_new_tensor_2d(
-            ctx, GGML_TYPE_I32, test_case.max_blocks, n_seq);
+            ctx, GGML_TYPE_I32, test_case.max_blocks, physical_n_seq);
     ggml_tensor * kv_seq_lens =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, physical_n_seq);
     for (ggml_tensor * input : {q, k, v, table, kv_seq_lens}) {
         ggml_set_input(input);
     }
 
-    ggml_tensor * output = ggml_paged_attn(
-        ctx, q, k, v, table, kv_seq_lens,
-        1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE,
-        *std::max_element(test_case.kv_seq_lens.begin(),
-                          test_case.kv_seq_lens.end()));
+    ggml_tensor * active = nullptr;
+    if (active_slot_ids) {
+        active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_set_input(active);
+    }
+    ggml_tensor * positions = nullptr;
+    if (query_positions) {
+        positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_set_input(positions);
+    }
+    ggml_tensor * parents = nullptr;
+    ggml_tensor * sizes = nullptr;
+    if (tree) {
+        parents = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, tree->width, tree->tree_sizes.size());
+        sizes = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, tree->tree_sizes.size());
+        ggml_set_input(parents);
+        ggml_set_input(sizes);
+    }
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    const int max_kv_seq_len = *std::max_element(
+        test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
+    ggml_tensor * output = tree
+        ? ggml_paged_attn_ext_tree(
+            ctx, q, k, v, table, kv_seq_lens, active,
+            positions, scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
+            tree_scratch_base, tree->scratch_stride)
+        : ggml_paged_attn_ext(
+            ctx, q, k, v, table, kv_seq_lens, active, positions,
+            scale, BLOCK_SIZE, max_kv_seq_len);
     ggml_set_output(output);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -254,6 +402,7 @@ bool run_case(ggml_backend_t backend,
     bool ok = !k_data.empty() && !v_data.empty() &&
               !k_reference.empty() && !v_reference.empty();
 
+    size_t wmma_launches = 0;
     if (ok) {
         ggml_backend_tensor_set(q, q_data.data(), 0,
                                 q_data.size() * sizeof(q_data[0]));
@@ -266,7 +415,27 @@ bool run_case(ggml_backend_t backend,
             kv_seq_lens, test_case.kv_seq_lens.data(), 0,
             test_case.kv_seq_lens.size() *
                 sizeof(test_case.kv_seq_lens[0]));
+        if (active_slot_ids) {
+            ggml_backend_tensor_set(
+                active, active_slot_ids->data(), 0,
+                active_slot_ids->size() * sizeof((*active_slot_ids)[0]));
+        }
+        if (query_positions) {
+            ggml_backend_tensor_set(
+                positions, query_positions->data(), 0,
+                query_positions->size() * sizeof((*query_positions)[0]));
+        }
+        if (tree) {
+            ggml_backend_tensor_set(
+                parents, tree->parent_ids.data(), 0,
+                tree->parent_ids.size() * sizeof(tree->parent_ids[0]));
+            ggml_backend_tensor_set(
+                sizes, tree->tree_sizes.data(), 0,
+                tree->tree_sizes.size() * sizeof(tree->tree_sizes[0]));
+        }
+        const size_t wmma_before = ggml_backend_cuda_get_paged_attn_wmma256_launch_count();
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        wmma_launches = ggml_backend_cuda_get_paged_attn_wmma256_launch_count() - wmma_before;
     }
 
     float max_abs_error = INFINITY;
@@ -277,7 +446,8 @@ bool run_case(ggml_backend_t backend,
         const std::vector<float> expected =
             reference_attention(
                 test_case, block_table, pool_tokens, physical_blocks,
-                q_data, k_reference, v_reference);
+                q_data, k_reference, v_reference, active_slot_ids,
+                query_positions, tree, tree ? tree_scratch_base : 0);
         max_abs_error = 0.0f;
         for (size_t i = 0; i < actual.size(); ++i) {
             if (!std::isfinite(actual[i])) {
@@ -287,11 +457,21 @@ bool run_case(ggml_backend_t backend,
             max_abs_error =
                 std::max(max_abs_error, std::fabs(actual[i] - expected[i]));
         }
-        ok = ok && max_abs_error < MAX_ABS_ERROR;
+        // The WMMA route accumulates the VKQ output in f16 (design: mirrors
+        // the contiguous fattn-mma kernel), so long-context rows carry ~1e-3
+        // absolute noise against the f32 reference; the decode route
+        // accumulates in f32 (~1e-5). Keyed on the launch counter rather than
+        // the env, so cases that fall back to V_DOT2 (tree mode, ineligible
+        // shapes) keep the strict bound.
+        const float tol = wmma_launches > 0 ? 2.0e-3f : MAX_ABS_ERROR;
+        ok = ok && max_abs_error < tol;
     }
 
-    std::printf("paged attention %-11s K=%-4s V=%-4s max_abs=%.6g %s\n",
+    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tree=%s max_abs=%.6g %s\n",
                 test_case.name, ggml_type_name(k_type), ggml_type_name(v_type),
+                active_slot_ids ? "yes" : "no",
+                query_positions ? "yes" : "no",
+                tree ? "yes" : "no",
                 max_abs_error, ok ? "PASS" : "FAIL");
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
@@ -319,8 +499,8 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
         ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
     ggml_tensor * kv_seq_lens =
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_tensor * output = ggml_paged_attn(
-        ctx, q, k, v, table, kv_seq_lens,
+    ggml_tensor * output = ggml_paged_attn_ext(
+        ctx, q, k, v, table, kv_seq_lens, nullptr, nullptr,
         1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE, 1);
 
     const bool rejected = !ggml_backend_supports_op(backend, output);
@@ -332,49 +512,180 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
 
 }  // namespace
 
-int main(int argc, char ** argv) {
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
-    if (!backend) {
-        std::fprintf(stderr, "GPU backend unavailable\n");
-        return 1;
-    }
+struct PagedAttention : CommonFixture {
+    using CommonFixture::CommonFixture;
 
-    const TestCase partitioned_case{
-        "partitioned",
-        65,
-        // Retains page boundaries and >64 blocks, while pinning both context
-        // clamps: negative becomes empty and over-capacity becomes 65 blocks.
-        {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
-        true,
-    };
-    // CTest also runs this case with the environment
-    // GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1 (paged_attention_direct),
-    // so despite its name it pins the partitioned path on small shapes.
-    const TestCase direct_case{
-        "direct",
-        64,
-        {0, 1, 15, 16, 17, 257, 511},
-        false,
-    };
-    const bool direct =
-        argc == 2 && std::strcmp(argv[1], "--direct") == 0;
-    if (argc > 2 || (argc == 2 && !direct)) {
-        std::fprintf(stderr, "usage: %s [--direct]\n", argv[0]);
-        ggml_backend_free(backend);
-        return 2;
-    }
-    const TestCase & test_case = direct ? direct_case : partitioned_case;
+void run_paged_attention_case(const TestCase & test_case) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
 
     const ggml_type types[] = {
         GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
     };
-    bool ok = rejects_unlaunchable_gqa(backend);
+    CHECK(rejects_unlaunchable_gqa(backend));
     for (ggml_type k_type : types) {
         for (ggml_type v_type : types) {
-            ok = run_case(backend, test_case, k_type, v_type) && ok;
+            CHECK(run_case(backend, test_case, k_type, v_type));
         }
     }
 
     ggml_backend_free(backend);
-    return ok ? 0 : 1;
+}
+
+void run_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase tree_case{"tree", 65, {1025, 17, 257}, false};
+    const TreeMetadata tree_metadata{
+        16, 16,
+        {
+            -1, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 9, 10, 11, 12, 13, 14,
+            -1, 0, 1, 2, 3, 4, 5, 6,
+            7, -1, -1, -1, -1, -1, -1, -1,
+        },
+        {16, 9},
+    };
+    const std::vector<int32_t> tree_slot_ids{
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 2, 2,
+    };
+    CHECK(run_case(backend, tree_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    CHECK(run_case(backend, tree_case, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    CHECK(run_case(backend, tree_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
+void run_mixed_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase mixed_case{"mixed-tree", 8, {33, 65, 17}, false};
+    const TreeMetadata tree_metadata{
+        16, 16,
+        {
+            -1, 0, 1, 2, 3, 4, 5, 6,
+            7, 8, 9, 10, 11, 12, 13, 14,
+        },
+        {16},
+        2,
+    };
+    std::vector<int32_t> query_slots{1, 0};
+    query_slots.insert(query_slots.end(), 16, 2);
+    std::vector<int32_t> query_positions{7, 15};
+    query_positions.insert(query_positions.end(), 16, -1);
+    CHECK(run_case(backend, mixed_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &query_slots, &query_positions, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
+void run_cyclic_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase tree_case{"cyclic-tree", 4, {17}, false};
+    const TreeMetadata tree_metadata{
+        4, 16,
+        {-1, 2, 1, -1},
+        {3},
+    };
+    const std::vector<int32_t> tree_slot_ids{0, 0, 0, 0};
+    CHECK(run_case(backend, tree_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
+void run_active_slot_case(const TestCase & test_case,
+                          const std::vector<int32_t> & active_slot_ids) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    CHECK(run_case(backend, test_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &active_slot_ids));
+    ggml_backend_free(backend);
+}
+
+void run_ragged_case(const TestCase & test_case,
+                     const std::vector<int32_t> & active_slot_ids,
+                     const std::vector<int32_t> & query_positions) {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    CHECK(run_case(backend, test_case, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                   &active_slot_ids, &query_positions));
+    ggml_backend_free(backend);
+}
+
+};
+TEST_CASE(PagedAttention, PartitionedPathMatchesReference) {
+    run_paged_attention_case({
+        "partitioned",
+        65,
+        {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
+        true,
+    });
+}
+
+TEST_CASE(PagedAttention, DirectPathMatchesReference) {
+    luce_test::ScopedEnvVar force_partitions(
+        "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS",
+        "1"
+    );
+    run_paged_attention_case({
+        "direct",
+        64,
+        {0, 1, 15, 16, 17, 257, 511},
+        false,
+    });
+}
+
+TEST_CASE(PagedAttention, ActiveSlotsMatchReference) {
+    run_active_slot_case({
+        "active-slots",
+        65,
+        {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
+        true,
+    }, {10, 9, -1, 4});
+}
+
+TEST_CASE(PagedAttention, CompactThreeSlotBucketMatchesReference) {
+    // Three physical slots round up to a four-row graph bucket. The final row
+    // is padding and maps to no physical block-table column.
+    run_active_slot_case({
+        "compact-3",
+        2,
+        {1, 17, 31},
+        false,
+    }, {2, 1, 0, -1});
+}
+
+TEST_CASE(PagedAttention, PackedTreesMatchReference) {
+    run_tree_case();
+}
+
+TEST_CASE(PagedAttention, CompactArAndFixedChainMatchReference) {
+    run_mixed_tree_case();
+}
+
+TEST_CASE(PagedAttention, CyclicParentMetadataIsMasked) {
+    run_cyclic_tree_case();
+}
+
+TEST_CASE(PagedAttention, RaggedCausalPositionsMatchReference) {
+    // Interleaved query rows from two sequences attend the paged pool causally
+    // through per-row positions. Sequence 1 spans 65 logical blocks, so its
+    // full-prefix row also exercises the partitioned path.
+    const std::vector<int32_t> active_slot_ids{1, 0, 1, 0, 0, -1};
+    // First token, short prefix, multi-partition full prefix, block-aligned
+    // prefix, an over-range clamp, and a padding row.
+    const std::vector<int32_t> query_positions{
+        0, 4, 1024, 31, INT32_MAX, -1,
+    };
+    run_ragged_case({
+        "ragged",
+        65,
+        {33, 1025},
+        false,
+    }, active_slot_ids, query_positions);
 }

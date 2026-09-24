@@ -1,4 +1,4 @@
-// DeepSeek V4 Flash target structs for dflash daemon.
+// DeepSeek V4 Flash target structs for luce daemon.
 //
 // Architecture summary (from DeepSeek V4 Flash):
 //   - MLA: Multi-head Latent Attention with low-rank Q projection and single
@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -24,14 +25,22 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/paged_attention_config.h"
 #include "common/prefill_attention_mode.h"
+#include "deepseek4_image_spans.h"
+#include "common/concurrency/paged_kv_pool.h"
+#include "deepseek4_paged_cache.h"
 
-namespace dflash::common {
+namespace luce::common {
 
-// Layer-major prefill may schedule two 2K numerical bands while preserving
+// Layer-major prefill may schedule five 2K numerical bands while preserving
 // the raw-cache rounding boundary between them.
 inline constexpr int DS4_NUMERICAL_PREFILL_BAND = 2048;
-inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 4096;
+inline constexpr int DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS = 10240;
+// Normal verification stays within one ratio-4 compressor window. Q5 is an
+// explicit opt-in whose fused graph models a second boundary.
+inline constexpr int DS4_CONSERVATIVE_VERIFY_MAX_TOKENS = 4;
+inline constexpr int DS4_Q5_VERIFY_TOKENS = 5;
 
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
@@ -130,6 +139,7 @@ struct DeepSeek4Layer {
     // Router
     ggml_tensor * ffn_gate_inp       = nullptr;  // [n_embd, n_expert] router weights F16
     ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] optional routing bias
+    ggml_tensor * ffn_gate_bias_vl   = nullptr;  // image router bias, loaded only with --mmproj
 
     // Hash routing table (first n_hash_layer layers only)
     ggml_tensor * ffn_gate_tid2eid   = nullptr;  // [n_expert_used, n_vocab] I32
@@ -153,6 +163,7 @@ struct DeepSeek4Layer {
 // ─── Global weights ─────────────────────────────────────────────────────
 
 struct DeepSeek4Weights {
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
@@ -235,7 +246,14 @@ struct DeepSeek4Weights {
     // GGUF is loaded; they are not model metadata.
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
     bool fused_decode        = false;
+    bool fused_verify_f16_kv = false;
 };
+
+// True when the image router biases were loaded, i.e. the backend was started
+// with a vision projector.
+inline bool ds4_image_capable(const DeepSeek4Weights & w) {
+    return !w.layers.empty() && w.layers.front().ffn_gate_bias_vl != nullptr;
+}
 
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
     return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)
@@ -248,6 +266,31 @@ inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
 struct DeepSeek4CompressorState {
     ggml_tensor * state_kv    = nullptr;  // [window_size, head_dim] rolling buffer
     ggml_tensor * state_score = nullptr;  // [window_size, head_dim] rolling scores
+};
+
+// Device-resident snapshot of the ratio-4 previous-window rows immediately
+// after the first flush in a q5 verification step. A q5 batch that begins at
+// position 3 mod 4 can flush twice; retaining this intermediate state lets a
+// rejected prefix commit the first window without replaying the target.
+struct DeepSeek4SpecBoundaryCheckpointLayer {
+    ggml_tensor * attn_kv_src = nullptr;
+    ggml_tensor * attn_kv_dst = nullptr;
+    ggml_tensor * attn_score_src = nullptr;
+    ggml_tensor * attn_score_dst = nullptr;
+    ggml_tensor * index_kv_src = nullptr;
+    ggml_tensor * index_kv_dst = nullptr;
+    ggml_tensor * index_score_src = nullptr;
+    ggml_tensor * index_score_dst = nullptr;
+};
+
+struct DeepSeek4SpecBoundaryCheckpoint {
+    std::vector<DeepSeek4SpecBoundaryCheckpointLayer> layers;
+    bool available = false;
+
+    void clear() {
+        layers.clear();
+        available = false;
+    }
 };
 
 // Per-layer cache
@@ -291,6 +334,22 @@ struct DeepSeek4Cache {
     ggml_backend_buffer_t buf = nullptr;
 };
 
+struct DeepSeek4PagedLayerCache : DeepSeek4LayerCache {
+    uint32_t ratio = 0;
+    uint64_t physical_rows = 0;
+};
+
+struct DeepSeek4PagedCache {
+    std::unique_ptr<PagedKvPool> pool;
+    DeepSeek4PagedCachePlan plan;
+    std::vector<DeepSeek4PagedLayerCache> layers;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    // Dedicated bounded gathered-reference graph cache (opaque here because
+    // its implementation shares the fused verifier's private machinery).
+    void * gathered_runtime = nullptr;
+};
+
 struct DeepSeek4Snapshot;
 
 struct DeepSeek4RawRingSpan {
@@ -298,10 +357,18 @@ struct DeepSeek4RawRingSpan {
     int count = 0;
 };
 
+struct DeepSeek4Head4Tail2Routes {
+    ggml_tensor * head_ids = nullptr;
+    ggml_tensor * head_weights = nullptr;
+    ggml_tensor * tail_ids = nullptr;
+    ggml_tensor * tail_weights = nullptr;
+};
+
 // ─── Configuration ──────────────────────────────────────────────────────
 
 struct DeepSeek4BackendConfig {
-    const char * model_path   = nullptr;
+    std::string  model_path;
+    std::string  mmproj_path;
     DevicePlacement device;
     int          stream_fd    = -1;
     int          chunk        = 512;   // prefill chunk size
@@ -309,9 +376,29 @@ struct DeepSeek4BackendConfig {
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
+    bool         fused_verify_f16_kv = false; // F16 KV in batched verifier attention
+    bool         paged_attention = false;
+    int          max_concurrency = 1;
+    long long    kv_pool_tokens = 0;
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
+
+// Select compressed rows plus the saved raw suffix of a batched verifier.
+// Indices are relative to the end of the physical raw ring. Causal visibility
+// remains in the attention mask; saving a row does not make it visible to all lanes.
+ggml_tensor * deepseek4_indexed_attention_rows(
+    ggml_context * ctx, ggml_tensor * compressed_topk,
+    int compressed_rows, int preserved_rows);
+
+// Snapshot the raw rows a cached verifier is about to overwrite. Expand this
+// tensor before the ring writes; row indices are supplied again on each replay.
+ggml_tensor * deepseek4_preserve_raw_rows(
+    ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows);
+
+// Keep a per-token indexer visibility mask aligned with the scored suffix.
+ggml_tensor * deepseek4_indexer_visibility_suffix(
+    ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored);
 
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
@@ -333,17 +420,80 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              int max_ctx,
                              DeepSeek4Cache & out);
 
+// Per-layer cache geometry implied by the weights. Single source of truth for
+// create_deepseek4_cache() and for snapshot declaration/validation
+// (deepseek4_snapshot.h), so the two can never disagree on shapes.
+struct DeepSeek4LayerGeometry {
+    uint32_t ratio = 0;            // compress ratio: 0 (raw window only), 4 or 128
+    int64_t  head_dim = 0;         // raw / compressed row width (F16)
+    int64_t  raw_rows = 0;         // n_swa
+    bool     has_comp = false;     // ratio > 0: comp_kv + attn compressor state
+    int64_t  comp_width = 0;       // attn compressor state width (F32)
+    int64_t  comp_state_rows = 0;
+    bool     has_index = false;    // ratio == 4: index_comp_kv + indexer state
+    int64_t  index_dim = 0;        // indexer row width (F16)
+    int64_t  index_state_width = 0;  // indexer compressor state width (F32)
+    int64_t  index_state_rows = 0;
+    // Compressed-row capacity for a cache of `max_ctx` tokens (0 if !has_comp).
+    int64_t comp_capacity(int max_ctx) const {
+        return has_comp ? (int64_t) max_ctx / (int64_t) ratio + 16 : 0;
+    }
+};
+DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer);
+inline int64_t deepseek4_hc_state_elements(const DeepSeek4Weights & w) {
+    return (int64_t) w.n_hc * (int64_t) w.n_embd;
+}
+
 void free_deepseek4_cache(DeepSeek4Cache & c);
+bool create_deepseek4_paged_cache(ggml_backend_t backend,
+                                  const DeepSeek4Weights & w,
+                                  uint32_t slots, uint32_t max_ctx,
+                                  uint32_t physical_blocks,
+                                  DeepSeek4PagedCache & out);
+void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot);
+void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
+// Exact gathered-reference decode for up to six independent lanes. Inputs are
+// lane-major; negative slots are inactive padding lanes. `logit_lanes` marks
+// the lanes that need full host logits. `out_logits` is empty when none do;
+// otherwise it is [n_vocab, lanes], with unrequested rows zeroed.
+bool deepseek4_paged_gathered_step(
+    ggml_backend_t backend, int device, const DeepSeek4Weights & w,
+    DeepSeek4PagedCache & cache, const float * embeddings,
+    const int32_t * token_ids, const int64_t * positions,
+    const int32_t * slots, uint32_t lanes, const int32_t * block_tables,
+    uint32_t block_table_stride, bool bucket_history,
+    const uint8_t * logit_lanes,
+    std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
+    MoeHybridStorage * moe_hybrid = nullptr,
+    MoeHybridRoutingStats * routing_stats = nullptr,
+    DeepSeek4StepTelemetry * telemetry = nullptr);
+void log_deepseek4_step_telemetry(
+    const char * phase, int tokens, int steps, double wall_s,
+    const DeepSeek4StepTelemetry & telemetry);
+void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
+// Release only reproducible large-batch graph arenas after prefill. KV/model
+// state and the DSpark feature tail remain live for the following decode.
+void deepseek4_release_prefill_scratch(DeepSeek4Cache & c,
+                                       MoeHybridStorage * moe_hybrid);
+// Retire all disposable decoder/owner graphs before the vision tower uses the
+// shared scratch allowance. KV and saved snapshots are left intact.
+void deepseek4_release_image_scratch(DeepSeek4Cache & c,
+                                     MoeHybridStorage * moe_hybrid);
+// Invalid/future raw-ring rows after all writes of a batched verifier.
+// Each span is bounded by n_swa, including batches that overwrite the full ring.
+int deepseek4_verify_raw_mask_spans(
+    int kv_start, int n_swa, int q, int lane, DeepSeek4RawRingSpan spans[2]);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,
     DeepSeek4RawRingSpan spans[2]);
-bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
-                             ggml_backend_t snapshot_backend,
-                             DeepSeek4Snapshot & out);
-bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
-                                DeepSeek4Cache & cache);
+bool build_deepseek4_head4_tail2_routes(
+    ggml_context * ctx,
+    ggml_tensor * selected,
+    ggml_tensor * router_weights,
+    int n_tokens,
+    DeepSeek4Head4Tail2Routes & out);
 
 // Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
 // next learned-compressor boundary. Multi-token dynamic forwards split on
@@ -373,7 +523,8 @@ bool deepseek4_step(
     DeepSeek4StepTelemetry *    telemetry = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
     Ds4VerifyHooks *            verify_hooks = nullptr,
-    MoeExpertComputeRuntime *   expert_runtime = nullptr);
+    MoeExpertComputeRuntime *   expert_runtime = nullptr,
+    bool                        need_logits = true);
 
 // Optional hooks for the DSpark spec-decode batched verify (deepseek4_dspark).
 // When set on a multi-token deepseek4_step_layer_range call they add: per-layer
@@ -389,6 +540,7 @@ struct Ds4VerifyHooks {
     std::vector<float> *     all_logits_out = nullptr;      // [n_vocab * n_tokens]
     std::vector<int32_t> *   argmax_out = nullptr;          // [n_tokens], optional GPU result
     bool                     prefer_argmax_only = false;     // skip logits D2H when available
+    DeepSeek4SpecBoundaryCheckpoint * boundary_checkpoint_out = nullptr;
 };
 
 bool deepseek4_step_layer_range(
@@ -409,7 +561,14 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks *            verify_hooks = nullptr,
     MoeHybridStorage *          moe_hybrid = nullptr,
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
-    MoeHybridRoutingStats *     routing_stats = nullptr);
+    MoeHybridRoutingStats *     routing_stats = nullptr,
+    vision::ImageSpanView       image_spans = {});
+
+bool deepseek4_validate_image_batch(
+    const DeepSeek4Weights & w, const DeepSeek4Cache & cache,
+    const MoeHybridStorage * hybrid, const int32_t * tokens,
+    int count, int position, vision::ImageSpanView spans,
+    bool & has_images, std::string & error);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
@@ -438,6 +597,14 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     std::string *               err = nullptr,
     ggml_backend_t              cold_gpu_backend = nullptr);
 
+// Attach each compact GPU owner tensor to the learned decode-table rows for
+// the global experts stored in that tensor.
+bool register_deepseek4_moe_hybrid_mix_tables(
+    const std::string &         path,
+    const DeepSeek4Weights &    w,
+    MoeHybridStorage &          storage,
+    std::string *               err = nullptr);
+
 // Snapshot
 struct DeepSeek4Snapshot {
     int cur_pos = 0;
@@ -453,10 +620,20 @@ struct DeepSeek4Snapshot {
         DeepSeek4CompressorState indexer_compressor;
     };
     std::vector<LayerSnap> layers;
+    // Optional serialization sidecars (ondisk prefix cache). Present when the
+    // snapshot was saved with DeepSeek4SnapshotAux or adopted from disk.
+    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer]
+    //   last_logits_snap F32 [n_vocab]
+    //   spec_feat_snap   F32 [1, max(1, n_spec_feat)]  (logical length in meta)
+    ggml_tensor * meta_snap        = nullptr;
+    ggml_tensor * last_logits_snap = nullptr;
+    ggml_tensor * spec_feat_snap   = nullptr;
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    // false when ctx/buf are shared with (and freed by) another owner, e.g.
+    // one merged ondisk context bound into several layer-split shard snapshots.
+    bool                  owns_storage = true;
 };
 
-void free_deepseek4_snapshot(DeepSeek4Snapshot & s);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -129,8 +129,8 @@ class ServerProfile:
 
 
 SERVER_PROFILES: dict[str, ServerProfile] = {
-    "rtx3090_dflash_fast": ServerProfile(
-        name="rtx3090_dflash_fast",
+    "rtx3090_luce_fast": ServerProfile(
+        name="rtx3090_luce_fast",
         args=(
             "--budget", "22",
             "--verify-mode", "ddtree",
@@ -142,8 +142,8 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--prefill-cache-slots", "0",
         ),
     ),
-    "rtx3090_dflash_safe": ServerProfile(
-        name="rtx3090_dflash_safe",
+    "rtx3090_luce_safe": ServerProfile(
+        name="rtx3090_luce_safe",
         args=(
             "--budget", "22",
             "--verify-mode", "ddtree",
@@ -155,8 +155,8 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--prefill-cache-slots", "0",
         ),
     ),
-    "rtx3090_dflash_16k": ServerProfile(
-        name="rtx3090_dflash_16k",
+    "rtx3090_luce_16k": ServerProfile(
+        name="rtx3090_luce_16k",
         args=(
             "--budget", "22",
             "--verify-mode", "ddtree",
@@ -168,8 +168,8 @@ SERVER_PROFILES: dict[str, ServerProfile] = {
             "--prefill-cache-slots", "0",
         ),
     ),
-    "rtx3090_dflash_long": ServerProfile(
-        name="rtx3090_dflash_long",
+    "rtx3090_luce_long": ServerProfile(
+        name="rtx3090_luce_long",
         args=(
             "--budget", "16",
             "--verify-mode", "ddtree",
@@ -750,7 +750,7 @@ def probe_anthropic_messages(base_url: str, *, include_long: bool = False) -> li
         "max_tokens": 32,
         "temperature": 0,
         "stop_sequences": ["\n\n\n"],
-        # Claude Code sends tool metadata. dflash_server currently ignores extra
+        # Claude Code sends tool metadata. luce_server currently ignores extra
         # Anthropic fields, but the request must not fail validation.
         "tools": [{
             "name": "Read",
@@ -1102,7 +1102,7 @@ def start_server(
     log_f = open(log_path, "w")
     proc = subprocess.Popen(
         args,
-        cwd=str(ROOT / "dflash"),
+        cwd=str(ROOT / "server"),
         env=env,
         stdout=log_f,
         stderr=subprocess.STDOUT,
@@ -1895,9 +1895,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sweep.add_argument("--target", type=Path, required=True)
     p_sweep.add_argument("--draft", type=Path, required=True)
     p_sweep.add_argument("--bin", type=Path, required=True,
-                         help="Path to dflash_server binary")
+                         help="Path to luce_server binary")
     p_sweep.add_argument("--prefill-drafter", type=Path, default=None)
-    p_sweep.add_argument("--profiles", default="rtx3090_dflash_fast,rtx3090_dflash_safe")
+    p_sweep.add_argument("--profiles", default="rtx3090_luce_fast,rtx3090_luce_safe")
     p_sweep.add_argument("--clients", default="all")
     p_sweep.add_argument("--install-packages", action="store_true")
     p_sweep.add_argument("--package-smoke", action="store_true")

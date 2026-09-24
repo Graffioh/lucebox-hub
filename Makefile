@@ -16,8 +16,8 @@ SHELL := /bin/bash
 
 # ── Build args ──────────────────────────────────────────────────────────
 # Narrow the CUDA arch list to your local GPU to cut build time 5-6×:
-#   make build DFLASH_CUDA_ARCHES=120
-DFLASH_CUDA_ARCHES ?= 75;80;86;89;90;120
+#   make build LUCE_CUDA_ARCHES=120
+LUCE_CUDA_ARCHES ?= 75;80;86;89;90;120
 
 # Where to mount models into the container.
 MODELS_DIR ?= $(HOME)/models
@@ -47,7 +47,7 @@ fix: sync  ## Ruff auto-fix + format.
 
 .PHONY: build
 build:  ## Build lucebox-hub:cuda12 locally via docker buildx bake.
-	DFLASH_CUDA_ARCHES="$(DFLASH_CUDA_ARCHES)" docker buildx bake cuda12-local --load
+	LUCE_CUDA_ARCHES="$(LUCE_CUDA_ARCHES)" docker buildx bake cuda12-local --load
 
 .PHONY: serve
 serve:  ## Run the local image, foreground. Models bind-mounted from $(MODELS_DIR).

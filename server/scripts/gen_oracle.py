@@ -13,7 +13,7 @@ the same shape convention (ggml col-major = PyTorch row-major for these
 specific layouts since everything is contiguous).
 
 Usage:
-    python gen_oracle.py --out /tmp/dflash_oracle --ctx-len 64
+    python gen_oracle.py --out /tmp/luce_oracle --ctx-len 64
 """
 
 import argparse

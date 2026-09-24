@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class KvFlashPager;
 
@@ -61,6 +61,11 @@ public:
     bool rollback_to_tree(int committed,
                           const DDTree & tree,
                           const std::vector<int> & accepted_dfs) override;
+    bool rollback_failure_is_recoverable() const override {
+        // A context-fatal CUDA error poisons the context: restore+replay is
+        // not safe to attempt, so tell the spec-decode loop to abort.
+        return !last_rollback_context_fatal_;
+    }
     bool last_rollback_context_fatal() const { return last_rollback_context_fatal_; }
 
     bool is_eos(int token) const override;
@@ -93,4 +98,4 @@ private:
     mutable int      required_tree_slots_ = 1;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

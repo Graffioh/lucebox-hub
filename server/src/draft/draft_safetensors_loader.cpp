@@ -55,8 +55,9 @@
 
 #include <unordered_map>
 #include <vector>
+namespace luce { namespace common { void dflash2_selector_graph_invalidate(); } }
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -449,10 +450,10 @@ static void bf16_to_f16_array(const uint16_t * src, uint16_t * dst, size_t n) {
 // CUDA builds keep BF16 only when built for native BF16 tensor-core support;
 // all other builds convert to F16 unless explicitly overridden.
 static bool build_prefers_bf16_projection() {
-    const char * env = std::getenv("DFLASH27B_DRAFT_FP16");
+    const char * env = std::getenv("LUCE_DRAFT_FP16");
     if (env && std::atoi(env) != 0) return false;  // force fp16
 
-#if defined(DFLASH27B_BACKEND_CUDA) && defined(DFLASH27B_CUDA_MIN_SM) && DFLASH27B_CUDA_MIN_SM >= 80
+#if defined(LUCE_BACKEND_CUDA) && defined(LUCE_CUDA_MIN_SM) && LUCE_CUDA_MIN_SM >= 80
     return true;
 #else
     return false;
@@ -513,6 +514,9 @@ bool load_draft_safetensors(const std::string & path,
                             ggml_backend_t       backend,
                             DraftWeights &       out,
                             const TargetWeights * target) {
+    out.swa_window = 0;
+    out.swa_pattern_loaded = false;
+
     // ── 1. Open + mmap ────────────────────────────────────────────
     Mmap mm;
     std::string err;
@@ -536,7 +540,7 @@ bool load_draft_safetensors(const std::string & path,
     const size_t    blob_len = mm.len - 8 - header_len;
 
     // ── 3. Allocate ggml context big enough for 5 layers × 11 + 3 top ─
-    const int n_layers    = DFLASH27B_DRAFT_LAYERS;
+    const int n_layers    = LUCE_DRAFT_LAYERS;
     const int n_tensors   = 3 + 11 * n_layers;  // with some headroom below
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(n_tensors + 16) * ggml_tensor_overhead();
@@ -692,6 +696,11 @@ bool load_draft_safetensors(const std::string & path,
 }
 
 void free_draft_weights(DraftWeights & w) {
+    // The dflash2 selector graph caches tensor pointers keyed on the
+    // DraftWeights address; a reload lands at the same address, so the
+    // cache must be invalidated when the weights go away.
+    dflash2_selector_graph_invalidate();
+
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     w.layers.clear();
@@ -701,4 +710,4 @@ void free_draft_weights(DraftWeights & w) {
     w.domino = DraftDominoWeights{};
 }
 
-} // namespace dflash::common
+} // namespace luce::common

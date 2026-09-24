@@ -37,7 +37,7 @@ context stays resident and evicts cold chunks. Paging keeps every token.
 ## Usage
 
 ```bash
-./server/build/dflash_server model.gguf --paged-attention --max-ctx 131072
+./server/build/luce_server model.gguf --paged-attention --max-ctx 131072
 ```
 
 ## Compatibility
@@ -53,7 +53,7 @@ context stays resident and evicts cold chunks. Paging keeps every token.
 
 **Rejected at startup** (exit 2, with the reason): `--draft`, `--ddtree`,
 `--target-devices`, `--target-shard-ipc-bin`, a non-zero `--fa-window`,
-`--prefill-compression`, and `DFLASH_KVFLASH`. The rules live with every other
+`--prefill-compression`, and `LUCE_KVFLASH`. The rules live with every other
 launch-admission rule in `check_feature_compatibility()`; which architecture and
 placement they are allowed on is one row in `model_capabilities.h`.
 

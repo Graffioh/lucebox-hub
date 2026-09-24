@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct BackendPrecisionPolicy {
     ggml_type   weight_type    = GGML_TYPE_BF16;
@@ -44,4 +44,4 @@ ggml_type select_cuda_backend_precision_type_for_sm(int sm);
 ggml_type select_hip_activation_precision_type_for_arch(const std::string & arch);
 ggml_type combine_activation_precision_types(ggml_type a, ggml_type b);
 
-} // namespace dflash::common
+} // namespace luce::common

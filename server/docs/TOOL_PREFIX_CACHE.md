@@ -1,7 +1,7 @@
 # Tool-heavy agent prefix caching
 
 Tool schemas do not need a separate server or a second snapshot protocol.
-`dflash_server` renders them into the stable system prefix and the native
+`luce_server` renders them into the stable system prefix and the native
 turn-boundary cache snapshots that prefix after the first request. Later turns
 restore the complete backend state and prefill only the new conversation
 suffix.
@@ -50,7 +50,7 @@ never restores past the stable prefix.
 No tool-specific flag is required. The native server default enables the
 in-memory prefix cache with 32 slots. Direct container launches inherit that
 default. Pass `--prefix-cache-slots N` to the native binary, or set
-`DFLASH_PREFIX_CACHE_SLOTS=N` through `server/scripts/entrypoint.sh`; use `0`
+`LUCE_PREFIX_CACHE_SLOTS=N` through `server/scripts/entrypoint.sh`; use `0`
 to disable prefix reuse.
 
 ## Reproducible benchmark
@@ -88,7 +88,7 @@ because `main` cannot expose the restored-token counts.
 When volatile text (for example a session clock) sits *inside* the first system
 message, the first chat boundary cannot exclude it. **DiffPin** can diff the
 head, float that volatility after the stable block, and pin the contiguous
-prefix. See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). `DFLASH_PPP`
+prefix. See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). `LUCE_PPP`
 (on by default) enables LCP pin-end annotation + sticky protect;
-`DFLASH_PPP_REARRANGE=1` opts into the token-level float rewrite (off by
+`LUCE_PPP_REARRANGE=1` opts into the token-level float rewrite (off by
 default — unconstrained peels can scramble tool JSON).

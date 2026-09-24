@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── HintStateMachine ───────────────────────────────────────────────────
 
@@ -231,4 +231,4 @@ ToolCallHint ToolHintGenerator::build_hint(const json & tools,
     return build_function_hint(*target_func);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

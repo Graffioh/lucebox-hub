@@ -3,6 +3,9 @@
 #include "ggml-cuda/dequantize.cuh"
 #include "ggml-cuda/mmvq.cuh"
 
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 static __device__ __forceinline__ float silu_f32(float x) {
@@ -309,6 +312,115 @@ static __global__ void laguna_moe_combine_kernel(
         (size_t)t * output_nb1) = sum;
 }
 
+static __global__ void moe_combine_vec4_kernel(
+    const char * __restrict__ experts,
+    const char * __restrict__ weights,
+    char * __restrict__ output,
+    const int n_embd_vec4,
+    const int n_used,
+    const int n_tokens,
+    const size_t experts_nb1,
+    const size_t experts_nb2,
+    const size_t weights_nb0,
+    const size_t weights_nb1,
+    const size_t output_nb1,
+    const float value_scale) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_embd_vec4 * n_tokens;
+    if (idx >= total) return;
+
+    const int h4 = idx % n_embd_vec4;
+    const int t = idx / n_embd_vec4;
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int e = 0; e < n_used; ++e) {
+        const float w = *(const float *)(weights +
+            (size_t)e * weights_nb0 +
+            (size_t)t * weights_nb1);
+        if (w == 0.0f) {
+            if (e == 0) sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+        }
+        const float4 value = *(const float4 *)(experts +
+            (size_t)h4 * sizeof(float4) +
+            (size_t)e * experts_nb1 +
+            (size_t)t * experts_nb2);
+        const float4 scaled = value_scale == 1.0f
+            ? value
+            : make_float4(
+                __fmul_rn(value.x, value_scale),
+                __fmul_rn(value.y, value_scale),
+                __fmul_rn(value.z, value_scale),
+                __fmul_rn(value.w, value_scale));
+        const float4 product = make_float4(
+            __fmul_rn(scaled.x, w),
+            __fmul_rn(scaled.y, w),
+            __fmul_rn(scaled.z, w),
+            __fmul_rn(scaled.w, w));
+        if (e == 0) {
+            sum = product;
+        } else {
+            sum.x = __fadd_rn(sum.x, product.x);
+            sum.y = __fadd_rn(sum.y, product.y);
+            sum.z = __fadd_rn(sum.z, product.z);
+            sum.w = __fadd_rn(sum.w, product.w);
+        }
+    }
+    *(float4 *)(output +
+        (size_t)h4 * sizeof(float4) +
+        (size_t)t * output_nb1) = sum;
+}
+
+static void launch_moe_combine(
+        cudaStream_t stream,
+        const char * experts,
+        const char * weights,
+        char * output,
+        int n_embd,
+        int n_used,
+        int n_tokens,
+        size_t experts_nb0,
+        size_t experts_nb1,
+        size_t experts_nb2,
+        size_t weights_nb0,
+        size_t weights_nb1,
+        size_t output_nb0,
+        size_t output_nb1,
+        float value_scale) {
+    static const bool vec4_requested = []() {
+        const char * raw = std::getenv("LUCE_MOE_COMBINE_VEC4");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    static_assert(sizeof(float4) == 4 * sizeof(float));
+    constexpr size_t vec4_alignment = sizeof(float4);
+    const bool aligned =
+        (reinterpret_cast<uintptr_t>(experts) % vec4_alignment) == 0 &&
+        (reinterpret_cast<uintptr_t>(output) % vec4_alignment) == 0 &&
+        experts_nb1 % vec4_alignment == 0 &&
+        experts_nb2 % vec4_alignment == 0 &&
+        output_nb1 % vec4_alignment == 0;
+    const bool use_vec4 = vec4_requested && n_embd % 4 == 0 && aligned &&
+        experts_nb0 == sizeof(float) && output_nb0 == sizeof(float);
+    constexpr int block = 256;
+    if (use_vec4) {
+        const int n_embd_vec4 = n_embd / 4;
+        const int total = n_embd_vec4 * n_tokens;
+        const int grid = (total + block - 1) / block;
+        moe_combine_vec4_kernel<<<grid, block, 0, stream>>>(
+            experts, weights, output, n_embd_vec4, n_used, n_tokens,
+            experts_nb1, experts_nb2, weights_nb0, weights_nb1,
+            output_nb1, value_scale);
+        return;
+    }
+
+    const int total = n_embd * n_tokens;
+    const int grid = (total + block - 1) / block;
+    laguna_moe_combine_kernel<<<grid, block, 0, stream>>>(
+        experts, weights, output, n_embd, n_used, n_tokens,
+        experts_nb0, experts_nb1, experts_nb2,
+        weights_nb0, weights_nb1, output_nb0, output_nb1,
+        value_scale);
+}
+
 static __global__ void ds4_peer_copy_f32_kernel(
         const float * __restrict__ src,
         float * __restrict__ dst,
@@ -435,6 +547,48 @@ static __global__ void ds4_align_moe_ids_kernel(
     }
 }
 
+static __global__ void ds4_balanced_owner_ids_kernel(
+        const int32_t * __restrict__ global_ids,
+        const float * __restrict__ router_weights,
+        const int32_t * __restrict__ local_id_lut,
+        const float * __restrict__ main_candidate_lut,
+        int32_t * __restrict__ owner_ids,
+        int n_routes,
+        int n_tokens,
+        int n_expert,
+        int main_quota,
+        bool main_owner) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+
+    // Assign one shared, host-rounded quota over the complete verification
+    // batch while keeping the decision device-local and identical on both
+    // owners.
+    int64_t assigned_main = 0;
+    for (int token = 0; token < n_tokens; ++token) {
+        const int64_t row = (int64_t) token * n_routes;
+        for (int route = 0; route < n_routes; ++route) {
+            const int64_t index = row + route;
+            const int32_t global_id = global_ids[index];
+            const bool active = router_weights[index] != 0.0f;
+            const bool valid_global = global_id >= 0 && global_id < n_expert;
+            const bool main_candidate = active && valid_global &&
+                main_candidate_lut[global_id] != 0.0f;
+            const bool route_on_main =
+                main_candidate && assigned_main < main_quota;
+            if (route_on_main) {
+                ++assigned_main;
+            }
+
+            const bool keep = active && valid_global &&
+                (main_owner ? route_on_main : !route_on_main);
+            const int32_t local_id = keep ? local_id_lut[global_id] : -1;
+            owner_ids[index] = local_id >= 0 ? local_id : -1;
+        }
+    }
+}
+
 static ggml_tensor make_contiguous_f32_tensor(
         float * data,
         int64_t ne0,
@@ -518,10 +672,8 @@ static void ggml_cuda_op_ds4_moe_owner(
     ggml_cuda_mul_mat_vec_q(
         ctx, down_w, &gu, expert_ids, &experts, nullptr);
 
-    const int total = n_embd * n_tokens;
-    const int block = 256;
-    const int grid = (total + block - 1) / block;
-    laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
+    launch_moe_combine(
+        ctx.stream(),
         (const char *) experts.data,
         (const char *) weights->data,
         (char *) dst->data,
@@ -591,10 +743,8 @@ static void ggml_cuda_op_ds4_moe_owner_split(
     ggml_cuda_mul_mat_vec_q(
         ctx, down_w, &gu, expert_ids, &experts, nullptr);
 
-    const int total = n_embd * n_tokens;
-    const int block = 256;
-    const int grid = (total + block - 1) / block;
-    laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
+    launch_moe_combine(
+        ctx.stream(),
         (const char *) experts.data,
         (const char *) weights->data,
         (char *) dst->data,
@@ -607,6 +757,52 @@ static void ggml_cuda_op_ds4_moe_owner_split(
 
 void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_MOE_FUSED_BALANCED_OWNER_IDS) {
+        const ggml_tensor * global_ids = dst->src[0];
+        const ggml_tensor * weights = dst->src[1];
+        const ggml_tensor * local_lut = dst->src[2];
+        const ggml_tensor * candidate_lut = dst->src[3];
+        GGML_ASSERT(global_ids && global_ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(weights && weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(local_lut && local_lut->type == GGML_TYPE_I32);
+        GGML_ASSERT(candidate_lut && candidate_lut->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_are_same_shape(global_ids, weights));
+        GGML_ASSERT(ggml_are_same_shape(global_ids, dst));
+        GGML_ASSERT(ggml_is_contiguous(global_ids));
+        GGML_ASSERT(ggml_is_contiguous(weights));
+        GGML_ASSERT(ggml_is_contiguous(local_lut));
+        GGML_ASSERT(ggml_is_contiguous(candidate_lut));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        GGML_ASSERT(global_ids->ne[0] > 0 && global_ids->ne[0] <= INT_MAX / 4 &&
+                    global_ids->ne[1] > 0 && global_ids->ne[1] <= INT_MAX &&
+                    global_ids->ne[2] == 1 && global_ids->ne[3] == 1);
+        const int n_routes = (int) global_ids->ne[0];
+        const int n_tokens = (int) global_ids->ne[1];
+        GGML_ASSERT(local_lut->ne[0] == 1 && local_lut->ne[2] == n_tokens &&
+                    local_lut->ne[3] == 1);
+        GGML_ASSERT(candidate_lut->ne[0] == 1 &&
+                    candidate_lut->ne[1] == local_lut->ne[1] &&
+                    candidate_lut->ne[2] == n_tokens &&
+                    candidate_lut->ne[3] == 1);
+        GGML_ASSERT(local_lut->ne[1] > 0 && local_lut->ne[1] <= INT_MAX);
+        // Dimension 1 is the base expert domain; later dimensions are only
+        // verifier-token replicas and must not expand the valid ID range.
+        const int n_expert = (int) local_lut->ne[1];
+        const int main_quota = ggml_get_op_params_i32(dst, 1);
+        GGML_ASSERT(main_quota > 0 &&
+                    (int64_t) main_quota <= (int64_t) n_routes * n_tokens);
+        const bool main_owner = ggml_get_op_params_i32(dst, 2) != 0;
+        ds4_balanced_owner_ids_kernel<<<1, 1, 0, ctx.stream()>>>(
+            (const int32_t *) global_ids->data,
+            (const float *) weights->data,
+            (const int32_t *) local_lut->data,
+            (const float *) candidate_lut->data,
+            (int32_t *) dst->data,
+            n_routes, n_tokens, n_expert, main_quota, main_owner);
+        return;
+    }
     if (mode == GGML_MOE_FUSED_ALIGN_IDS) {
         const ggml_tensor * ids = dst->src[0];
         GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
@@ -619,6 +815,33 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (int) ids->ne[1],
             (int) (ids->nb[1] / sizeof(int32_t)),
             (int) (dst->nb[1] / sizeof(int32_t)));
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {
+        // The collective runs as an ordinary graph node on this backend's
+        // stream, so partial sums are combined between the kernels that
+        // produce and consume them without a host round trip. ggml stays free
+        // of any collective library: the caller registered a callback.
+        const ggml_tensor * src = dst->src[0];
+        GGML_ASSERT(src && src->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
+        GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+
+        ggml_cluster_allreduce_fn fn = nullptr;
+        memcpy(&fn, &dst->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_FN_WORD],
+               sizeof(fn));
+        GGML_ASSERT(fn);
+        void * user = nullptr;
+        memcpy(&user, &dst->op_params[GGML_MOE_FUSED_CLUSTER_ALLREDUCE_USER_WORD],
+               sizeof(user));
+
+        const size_t n = (size_t) ggml_nelements(dst);
+        if (dst->data != src->data) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, n * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        fn(user, dst->data, n, (void *) ctx.stream());
         return;
     }
     if (mode == GGML_MOE_FUSED_DEFERRED_PEER_COPY) {
@@ -671,11 +894,8 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         const int n_embd   = (int) experts->ne[0];
         const int n_used   = (int) experts->ne[1];
         const int n_tokens = (int) experts->ne[2];
-        const int total = n_embd * n_tokens;
-
-        const int block = 256;
-        const int grid = (total + block - 1) / block;
-        laguna_moe_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
+        launch_moe_combine(
+            ctx.stream(),
             (const char *) experts->data,
             (const char *) weights->data,
             (char *) dst->data,

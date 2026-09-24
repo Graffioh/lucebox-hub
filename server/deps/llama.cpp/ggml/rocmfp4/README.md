@@ -31,7 +31,7 @@ Vulkan kernels are not implemented in this vendored build.
 
 ## Tests
 
-With `DFLASH27B_TESTS=ON`:
+With `LUCE_TESTS=ON`:
 
 - `test_rocmfp4` checks CPU reference round trips, validation, and imatrix
   handling.

@@ -31,14 +31,14 @@ The script is idempotent and configures `nvcc` on PATH for both bash and zsh. Fo
 | Tool | Min version |
 |------|------------|
 | GCC / G++ | 11 |
-| CMake | 3.18 |
+| CMake | 3.21 |
 | Git | 2.x |
 | git-lfs | any |
 | CUDA Toolkit | 12.0+ |
 | huggingface-cli | any |
 | uv | 0.11+ (Python deps) |
 
-After setup:
+After setup, run these commands from the repository root:
 
 ```bash
 git submodule update --init --recursive
@@ -51,7 +51,7 @@ uv sync --extra megakernel    # also compile the megakernel CUDA extension
 bash scripts/check_uv_workspace.sh  # lockfile + frozen-sync import smoke
 
 # C++/CUDA decoder
-cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build --target test_dflash -j
 ```
 
@@ -75,7 +75,19 @@ fix(dflash): clamp int8 DeltaNet state update before dequant
 docs(hub): add DVFS methodology link
 ```
 
-Allowed types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `bench`, `chore`, `ci`.
+Allowed types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `bench`, `build`, `chore`, `ci`, `revert`.
+The scope is required and lowercase, and the subject stays under 100 characters with no
+trailing period. CI checks every commit in a pull request
+([`commit-style.yml`](.github/workflows/commit-style.yml)).
+
+## Compacting commits before merge
+
+When a pull request is ready, a maintainer can add the `compact-commits` label. A bot then
+folds a pull request with 2 or more commits into a few conventional commits (usually
+one per type), checks the code is unchanged, and force-pushes them to the branch. It
+never merges: press Merge as usual once CI passes on the new head. On a fork, keep
+"Allow edits by maintainers" ticked. See
+[`compact-commits.yml`](.github/workflows/compact-commits.yml).
 
 ## Hardware access
 
@@ -87,7 +99,7 @@ If you want to contribute benchmarks but don't have the hardware:
 ## Getting help
 
 - [Discord](https://discord.gg/yHfswqZmJQ) — fastest feedback
-- [Issues](https://github.com/Luce-Org/lucebox-hub/issues) — for bugs and proposals
+- [Issues](https://github.com/Luce-Org/lucebox/issues) — for bugs and proposals
 - Mention `@Luce-Org/maintainers` on a PR when it's ready for review
 
 ## Licensing

@@ -10,12 +10,16 @@
 
 #include <cstddef>
 #include <list>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
+// Thread-safe: lookup() is called from HTTP client threads during request
+// parsing while the worker/scheduler thread calls remember() at stream
+// finish, and lookup() mutates the LRU. One mutex covers both.
 class ToolMemory {
 public:
     explicit ToolMemory(size_t max_entries = 50000,
@@ -40,10 +44,12 @@ public:
         size_t current_bytes;
     };
     Stats stats() const {
+        std::lock_guard<std::mutex> lk(mu_);
         return {max_entries_, max_bytes_, by_id_.size(), total_bytes_};
     }
 
 private:
+    mutable std::mutex mu_;
     struct Block {
         size_t      size_bytes;
         size_t      refs = 0;
@@ -67,4 +73,4 @@ private:
     std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

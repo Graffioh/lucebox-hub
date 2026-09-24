@@ -29,15 +29,18 @@
 // which is a 32-lane instruction. A wave64 target would need a different WMMA
 // instruction and fragment layout, not a warp-width tweak, so we fail the build
 // loudly rather than emit silently-wrong results. All currently declared AMD
-// targets (gfx1100 / gfx1151, RDNA3) are wave32. __AMDGCN_WAVEFRONT_SIZE(__) is
-// defined only in the device compile pass.
-#if defined(__AMDGCN_WAVEFRONT_SIZE__) && (__AMDGCN_WAVEFRONT_SIZE__ != 32)
+// targets (gfx1100 / gfx1151, RDNA3) are wave32. Check the compiler-provided
+// wavefront macros only in the device pass: some ROCm versions expose a
+// host-side definition that is not an integer constant expression.
+#if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__
+#  if defined(__AMDGCN_WAVEFRONT_SIZE__) && (__AMDGCN_WAVEFRONT_SIZE__ != 32)
 #  error "flashprefill_kernels.hip.cu requires a 32-lane wavefront (RDNA v_wmma_f32_16x16x16 fragment layout). Build for a wave32 target (gfx10/gfx11) or provide a wave64 WMMA rewrite."
-#elif !defined(__AMDGCN_WAVEFRONT_SIZE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && (__AMDGCN_WAVEFRONT_SIZE != 32)
+#  elif !defined(__AMDGCN_WAVEFRONT_SIZE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && (__AMDGCN_WAVEFRONT_SIZE != 32)
 #  error "flashprefill_kernels.hip.cu requires a 32-lane wavefront (RDNA v_wmma_f32_16x16x16 fragment layout). Build for a wave32 target (gfx10/gfx11) or provide a wave64 WMMA rewrite."
+#  endif
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // ---- Kernel 1: compute_mean_vector ----
@@ -83,7 +86,7 @@ extern "C" int launch_compute_mean_vector_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128 || block_size != 128) {
-        fprintf(stderr, "[dflash] launch_compute_mean_vector_bf16: unsupported shape "
+        fprintf(stderr, "[luce] launch_compute_mean_vector_bf16: unsupported shape "
                 "head_dim=%d block_size=%d (only 128×128 supported)\n",
                 head_dim, block_size);
         return -1;
@@ -194,7 +197,7 @@ extern "C" int launch_compute_block_score_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128 || block_size != 128) {
-        fprintf(stderr, "[dflash] launch_compute_block_score_bf16: unsupported shape "
+        fprintf(stderr, "[luce] launch_compute_block_score_bf16: unsupported shape "
                 "head_dim=%d block_size=%d (only 128×128 supported)\n",
                 head_dim, block_size);
         return -1;
@@ -301,7 +304,7 @@ extern "C" int launch_compute_block_score_gemm_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128) {
-        fprintf(stderr, "[dflash] launch_compute_block_score_gemm_bf16: unsupported "
+        fprintf(stderr, "[luce] launch_compute_block_score_gemm_bf16: unsupported "
                 "head_dim=%d (only 128 supported)\n", head_dim);
         return -1;
     }
@@ -681,7 +684,7 @@ extern "C" int launch_transpose_kv_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128) {
-        fprintf(stderr, "[dflash] launch_transpose_kv_bf16: unsupported head_dim=%d "
+        fprintf(stderr, "[luce] launch_transpose_kv_bf16: unsupported head_dim=%d "
                 "(only 128 supported)\n", head_dim);
         return -1;
     }
@@ -775,4 +778,4 @@ extern "C" void launch_block_select(
 // launch_rms_norm_mul_w_f32 is defined in rms_norm_hip.cu (compiled for all HIP builds).
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common

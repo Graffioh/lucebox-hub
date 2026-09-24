@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -42,6 +42,9 @@ This repo provides the GGUF target path and runtime pieces needed to run that st
 
 The default setup fits on a 24 GB RTX 3090: ~16 GB Q4_K_M target, 1.84 GB GGUF draft, DDTree verify state, and KV cache.
 
+For one listener with Qwen on R9700 and DS4 on Strix Halo, see
+[model load balancing](docs/MODEL_LOAD_BALANCING.md).
+
 ## Results
 
 Qwen3.5-27B Q4_K_M, concurrency=1, n_gen=256, 10 prompts/dataset:
@@ -67,13 +70,13 @@ Prefill numbers assume `--max-ctx` sized to the prompt (auto-fit in `run.py` / `
 
 HE 10-prompt bench mean in 128K mode (ctx=131072, ddtree-budget=16, FA window=2048): **134.78 tok/s** at AL 8.33.
 
-Decode tok/s assume the default sliding-window flash attention (`--fa-window 2048`, lossless: 100% acceptance at all window sizes). Disable with `--fa-window 0` for full attention; expect ~25 tok/s at 60K+. Tune the window via `python3 scripts/run.py --fa-window N` or `--fa-window N` on `test_dflash`/`dflash_server` (sweet spot 1024–2048; bigger windows trade speed for marginally tighter attention).
+Decode tok/s assume the default sliding-window flash attention (`--fa-window 2048`, lossless: 100% acceptance at all window sizes). Disable with `--fa-window 0` for full attention; expect ~25 tok/s at 60K+. Tune the window via `python3 scripts/run.py --fa-window N` or `--fa-window N` on `test_dflash`/`luce_server` (sweet spot 1024–2048; bigger windows trade speed for marginally tighter attention).
 
-Set `DFLASH27B_KV_TQ3=1` (TQ3_0, 3.5 bpv, default) or `DFLASH27B_KV_Q4=1` (Q4_0, 4.5 bpv, legacy) to enable. Full sweep in [RESULTS.md](RESULTS.md).
+Set `LUCE_KV_TQ3=1` (TQ3_0, 3.5 bpv, default) or `LUCE_KV_Q4=1` (Q4_0, 4.5 bpv, legacy) to enable. Full sweep in [RESULTS.md](RESULTS.md).
 
 ### Asymmetric K/V quantization
 
-The cache now supports independent quantization types for keys and values, optimizing memory-asymmetric workloads. Set `DFLASH27B_KV_K=<type>` and `DFLASH27B_KV_V=<type>` via environment or CLI flags. Supported types (case-insensitive): `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `tq3_0`.
+The cache now supports independent quantization types for keys and values, optimizing memory-asymmetric workloads. Set `LUCE_KV_K=<type>` and `LUCE_KV_V=<type>` via environment or CLI flags. Supported types (case-insensitive): `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `tq3_0`.
 
 **Supported (K, V) pairs:**
 - K ∈ {F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0} × V ∈ {F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, TQ3_0}
@@ -83,7 +86,7 @@ Unsupported pairs abort at allocation with a printed list. Precedence (high→lo
 
 **Environment variables:**
 ```bash
-DFLASH27B_KV_K=q8_0 DFLASH27B_KV_V=q4_0 ./test_dflash …
+LUCE_KV_K=q8_0 LUCE_KV_V=q4_0 ./test_dflash …
 ```
 
 **CLI flags on `test_dflash` / `test_generate`:**
@@ -134,18 +137,18 @@ Qwen3.6-27B is the default integration path. It uses the same `qwen35` target ar
 # 1. target
 hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 
-# 2. matched 3.6 draft (GGUF, used by default by scripts/run.py and dflash_server)
+# 2. matched 3.6 draft (GGUF, used by default by scripts/run.py and luce_server)
 hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir models/draft/
 
 # 3. bench
-DFLASH_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
+LUCE_TARGET=models/Qwen3.6-27B-Q4_K_M.gguf python3 scripts/bench_he.py --n-gen 128
 ```
 
-The default draft path is discovered under `models/draft/`. Scripts prefer `dflash-draft-*.gguf`, then any `.gguf`, then `model.safetensors`. Explicit `.gguf` and safetensors drafts still work via `DFLASH_DRAFT` / `--draft`; qwen35-compatible targets remain swappable via `DFLASH_TARGET` / `--target`.
+The default draft path is discovered under `models/draft/`. Scripts prefer `dflash-draft-*.gguf`, then any `.gguf`, then `model.safetensors`. Explicit `.gguf` and safetensors drafts still work via `LUCE_DRAFT` / `--draft`; qwen35-compatible targets remain swappable via `LUCE_TARGET` / `--target`.
 
 ## Native C++ HTTP server
 
-`dflash_server` serves the same client-facing local API surface used by the
+`luce_server` serves the same client-facing local API surface used by the
 harnesses. It supports `/health`,
 `/v1/models`, OpenAI Chat Completions including streaming and tool metadata,
 OpenAI Responses for Codex and OMP, Anthropic Messages for Claude Code, and
@@ -155,13 +158,13 @@ Build it with the rest of the CUDA runtime:
 
 ```bash
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target dflash_server -j
+cmake --build build --target luce_server -j
 ```
 
 Run it directly:
 
 ```bash
-./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --host 127.0.0.1 --port 18080 \
   --max-ctx 32768 --max-tokens 512 \
@@ -170,9 +173,15 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+Use `--specla` to enable speculative linear-attention verification when the
+target supports it. The runtime chooses a compatible proposal adapter; the
+current monolithic Qwen3.5/Qwen3.6 path uses DDTree with tested defaults.
+Hardware- or checkpoint-specific overrides remain available through
+`--ddtree-budget`, `--ddtree-tau`, `--specla-top-k`, and `--draft-swa`.
+
 ### Compression proxy mode
 
-`dflash_server` can run as a **PFlash compression proxy** in front of any
+`luce_server` can run as a **PFlash compression proxy** in front of any
 OpenAI-compatible backend instead of doing local inference. When
 `--prefill-upstream-base` is set, each request is compressed (PFlash) and
 forwarded upstream: compressed requests are sent as a raw `prompt` to
@@ -183,7 +192,7 @@ are rewritten back to the Chat Completions shape. With no upstream flags the
 server is byte-identical to local-inference mode.
 
 ```bash
-./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --prefill-compression auto --prefill-threshold 10000 \
   --prefill-drafter models/Qwen3-0.6B-BF16.gguf \
   --prefill-curve 10000:0.5 40000:0.2 100000:0.1 \
@@ -212,6 +221,180 @@ python3 ../harness/client_test_runner.py probe \
 
 On fragile external RTX links, use the same conservative NVIDIA profile as the
 RTX mixed-hardware notes before running long prompts.
+
+## Server parameter reference
+
+The command shape is `luce_server <model.gguf> [options]`. The first positional argument selects the target weights. `--model-name` only changes the name reported by the API; it does not select a model file.
+
+### Core server
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--draft <path>` | none | Draft model for speculative decode. |
+| `--host <addr>` | `0.0.0.0` | Bind address. |
+| `--port <N>` | `8080` | Listen port. |
+| `--max-ctx <N>` | `131072` | Maximum context length. |
+| `--max-tokens <N>` | model card | Legacy alias for `--default-max-tokens`. |
+| `--default-max-tokens <N>` | model card or `16000` | Output cap when a request omits a token limit. |
+| `--model-name <name>` | `dflash` | API alias returned by `/v1/models` and responses. It does not change the loaded weights. |
+| `--chat-template-file <path>` | model default | Jinja chat-template override. |
+| `--no-cors` | CORS enabled | Disable CORS headers. |
+
+### Speculative decode
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--draft-block-size <N>` | checkpoint metadata | Dense Qwen proposal width, from 2 through 32 and no more than twice the trained block size. |
+| `--draft-swa <N>` | `0` | Draft sliding-attention window. |
+| `--draft-residency auto\|persistent\|request-scoped` | `auto` | Control when draft weights remain resident. |
+| `--lazy-draft` | off | Alias for request-scoped draft residency. |
+| `--fast-rollback` | on | Enable speculative fast rollback. |
+| `--no-fast-rollback` | off | Disable fast rollback. |
+| `--specla` | off | Enable SpecLA when the target supports it. |
+| `--specla-top-k <K>` | `4` | SpecLA draft-tree width. |
+| `--ddtree` | off | Enable DDTree verification. |
+| `--ddtree-budget <N>` | `22` | DDTree candidate budget. |
+| `--ddtree-tau <T>` | off | Confidence margin; SpecLA defaults to 6. |
+| `--verify-width <N>` | adaptive base 8 | Laguna chain-verification width. |
+| `--adaptive-experts [tau]` | off | Enable expert-count gating with a default threshold of 0.80. |
+| `--fa-window <N>` | `0` | Target attention window. Keep `0` for full attention and tool use at long context. |
+
+### Device placement
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--target-device <backend:gpu>` | `auto:0` | Place the target on a CUDA or HIP device. |
+| `--draft-device <backend:gpu>` | `auto:0` | Place the draft on a CUDA or HIP device. |
+| `--target-devices <list>` | one device | Select multiple target devices, such as `cuda:0,cuda:1`. |
+| `--target-split-mode layer\|tensor` | `layer` | Select the multi-GPU target strategy. |
+| `--target-layer-split <weights>` | none | Optional layer-split weights. |
+| `--target-split-fast-rollback` | off | Use exact F32 checkpoints for supported local Qwen layer splits. |
+| `--peer-access` | off | Enable peer access between target GPUs. |
+| `--chunk <N>` | `512` | Chunked-prefill batch size. |
+| `--draft-ipc-bin <path>` | none | Remote draft daemon for mixed backends. |
+| `--draft-ipc-work-dir <path>` | none | Remote draft scratch directory. |
+| `--draft-ipc-ring-cap <N>` | runtime default | Remote draft feature-ring capacity. |
+| `--target-shard-ipc-bin <path>` | none | Remote target-shard daemon. |
+| `--target-shard-ipc-work-dir <path>` | none | Remote target-shard scratch directory. |
+
+See [recommended setups](docs/RECOMMENDED_SETUPS.md) for tested combinations and [mixed-backend placement](docs/MIXED_BACKEND.md) for build requirements.
+
+### DeepSeek V4
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--ds4-fused-decode` | off | Enable single-graph GPU decode. |
+| `--ds4-fused-verify-f16-kv` | off | Reuse the F16 MLA cache during batched verification. |
+| `--ds4-expert-top-k <N>` | `0`, model default | Set routed experts per token. The current DeepSeek V4 profile uses `6`. |
+| `--ds4-prefill exact\|dense\|sparse` | `exact` | Select prefill mode. Dense and sparse modes can change generated tokens. |
+
+See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/deepseek-v4-flash-0731) and the [DeepSeek V4 implementation guide](docs/DS4.md).
+
+### KV cache, paging, and concurrency
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--cache-type-k <type>` | model and backend default | K-cache type: `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, or `tq3_0`. |
+| `--cache-type-v <type>` | model and backend default | V-cache type using the same choices. |
+| `--kvflash <tokens\|auto>` | off | Enable bounded KV residency. |
+| `--kvflash-policy drafter\|lru\|qk` | `drafter` | Choose the KVFlash residency policy. |
+| `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
+| `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
+| `--concurrent-prefix-cache-max-mib <MiB>` | `4096` | Resident RAM limit for copied concurrent paged prefix checkpoints; `0` is unlimited. |
+| `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
+| `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
+| `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |
+| `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences. Qwen supports up to 64; DeepSeek4 supports up to 6. Values above 1 enable paged attention. |
+| `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
+| `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
+| `--decode-kv-offload-mb <auto\|N>` | `auto` | Automatically size the RAM budget for active KV suspension; `N` sets a per-model cap in MiB, `0` disables. Applies to concurrent serving. |
+| `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
+| `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
+| `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
+| `--kv-cache-interval <N>` | `10240` | Continued-checkpoint interval. |
+| `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |
+| `--disk-prefix-cache off\|full\|auto\|auto:N\|N` | `full` | Default disk prefix policy. |
+| `--disk-prefix-cache-compress` | off | Clamp FlowKV snapshots to the stable system prefix. Requires a prefill drafter. |
+
+Decode-pressure suspension defaults to `auto`. After all models load, the
+server shares 25% of available host RAM across eligible models, subtracting
+explicit offload caps first. Each model's automatic cap is also bounded by
+the payload needed to preserve up to `max_concurrency - 1` contexts at their
+individual context/pool limit. Repeated suspensions may save more than one
+pool's payload as resident requests reuse pages and continue growing. These
+are allocation caps; no RAM is reserved until a request is suspended.
+
+Linux uses `MemAvailable`, bounded by the current cgroup v2 and its visible
+ancestors' remaining memory limits. Windows uses available physical RAM.
+Unknown memory reporting (including cgroup v1 memory control) disables
+automatic offload; an explicit MiB cap remains available. The resolved byte
+cap is logged at startup and exposed in `/props` under
+`runtime.continuous_batching.decode_kv_offload_bytes`. Available memory is
+checked again before each checkpoint allocation when reporting is available.
+This is conservative sizing, not a reservation against other processes.
+
+Use `--decode-kv-offload-mb 1024` to override the automatic value with a 1 GiB
+per-model cap, or `--decode-kv-offload-mb 0` to disable it. Explicit nonzero
+caps require concurrency greater than one. Automatic mode resolves to zero
+for single-request or unsupported engines. Disabling recovery still checks
+decode capacity and reduces speculation when necessary; if one-token decode
+cannot fit, only the selected request fails, before model execution.
+
+Before a decode step, the scheduler reserves its growth; if necessary it
+first reduces speculation to one token, then suspends a newer request.
+Copies finish before its blocks are released. The same slot retains
+recurrent/compressor/draft state, sampler, pending token, and response
+connection; existing SSE heartbeats continue during the pause. Parked
+requests resume in admission order once resident requests drain, or earlier
+when the pool has room for the checkpoint plus the cohort's next step; new
+admissions wait while any request is parked.
+
+A request that cannot be checkpointed within the RAM budget — or whose
+checkpoint cannot be copied back — is not terminated: it parks without a
+payload and resumes through ordinary chunked prefill over its retained
+token history, which rebuilds paged KV and slot-local state together.
+Requests whose context cannot fit the pool even alone, and unrecoverable
+engine failures, still produce an error.
+
+This is an in-process checkpoint: it neither survives a server restart nor
+moves a request between models. RAM avoids disk I/O and checkpoint files.
+Slot-local state remains on the device, so this recovers pool blocks, not
+the whole request's device footprint. `/status/json` reports
+`parked_requests` (suspended plus recompute-parked) and
+`offloaded_kv_bytes` per model.
+
+### PFlash
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--prefill-compression off\|auto\|always` | `off` | Select when PFlash compresses a prompt. |
+| `--prefill-threshold <N>` | `32000` | Token threshold used by auto mode. |
+| `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
+| `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
+| `--prefill-drafter <path>` | none | PFlash drafter GGUF. |
+| `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
+| `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
+| `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
+| `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
+
+### Reasoning and MoE controls
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--think-max-tokens <N>` | model card | Reasoning-phase cap. |
+| `--hard-limit-reply-budget <N>` | `4096` | Reserve output space by closing the reasoning phase near the limit; `0` disables. |
+| `--reasoning-effort-low <N>` | model card | Token budget for low effort. |
+| `--reasoning-effort-medium <N>` | model card | Token budget for medium effort. |
+| `--reasoning-effort-high <N>` | model card | Token budget for high effort. |
+| `--reasoning-effort-x-high <N>` | model card | Token budget for x-high effort. |
+| `--reasoning-effort-max <N>` | model card | Token budget for max effort. |
+| `--spark` | off | Enable self-tuning MoE expert placement. |
+| `--spark-slots <N>` | auto | Set expert-cache slots per layer. |
+| `--spark-vram <GiB>` | whole card | Cap total VRAM used by Spark. |
+| `--freq` | off | Print expert-frequency analysis at shutdown. |
+| `--collect-routing <path>` | none | Write binary routing data for predictor training. |
+
+Burn-in switches, profiling controls, and compatibility environment variables are listed in the [environment reference](docs/ENVIRONMENT.md). The executable's usage text and `server_main.cpp` remain the source of truth for the current CLI.
 
 Reference measurements from the Qwen3.6 bring-up on RTX 3090:
 
@@ -256,23 +439,23 @@ pin the cache ring directly with `--spark-slots <N>` (default: auto-sized from
 the VRAM target).
 
 ```bash
-dflash_server models/laguna-xs2-Q4_K_M.gguf --spark                  # size to the card
-dflash_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-vram 14  # cap total VRAM
-dflash_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-slots 48 # pin 48 cache slots/layer
+luce_server models/laguna-xs2-Q4_K_M.gguf --spark                  # size to the card
+luce_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-vram 14  # cap total VRAM
+luce_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-slots 48 # pin 48 cache slots/layer
 ```
 
 Under offload, laguna decodes the whole token in **one fused graph**
 (`laguna_step_hybrid`), so throughput stays near the all-GPU ceiling (e.g.
 ~100 tok/s at 60% residency vs ~118 all-GPU on an RTX 3090); set
-`DFLASH_LAGUNA_NO_SINGLE_GRAPH=1` to fall back to the per-layer path.
+`LUCE_LAGUNA_NO_SINGLE_GRAPH=1` to fall back to the per-layer path.
 
 ### Budget knobs
 
 | Env | Arch | Effect |
 |---|---|---|
-| `DFLASH_EXPERT_BUDGET_MB N` | both | Cap hot-expert VRAM to `N` MB. Applies only when `N` is below the auto-computed budget; experts beyond it go cold (CPU). |
-| `DFLASH_EXPERT_BUDGET_PCT P` | laguna | Keep hot experts to `P`% (`0<P<100`) of total expert bytes. Applies only when below the auto budget. |
-| `DFLASH_MAX_CONTEXT N` | both | Override the max context used when sizing the KV cache (more KV = less VRAM left for hot experts). |
+| `LUCE_EXPERT_BUDGET_MB N` | both | Cap hot-expert VRAM to `N` MB. Applies only when `N` is below the auto-computed budget; experts beyond it go cold (CPU). |
+| `LUCE_EXPERT_BUDGET_PCT P` | laguna | Keep hot experts to `P`% (`0<P<100`) of total expert bytes. Applies only when below the auto budget. |
+| `LUCE_MAX_CONTEXT N` | both | Override the max context used when sizing the KV cache (more KV = less VRAM left for hot experts). |
 
 ### Placement / tuning knobs (per arch)
 
@@ -280,12 +463,12 @@ Substitute `<ARCH>` = `LAGUNA` or `QWEN35MOE`:
 
 | Env | Effect |
 |---|---|
-| `DFLASH_<ARCH>_HOTNESS <file>` | Expert frequency/hotness file driving which experts are placed hot. |
-| `DFLASH_<ARCH>_TELEMETRY 1` | Log per-layer hot/cold FFN timing telemetry. |
-| `DFLASH_<ARCH>_SWAP_MAX N` | Max hot/cold promotions per request boundary (runtime re-placement); `0` disables swapping. |
-| `DFLASH_<ARCH>_SWAP_MIN_GAIN N` | Min observed-frequency gain before a cold expert is promoted to hot. |
-| `DFLASH_<ARCH>_NEXT_PLACEMENT_OUT <file>` | Dump the placement chosen this run (warm-start the hotness file next time). |
-| `DFLASH_QWEN35MOE_RUNTIME_STATS_OUT <file>` | (qwen only) Dump runtime routing-frequency stats. |
+| `LUCE_<ARCH>_HOTNESS <file>` | Expert frequency/hotness file driving which experts are placed hot. |
+| `LUCE_<ARCH>_TELEMETRY 1` | Log per-layer hot/cold FFN timing telemetry. |
+| `LUCE_<ARCH>_SWAP_MAX N` | Max hot/cold promotions per request boundary (runtime re-placement); `0` disables swapping. |
+| `LUCE_<ARCH>_SWAP_MIN_GAIN N` | Min observed-frequency gain before a cold expert is promoted to hot. |
+| `LUCE_<ARCH>_NEXT_PLACEMENT_OUT <file>` | Dump the placement chosen this run (warm-start the hotness file next time). |
+| `LUCE_QWEN35MOE_RUNTIME_STATS_OUT <file>` | (qwen only) Dump runtime routing-frequency stats. |
 
 ### Cache + single-graph knobs
 
@@ -293,18 +476,18 @@ Substitute `<ARCH>` = `LAGUNA` or `QWEN35MOE`. `--spark` sets these for you.
 
 | Env | Effect |
 |---|---|
-| `DFLASH_SPARK 1` | Enable the autotuning Spark path (set by `--spark`). |
-| `DFLASH_SPARK_VRAM_MB N` | Total VRAM target Spark sizes the hot tier + cache to (set by `--spark-vram`). |
-| `DFLASH_<ARCH>_EXPERT_CACHE 1` | Bounded GPU expert cache: swap selected cold experts into spare slots (LRU) so they are served on-GPU; cold-miss falls toward 0 after warmup. |
-| `DFLASH_<ARCH>_CACHE_SLOTS N` | Cache slots per layer (default: auto-sized from the VRAM target; `--spark-slots N` is the CLI equivalent). |
-| `DFLASH_LAGUNA_GPU_REMAP 1` | Serve the cache through the unified on-GPU FFN (required for the laguna cache to take effect). |
-| `DFLASH_LAGUNA_NO_SINGLE_GRAPH 1` | Fall back to per-layer decode instead of the default single-graph hybrid. |
+| `LUCE_SPARK 1` | Enable the autotuning Spark path (set by `--spark`). |
+| `LUCE_SPARK_VRAM_MB N` | Total VRAM target Spark sizes the hot tier + cache to (set by `--spark-vram`). |
+| `LUCE_<ARCH>_EXPERT_CACHE 1` | Bounded GPU expert cache: swap selected cold experts into spare slots (LRU) so they are served on-GPU; cold-miss falls toward 0 after warmup. |
+| `LUCE_<ARCH>_CACHE_SLOTS N` | Cache slots per layer (default: auto-sized from the VRAM target; `--spark-slots N` is the CLI equivalent). |
+| `LUCE_LAGUNA_GPU_REMAP 1` | Serve the cache through the unified on-GPU FFN (required for the laguna cache to take effect). |
+| `LUCE_LAGUNA_NO_SINGLE_GRAPH 1` | Fall back to per-layer decode instead of the default single-graph hybrid. |
 
 ### Example
 
 ```bash
 # Force ~8 GB of hot experts on GPU; the rest run cold on the CPU.
-DFLASH_EXPERT_BUDGET_MB=8000 ./build/dflash_server models/laguna-xs2-Q4_K_M.gguf --port 8000
+LUCE_EXPERT_BUDGET_MB=8000 ./build/luce_server models/laguna-xs2-Q4_K_M.gguf --port 8000
 # Startup log e.g.: "dynamic placement result: 4717 hot experts, 5267 cold experts"
 ```
 
@@ -327,9 +510,9 @@ layers and is removed once the kernel is fixed upstream.
 and dispatches by arch:
 
   - `qwen35` / `qwen36` → existing DFlash + DDTree pipeline (no change).
-  - `laguna` → `dflash::common::run_laguna_daemon()` (no spec-decode, no DDTree).
+  - `laguna` → `luce::common::run_laguna_daemon()` (no spec-decode, no DDTree).
 
-The daemon stdin/stream-fd protocol is identical, so `dflash_server`
+The daemon stdin/stream-fd protocol is identical, so `luce_server`
 drives both arches end-to-end. The only thing the user changes is the model path.
 
 ### Build + run
@@ -344,21 +527,21 @@ hf download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 \
     --include 'tokenizer*' '*.json'
 
 # OpenAI-compatible HTTP server.
-# dflash_server routes to run_laguna_daemon() when arch=laguna.
-./build/dflash_server models/laguna-xs2-Q4_K_M.gguf \
+# luce_server routes to run_laguna_daemon() when arch=laguna.
+./build/luce_server models/laguna-xs2-Q4_K_M.gguf \
     --max-ctx 16384 --port 8000
 
 curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"luce-dflash","messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
+  -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":32}'
 
 # Smoke (loader only, no forward)
 ./build/smoke_load_target_laguna models/laguna-xs2-Q4_K_M.gguf
 
-# Variable-N TTFT bench (DFLASH_KV_TYPE=q4_0 for ctx > 32K, DFLASH_CHUNK=2048 default)
-DFLASH_KV_TYPE=q4_0 ./build/bench_laguna_ttft models/laguna-xs2-Q4_K_M.gguf '4096,16384,65536'
+# Variable-N TTFT bench (LUCE_KV_TYPE=q4_0 for ctx > 32K, LUCE_CHUNK=2048 default)
+LUCE_KV_TYPE=q4_0 ./build/bench_laguna_ttft models/laguna-xs2-Q4_K_M.gguf '4096,16384,65536'
 
 # NIAH single-needle, with PFlash compression. The driver still spawns the
-# standalone test_laguna_daemon binary so it can run without dflash_server.
+# standalone test_laguna_daemon binary so it can run without luce_server.
 python3 scripts/laguna_pflash_niah.py \
     --target models/laguna-xs2-Q4_K_M.gguf \
     --drafter models/Qwen3-0.6B-BF16.gguf \
@@ -419,15 +602,15 @@ tokens) is the path to bring code recall to the same ratio as prose.
 
 - **No Laguna spec-decode draft published yet.** Current decode is autoregressive only (~111 tok/s on RTX 3090). When a matched draft lands, the DFlash + DDTree machinery already in `test_dflash` ports across.
 - **Prefix cache + in-process PFlash compression** are disabled on the laguna path. Both require `SNAPSHOT` / `RESTORE` / `FREE_SNAPSHOT` and `compress` / `park` / `unpark` commands inside `run_laguna_daemon`. Tracked as follow-ups; the qwen35 path uses them today.
-- **Path B (in-process Python drafter)** is not used here. Path A keeps the dflash daemon ggml-only.
+- **Path B (in-process Python drafter)** is not used here. Path A keeps the luce daemon ggml-only.
 
 ## Quick start
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
+cd lucebox/server
 
-# Build (CUDA 12+, CMake 3.18+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
+# Build (CUDA 12+, CMake 3.21+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
 # Pass -DCMAKE_CUDA_ARCHITECTURES matching your GPU. Common values:
 #   60;61 = Pascal P100/P40 (scalar flashprefill fallback, no WMMA)
 #   70 = V100 (F16 WMMA kernels, BF16 draft → FP16 at load)
@@ -441,7 +624,7 @@ cd lucebox-hub/dflash
 # which compiles Pascal (scalar), Volta/Turing (F16 WMMA), and Ampere+ (BF16 WMMA)
 # flashprefill paths.
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build --target test_dflash -j
+cmake --build build --target test_dflash luce_server -j
 
 # Fetch models: ~16 GB target + 0.98 GB Lucebox Q4_K_M GGUF DFlash draft.
 # Quickstart pins to Qwen3.6-27B (latest release). For Qwen3.5-27B swap in
@@ -451,14 +634,14 @@ hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf --local-dir models/
 hf download Lucebox/Qwen3.6-27B-DFlash-GGUF dflash-draft-3.6-q4_k_m.gguf --local-dir models/draft/
 
 # Streaming one-shot generate (run.py defaults to models/Qwen3.6-27B-Q4_K_M.gguf;
-# override with --target or DFLASH_TARGET=... env var).
+# override with --target or LUCE_TARGET=... env var).
 python3 scripts/run.py --prompt "def fibonacci(n):"
 
 # Multi-turn chat REPL
 python3 examples/chat.py
 
 # OpenAI-compatible HTTP server (drop-in for Open WebUI / LM Studio / Cline).
-./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft models/draft/dflash-draft-3.6-q4_k_m.gguf --port 8000
 
 # Reproduce paper numbers
@@ -468,7 +651,7 @@ python3 scripts/bench_he.py --n-gen 256 --ddtree-budget 22   # minimal HE bench
 
 **Long-context mode (up to 256K):**
 ```bash
-DFLASH27B_KV_TQ3=1 DFLASH27B_PREFILL_UBATCH=16 \
+LUCE_KV_TQ3=1 LUCE_PREFILL_UBATCH=16 \
   build/test_dflash models/Qwen3.6-27B-Q4_K_M.gguf \
   models/draft/dflash-draft-3.6-q4_k_m.gguf /tmp/long_prompt.bin 64 /tmp/out.bin \
   --fast-rollback --ddtree --ddtree-budget=16 --max-ctx=4096   # align_up(prompt + n_gen + 64, 256); raise up to 262144 for long prompts
@@ -487,9 +670,9 @@ nvcc --version
 
 ```bash
 nvcc --version  # must show >= 12.9
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
-cmake --build build --target test_dflash dflash_server -j
+cmake --build build --target test_dflash luce_server -j
 ```
 
 On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify throughput until memory bandwidth saturates) and consider skipping KV quantization entirely (`--cache-type-k f16 --cache-type-v f16`).
@@ -498,9 +681,9 @@ On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify 
 
 ```bash
 nvcc --version  # must show >= 13.0
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds Thor arch
-cmake --build build --target test_dflash dflash_server -j
+cmake --build build --target test_dflash luce_server -j
 ```
 
 ### Per-GPU retune
@@ -515,8 +698,28 @@ Same DFlash + PFlash stack on AMD GPUs. PR #119 ports the Phase 2 rocWMMA flashp
 
 **RDNA4 — Radeon AI PRO R9700 (`gfx1201`, 32 GB).** First-class RDNA4 target as of this build. Qwen3.6-27B Q4_K_M + DFlash draft (`dflash-draft-3.6-q4_k_m.gguf`), `--ddtree-budget=22`: **54.65 tok/s mean DFlash decode** across the 10-prompt HumanEval suite (`bench_he.py --n-gen 256`, AL 7.14, range 36.9–93.0 tok/s) on ROCm 7.1.1. The rocWMMA Phase 2 flashprefill kernels are numerically correct on RDNA4 — ROCm 7.1's rocWMMA handles the gfx12 WMMA operand-format change internally, so no kernel changes are needed (`test_flashprefill_kernels` PASS on `gfx1201`: max diff 5e-4, e2e `flash_prefill_forward_bf16` at S=8192 in 10.7 ms/iter). Note `gfx1200` (RX 9060) and `gfx1201` (RX 9070 / R9700) are **not** code-object compatible — build for `gfx1201` explicitly for the R9700.
 
+For Qwen3.8-27B IQ4_XS with the Q8_0 DFlash2 drafter, the checkpoint declares
+a block size of 8: one seed token plus seven speculative tokens. Greedy chain
+verification keeps the output byte-identical to plain decode at any width, so
+`--draft-block-size` accepts values from 2 up to 2x the checkpoint metadata;
+widening only risks acceptance depth, and on this checkpoint it extrapolates:
+completions stayed byte-identical across widths 8/10/12/16 while per-step
+commits grew.
+
+On the R9700 (`gfx1201`), chain verification with `--draft-block-size 16` is
+the fastest measured code/math configuration: HumanEval ten-prompt decode went
+from 143.6 tok/s (block 8) to 204.1 average with per-request peaks above 230,
+and a five-prompt math set from 129.2 to 152.6. Prose stays on block 8 (low
+acceptance pays the wider draft without commit gains). Widths past 16 measured
+a step-time cliff with no commit gain and stay rejected. The block-8
+`--specla --ddtree-budget 8` configuration is a quality-validated alternative
+(the out-of-the-box default is the plain chain at the checkpoint's block 8):
+163.9 versus 159.0 aggregate decode tok/s across repeated ten-prompt
+HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
+short A/B replies and 133/164 full-suite replies byte-identical.
+
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 
 # Ubuntu/ROCm build dependencies used by ggml's HIP backend.
 sudo apt-get update
@@ -525,19 +728,19 @@ sudo apt-get install hipblas-dev hipcub-dev rocblas-dev rocprim-dev rocwmma-dev
 # Build for gfx1151 (Strix Halo). Swap arch for gfx1100 / gfx1201.
 cmake -B build -S . \
   -DCMAKE_BUILD_TYPE=Release \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
-  -DDFLASH27B_HIP_SM80_EQUIV=ON
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES=gfx1151 \
+  -DLUCE_HIP_SM80_EQUIV=ON
 cmake --build build --target test_dflash -j
 ```
 
-`DFLASH27B_HIP_SM80_EQUIV=ON` enables the rocWMMA Phase 2 flashprefill kernels (path that delivers the prefill speedup). `OFF` falls back to ggml's `flash_attn_ext` (slower but no rocwmma headers needed). With `SM80_EQUIV=ON` the build also produces `test_flashprefill_kernels` (HIP) — run it on your card to validate the rocWMMA kernels numerically (`HIP_VISIBLE_DEVICES=<gpu> ./build/test_flashprefill_kernels`).
+`LUCE_HIP_SM80_EQUIV=ON` enables the rocWMMA Phase 2 flashprefill kernels (path that delivers the prefill speedup). `OFF` falls back to ggml's `flash_attn_ext` (slower but no rocwmma headers needed). With `SM80_EQUIV=ON` the build also produces `test_flashprefill_kernels` (HIP) — run it on your card to validate the rocWMMA kernels numerically (`HIP_VISIBLE_DEVICES=<gpu> ./build/test_flashprefill_kernels`).
 
 **Per-arch DDTree tuning:** `gfx1151` (Strix Halo iGPU, bandwidth-bound on LPDDR5X) peaks at `--ddtree-budget=22`. `gfx1100` (7900 XTX, GDDR6) prefers `budget=8` per the [PR #156 cross-arch perf plan](https://github.com/Luce-Org/lucebox-hub/pull/156). `gfx1201` (RDNA4 / R9700, GDDR6) prefers `budget=22` (`budget=8` is a ~9% regression). Run `scripts/bench_he.py --ddtree-budget N` to verify on your card.
 
 > **Multi-GPU / distro note.** On a host with more than one AMD GPU, pin the bench to the target with `HIP_VISIBLE_DEVICES`. On distros that link PIE executables by default (e.g. Fedora's system ROCm under `/usr`), add `-DCMAKE_EXE_LINKER_FLAGS=-no-pie` to the `cmake` configure line, and point at the toolchain with `-DCMAKE_HIP_COMPILER_ROCM_ROOT=/usr -DROCM_PATH=/usr` if ROCm lives under `/usr` rather than `/opt/rocm`.
 
-**Drafter recipe for max decode:** target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. For the unsloth Qwen3.6 target, pass `--qwen36-swa` when creating the Q8_0 draft so its GGUF embeds the required 2048-token, 4-of-5-layer sliding-window configuration. Older Qwen3.6 drafts without that metadata still need `DFLASH27B_DRAFT_SWA=2048` at runtime.
+**Drafter recipe for max decode:** target = Qwen3.5-27B Q4_K_M, drafter = same gen quantized to Q8_0 via `server/scripts/quantize_draft_q8.py`. For the unsloth Qwen3.6 target, pass `--qwen36-swa` when creating the Q8_0 draft so its GGUF embeds the required 2048-token, 4-of-5-layer sliding-window configuration. Older Qwen3.6 drafts without that metadata still need `LUCE_DRAFT_SWA=2048` at runtime.
 
 See also: [`docs/HIP_PERF_PLAN.md`](docs/HIP_PERF_PLAN.md) (perf sweeps), [`docs/MIXED_BACKEND.md`](docs/MIXED_BACKEND.md) (mixed CUDA+HIP runs).
 
@@ -589,7 +792,7 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 
 ## Contributing
 
-Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
+Open an issue or PR against `Luce-Org/lucebox`. Good first picks:
 
 - **Leviathan-style rejection sampling** on each DDTree branch (the current implementation samples only the committed token; full prob-matching across the tree is the next step)
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
@@ -600,7 +803,7 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 @software{luce_dflash_2026,
   title  = {Luce DFlash: GGUF port of block-diffusion speculative decoding for Qwen3.5-27B on consumer GPUs},
   author = {Lucebox},
-  url    = {https://github.com/Luce-Org/lucebox-hub/tree/main/dflash},
+  url    = {https://github.com/Luce-Org/lucebox/tree/main/server},
   year   = {2026}
 }
 
@@ -635,7 +838,7 @@ only wire protocol used by [OpenAI Codex](https://github.com/openai/codex).
 ### 1. Start the DFlash server
 
 ```bash
-./build/dflash_server models/Qwen3.5-27B-Q4_K_M.gguf \
+./build/luce_server models/Qwen3.5-27B-Q4_K_M.gguf \
   --draft models/Qwen3.5-3B-f16.safetensors \
   --ddtree --ddtree-budget 22 --port 8080
 ```
@@ -646,10 +849,10 @@ Create or edit `~/.codex/config.toml`:
 
 ```toml
 model = "luce-dflash"
-model_provider = "dflash"
+model_provider = "luce"
 
-[model_providers.dflash]
-name = "DFlash"
+[model_providers.luce]
+name = "Luce"
 base_url = "http://localhost:8080/v1"
 wire_api = "responses"
 supports_websockets = false
@@ -660,7 +863,7 @@ No `env_key` is needed — the local server accepts any token.
 ### 3. Run Codex
 
 ```bash
-codex --provider dflash "Explain this codebase"
+codex --provider luce "Explain this codebase"
 ```
 
 ### Supported features

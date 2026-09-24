@@ -5005,6 +5005,7 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    const bool masked = ggml_get_op_params_i32(dst, 0) != 0;
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -5014,6 +5015,10 @@ static void ggml_compute_forward_set_rows_f32(
                 const int64_t i10 = i;
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+                if (i1 < 0 && masked) {
+                    continue;
+                }
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
@@ -5351,6 +5356,12 @@ static void ggml_compute_forward_soft_max_f32(
 
     // sinks
     const float * sk = src2 ? (float *)((char *) src2->data) : nullptr;
+    // Lucebox sink-as-virtual-column mode (see ggml_soft_max_ext_sink_col)
+    int32_t sink_col = 0;
+    memcpy(&sink_col, (int32_t *) dst->op_params + 2, sizeof(int32_t));
+    if (sink_col) {
+        GGML_ASSERT(sk && !src1);
+    }
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -5391,6 +5402,20 @@ static void ggml_compute_forward_soft_max_f32(
                 }
 #endif // NDEBUG
 
+                if (sink_col) {
+                    // Append the row's sink as one more column and run the
+                    // plain softmax over ne00 + 1 values, exactly as the
+                    // concat form would; only the first ne00 outputs are kept.
+                    const int64_t row = i01 + ne01*(i02 + ne02*i03);
+                    wp[ne00] = sk[row];
+                    float max = -INFINITY;
+                    ggml_vec_max_f32(ne00 + 1, &max, wp);
+                    ggml_float sum = ggml_vec_soft_max_f32(ne00 + 1, wp, wp, max);
+                    assert(sum > 0.0);
+                    sum = 1.0/sum;
+                    ggml_vec_cpy_f32(ne00, dp, wp);
+                    ggml_vec_scale_f32(ne00, dp, sum);
+                } else {
                 float max = -INFINITY;
                 ggml_vec_max_f32(ne00, &max, wp);
 
@@ -5408,6 +5433,7 @@ static void ggml_compute_forward_soft_max_f32(
 
                 sum = 1.0/sum;
                 ggml_vec_scale_f32(ne00, dp, sum);
+                }
 
 #ifndef NDEBUG
                 for (int i = 0; i < ne00; ++i) {
@@ -5866,9 +5892,13 @@ static void ggml_compute_forward_rope_flt(
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
 
-    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE; // qwen3vl apply interleaved mrope
-    const bool mrope_used = mode & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, note: also true for vision (24 & 8 == true) and for imrope
-    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+    const bool is_tail = mode & GGML_ROPE_TYPE_TAIL;      // rotate the last n_dims, pass the head through
+    const int  mode_base = mode & ~GGML_ROPE_TYPE_TAIL;
+    GGML_ASSERT(!is_tail || mode_base == GGML_ROPE_TYPE_NORMAL);
+    const int64_t rot_off = is_tail ? ne0 - n_dims : 0;
+    const bool is_imrope = mode_base == GGML_ROPE_TYPE_IMROPE; // qwen3vl apply interleaved mrope
+    const bool mrope_used = mode_base & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, note: also true for vision (24 & 8 == true) and for imrope
+    const bool is_vision = mode_base == GGML_ROPE_TYPE_VISION;
 
     if (mrope_used) {
         GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0);
@@ -5904,7 +5934,7 @@ static void ggml_compute_forward_rope_flt(
                 if (last_i2 != i2) {
                     if (!mrope_used) {
                         const int64_t p = pos[i2];
-                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, is_tail ? n_dims : ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
                     }
                     else {
                         const int64_t p_t = pos[i2];
@@ -5922,9 +5952,12 @@ static void ggml_compute_forward_rope_flt(
                 T * src = (T *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01);
                 T * dst_data  = (T *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1);
 
-                switch (mode) {
+                switch (mode_base) {
                     case GGML_ROPE_TYPE_NORMAL:
-                        rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
+                        // For the tail mode the cache entries [0, n_dims) hold
+                        // the angles of the rotated span, as they would for an
+                        // extracted n_dims-wide tail tensor.
+                        rotate_pairs<T>(n_dims, 1, cache, src + rot_off, dst_data + rot_off, 1);
                         break;
                     case GGML_ROPE_TYPE_NEOX:
                     case GGML_ROPE_TYPE_MROPE:
@@ -5940,7 +5973,11 @@ static void ggml_compute_forward_rope_flt(
 
                 if (!is_vision) {
                     // fill the remain channels with data from src tensor
-                    for (int64_t i0 = n_dims; i0 < ne0; i0 += 2) {
+                    // (the head [0, rot_off) for the tail mode, the tail
+                    // [n_dims, ne0) otherwise)
+                    const int64_t copy_begin = is_tail ? 0 : n_dims;
+                    const int64_t copy_end   = is_tail ? rot_off : ne0;
+                    for (int64_t i0 = copy_begin; i0 < copy_end; i0 += 2) {
                         const T * const src = (T *)((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
                         T * dst_data  = (T *)((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + i0*nb0);
 
@@ -9327,6 +9364,8 @@ void ggml_compute_forward_flash_attn_back(
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // dflash: the fused step mode (ggml_ssm_conv_step) is CUDA/HIP only
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 0 && "ggml_ssm_conv_step is not supported on CPU");
     const ggml_tensor * src0 = dst->src[0]; // conv_x
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
 
@@ -10518,11 +10557,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_active_slots = dst->src[8];
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
     const int64_t n_tokens = src_v->ne[2];
     const int64_t n_seqs   = src_v->ne[3];
+    const int64_t n_state_slots = src_state->ne[3];
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
@@ -10556,10 +10597,24 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // attn_scores: S_v * H * n_tokens * n_seqs floats
     // new_states:  S_v * S_v * H * n_seqs floats
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
-    float * attn_out_base  = (float *)dst->data;
-    float * state_out_base = (float *)dst->data + attn_score_elems;
+    float * attn_out_base = (float *)dst->data;
+    float * compact_state_out_base =
+        (float *)dst->data + attn_score_elems;
+    const bool inplace_state = ggml_get_op_params_i32(dst, 1) != 0;
+    float * state_out_base = inplace_state
+        ? (float *)src_state->data
+        : compact_state_out_base;
 
     const float * state_in_base = (const float *)src_state->data;
+    const int32_t * active_slot_ids = src_active_slots
+        ? (const int32_t *)src_active_slots->data
+        : nullptr;
+    if (src_active_slots) {
+        GGML_ASSERT(inplace_state);
+        GGML_ASSERT(src_active_slots->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(src_active_slots));
+        GGML_ASSERT(ggml_nelements(src_active_slots) == n_seqs);
+    }
 
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
@@ -10571,6 +10626,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
+        const int32_t mapped_seq = active_slot_ids
+            ? active_slot_ids[iv3]
+            : (int32_t)iv3;
+        const int32_t physical_seq =
+            mapped_seq >= 0 && mapped_seq < n_state_slots
+                ? mapped_seq
+                : -1;
 
         const int64_t iq1 = iv1 % neq1;
         const int64_t ik1 = iv1 % nek1;
@@ -10578,11 +10640,19 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        float * s_out = physical_seq >= 0
+            ? state_out_base + ((int64_t)physical_seq * H + iv1) * S_v * S_v
+            : compact_state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into output buffer and operate in-place
-        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        const float * s_in = physical_seq >= 0
+            ? state_in_base + ((int64_t)physical_seq * H + iv1) * S_v * S_v
+            : nullptr;
+        if (!s_in) {
+            memset(s_out, 0, S_v * S_v * sizeof(float));
+        } else if (s_out != s_in) {
+            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -10680,6 +10750,12 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // Raw-gate mode (loader-built [dt_bias|A] in src[9], op_params[10])
+    // is CUDA/HIP only; the CPU path would silently use the raw values
+    // as final gates.
+    GGML_ASSERT(dst->op_params[10] == 0 && dst->src[9] == NULL &&
+                "raw-gate gated_delta_net is CUDA/HIP only");
+
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

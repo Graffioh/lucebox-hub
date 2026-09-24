@@ -47,7 +47,11 @@ Request 2: [system + user1 + assistant1 + user2 + assistant2 + user3]
 
 Caches KV state at **turn boundaries** within a conversation. The boundary
 detector uses `ChatMarkers` to find end-of-message + start-of-next-role
-token sequences.
+token sequences. DeepSeek's template closes only assistant turns with an end
+marker (the system text and user turns end where the next role starts), so
+for that family every role marker is a boundary: the system text, each
+completed turn, and the generation prompt. A first turn therefore snapshots
+its system prompt, and a new session on the same system prompt restores it.
 
 For tool-using chat templates, tool definitions are rendered in the system
 prefix. The first safe boundary therefore includes the complete tool schema:
@@ -86,7 +90,10 @@ when the selected boundary advances beyond the restored prefix.
 The disk prefix cache is a separate persistence/overflow layer for token-keyed
 snapshots. Today it is integrated with the inline/effective-prompt path; exact
 prefill snapshots are kept in RAM unless a dedicated raw-prompt disk path is
-added.
+added. With the default `full` policy a lookup probes the whole prompt and
+then every chat boundary, deepest first, so a restart recovers the inline
+snapshots the previous process persisted (probes are index lookups; only a
+hit reads a file).
 
 ## Snapshot Memory Management
 
@@ -195,6 +202,7 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 | Server flag | Default | Description |
 |-------------|---------|-------------|
 | `--prefix-cache-slots N` | 32 | Max turn-boundary prefix cache slots |
+| `--concurrent-prefix-cache-max-mib N` | 4096 | Resident RAM limit for copied concurrent paged checkpoints; `0` is unlimited |
 | `--prefill-cache-slots N` | 0 | Max exact full-prompt prefill cache slots |
 | `--skip-park` | false | Skip parking draft model during compress |
 
@@ -202,17 +210,25 @@ free_snapshot_backend(snap_backend_, compute_backend_);  // then backend
 
 With right-sized, CPU-resident snapshots the limiting resource is **system RAM**,
 not VRAM. Each slot costs approximately `cur_pos × 5 KB` (for Qwen3.5-27B Q8_0 KV),
-so 32 slots with an average prefix of 2000 tokens ≈ 320 MB of system RAM — negligible
-on most workstations.
+so 32 slots with an average prefix of 2000 tokens use about 320 MB of system RAM.
+
+Concurrent paged serving measures the exact backend allocation required for
+each checkpoint before copying it. The cache keeps committed checkpoints under
+`--concurrent-prefix-cache-max-mib`: when necessary it replaces one eligible least-recently-used
+entry, and if no single eligible entry can make enough room it skips the new
+checkpoint without disturbing the committed cache. The configured limit covers
+resident committed checkpoint buffers. During an atomic replacement, the new
+buffer and the selected victim can coexist briefly, so transient process memory
+can exceed the limit by up to one checkpoint.
 
 | Scenario | Typical prefix length | Recommended cap |
 |----------|----------------------|-----------------|
 | Single-user chat | 200–2000 tokens | 16–32 |
-| Multi-session agent | 500–5000 tokens | 32–64 |
+| Multi-session agent | 500–5000 tokens | 32–63 |
 | Batch / benchmark | N/A (cold starts) | 4 |
 
-The hard limit is `MAX_SLOTS = 64`. Beyond that, increase the constant in
-`prefix_cache.h` and `model_backend.h`.
+The in-memory cache limit is 63 slots. Backend slot 63 is reserved for disk
+cache staging, preventing disk loads from overwriting a live in-memory entry.
 
 ## File Map
 

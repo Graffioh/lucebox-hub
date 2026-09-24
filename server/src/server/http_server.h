@@ -1,10 +1,10 @@
-// HTTP server infrastructure for dflash::common native server.
+// HTTP server infrastructure for luce::common native server.
 //
 // Ported from ds4_server.c's socket/threading/HTTP layer, converted to C++.
 // Architecture:
 //   - Main thread: listen + accept
 //   - Per-client thread: parse HTTP request, enqueue job, wait for completion
-//   - Single worker thread: dequeue jobs, call ModelBackend::generate()
+//   - LuceEngine execution thread: run the selected backend serving loop
 //
 // Client disconnect detection: the client thread watches the socket while the
 // worker generates, and streaming writes provide a second failure signal.
@@ -14,7 +14,9 @@
 #pragma once
 
 #include "socket_handle.h"
+#include "client_send_buffer.h"
 #include "common/model_backend.h"
+#include "common/concurrency/paged_kv_offload.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -28,9 +30,11 @@
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
+#include "sse_emitter.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -43,15 +47,22 @@
 #include <unistd.h>
 #endif
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::engine {
+class LuceEngine;
+}
+
+namespace luce::common {
 
 using json = nlohmann::json;
 
 // ─── Forward declarations ───────────────────────────────────────────────
 struct ServerJob;
-class SseEmitter;
+
+// Admission feedback is returned before any response bytes or model compute.
+enum class RoutingAdmission { handled, busy, unfit };
 
 namespace http_detail {
 // Non-consuming peer-state probe used by the client-thread job monitor.
@@ -68,6 +79,16 @@ PeerSocketState inspect_peer_socket(SocketHandle fd);
 // `partial_line` carries an unterminated line across transport chunks.
 bool sse_chunk_has_done(std::string & partial_line,
                         const char * data, size_t size);
+
+// Advance one heartbeat on an already-nonblocking job socket without waiting
+// for writability. `offset` preserves a partial write across monitor ticks.
+// Public for the model-free socket regression test.
+enum class HeartbeatSendResult {
+    Complete,
+    Retry,
+    Disconnected,
+};
+HeartbeatSendResult try_send_sse_heartbeat(SocketHandle fd, size_t & offset);
 }
 
 // ─── Server configuration ───────────────────────────────────────────────
@@ -75,16 +96,24 @@ struct ServerConfig {
     std::string host        = "0.0.0.0";
     int         port        = 8080;
     int         max_tokens  = 4096;     // default max output tokens (legacy alias for default_max_tokens)
+    int         routing_queue_limit = 32; // waiting auto requests across the listener
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
-    std::string model_name  = "dflash";
+    std::string model_name  = "luce";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Resident system-memory budget for copied paged checkpoints. The
+    // scheduler enforces it only when concurrent paged prefix storage is
+    // active. Zero means unlimited.
+    size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    bool        concurrent_paged_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
+    // Extend the existing prefix cache through generated tool-call turns.
+    bool        agent_turn_cache = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
-    // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
-    // DFLASH_PPP_REARRANGE=0|1, DFLASH_PPP_LCP_WINDOW=N,
-    // DFLASH_PPP_MIN_PIN_TOKENS=N, DFLASH_PPP_MAX_EPHEMERAL=N.
+    // See docs/PIN_FRIENDLY_PROMPT.md. Env: LUCE_PPP=0|1,
+    // LUCE_PPP_REARRANGE=0|1, LUCE_PPP_LCP_WINDOW=N,
+    // LUCE_PPP_MIN_PIN_TOKENS=N, LUCE_PPP_MAX_EPHEMERAL=N.
     bool        ppp_enabled = true;
     bool        ppp_rearrange = false;
     int         ppp_lcp_window = 8;
@@ -164,18 +193,24 @@ struct ServerConfig {
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
+    bool        image_input_enabled = false;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed
     // because pre-c35a8a4 snapshots had no /props capture and post-hoc
     // forensics on which chunk was used are otherwise impossible. See
-    // dflash/docs/specs/props-endpoint.md §4.5.
+    // docs/specs/props-endpoint.md §4.5.
     int         chunk               = 0;
     // Resolved device placement strings (e.g. "auto:0", "cuda:0"). Sourced
     // from placement_device_name(bargs.device / bargs.draft_device) in
     // server_main after CLI parse.
     std::string target_device;
     std::string draft_device;
+    // Idle-to-busy batching window. It is ignored by single-slot engines and
+    // never delays an already decoding request.
+    int admission_coalesce_ms = 20;
+    // Auto resolves after all models load, before workers start. Zero disables.
+    size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
@@ -219,11 +254,60 @@ struct ServerConfig {
     std::string collect_routing_path;
 };
 
+namespace http_detail {
+
+inline constexpr int kFlowKvInertMinTokens = 512;
+
+// Small policy helpers kept outside HttpServer so model-free unit tests use
+// the same decisions as the request path.
+int flowkv_activation_threshold(const ServerConfig & config);
+bool flowkv_should_activate(const ServerConfig & config,
+                            int aged_token_estimate);
+float resolve_pflash_keep_ratio(float configured_ratio,
+                                const std::string & session_id,
+                                const HttpServerSessions & sessions);
+bool should_clamp_flowkv_disk_cache(
+    bool flowkv, const DiskPrefixCachePolicy & policy);
+bool canonical_turn_matches_checkpoint(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & completed_turn,
+    int checkpoint);
+bool canonical_assistant_content(
+    const std::string & generation_prompt,
+    const std::string & sentinel_rendered,
+    const std::string & sentinel,
+    const std::string & generated_text,
+    std::string & content);
+
+struct PflashQueryWindow {
+    int end = -1;       // exclusive token offset in the rendered prompt
+    int tokens = 0;     // width of the matching query suffix
+
+    bool valid() const { return end >= tokens && tokens > 0; }
+};
+
+// Select the final normalized user message as the scorer query. Public for
+// model-free coverage of every request shape accepted by prompt rendering.
+std::string pflash_user_query_text(
+    const std::vector<ChatMessage> & messages);
+
+// Find the last sufficiently-specific suffix of the user query before the
+// assistant-generation suffix. Public for model-free regression tests.
+PflashQueryWindow find_pflash_query_window(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & query,
+    int search_end,
+    int max_tokens = 8);
+
+}  // namespace http_detail
+
 // ─── Parsed request ─────────────────────────────────────────────────────
 
 struct ParsedRequest {
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
+    ImagePromptHandle         images;
+    std::string               rendered_prompt;
     int                       max_output   = 4096;
     bool                      stream       = true;
     SamplerCfg                sampler;
@@ -241,10 +325,14 @@ struct ParsedRequest {
     // Thinking/reasoning state
     bool                      thinking_enabled = true;
     bool                      started_in_thinking = false;
+    // Normalized model-facing effort. DeepSeek V4 officially defines low,
+    // high, and max; high and max select distinct prompt prefixes.
+    std::string               reasoning_effort;
     // True when the request opted in to the thinking-budget envelope via
-    // `thinking: {type: "enabled"}`. Distinct from thinking_enabled (which
-    // can be set via the chat template kwarg alone). When true, the response
-    // includes a `finish_details` block when thinking was opted in.
+    // thinking.type="enabled" or an explicit reasoning effort. Distinct from
+    // thinking_enabled, which is the final template-rendering state after
+    // overrides. Bare chat-template toggles remain renderer-only. When true,
+    // the response includes a `finish_details` block.
     bool                      thinking_opt_in = false;
     // Per-request thinking-budget envelope (spec §4). Populated from
     // `thinking.budget_tokens` and `thinking.reply_budget`, or selected
@@ -275,6 +363,13 @@ json require_messages_array(const json & body);
 // selected field is parsed, so malformed lower-priority aliases are ignored.
 int resolve_max_output_tokens(const json & body, int default_max_tokens);
 
+// Apply request-level thinking controls and resolve the model-facing effort
+// plus the server's phase-1 budget. Kept independent of HttpServer so the
+// wire-format precedence and compatibility aliases can be unit-tested.
+void apply_request_reasoning(const json & body,
+                             const ServerConfig & config,
+                             ParsedRequest & req);
+
 // Sticky tools-boundary pinning is part of PPP and must follow its master
 // toggle. Kept as a small policy helper so the disabled path is testable.
 bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
@@ -289,7 +384,7 @@ json build_props_body(const ServerConfig & config,
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
-    HttpServer(ModelBackend & backend,
+    HttpServer(luce::engine::LuceEngine & engine,
                Tokenizer & tokenizer,
                const ServerConfig & config);
     ~HttpServer();
@@ -303,10 +398,13 @@ public:
     // Set the chat template format (detected from model arch).
     void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
 
-    // Start listening. Blocks until shutdown() is called.
-    int run();
+    // Start one listener. Optional model contexts are borrowed until run()
+    // returns and must include this first. Model names must be explicit and unique.
+    // Each context gets its existing scheduler or single-request worker, never another socket.
+    int run(const std::vector<HttpServer *> & models = {});
 
-    // Signal the server to stop accepting new connections and drain.
+    // Finalize after run() returns; also called by the destructor.
+    // Use request_stop() to stop a running listener from another thread.
     void shutdown();
 
     // Async-signal-safe: only sets the stopping flag. The accept loop polls
@@ -319,8 +417,17 @@ public:
     }
 
 private:
+    friend struct SchedulerTestHarness;
+
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
+
+    struct HttpRequest;
+    bool start_worker();
+    bool route_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
+    bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only,
+                              RoutingAdmission * admission = nullptr);
+    json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
     // lifecycle of one dequeued request, including signaling completion.
@@ -329,7 +436,9 @@ private:
 
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
+        ImagePromptHandle images;
         bool compressed = false;
+        bool flowkv = false;
         int full_cache_served_tokens = -1;
         int full_cache_hit_slot = -1;
         int full_cache_hit_len = 0;
@@ -359,6 +468,7 @@ private:
         // When DiffPin rewrote tokens, full-cache keys must use
         // prepared.tokens (effective), not req.prompt_tokens.
         bool full_snap_key_effective = false;
+        PrefixCache::InlineReservation snap_reservation;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
@@ -369,17 +479,20 @@ private:
         GenerateRequest & generate_request);
     void finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
+    void remember_agent_turn(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache, const GenerateResult & result,
+        const SseEmitter & emitter, int completion_tokens,
+        bool visible_output_seen, bool client_disconnected,
+        bool replay_cache);
+    void forget_inline_slot_metadata(int slot);
 
     struct GenerationInputs {
         GenerateRequest request;
         int generation_cap = 0;
-        std::vector<int32_t> hint_tokens;
-        std::vector<int32_t> stall_tool_prefix_tokens;
-        std::vector<int32_t> stall_action_suffix_tokens;
-        std::vector<int32_t> stall_skip_tokens;
     };
 
     struct GenerationOutputState {
@@ -395,6 +508,33 @@ private:
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
 
+    // Worker thread, concurrent mode (the backend exposes a SeqEngine):
+    // iteration-level scheduler. Admission is claim-only; this baseline
+    // drains its pending prefill between decode iterations, then advances
+    // active slots together in one batched step.
+    void scheduler_loop(SeqEngine & engine);
+
+    // Non-blocking dequeue used for admission polling between decode steps.
+    ServerJob * try_dequeue();
+    // Bounded wait used only during an idle-to-busy admission window.
+    ServerJob * dequeue_for(
+        std::chrono::steady_clock::duration timeout);
+
+    // Concurrent-scheduler token delivery and shared response construction.
+    // A send buffer keeps slow clients off the shared decode loop.
+    bool deliver_generation_token(
+        ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
+        int32_t token, int & completion_tokens,
+        ClientSendBuffer & send_buffer);
+    void send_nonstream_response(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        const std::vector<int32_t> & gen_tokens, int n_gen_cap,
+        bool budget_forced_close, bool degenerate_decode_close,
+        const GenTimings & gen_timings,
+        ClientSendBuffer * send_buffer = nullptr);
+    std::string format_http_response(
+        int status, const std::string & content_type,
+        const std::string & body);
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -414,13 +554,18 @@ private:
                                      ParsedRequest & req);
     bool parse_endpoint_request(const std::string & path, const json & body,
                                 ParsedRequest & req, bool & count_tokens_only);
-    void apply_request_reasoning(const json & body, ParsedRequest & req);
     bool render_and_tokenize_request(
         SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
-    bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
+    bool render_messages_to_text(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool add_generation_prompt,
+        std::string & rendered, std::string & error);
+    bool validate_request_context(SocketHandle fd, const ParsedRequest & req,
+                                  bool send_failure = true);
     void log_parsed_request(const ParsedRequest & req) const;
-    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
+    RoutingAdmission enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
+                                  bool report_admission = false);
 
     // Send HTTP response helpers.
     bool send_response(SocketHandle fd, int status, const std::string & content_type,
@@ -432,14 +577,17 @@ private:
     bool send_all(SocketHandle fd, const void * data, size_t len);
     bool send_job_bytes(ServerJob * job, const void * data, size_t len);
     void start_job_stream(ServerJob * job);
-    void stop_job_stream(ServerJob * job);
+    void stop_job_stream(ServerJob * job,
+                         ClientSendBuffer * pending_output = nullptr);
     void maybe_send_job_heartbeat(ServerJob * job, bool peer_read_closed);
 
     // Job queue.
     void enqueue(ServerJob * job);
     ServerJob * dequeue();
+    bool has_pending_jobs();
 
     // Members.
+    luce::engine::LuceEngine & engine_;
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
@@ -475,12 +623,13 @@ private:
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
+    std::unordered_set<int> agent_turn_cache_slots_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
     // Recent tool-bearing prompt prefixes for PPP LCP annotate.
     std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 
     // FlowKV freeze-history: per-message compression cache.
-    // Key: SHA-1 hash of the drafter-token slice for an aged message.
+    // Key: SHA-1 hash of the drafter-token slice and selected keep ratio.
     // Value: compressed content text (output of drafter_tokenizer_->decode).
     // Bounded to kFrozenCacheMax entries; cleared on overflow (simple eviction).
     static constexpr size_t kFrozenCacheMax = 256;
@@ -498,8 +647,20 @@ private:
     std::unordered_map<PrefixHash, std::string,
                        PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
 
-    // Worker thread.
-    std::thread                     worker_thread_;
+    // Immutable model table after run() starts; only reservations mutate under
+    // routing_mu_. A reservation spans parsing through job retirement/output
+    // draining, so disconnects never make still-running engine work invisible.
+    struct RoutedModel {
+        HttpServer * server;
+        int capacity;
+        int in_flight = 0;
+    };
+    std::vector<RoutedModel> models_;
+    std::mutex routing_mu_;
+    std::condition_variable routing_cv_;
+    int routing_waiters_ = 0;
+
+    // Request queue consumed by the serving loop owned by LuceEngine.
     std::mutex                      queue_mu_;
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;
@@ -527,10 +688,19 @@ struct ServerJob {
     // so their bytes can never interleave.
     std::mutex    write_mu;
     bool          stream_ready = false;
-    bool          read_close_probe_sent = false;
+    size_t        heartbeat_offset = 0;
     std::chrono::steady_clock::time_point last_stream_write{};
     std::atomic<bool> client_disconnected{false};
     ServerJob *   next = nullptr;
+
+    // Concurrent-scheduler state that survives a pool-full admission retry.
+    // The classic worker leaves these fields untouched.
+    bool          report_admission = false; // return busy before committing a response
+    RoutingAdmission admission = RoutingAdmission::handled; // published with done
+    bool          announced = false;
+    // First concurrent-scheduler attempt; retained across busy deferrals so
+    // server-side prefill/elapsed telemetry does not erase queueing delay.
+    std::chrono::steady_clock::time_point parallel_started_at{};
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
@@ -549,4 +719,4 @@ inline std::string parse_session_id_from_body(const json & body) {
     return {};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -39,7 +39,7 @@
 
 #include "laguna_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
 
@@ -61,7 +61,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 // fwd-decl: defined below at file scope, used by should_load_laguna_tensor
 static bool is_laguna_expert_tensor(const char * name);
@@ -437,7 +437,7 @@ bool load_target_gguf_laguna_partial(const std::string & path,
     // weight buffer so one fused tensor can view both regions (saves one
     // matmul launch + one activation quantization per pair per forward).
     static const bool fuse_qk_env = []() {
-        const char * e = getenv("DFLASH_LAGUNA_FUSED_QK");
+        const char * e = getenv("LUCE_LAGUNA_FUSED_QK");
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
     if (fuse_qk_env) {
@@ -783,4 +783,4 @@ static bool is_laguna_expert_tensor(const char * name) {
            std::strstr(name, "ffn_up_exps") != nullptr ||
            std::strstr(name, "ffn_down_exps") != nullptr;
 }
-} // namespace dflash::common
+} // namespace luce::common

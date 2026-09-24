@@ -23,17 +23,17 @@ from placement.test_dflash_args import TestDflashLaunchArgs
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET = os.environ.get(
-    "DFLASH_TARGET",
+    "LUCE_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
 _LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
 TEST_DFLASH = os.environ.get(
-    "DFLASH_BIN",
+    "LUCE_BIN",
     str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"),
 )
-TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
+TMPDIR = Path(tempfile.gettempdir()) / "luce_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
 PROMPTS = [
@@ -194,12 +194,12 @@ def _find_draft_file(root: Path) -> str | None:
 
 
 def _resolve_draft() -> str:
-    env = os.environ.get("DFLASH_DRAFT")
+    env = os.environ.get("LUCE_DRAFT")
     if env:
         found = _find_draft_file(Path(env))
         if found:
             return found
-        raise FileNotFoundError(f"DFLASH_DRAFT does not point to a draft file: {env}")
+        raise FileNotFoundError(f"LUCE_DRAFT does not point to a draft file: {env}")
 
     for candidate in (_LOCAL_DRAFT_FILE, _LOCAL_DRAFT_ROOT):
         found = _find_draft_file(candidate)
@@ -209,7 +209,7 @@ def _resolve_draft() -> str:
     raise FileNotFoundError(
         "draft model file not found. Expected one of:\n"
         f"  - {_LOCAL_DRAFT_FILE}\n"
-        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit .safetensors/.gguf file or directory."
+        "Download it as documented in the README, or set LUCE_DRAFT to an explicit .safetensors/.gguf file or directory."
     )
 
 
@@ -236,8 +236,10 @@ def tokenize_prompt(prompt: str, out_path: Path, tokenizer) -> int:
 
 
 def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
+                    specla: bool = False,
                     ddtree_budget: int | None = None,
                     ddtree_temp: float | None = None,
+                    ddtree_tau: float | None = None,
                     ddtree_no_chain_seed: bool = False,
                     extra_args: list[str] | None = None,
                     extra_env: dict[str, str] | None = None) -> dict:
@@ -247,11 +249,15 @@ def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
     ]
     if fast_rollback:
         cmd.append("--fast-rollback")
+    if specla:
+        cmd.append("--specla")
     if ddtree_budget is not None:
         cmd.append("--ddtree")
         cmd.append(f"--ddtree-budget={ddtree_budget}")
     if ddtree_temp is not None:
         cmd.append(f"--ddtree-temp={ddtree_temp}")
+    if ddtree_tau is not None:
+        cmd.append(f"--ddtree-tau={ddtree_tau}")
     if ddtree_no_chain_seed:
         cmd.append("--ddtree-no-chain-seed")
     if extra_args:
@@ -308,6 +314,8 @@ def main():
     DRAFT = _resolve_draft()
     _require_file(TARGET, "target GGUF")
     _require_file(TEST_DFLASH, "test_dflash binary")
+    if not os.access(TEST_DFLASH, os.X_OK):
+        raise PermissionError(f"test_dflash binary is not executable: {TEST_DFLASH}")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-gen", type=int, default=128)
@@ -315,8 +323,12 @@ def main():
     ap.add_argument("--skip-tokenize", action="store_true")
     ap.add_argument("--ddtree-budget", type=int, default=None,
                     help="Enable DDTree mode with this node budget (e.g. 15, 32, 64)")
+    ap.add_argument("--specla", action="store_true",
+                    help="Enable SpecLA with its tested defaults")
     ap.add_argument("--ddtree-temp", type=float, default=None,
                     help="Sharpen draft logits with this temperature (T<1 widens top-1/top-2 gap)")
+    ap.add_argument("--ddtree-tau", type=float, default=None,
+                    help="SpecLA cumulative path-log-probability pruning margin")
     ap.add_argument("--ddtree-no-chain-seed", action="store_true",
                     help="Use paper's pure best-first (no chain pre-seed)")
     ap.add_argument("--draft-feature-mirror", action="store_true",
@@ -346,13 +358,13 @@ def main():
     ap.add_argument("--max-ctx", type=int, default=None,
                     help="Forward --max-ctx=N to test_dflash")
     ap.add_argument("--prefill-ubatch", type=int, default=None,
-                    help="Set DFLASH27B_PREFILL_UBATCH for target split prefill")
+                    help="Set LUCE_PREFILL_UBATCH for target split prefill")
     ap.add_argument("--cuda-visible-devices", default=None,
                     help="Optional CUDA_VISIBLE_DEVICES override for test_dflash")
     ap.add_argument("--target-tokenizer",
-                    default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.5-27B"),
+                    default=os.environ.get("LUCE_TOKENIZER", "Qwen/Qwen3.5-27B"),
                     help="HuggingFace tokenizer repo for the target. Defaults to "
-                         "$DFLASH_TOKENIZER, then Qwen/Qwen3.5-27B. Override for "
+                         "$LUCE_TOKENIZER, then Qwen/Qwen3.5-27B. Override for "
                          "Qwen3.6 or other variants, e.g. "
                          "--target-tokenizer Qwen/Qwen3.6-27B")
     args = ap.parse_args()
@@ -415,7 +427,7 @@ def main():
             base_env=extra_env,
         )
     if args.prefill_ubatch is not None:
-        extra_env["DFLASH27B_PREFILL_UBATCH"] = str(args.prefill_ubatch)
+        extra_env["LUCE_PREFILL_UBATCH"] = str(args.prefill_ubatch)
 
     results = []
     for i, (name, _) in enumerate(PROMPTS):
@@ -423,8 +435,10 @@ def main():
         try:
             r = run_test_dflash(path, args.n_gen,
                                 fast_rollback=(args.mode == "fast" and not args.target_split_dflash),
+                                specla=args.specla,
                                 ddtree_budget=args.ddtree_budget,
                                 ddtree_temp=args.ddtree_temp,
+                                ddtree_tau=args.ddtree_tau,
                                 ddtree_no_chain_seed=args.ddtree_no_chain_seed,
                                 extra_args=extra_args,
                                 extra_env=extra_env)

@@ -21,18 +21,16 @@
 // neighbouring tensor's codebook. That failure mode is wrong numbers, not a crash.
 
 #include "ds4_test_gpu_runtime.h"
+#include "CppUnitTestFramework.hpp"
+#include "ggml-cuda.h"
+using CppUnitTestFramework::CommonFixture;
+#undef CHECK
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
-extern "C" void ggml_cuda_rocmfp3_mix_register_host(
-    const void * base, size_t nb02, int n_experts, int out, int in,
-    const void * codebooks_bf16_host, const uint8_t * modes_host,
-    const uint8_t * rotations_host);
-extern "C" void ggml_cuda_rocmfp3_mix_unregister(const void * base);
 
 bool ggml_cuda_rocmfp3_mix_mul_mat_vec(
     const void * vx, const float * x, float * y,
@@ -73,11 +71,16 @@ static constexpr int BLOCK_BYTES = 14;
 static uint32_t xs = 0x2545F491u;
 static uint32_t rnd() { xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5; return xs; }
 
-int main() {
+namespace {
+struct RocmfpMixSliceMatvecFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(RocmfpMixSliceMatvecFixture, slice_matvec_matches_reference) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
-        std::fprintf(stderr, "SKIP: no HIP device\n");
-        return 0;
+        SKIP("no HIP device available");
     }
 
     // Shapes echo the real case in miniature: attn_output_a is [group_dim, n_lora_o]
@@ -114,7 +117,7 @@ int main() {
         books[i] = (uint16_t) (bits >> 16);   // fp32 -> bf16 (truncate)
     }
     std::vector<uint8_t> modes(nslices, 1);   // 1 = adaptive: exercises the codebook path
-    std::vector<uint8_t> rots(nslices, 0);
+    modes[0] = 0;  // Also compare paired/unpaired accumulation for fixed levels.
 
     uint8_t * d_w = nullptr;
     float   * d_x = nullptr;
@@ -139,18 +142,31 @@ int main() {
     const int64_t d_tok  = out, d_sl  = (int64_t) out * ntokens;
 
     // --- 1. the guard: too few registered slices must be REFUSED, not decoded ---
-    ggml_cuda_rocmfp3_mix_register_host(d_w, slice_bytes, /*n_experts=*/nslices - 1,
-                                        out, in, books.data(), modes.data(), rots.data());
+    CHECK(ggml_cuda_rocmfp3_mix_register_host(
+              d_w, slice_bytes, /*n_experts=*/nslices - 1,
+              out, in, books.data(), modes.data()),
+          "partial slice registration succeeds");
     CHECK(!ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
               d_w, d_x, d_y3, in, out, nslices, ntokens,
               s1_tok, s1_sl, d_tok, d_sl, nullptr),
           "3d matvec refuses a tensor registered with fewer slices than the grid indexes");
     ggml_cuda_rocmfp3_mix_unregister(d_w);
 
-    // --- 2. correctness: 3-D launch vs the validated 2-D entry point, per slice ---
-    ggml_cuda_rocmfp3_mix_register_host(d_w, slice_bytes, nslices, out, in,
-                                        books.data(), modes.data(), rots.data());
+    // --- 2. registered metadata must match the requested launch shape -----------
+    CHECK(ggml_cuda_rocmfp3_mix_register_host(
+              d_w, slice_bytes, nslices, out, in,
+              books.data(), modes.data()),
+          "full slice registration succeeds");
+    CHECK(!ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
+              d_w, d_x, d_y3, in, out + 1, nslices, ntokens,
+              s1_tok, s1_sl, d_tok, d_sl, nullptr),
+          "3d matvec refuses a shape that differs from its registration");
+    CHECK(!ggml_cuda_rocmfp3_mix_mul_mat_vec(
+              d_w + BLOCK_BYTES, d_x, d_y2, in, out, 1,
+              s1_tok, d_tok, nullptr),
+          "2d matvec refuses an interior block pointer as a full slice");
 
+    // --- 3. correctness: 3-D launch vs the validated 2-D entry point, per slice ---
     CHECK(ggml_cuda_rocmfp3_mix_mul_mat_vec_3d(
               d_w, d_x, d_y3, in, out, nslices, ntokens,
               s1_tok, s1_sl, d_tok, d_sl, nullptr),
@@ -204,5 +220,5 @@ int main() {
                     "(%d slices x %d tokens x %d rows) and refuses under-registration\n",
                     nslices, ntokens, out);
     }
-    return g_fails == 0 ? 0 : 1;
+    REQUIRE_TRUE(g_fails == 0);
 }

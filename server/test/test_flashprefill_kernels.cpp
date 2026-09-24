@@ -1,3 +1,5 @@
+#include "CppUnitTestFramework.hpp"
+
 // Smoke test for the FlashPrefill CUDA kernels.
 //
 // Tiny shapes (B=1, S=256, H=4, Hk=2, D=128, BLOCK=128) so we can run on
@@ -20,6 +22,8 @@
 #include <cuda_bf16.h>
 
 #include "../src/flashprefill.h"
+
+using namespace CppUnitTestFramework;
 
 extern "C" {
 void launch_compute_mean_vector_bf16(
@@ -59,14 +63,25 @@ void launch_sparse_flash_forward_bf16(
     cudaError_t e = (call); \
     if (e != cudaSuccess) { \
         std::fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call, __FILE__, __LINE__, cudaGetErrorString(e)); \
-        return 1; \
+        REQUIRE(e == cudaSuccess); \
     } \
 } while (0)
 
 static __nv_bfloat16 f2b(float x) { return __float2bfloat16(x); }
 static float b2f(__nv_bfloat16 x) { return __bfloat162float(x); }
 
-int main() {
+namespace {
+struct FlashprefillKernelsFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
+}
+
+TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        SKIP("CUDA/HIP device unavailable");
+    }
+
     constexpr int B = 1;
     constexpr int S = 256;
     constexpr int H = 4;
@@ -248,7 +263,7 @@ int main() {
         CK(cudaMemcpy(bdK, bK.data(), bK.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(bdV, bV.data(), bV.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
-        dflash::common::flashprefill::FlashPrefillConfig cfg;
+        luce::common::flashprefill::FlashPrefillConfig cfg;
         cfg.block_size = BL;
         cfg.attention_sink = 2;
         cfg.window = 4;
@@ -256,7 +271,7 @@ int main() {
         cfg.alpha = 0.12f;
 
         // Warm-up
-        dflash::common::flashprefill::flash_prefill_forward_bf16(
+        luce::common::flashprefill::flash_prefill_forward_bf16(
             bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
             1.0f / std::sqrt((float)BD), cfg);
         CK(cudaDeviceSynchronize());
@@ -266,7 +281,7 @@ int main() {
         cudaEventCreate(&e_b);
         cudaEventRecord(e_a);
         for (int it = 0; it < 5; ++it) {
-            dflash::common::flashprefill::flash_prefill_forward_bf16(
+            luce::common::flashprefill::flash_prefill_forward_bf16(
                 bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
                 1.0f / std::sqrt((float)BD), cfg);
         }
@@ -281,5 +296,4 @@ int main() {
 
         cudaFree(bdQ); cudaFree(bdK); cudaFree(bdV); cudaFree(bdO);
     }
-    return 0;
 }

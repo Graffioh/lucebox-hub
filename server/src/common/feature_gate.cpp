@@ -7,11 +7,11 @@
 
 #include <climits>
 
-namespace dflash::common {
+namespace luce::common {
 
 std::string check_feature_compatibility(
     const BackendArgs & args,
-    const BackendFeatureConfig & features,
+    const BackendAdmissionContext & admission,
     const std::string & arch,
     PlacementBackend    target_backend,
     PlacementBackend    compiled_backend)
@@ -32,7 +32,7 @@ std::string check_feature_compatibility(
             ? target_backend
             : args.draft_device.backend;
     const bool draft_placement_used =
-        features.pflash_enabled || args.draft_path != nullptr;
+        admission.pflash_enabled || args.draft_path.has_value();
     const bool mixed_draft_placement =
         draft_placement_used && target_backend != draft_backend;
 
@@ -47,10 +47,27 @@ std::string check_feature_compatibility(
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
     }
 
+    // ── vision projector × architecture / placement
+    if (args.mmproj_path.has_value()) {
+        if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
+            args.device.is_tensor_parallel() || args.remote_target_shard.enabled() ||
+            args.max_concurrency != 1) {
+            return "--mmproj requires a local single-request DeepSeek4 or Qwen3.5 backend "
+                   "that is not split across GPUs by layer or tensor";
+        }
+        if (arch == "deepseek4" && target_backend != PlacementBackend::Hip) {
+            return "--mmproj with DeepSeek4 requires a HIP backend";
+        }
+    }
+
     // ── PFlash enablement × drafter model
-    if (features.pflash_enabled &&
-        !features.pflash_drafter_configured) {
+    if (admission.pflash_enabled &&
+        !admission.pflash_drafter_configured) {
         return "--prefill-compression requires --prefill-drafter";
+    }
+    if (admission.pflash_enabled && arch == "deepseek4" &&
+        args.device.is_layer_split()) {
+        return "--prefill-compression is not supported with DeepSeek4 layer splitting";
     }
 
     // ── target/draft backend mixing × remote draft IPC
@@ -98,7 +115,7 @@ std::string check_feature_compatibility(
         if (args.remote_target_shard.enabled()) {
             return "tensor parallelism is incompatible with --target-shard-ipc-bin";
         }
-        if (features.pflash_enabled) {
+        if (admission.pflash_enabled) {
             return "tensor parallelism does not yet support prefill compression";
         }
     }
@@ -150,28 +167,57 @@ std::string check_feature_compatibility(
     }
 
     // ── remote draft execution × architecture
-    if (args.remote_draft.enabled() && args.draft_path &&
+    if (args.remote_draft.enabled() && args.draft_path.has_value() &&
         !arch_supports_remote_draft(arch)) {
         return "model architecture '" + arch +
                "' does not support remote draft execution";
     }
 
     // ── mixed-backend PFlash × architecture
-    if (features.pflash_enabled && mixed_draft_placement &&
+    if (admission.pflash_enabled && mixed_draft_placement &&
         !arch_supports_pflash_compression(arch)) {
         return "model architecture '" + arch +
                "' does not support PFlash compression";
     }
 
+    // A block-size override changes the local draft graph itself. Remote
+    // drafters own that shape in the IPC process and cannot be resized here.
+    if (args.draft_block_size != 0) {
+        if (!args.draft_path.has_value()) {
+            return "--draft-block-size requires --draft";
+        }
+        if (args.remote_draft.enabled()) {
+            return "--draft-block-size requires an in-process draft";
+        }
+    }
+
+    const bool concurrent_local_chain =
+        arch == "qwen35" && args.paged_attention &&
+        args.max_concurrency > 1 && args.draft_path.has_value() &&
+        !args.ddtree_mode && !args.remote_draft.enabled() &&
+        !args.device.is_layer_split() &&
+        !args.device.is_tensor_parallel() &&
+        !args.remote_target_shard.enabled() &&
+        target_backend == draft_backend &&
+        args.device.gpu == args.draft_device.gpu &&
+        args.fa_window == 0;
+
+    if (concurrent_local_chain &&
+        admission.draft_residency == DraftResidencyPolicy::RequestScoped) {
+        return "concurrent DFlash2 does not support "
+               "--draft-residency=request-scoped";
+    }
+
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by
-    // the monolithic qwen35 backend, so every rule below is about reaching
-    // that one code path. All are errors rather than warnings: running dense
+    // a monolithic Qwen or DeepSeek backend. All are errors rather than
+    // warnings: running dense
     // instead would hide the memory behavior the flag was chosen for.
     if (args.paged_attention) {
         if (!arch_supports_paged_attention(arch, /*is_layer_split=*/false)) {
-            return "--paged-attention requires a Qwen3.5/Qwen3.6 dense target "
-                   "(architecture '" + arch + "' has no paged decode path)";
+            return "--paged-attention requires a dense Qwen3.5/Qwen3.6 or "
+                   "DeepSeek4 target (architecture '" + arch +
+                   "' has no paged decode path)";
         }
         // No rule for "requires a CUDA or HIP build": those are the only two
         // backends this binary can be configured with, and GGML_OP_PAGED_ATTN
@@ -180,17 +226,35 @@ std::string check_feature_compatibility(
             args.remote_target_shard.enabled()) {
             return "--paged-attention requires one local target device";
         }
-        if (args.draft_path != nullptr || args.remote_draft.enabled() ||
-            args.ddtree_mode) {
+        if ((args.draft_path.has_value() || args.remote_draft.enabled()) &&
+            !concurrent_local_chain) {
             return "--paged-attention requires autoregressive decode without a "
-                   "draft or DDTree";
+                   "draft, or concurrent local same-device DFlash2 chains";
+        }
+        if (args.ddtree_mode) {
+            return "--paged-attention does not support DDTree";
         }
         if (args.fa_window != 0) {
             return "--paged-attention requires full attention (--fa-window 0)";
         }
-        if (features.pflash_enabled) {
+        if (admission.pflash_enabled) {
             return "--paged-attention cannot be combined with PFlash prefill "
                    "compression";
+        }
+        if (admission.fixed_kvflash_requested()) {
+            return "--paged-attention cannot be combined with KVFlash";
+        }
+        if (arch == "deepseek4") {
+            if (target_backend != PlacementBackend::Hip) {
+                return "DeepSeek4 paged attention requires a local HIP target";
+            }
+            if (args.ds4_prefill_mode != PrefillAttentionMode::Exact) {
+                return "DeepSeek4 paged attention requires --ds4-prefill exact";
+            }
+            if (args.ds4_fused_decode || args.ds4_fused_verify_f16_kv) {
+                return "DeepSeek4 paged attention requires non-fused "
+                       "autoregressive decode";
+            }
         }
         // The pool rounds max_ctx up to a whole number of blocks, so the top
         // of the range is what can be rounded without overflowing int.
@@ -198,6 +262,50 @@ std::string check_feature_compatibility(
             args.device.max_ctx > INT_MAX - PAGED_BLOCK_SIZE + 1) {
             return "--paged-attention requires a positive --max-ctx small "
                    "enough to round up to whole blocks";
+        }
+    }
+
+    // ── --max-concurrency × paged attention
+    // Concurrent decode slots are implemented by model-specific paged
+    // backends. The common scheduler does not require a particular
+    // model-state representation; each backend owns whatever per-slot state
+    // its graph needs alongside one block-table column per sequence.
+    // Everything the paged cluster above rejects is transitively rejected,
+    // so the rules here are only about the flag pair itself.
+    if (args.max_concurrency < 1) {
+        return "--max-concurrency must be at least 1";
+    }
+    if (args.max_concurrency > 1) {
+        if (!args.paged_attention) {
+            return "--max-concurrency requires --paged-attention";
+        }
+        // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
+        // whole-model graph has a smaller, separately qualified ceiling.
+        const int max_slots = arch == "deepseek4"
+            ? DEEPSEEK4_MAX_PAGED_SEQUENCES : 64;
+        if (args.max_concurrency > max_slots) {
+            return "--max-concurrency must be at most " +
+                   std::to_string(max_slots) + " for " + arch;
+        }
+        // Physical capacity is memory-derived and capped independently of the
+        // logical slot count, so max-concurrency no longer multiplies max_ctx
+        // in the pool's tensor address space.
+    }
+    if (args.kv_pool_tokens != 0) {
+        if (args.max_concurrency <= 1) {
+            return "--kv-pool-tokens requires --max-concurrency greater than 1";
+        }
+        const int64_t chain_scratch = concurrent_local_chain
+            ? (int64_t)args.max_concurrency * paged_token_capacity(16)
+            : 0;
+        const int64_t max_pool_tokens =
+            ((int64_t)INT32_MAX - PAGED_BLOCK_SIZE - chain_scratch) /
+            PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+        if (args.kv_pool_tokens < PAGED_BLOCK_SIZE ||
+            args.kv_pool_tokens > max_pool_tokens) {
+            return "--kv-pool-tokens must be in [" +
+                   std::to_string(PAGED_BLOCK_SIZE) + ", " +
+                   std::to_string(max_pool_tokens) + "]";
         }
     }
 
@@ -235,6 +343,12 @@ std::string check_feature_compatibility(
     if (args.ds4_fused_decode && !monolithic_ds4) {
         return "--ds4-fused-decode currently requires single-device HIP "
                "DeepSeek4";
+    }
+
+    // ── --ds4-fused-verify-f16-kv × placement
+    if (args.ds4_fused_verify_f16_kv && !monolithic_ds4) {
+        return "--ds4-fused-verify-f16-kv currently requires single-device "
+               "HIP DeepSeek4";
     }
 
     // ── --ds4-expert-top-k × architecture/adapter
@@ -275,7 +389,6 @@ void warn_inert(std::vector<std::string> & out,
 
 std::vector<std::string> collect_feature_warnings(
     const BackendArgs & args,
-    const BackendFeatureConfig & features,
     const std::string & arch)
 {
     std::vector<std::string> out;
@@ -283,7 +396,7 @@ std::vector<std::string> collect_feature_warnings(
 
     // Each entry pairs a requested option with the capability predicate for
     // the field create_backend() would have to forward for it to take effect.
-    warn_inert(out, args.draft_path != nullptr,
+    warn_inert(out, args.draft_path.has_value(),
                arch_supports_decode_draft(arch, split),
                arch_supports_decode_draft(arch, false),
                split, arch, "--draft", "speculative decode");
@@ -298,6 +411,11 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_verify_width(arch, false),
                split, arch, "--verify-width", "chain-spec verify width");
 
+    warn_inert(out, args.draft_block_size != 0,
+               arch_supports_draft_block_size(arch, split),
+               arch_supports_draft_block_size(arch, false),
+               split, arch, "--draft-block-size", "draft block-size override");
+
     warn_inert(out, args.fa_window != 0,
                arch_supports_fa_window(arch, split),
                arch_supports_fa_window(arch, false),
@@ -308,13 +426,13 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_draft_swa(arch, false),
                split, arch, "--draft-swa", "draft sliding-window attention");
 
-    // MoE-only server features. These drive the DFLASH_QWEN35MOE_* /
-    // DFLASH_LAGUNA_* env vars, which a dense backend never reads.
-    if (features.routing_stats_requested && !arch_has_expert_offload(arch)) {
+    // MoE-only backend requests. These drive the LUCE_QWEN35MOE_* /
+    // LUCE_LAGUNA_* env vars, which a dense backend never reads.
+    if (args.routing_stats_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--freq/--collect-routing ignored: architecture '" +
                       arch + "' has no expert routing to record");
     }
-    if (features.adaptive_experts_requested && !arch_has_expert_offload(arch)) {
+    if (args.adaptive_experts_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--adaptive-experts ignored: architecture '" + arch +
                       "' has no expert-count gating");
     }
@@ -322,4 +440,4 @@ std::vector<std::string> collect_feature_warnings(
     return out;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

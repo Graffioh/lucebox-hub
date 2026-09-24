@@ -12,7 +12,7 @@ TIMEOUT_CAPTURE="$TMP_DIR/timeout-duration"
 FAKE_REPO="$TMP_DIR/repo"
 FAKE_TARGET="$TMP_DIR/model.gguf"
 FAKE_DRAFT="$TMP_DIR/draft.gguf"
-FAKE_SERVER="$TMP_DIR/dflash_server"
+FAKE_SERVER="$TMP_DIR/luce_server"
 FAKE_CLIENT="$TMP_DIR/client"
 mkdir -p "$FAKE_BIN"
 mkdir -p "$FAKE_REPO"
@@ -95,7 +95,7 @@ run_launcher() {
     STAMP="${script%.sh}-$timeout_value" \
     TARGET="$FAKE_TARGET" \
     DRAFT="$FAKE_DRAFT" \
-    DFLASH_SERVER_BIN="$FAKE_SERVER" \
+    LUCE_SERVER_BIN="$FAKE_SERVER" \
     AUTO_INSTALL_CLIENTS=0 \
     FA_WINDOW=1 \
     TIMEOUT_CAPTURE="$TIMEOUT_CAPTURE" \

@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -40,15 +40,15 @@ does not fit at all.)
 ```bash
 # recommended: drafter-scored residency, pool auto-sized from VRAM.
 # pass --prefill-drafter so the drafter is guaranteed (no silent LRU fallback).
-dflash_server model.gguf --max-ctx 32768 --kvflash auto \
+luce_server model.gguf --max-ctx 32768 --kvflash auto \
     --prefill-drafter /opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf
 
 # drop the path to auto-probe (model dir, drafter/, draft/, /opt/lucebox/models/drafter/);
 # falls back to LRU if none is found, so check the banner reads policy=drafter
-dflash_server model.gguf --max-ctx 32768 --kvflash auto
+luce_server model.gguf --max-ctx 32768 --kvflash auto
 
 # explicit pool size, recency-only LRU
-dflash_server model.gguf --max-ctx 32768 --kvflash 8192 --kvflash-policy lru
+luce_server model.gguf --max-ctx 32768 --kvflash 8192 --kvflash-policy lru
 ```
 
 Drafter-scored residency is the DEFAULT policy on every model family:
@@ -66,7 +66,7 @@ which policy you got) or the explicit choice via `--kvflash-policy lru`.
 free VRAM left after weights (minus a reserve for compute buffers and
 the drafter), converted at the model's KV density, capped where decode
 speed stays near the flat optimum (16384 tokens by default,
-`DFLASH_KVFLASH_MAX_POOL` to override) and at `--max-ctx`. Bigger pools
+`LUCE_KVFLASH_MAX_POOL` to override) and at `--max-ctx`. Bigger pools
 mean more resident chunks and fewer forced evictions of useful context;
 the cap keeps the per-step KV read small enough that decode stays near
 the small-pool speed.
@@ -74,10 +74,10 @@ the small-pool speed.
 - `--kvflash <tokens|auto>`: resident pool size (rounded to 256; clamped to
   `--max-ctx`; floored at the protected minimum — 512 for qwen-family and
   gemma4, larger on laguna where the SWA window stays resident — so
-  eviction always has a victim). Env: `DFLASH_KVFLASH`.
+  eviction always has a victim). Env: `LUCE_KVFLASH`.
 - `--kvflash-tau <N>`: reselect interval floor (default 64; the effective
   interval grows with history so rescore overhead stays ~15% of decode).
-  Env: `DFLASH_KVFLASH_TAU`.
+  Env: `LUCE_KVFLASH_TAU`.
 
 Sizing rule: without a drafter, pool >= prompt + generation headroom
 (LRU is recency-only memory — an undersized pool can evict the question
@@ -138,7 +138,7 @@ full-attention layers. This is the Phase-0-validated scorer from
 `optimizations/msa-sm86/` (oracle-relative recall 87-92% @20% keep;
 2x the drafter scorer's recall on identical shards). Costs no drafter
 VRAM and rescores in ~0.2 s where the drafter pays 3-70 s.
-Env: `DFLASH_KVFLASH_POLICY=qk`. Bench: `test_kvflash --qkbench`.
+Env: `LUCE_KVFLASH_POLICY=qk`. Bench: `test_kvflash --qkbench`.
 
 ## Files
 

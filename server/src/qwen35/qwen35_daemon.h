@@ -8,7 +8,7 @@
 #include "placement/placement_config.h"
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35DaemonArgs {
     const char * target_path    = nullptr;
@@ -39,4 +39,4 @@ struct Qwen35DaemonArgs {
 // Run the qwen35 daemon loop. Returns 0 on clean exit, 1 on init failure.
 int run_qwen35_daemon(const Qwen35DaemonArgs & args);
 
-}  // namespace dflash::common
+}  // namespace luce::common

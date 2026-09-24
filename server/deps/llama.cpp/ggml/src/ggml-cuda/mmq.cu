@@ -1,15 +1,96 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "mmq_big.h"
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "rocmfp2_mix.cuh"
 #include "rocmfp3_mix.cuh"
+
+static thread_local size_t g_mmq_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_mmq_launch_count(void) {
+    return g_mmq_launch_count;
+}
+
+namespace {
+
+class mix_registry_dispatch_guard {
+public:
+    explicit mix_registry_dispatch_guard(ggml_type type) : type_(type) {
+        if (type_ == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            ggml_cuda_rocmfp2_mix_registry_lock();
+        } else if (type_ == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            ggml_cuda_rocmfp3_mix_registry_lock();
+        }
+    }
+
+    ~mix_registry_dispatch_guard() {
+        if (type_ == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
+            ggml_cuda_rocmfp2_mix_registry_unlock();
+        } else if (type_ == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+            ggml_cuda_rocmfp3_mix_registry_unlock();
+        }
+    }
+
+    mix_registry_dispatch_guard(const mix_registry_dispatch_guard &) = delete;
+    mix_registry_dispatch_guard & operator=(
+        const mix_registry_dispatch_guard &) = delete;
+
+private:
+    ggml_type type_;
+};
+
+}  // namespace
+
+// Big-tile dispatch (see mmq_big.h): the default instances for the dense
+// hybrid types are 64x64 (GGML_CUDA_MMQ_SMALL_TILE, tuned for spec-decode
+// verify widths); at prefill widths the narrow x-tile re-streams the weights,
+// so wide batches take the 128x128 twin instances instead. RDNA4 only: the
+// measurement is from gfx1201, and gfx1151 keeps its existing behavior.
+// LUCE_MMQ_BIG_PREFILL=0 disables.
+static bool lucebox_mmq_big_tile_take(const ggml_type type, const int64_t ncols_dst) {
+    static const bool enabled = []() {
+        const char * e = getenv("LUCE_MMQ_BIG_PREFILL");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    // Measured crossover on gfx1201 (iq4_xs 17408x5120): small tile wins to
+    // N=64, tie at 128, big wins 16-18% at 512. Take big only where it is a
+    // clear win.
+    if (!enabled || ncols_dst < 256) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const bool is_mix_type =
         args.type_x == GGML_TYPE_Q2_1_ROCMFP2_MIX ||
         args.type_x == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     GGML_ASSERT(!is_mix_type || (args.mix_codebooks && args.mix_modes));
+    ++g_mmq_launch_count;
+    if (lucebox_mmq_big_tile_take(args.type_x, args.ncols_dst)) {
+        switch (args.type_x) {
+            case GGML_TYPE_IQ4_XS: mul_mat_q_case_big_iq4_xs(ctx, &args, stream); return;
+            case GGML_TYPE_Q4_K:   mul_mat_q_case_big_q4_k  (ctx, &args, stream); return;
+            case GGML_TYPE_Q5_K:   mul_mat_q_case_big_q5_k  (ctx, &args, stream); return;
+            case GGML_TYPE_Q6_K:   mul_mat_q_case_big_q6_k  (ctx, &args, stream); return;
+            case GGML_TYPE_Q8_0:   mul_mat_q_case_big_q8_0  (ctx, &args, stream); return;
+            default: break;
+        }
+    }
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
             mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, args, stream);
@@ -137,6 +218,10 @@ static void ggml_cuda_mul_mat_q_impl(
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
+    // Keep mix side data alive until every MMQ launch using it is enqueued.
+    // Registry teardown takes the same lock and drains the owning device before
+    // freeing those buffers.
+    mix_registry_dispatch_guard mix_guard(src0->type);
     const void * mix_codebooks_raw = nullptr;
     const uint8_t * mix_modes = nullptr;
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
@@ -371,11 +456,16 @@ static void ggml_cuda_mul_mat_q_impl(
         ne03, ne13, s03, s13, s3,
         use_stream_k, ncols_max};
 
+    // Negative expert IDs represent masked owner routes. The compact MMID
+    // kernels intentionally do not write those destination columns, so clear
+    // the output before dispatch to make their contribution exactly zero.
+    CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     if (src0_pair) {
         mmq_args pair_args = args;
         pair_args.x = (const char *) src0_pair->data;
         pair_args.dst = (float *) dst_pair->data;
+        CUDA_CHECK(cudaMemsetAsync(pair_args.dst, 0, ggml_nbytes(dst_pair), stream));
         if (src0_pair->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
             const void * pair_codebooks = nullptr;
             const uint8_t * pair_modes = nullptr;
@@ -448,6 +538,7 @@ void ggml_cuda_op_mul_mat_q(
     const bool use_stream_k = ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
+    mix_registry_dispatch_guard mix_guard(src0->type);
     const void * mix_codebooks_raw = nullptr;
     const uint8_t * mix_modes = nullptr;
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
@@ -471,10 +562,76 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+bool ggml_cuda_mixed_mmq_enabled(const ggml_tensor * op, bool default_enabled) {
+    const auto policy = ggml_mul_mat_get_mixed_mmq(op);
+    if (policy != GGML_MIXED_MMQ_DEFAULT) {
+        return policy == GGML_MIXED_MMQ_ENABLED;
+    }
+    const char * value = std::getenv("LUCE_DS4_MIX_MMQ_PREFILL");
+    return value ? std::strcmp(value, "0") != 0 : default_enabled;
+}
+
+bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int64_t n_experts) {
+    const ggml_type type = op->src[0]->type;
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+#ifdef ROCMFP2_AFFINE
+    // The affine Q8_1 tile loader carries scale and -offset and uses the
+    // activation sum correction. Keep it opt-in until model-level validation.
+    if (type == GGML_TYPE_Q2_0_ROCMFP2 &&
+        std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE") == nullptr) {
+        return false;
+    }
+    // Batched expert MMQ is finite with the affine correction, but its
+    // gather/quantize path is slower than grouped MMVQ at DS4 verify width.
+    if (type == GGML_TYPE_Q2_0_ROCMFP2 && n_experts > 1) {
+        return false;
+    }
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        const char * runtime_disable = std::getenv(
+            "LUCE_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
+        if (runtime_disable && *runtime_disable &&
+            std::strcmp(runtime_disable, "0") != 0) {
+            return false;
+        }
+    }
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        // Owner-isolation/qualification switch. AMD architecture codes are
+        // accepted in decimal or 0x form (for example 0x1100 or 0x1151).
+        static const int required_cc = [] {
+            const char * raw = std::getenv(
+                "LUCE_CUDA_MMQ_FP2_AFFINE_CC");
+            if (!raw || !*raw) return 0;
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 0);
+            return end && end != raw && *end == '\0' && parsed > 0 &&
+                           parsed <= INT_MAX
+                ? (int) parsed
+                : 0;
+        }();
+        if (required_cc > 0 && cc != required_cc) {
+            return false;
+        }
+    }
+    if (type == GGML_TYPE_Q2_0_ROCMFP2) {
+        static const int min_ncols = [] {
+            const char * raw = std::getenv(
+                "LUCE_CUDA_MMQ_FP2_AFFINE_MIN_NCOLS");
+            if (!raw || !*raw) return 0;
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 10);
+            return end && end != raw && *end == '\0' && parsed > 0 &&
+                           parsed <= INT_MAX
+                ? (int) parsed
+                : 0;
+        }();
+        if (ne11 < min_ncols) {
+            return false;
+        }
+    }
+#endif // ROCMFP2_AFFINE
 
     bool mmq_supported;
 
@@ -516,21 +673,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
-        case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
-            break;
-        }
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
+            mmq_supported = ggml_cuda_mixed_mmq_enabled(op) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
             break;
         }
@@ -594,6 +739,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                // Wide Q4_K batches on gfx1151 favor dequantization +
+                // hipBLAS; keep MMQ for decode/small-prefill shapes and for
+                // the unmeasured RDNA 3.0 family.
+                case GGML_TYPE_Q4_K:
+                    return !GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 256;
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
