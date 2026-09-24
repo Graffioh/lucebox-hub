@@ -138,6 +138,17 @@ void write_compression_trace(
             }
             std::fputc(']', file);
         }
+        if (trace_fields->drafter_profile && trace_fields->drafter_profile->valid) {
+            const auto & prof = *trace_fields->drafter_profile;
+            std::fprintf(file,
+                ",\"drafter_profile\":{\"S\":%d,\"resume\":%d,\"new_tokens\":%d,"
+                "\"ubatches\":%d,\"mask_ms\":%.6g,\"graph_ms\":%.6g,"
+                "\"attn_ms\":%.6g,\"deltanet_ms\":%.6g,\"score_ms\":%.6g,"
+                "\"total_ms\":%.6g}",
+                prof.input_tokens, prof.resume, prof.new_tokens, prof.ubatches,
+                prof.mask_ms, prof.graph_ms, prof.attn_ms, prof.deltanet_ms,
+                prof.score_ms, prof.total_ms);
+        }
     }
     std::fprintf(file,
         ",\"chunk_size\":%d,\"n_lookahead\":%d,\"pool_kernel\":%d,"
@@ -183,7 +194,16 @@ namespace {
 thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
 thread_local PFlashScoringStats g_last_scoring_stats;
 thread_local std::vector<PFlashCandidateLift> g_last_candidate_lifts;
+thread_local PFlashDrafterProfile g_last_drafter_profile;
 } // namespace
+
+const PFlashDrafterProfile & pflash_last_drafter_profile() {
+    return g_last_drafter_profile;
+}
+
+void pflash_set_drafter_profile(const PFlashDrafterProfile & profile) {
+    g_last_drafter_profile = profile;
+}
 
 const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts() {
     return g_last_candidate_lifts;
@@ -205,6 +225,7 @@ void pflash_clear_kept_spans() {
     g_last_kept_spans.clear();
     g_last_scoring_stats = {};
     g_last_candidate_lifts.clear();
+    g_last_drafter_profile = {};
 }
 
 std::vector<int32_t> select_pflash_chunks(
@@ -368,6 +389,9 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
         strict_fields.top_k =
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
+        if (g_last_drafter_profile.valid) {
+            strict_fields.drafter_profile = &g_last_drafter_profile;
+        }
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

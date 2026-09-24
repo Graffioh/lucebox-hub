@@ -745,6 +745,21 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         experiment.segmentation != luce::pflash::PFlashSegmentation::Fixed;
 
     auto t0 = std::chrono::steady_clock::now();
+    // PFLASH_DRAFTER_PROFILE=1: wall time per phase of this forward, the
+    // backend synchronized at every mark. Off, nothing below is timed.
+    const char * profile_raw = std::getenv("PFLASH_DRAFTER_PROFILE");
+    const bool profile = profile_raw && std::strcmp(profile_raw, "1") == 0;
+    PFlashDrafterProfile prof;
+    using ProfileClock = std::chrono::steady_clock;
+    const auto profile_mark = [&]() {
+        if (profile) ggml_backend_synchronize(w.backend);
+        return ProfileClock::now();
+    };
+    // Milliseconds from ``since`` to now, after the backend drained.
+    const auto elapsed_ms = [&](ProfileClock::time_point since) {
+        const auto now = profile_mark();
+        return std::chrono::duration<double, std::milli>(now - since).count();
+    };
     int resume = 0;
     int shared_prefix = 0;
     std::unique_ptr<Qwen35ScoringSession> scratch;
@@ -838,6 +853,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             const int stop = start < checkpoint ? checkpoint : S;
             const int n = std::min(ubatch, stop - start);
             const int kv_len = start + n;
+            if (profile && il == 0) ++prof.ubatches;
+            ProfileClock::time_point mark{};
+            if (profile) mark = profile_mark();
             ggml_init_params ip{};
             ip.mem_size = 512 * 1024 * 1024;
             ip.no_alloc = true;
@@ -871,6 +889,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 ggml_free(ctx); ggml_gallocr_free(alloc);
                 return fail("qwen35 drafter graph allocation failed");
             }
+            if (profile) prof.graph_ms += elapsed_ms(mark);
             if (is_attn) {
                 std::vector<int32_t> p4((size_t)4 * n, 0);
                 for (int i = 0; i < n; ++i) {
@@ -880,11 +899,17 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                     p4[(size_t)2 * n + i] = p;
                 }
                 ggml_backend_tensor_set(pos, p4.data(), 0, p4.size() * sizeof(int32_t));
+                if (profile) mark = profile_mark();
                 build_causal_mask_f16(mask_bits, kv_len, n, start);
                 ggml_backend_tensor_set(mask, mask_bits.data(), 0,
                                         mask_bits.size() * sizeof(uint16_t));
+                if (profile) prof.mask_ms += elapsed_ms(mark);
             }
+            if (profile) mark = profile_mark();
             const auto status = ggml_backend_graph_compute(w.backend, gf);
+            if (profile) {
+                (is_attn ? prof.attn_ms : prof.deltanet_ms) += elapsed_ms(mark);
+            }
             ggml_free(ctx);
             if (status != GGML_STATUS_SUCCESS) {
                 ggml_gallocr_free(alloc);
@@ -899,6 +924,8 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     }
     ggml_gallocr_free(alloc);
     auto t1 = std::chrono::steady_clock::now();
+    ProfileClock::time_point score_mark{};
+    if (profile) score_mark = profile_mark();
 
     // Block-14 rows of each query window -- the query, then earlier
     // questions -- from this call when it computed them, else from the
@@ -1280,6 +1307,25 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 density ? "density" : "sum");
         }
         std::fflush(stderr);
+    }
+
+    if (profile) {
+        prof.valid = true;
+        prof.input_tokens = S;
+        prof.resume = resume;
+        prof.new_tokens = n_new;
+        prof.score_ms = elapsed_ms(score_mark);
+        prof.total_ms = std::chrono::duration<double, std::milli>(
+            ProfileClock::now() - t0).count();
+        std::fprintf(stderr,
+            "[qwen35-drafter-profile] S=%d ubatches=%d mask_ms=%.3f graph_ms=%.3f "
+            "attn_ms=%.3f deltanet_ms=%.3f score_ms=%.3f total_ms=%.3f "
+            "resume=%d new=%d\n",
+            prof.input_tokens, prof.ubatches, prof.mask_ms, prof.graph_ms,
+            prof.attn_ms, prof.deltanet_ms, prof.score_ms, prof.total_ms,
+            prof.resume, prof.new_tokens);
+        std::fflush(stderr);
+        pflash_set_drafter_profile(prof);
     }
 
     if (token_mass_out) {
