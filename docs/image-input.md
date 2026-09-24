@@ -136,9 +136,31 @@ concurrent sequence scheduling (`--paged-attention --max-concurrency N`): each
 image request is encoded when it is admitted and then prefills and decodes in
 the shared batch like text, with the drafter. On one R9700, four concurrent
 256-token image answers finish in 6.9 s (149 tok/s in total) against 13.3 s
-(77 tok/s) one at a time. DeepSeek V4 image requests still need one request
-at a time. `/props` reports the effective capability in
-`capabilities.image_input_supported` after backend initialization.
+(77 tok/s) one at a time.
+
+DeepSeek V4 Flash Vision batches too, with the batched launch from the DeepSeek
+guide plus `--mmproj` (and `--mmproj-device` for an R9700 encoder):
+
+```
+luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
+  --target-device hip:1 --mmproj-device hip:0 \
+  --paged-attention --max-concurrency 4 --kv-pool-tokens 24576 --max-ctx 8192 \
+  --ds4-prefill exact --prefix-cache-slots 0 --ds4-expert-top-k 6 \
+  --mmproj models/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf
+```
+
+Its image blocks need whole-block bidirectional prefill, which the batched
+engine's 16-row step cannot run. Image requests admitted since the last step
+are therefore prefilled up to their last token together, in shared
+layer-major sparse passes into per-request staging caches (each layer's
+experts are read once for all of them); that state is copied into each
+request's paged slot and the last token prefills in the batch, so the answers
+decode alongside everyone else. On the Strix Halo with the encoder on the
+R9700, four concurrent image answers of 256 tokens finish in 35 s (29 tok/s in
+total), two images plus two text requests at 31 tok/s; four text requests
+reach 38 tok/s. Image requests beyond the free slots wait in the queue. `/props` reports the
+effective capability in `capabilities.image_input_supported` after backend
+initialization.
 
 ## Qwen3.5 / Qwen3.8
 
@@ -238,10 +260,11 @@ per-expert layout is used expert by expert; the community publishes one for
 this model) or `--absmax-only`. The converter uses every core: about 40 minutes
 for this checkpoint on 32 cores.
 
-One image request may be outstanding per backend. Its admission lease remains
-with the immutable payload through queueing and generation; another image
-request is rejected until that payload is released. This bounds simultaneous
-preprocessing and prepared-image memory. Text requests retain the normal queue.
+Image requests wait in the same queue as text requests. A waiting request
+holds only its preprocessed patches, a few MB per image; its encoded rows
+exist only while it runs, so the number of slots bounds them. When host
+memory is too short to prepare another image request, the server answers
+HTTP 503 and the client should retry.
 
 The server expands image markers after final rendering and tokenization.
 Expanded image tokens count toward context and usage. Image blocks remain

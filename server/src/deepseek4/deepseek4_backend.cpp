@@ -55,9 +55,8 @@ private:
     friend class DeepSeek4Backend;
     DeepSeek4ImagePrompt(const DeepSeek4Backend * owner,
                         vision::PreparedImagePrompt prepared,
-                        std::vector<EncodedImage> encoded, std::shared_ptr<void> lease)
-        : owner_(owner), prepared_(std::move(prepared)), encoded_(std::move(encoded)),
-          lease_(std::move(lease)) {
+                        std::vector<EncodedImage> encoded)
+        : owner_(owner), prepared_(std::move(prepared)), encoded_(std::move(encoded)) {
         for (const auto & image : prepared_.images) spans_.push_back(image.layout.span);
     }
 
@@ -108,7 +107,6 @@ private:
     const DeepSeek4Backend * const owner_;
     const vision::PreparedImagePrompt prepared_;
     const std::vector<EncodedImage> encoded_;
-    const std::shared_ptr<void> lease_;
     std::vector<vision::TokenSpan> spans_;
     mutable std::vector<std::vector<float>> materialized_;
     mutable std::mutex stream_mutex_;
@@ -1076,7 +1074,7 @@ DeepSeek4Backend::~DeepSeek4Backend() {
     shutdown();
 }
 
-bool DeepSeek4Backend::prepare_images(
+ImagePrepareStatus DeepSeek4Backend::prepare_images(
         std::vector<int32_t> & tokens, std::vector<EncodedImage> images,
         uint64_t context_capacity, uint64_t output_reserve,
         ImagePromptHandle & payload, std::string & error) const {
@@ -1088,29 +1086,27 @@ bool DeepSeek4Backend::prepare_images(
             for (int32_t token : tokens) {
                 if (token == marker || token < 0 || token >= w_.n_vocab) {
                     error = "unbound image marker or invalid token in rendered prompt";
-                    return false;
+                    return ImagePrepareStatus::invalid;
                 }
             }
         }
         payload.reset();
-        return true;
+        return ImagePrepareStatus::ok;
     }
     if (!image_capable_) {
         error = "image input requires a validated --mmproj projector and heterogeneous HIP sparse prefill";
-        return false;
+        return ImagePrepareStatus::invalid;
     }
     try {
         if (images.size() > MAX_REQUEST_IMAGES) {
             error = "too many images in request";
-            return false;
+            return ImagePrepareStatus::invalid;
         }
-        auto lease = image_request_gate_.try_acquire();
-        if (!lease) {
-            error = "an image request is already in progress; retry after it completes";
-            return false;
-        }
+        // Image requests queue like text ones: a waiting request holds only
+        // its patches (a few MB per image); the encoded rows exist only once
+        // it runs, so the slots bound them. Short host memory is capacity.
         if (!vision::check_deepseek4_image_host_preparation(4ULL * 1024 * 1024 * 1024, error)) {
-            return false;
+            return ImagePrepareStatus::busy;
         }
         std::vector<vision::ImagePatchInput> patches;
         patches.reserve(images.size());
@@ -1119,13 +1115,13 @@ bool DeepSeek4Backend::prepare_images(
             if (image.bytes.size() > 16ULL * 1024 * 1024 ||
                 encoded_bytes > 32ULL * 1024 * 1024 - image.bytes.size()) {
                 error = "images exceed request byte limit";
-                return false;
+                return ImagePrepareStatus::invalid;
             }
             encoded_bytes += image.bytes.size();
             auto decoded = vision::decode_image({image.bytes.data(), image.bytes.size()});
-            if (!decoded) { error = decoded.status.message; return false; }
+            if (!decoded) { error = decoded.status.message; return ImagePrepareStatus::invalid; }
             auto processed = vision::preprocess_rgb(decoded.image.view(), 0);
-            if (!processed) { error = processed.status.message; return false; }
+            if (!processed) { error = processed.status.message; return ImagePrepareStatus::invalid; }
             patches.push_back({processed.image.plan, std::move(processed.image.patches_bf16)});
         }
         vision::ImagePromptLimits limits;
@@ -1133,21 +1129,110 @@ bool DeepSeek4Backend::prepare_images(
         limits.output_reserve = output_reserve;
         limits.max_expanded_tokens = std::min(context_capacity, vision::MAX_PREPARED_PROMPT_TOKENS);
         auto prepared = vision::prepare_image_prompt(tokens, patches, limits);
-        if (!prepared) { error = prepared.message; return false; }
+        if (!prepared) { error = prepared.message; return ImagePrepareStatus::invalid; }
         auto binding = std::shared_ptr<DeepSeek4ImagePrompt>(
-            new DeepSeek4ImagePrompt(this, std::move(prepared), std::move(images), std::move(lease)));
+            new DeepSeek4ImagePrompt(this, std::move(prepared), std::move(images)));
         if (!vision::valid_image_spans(binding->spans(), binding->prepared_.tokens.size())) {
             error = "invalid prepared image spans";
-            return false;
+            return ImagePrepareStatus::invalid;
         }
         std::vector<int32_t> expanded = binding->prepared_.tokens;
         tokens.swap(expanded);
         payload = std::move(binding);
-        return true;
+        return ImagePrepareStatus::ok;
     } catch (const std::bad_alloc &) {
         error = "image preparation allocation failed";
+        return ImagePrepareStatus::invalid;
+    }
+}
+
+bool DeepSeek4Backend::encode_image_request(const std::vector<int32_t> & prompt,
+                                            const ImagePromptHandle & handle, std::string & error) {
+    const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(handle.get());
+    if (!images || images->owner_ != this || !images->matches(prompt)) {
+        error = "image binding does not match this prompt";
         return false;
     }
+    DaemonIO io;
+    const auto t0 = Clock::now();
+    const bool ok = materialize_images(*images, io, error);
+    join_image_stream();
+    if (ok && !images->complete()) {
+        error = "image encoding did not complete";
+        return false;
+    }
+    std::fprintf(stderr, "[deepseek4] batched image request encoded in %.0f ms\n", elapsed_s(t0) * 1000.0);
+    return ok;
+}
+
+void DeepSeek4Backend::prefill_staged(std::vector<StagedPrefill> & batch) {
+    // Embeddings for every request's prefix (image rows + text rows).
+    struct Seq { StagedPrefill * item; const DeepSeek4ImagePrompt * images; std::vector<float> embed; int done = 0; };
+    std::vector<Seq> seqs;
+    for (auto & item : batch) {
+        const auto * images = dynamic_cast<const DeepSeek4ImagePrompt *>(item.images.get());
+        if (!images || !item.prompt || !item.staging || item.prefix < DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS ||
+            item.prefix > int(item.prompt->size()) || item.prefix > item.staging->max_ctx) {
+            item.error = "invalid staged prefill request";
+            continue;
+        }
+        std::vector<float> embed(size_t(item.prefix) * size_t(w_.n_embd));
+        if (!images->embed_chunk(w_.embedder, 0, item.prefix, embed.data())) {
+            item.error = "staged prefill embedding failed";
+            continue;
+        }
+        reset_deepseek4_cache(*item.staging);
+        item.staging->prefill_mode = PrefillAttentionMode::Sparse;
+        seqs.push_back({&item, images, std::move(embed), 0});
+    }
+    ggml_backend_synchronize(backend_);
+    deepseek4_release_image_scratch(cache_, moe_hybrid_.get());
+    const int budget_total = std::min(1024, DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS);
+    constexpr int min_rows = DS4_MIN_LAYER_MAJOR_PREFILL_TOKENS;
+    const auto t0 = Clock::now();
+    int passes = 0, rows = 0;
+    for (;;) {
+        // One pass takes the next chunk of every unfinished request that fits:
+        // whole image blocks only, and never a chunk or tail below the
+        // layer-major minimum.
+        std::vector<DeepSeek4PrefillSeq> pass;
+        std::vector<Seq *> members;
+        int budget = budget_total;
+        for (auto & s : seqs) {
+            const int remaining = s.item->prefix - s.done;
+            if (remaining <= 0 || !s.item->error.empty() || budget < min_rows) continue;
+            int n = std::min(remaining, budget);
+            if (remaining - n > 0 && remaining - n < min_rows) n = std::max(0, remaining - min_rows);
+            n = n >= min_rows ? vision::atomic_image_chunk(s.images->spans(), uint64_t(s.done), n,
+                                                    uint64_t(remaining), budget) : 0;
+            if (n < min_rows) continue;
+            DeepSeek4PrefillSeq seq;
+            seq.cache = s.item->staging;
+            seq.embed = s.embed.data() + size_t(s.done) * size_t(w_.n_embd);
+            seq.token_ids = s.item->prompt->data() + s.done;
+            seq.n_tokens = n;
+            seq.kv_start = s.done;
+            seq.image_spans = s.images->spans();
+            pass.push_back(seq);
+            members.push_back(&s);
+            budget -= n;
+        }
+        if (pass.empty()) break;
+        std::string error;
+        if (!deepseek4_prefill_multi(backend_, cfg_.device.gpu, w_, pass, error)) {
+            for (Seq * m : members) m->item->error = error.empty() ? "staged prefill failed" : error;
+            continue;
+        }
+        for (size_t k = 0; k < members.size(); ++k) members[k]->done += pass[k].n_tokens;
+        ++passes;
+        for (const auto & p : pass) rows += p.n_tokens;
+    }
+    for (auto & s : seqs) {
+        if (s.item->error.empty() && s.done != s.item->prefix) s.item->error = "staged prefill could not be chunked";
+        s.item->ok = s.item->error.empty();
+    }
+    std::fprintf(stderr, "[deepseek4] staged prefill: %zu requests, %d rows in %d shared passes, %.0f ms\n",
+                 seqs.size(), rows, passes, elapsed_s(t0) * 1000.0);
 }
 
 void DeepSeek4Backend::join_image_stream() {
@@ -1432,8 +1517,10 @@ bool DeepSeek4Backend::load_model() {
         const bool two_gpu_ok = tp.in_process && tp.backend_valid &&
             tp.secondary_backend == PlacementBackend::Hip &&
             tp.secondary_gpu != cfg_.device.gpu && !tp.all_on_secondary && !force_full;
+        // Batched serving keeps exact prefill for text; its image admissions
+        // prefill into a sparse staging cache instead.
         if (target_backend != PlacementBackend::Hip || cfg_.device.is_layer_split() ||
-            cfg_.prefill_mode != PrefillAttentionMode::Sparse ||
+            (cfg_.prefill_mode != PrefillAttentionMode::Sparse && !cfg_.paged_attention) ||
             (tp.requested && !two_gpu_ok) ||
             env_flag_enabled("LUCE_DS4_DENSE_TP_MASK")) {
             std::fprintf(stderr, "[deepseek4] --mmproj requires a HIP target with --ds4-prefill sparse, "
@@ -1816,6 +1903,17 @@ bool DeepSeek4Backend::init() {
                 (unsigned long long)requested);
             return false;
         }
+        if (vision_) {
+            // Image admissions prefill on the single-request sparse path into
+            // this staging cache, then copy it into their paged slot.
+            if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+                std::fprintf(stderr, "[deepseek4] image staging cache allocation failed (ctx=%d)\n", max_ctx);
+                return false;
+            }
+            cache_.prefill_mode = PrefillAttentionMode::Sparse;
+            std::fprintf(stderr, "[deepseek4] batched image serving: %d slots, staging cache ctx=%d\n",
+                         cfg_.max_concurrency, max_ctx);
+        }
     } else {
         if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
             std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
@@ -1834,7 +1932,7 @@ bool DeepSeek4Backend::init() {
         return false;
     }
     if (cfg_.paged_attention && moe_hybrid_ &&
-        moe_hybrid_->streams_cold_experts()) {
+        !moe_hybrid_->materialized_cold_experts) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires statically materialized "
             "expert ownership; enable in-process LUCE_DS4_MOE_TP\n");
@@ -2499,7 +2597,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      "[deepseek4] speculative verifier routes all experts "
                      "to the duplicated secondary stack\n");
     }
-    if (hybrid->has_mmap() && hybrid->streams_cold_experts()) {
+    if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
         size_t max_expert_bytes = 0;
         for (const auto & layer : hybrid->layers) {
             const size_t per_expert_bytes = layer.fused_gate_up
@@ -2526,9 +2624,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
     w_.moe_hybrid = true;
     const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
     const char * cold_backend =
-        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu  ? "gpu"
-        : moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::None ? "none"
-                                                                       : "cpu";
+        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
     std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
                  moe_placement_.total_hot, total_cold, cold_backend, "");
     return true;
@@ -2750,12 +2846,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int kv_offset,
                                   int snap_slot,
                                   int snap_pos,
-                                  const DeepSeek4ImagePrompt * images) {
+                                  const DeepSeek4ImagePrompt * images,
+                                  int prefix_tokens) {
     // Image prompts capture DSpark features from their text chunks only: the
     // image graph takes no capture hooks (see the chunking below).
     const bool capture_spec = spec_enabled_ && spec_drafter_;
     const InferencePhase phase = deepseek4_roctx_prefill_phase(
-        prefill_attention_mode_name(cfg_.prefill_mode));
+        prefill_attention_mode_name(cache_.prefill_mode));
     const DeepSeek4RoctxPhaseScope roctx_phase(phase);
     const DeepSeek4RoctxRange roctx_range(
         "ds4.prefill",
@@ -2776,7 +2873,8 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // Mixed hot/cold hybrid execution still has single-token HC semantics, so
     // retain the reference path there.  --chunk 1 is the explicit fallback.
     const int requested_chunk = cfg_.chunk > 0 ? cfg_.chunk : w_.n_swa;
-    const int n_total = (int)tokens.size();
+    const int n_total = prefix_tokens > 0
+        ? std::min(prefix_tokens, (int)tokens.size()) : (int)tokens.size();
     // Bound the layer-major graph to the topology validated by the prefill
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
@@ -2787,17 +2885,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // hybrid execution remains tokenwise; batching it would skip per-token HC
     // post-mixing and corrupt the hidden state.
     const bool hybrid_batch_supported =
-        !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        !moe_hybrid_ || cache_.prefill_mode == PrefillAttentionMode::Sparse;
     const int base_chunk =
         !hybrid_batch_supported ||
-        (cfg_.prefill_mode == PrefillAttentionMode::Exact &&
+        (cache_.prefill_mode == PrefillAttentionMode::Exact &&
          spec_drafter_ != nullptr)
         ? 1
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
     const bool bound_hybrid_scratch =
         moe_hybrid_ &&
-        cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+        cache_.prefill_mode == PrefillAttentionMode::Sparse;
     const int chunk = bound_hybrid_scratch
         ? deepseek4_hybrid_prefill_chunk_tokens(
               base_chunk, kv_offset + n_total,
@@ -3052,7 +3150,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             need_logits ? &logits : nullptr,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
-                                            cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp,
+                                            cache_.prefill_mode != PrefillAttentionMode::Sparse, hp,
                                             /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
                                             /*routing_stats=*/nullptr,
                                             images ? images->spans() : vision::ImageSpanView{});

@@ -75,12 +75,12 @@ public:
     void print_ready_banner() const override;
     bool supports_images() const override { return image_capable_ && vision_ != nullptr; }
     std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
-    bool prepare_images(std::vector<int32_t> & tokens,
-                        std::vector<EncodedImage> images,
-                        uint64_t context_capacity,
-                        uint64_t output_reserve,
-                        ImagePromptHandle & payload,
-                        std::string & error) const override;
+    ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
+                                      std::vector<EncodedImage> images,
+                                      uint64_t context_capacity,
+                                      uint64_t output_reserve,
+                                      ImagePromptHandle & payload,
+                                      std::string & error) const override;
 
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
@@ -137,7 +137,6 @@ private:
     ggml_backend_t         vision_backend_ = nullptr;
     // Encodes images on vision_backend_ while prefill consumes them.
     std::thread            image_stream_;
-    vision::ImageRequestGate image_request_gate_;
     vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler
@@ -196,13 +195,31 @@ private:
                                            int snapshot_capture_to);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
+    // prefix_tokens > 0 prefills only that many leading tokens (the batched
+    // image admission leaves the last prompt token to the paged engine).
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
-                   const DeepSeek4ImagePrompt * images = nullptr);
+                   const DeepSeek4ImagePrompt * images = nullptr,
+                   int prefix_tokens = 0);
     bool load_vision();
     bool init_single_gpu_vision();
     // Waits for a streaming image encode started by materialize_images.
     void join_image_stream();
+    // Batched serving. encode_image_request materializes an image request's
+    // rows; prefill_staged fills each request's first `prefix` tokens into
+    // its own staging cache in shared layer-major passes (expert weights read
+    // once per pass for every request in it).
+    struct StagedPrefill {
+        ImagePromptHandle images;
+        const std::vector<int32_t> * prompt = nullptr;
+        int prefix = 0;
+        DeepSeek4Cache * staging = nullptr;
+        bool ok = false;
+        std::string error;
+    };
+    bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
+                              std::string & error);
+    void prefill_staged(std::vector<StagedPrefill> & batch);
     bool materialize_images(const DeepSeek4ImagePrompt & images,
                             const DaemonIO & io, std::string & error);
 
