@@ -4867,15 +4867,16 @@ bool HttpServer::serve_pflash_chat_view(
             recalled_tokens += span.end - span.begin;
         }
         if (!excerpts.empty()) {
-            recall_block = "[Earlier in this conversation]\n" + excerpts +
-                "\n[End of earlier excerpts]\n\n";
+            recall_block = "\n\n[Passages from the documents that may help with this question]\n" + excerpts + "\n[End of passages]";
         }
     }
 
     // This turn's new tokens from where the previous generation prompt
     // started: all of them, or the parts the fresh selection keeps when they
-    // are compressed. Recalled excerpts open the new user turn's content,
-    // after everything the target cached.
+    // are compressed. Recalled passages close the new user turn's content,
+    // after the user's own words: a question that refers back ("where does
+    // it come from?") then follows the conversation it refers to, not
+    // passages about something else. Everything before stays cached.
     const auto decode_range = [&] (int begin, int end) {
         return end > begin
             ? drafter_tokenizer_->decode(std::vector<int32_t>(
@@ -4890,7 +4891,7 @@ bool HttpServer::serve_pflash_chat_view(
         delta_spans.push_back({view.drafter_gen_begin, input});
     }
     const int split = new_question && !recall_block.empty()
-        ? turn.content_begin : input;
+        ? turn.content_end : input;
     std::vector<PFlashTokenSpan> before_split;
     std::vector<PFlashTokenSpan> after_split;
     for (const auto & span : delta_spans) {

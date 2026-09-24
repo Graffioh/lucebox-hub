@@ -7407,7 +7407,7 @@ TEST_CASE(ServerUnitFixture,
          "Question", " one", " two", "?", "Answer", "user", "assistant",
          "system", "\n", "You", " are", " helpful"},
         render(turn2) +
-            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+            "[Passages from the documents that may help with this question]\n[End of passages]\n");
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
 
@@ -7475,14 +7475,15 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(served2.size() > reused);
     TEST_ASSERT(std::equal(served1.begin(), served1.begin() + (long) reused,
                            served2.begin()));
-    // The recalled segment opens the new user turn, after the answer.
+    // The recalled segment closes the new user turn, after the question.
     const size_t answer = text2.find("Answer one.");
-    const size_t recall = text2.find("[Earlier in this conversation]");
+    const size_t recall = text2.find("[Passages from the documents that may help with this question]");
     const size_t question = text2.find("Question two?");
     TEST_ASSERT(answer != std::string::npos);
-    TEST_ASSERT(recall != std::string::npos && recall > answer);
+    TEST_ASSERT(question != std::string::npos && question > answer);
+    TEST_ASSERT(recall != std::string::npos && recall > question);
     TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
-    TEST_ASSERT(question != std::string::npos && question > recall);
+    TEST_ASSERT(text2.find("<|im_end|>", recall) != std::string::npos);
     TEST_ASSERT(served3 == served2);
     TEST_ASSERT(modes == std::vector<std::string>({"fresh", "continue", "repeat"}));
     unlink(path.c_str());
@@ -7593,7 +7594,7 @@ static PflashTwoTurnRun pflash_two_turn_run(const std::string & follow_up) {
          "Question", " one", " two", "?", "Answer", "user", "assistant",
          "system", "\n", "You", " are", " helpful", " pasted", " notes"},
         render(turn2) +
-            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+            "[Passages from the documents that may help with this question]\n[End of passages]\n");
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
     auto backend_owner = std::make_unique<MockPflashSpanBackend>();
@@ -7651,7 +7652,7 @@ TEST_CASE(ServerUnitFixture,
     // Turn 2 is appended exactly as full prefill appends it: no scoring.
     TEST_ASSERT(run.compress_calls == 1);
     TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue"}));
-    TEST_ASSERT(run.text2.find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.text2.find("[Passages from the documents that may help with this question]") == std::string::npos);
     TEST_ASSERT(run.text2.find("Answer one.") != std::string::npos);
     TEST_ASSERT(run.text2.find("Question two?") != std::string::npos);
 }
