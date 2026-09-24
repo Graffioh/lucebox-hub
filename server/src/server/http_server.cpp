@@ -4795,14 +4795,26 @@ bool HttpServer::serve_pflash_chat_view(
         auto in_view = view.spans;
         in_view.push_back({view.drafter_gen_begin, input});
         in_view = http_detail::canonicalize_pflash_token_spans(std::move(in_view));
-        recalled = http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
+        const auto missing =
+            http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
         size_t recall_size = 0;
-        for (const auto & span : recalled) {
+        for (const auto & span : missing) {
             recall_size += (size_t) (span.end - span.begin);
         }
         if (3 * recall_size > fresh->size()) {
             return serve_fresh("rebuild", view.turns + 1);
         }
+        // Whole kept pieces: a passage the view holds only part of comes
+        // back in one piece, in order, not as a fragment far from the rest.
+        for (const auto & span : *kept_spans) {
+            for (const auto & part : missing) {
+                if (part.begin < span.end && part.end > span.begin) {
+                    recalled.push_back(span);
+                    break;
+                }
+            }
+        }
+        recalled = http_detail::canonicalize_pflash_token_spans(std::move(recalled));
     }
     std::string recall_block;
     int recalled_tokens = 0;
@@ -4839,16 +4851,15 @@ bool HttpServer::serve_pflash_chat_view(
             recalled_tokens += span.end - span.begin;
         }
         if (!excerpts.empty()) {
-            recall_block = "\n\n[Passages from the documents that may help with this question]\n" + excerpts + "\n[End of passages]";
+            recall_block = "[Earlier in this conversation]\n" + excerpts +
+                "\n[End of earlier excerpts]\n\n";
         }
     }
 
     // This turn's new tokens from where the previous generation prompt
     // started: all of them, or the parts the fresh selection keeps when they
-    // are compressed. Recalled passages close the new user turn's content,
-    // after the user's own words: a question that refers back ("where does
-    // it come from?") then follows the conversation it refers to, not
-    // passages about something else. Everything before stays cached.
+    // are compressed. Recalled excerpts open the new user turn's content,
+    // after everything the target cached.
     const auto decode_range = [&] (int begin, int end) {
         return end > begin
             ? drafter_tokenizer_->decode(std::vector<int32_t>(
@@ -4863,7 +4874,7 @@ bool HttpServer::serve_pflash_chat_view(
         delta_spans.push_back({view.drafter_gen_begin, input});
     }
     const int split = new_question && !recall_block.empty()
-        ? turn.content_end : input;
+        ? turn.content_begin : input;
     std::vector<PFlashTokenSpan> before_split;
     std::vector<PFlashTokenSpan> after_split;
     for (const auto & span : delta_spans) {

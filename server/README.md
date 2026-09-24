@@ -419,9 +419,7 @@ generation prompt), PFlash serves that view plus the new turns instead of a
 fresh compression, so the target restores its prefix-cache snapshot of the
 view (taken at the start of its generation prompt) and prefills only what is
 new. Segments the fresh selection keeps for the new question that the view
-lacks are recalled as passages at the end of the new user turn, after the
-user's own words, so a question that refers back follows the conversation it
-refers to. When the
+lacks are recalled as excerpts at the start of the new user turn. When the
 view grows past twice the fresh prompt, or past the context, the fresh prompt
 starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
 turn.
