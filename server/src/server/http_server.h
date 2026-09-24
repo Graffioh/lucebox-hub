@@ -230,6 +230,10 @@ struct ServerConfig {
     // resolve off. See placement/skip_park_guard.h.
     SkipParkMode pflash_skip_park_mode = SkipParkMode::Auto;
     bool         pflash_skip_park = false;
+    // Auto only: the estimate also fits the drafter kept resident beside the
+    // target's compute reserve, so draft-residency auto keeps the pflash
+    // drafter loaded between requests. False for explicit on/off.
+    bool         pflash_keep_drafter_loaded = false;
     // Auto estimate (bytes incl. margin) and free VRAM at resolve time —
     // exposed in logs and /props for forensics. 0 when not estimated.
     int64_t      pflash_skip_park_required_bytes = 0;

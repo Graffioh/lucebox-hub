@@ -29,6 +29,9 @@
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
+#include "placement/gpu_vmm_pool.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/pflash_selection.h"
 #include "kvflash_pager.h"
 #include "kv_quant.h"
 
@@ -1232,9 +1235,21 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     if (pflash_enabled && !sconfig.pflash_drafter_path.empty() &&
         !sconfig.pflash_remote_drafter &&
         sconfig.pflash_upstream_base.empty()) {
+        // The scorer's query window sizes its logits; an invalid selection
+        // config fails every request later, so the widest window is a safe
+        // stand-in here.
+        luce::pflash::PFlashSelectionConfig selection;
+        std::string selection_error;
+        const int query_tokens =
+            luce::pflash::resolve_pflash_selection(
+                sconfig.max_ctx, /*legacy_chunk_size=*/32, selection,
+                selection_error)
+                ? selection.query_tokens : 512;
         SkipParkDrafterInfo footprint;
-        const bool footprint_ok =
-            inspect_drafter_footprint(sconfig.pflash_drafter_path, footprint);
+        const bool footprint_ok = inspect_drafter_footprint(
+            sconfig.pflash_drafter_path, query_tokens,
+            pflash_scoring_sessions(), footprint);
+        const bool vmm_pool = gpu_backend_uses_vmm_pool();
         int64_t total_vram = -1, free_vram = -1;
         int prev_dev = -1;
         if (cudaGetDevice(&prev_dev) == cudaSuccess) {
@@ -1255,21 +1270,25 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             sconfig.pflash_skip_park_mode,
             /*drafter_configured=*/true,
             footprint_ok ? footprint : SkipParkDrafterInfo{},
-            free_vram, total_vram, sconfig.max_ctx);
+            free_vram, total_vram, sconfig.max_ctx, vmm_pool);
         sconfig.pflash_skip_park = decision.enabled;
+        sconfig.pflash_keep_drafter_loaded = decision.keep_drafter_loaded;
         sconfig.pflash_skip_park_required_bytes = decision.required_bytes;
         sconfig.pflash_skip_park_free_bytes =
             std::max<int64_t>(free_vram, 0);
         std::fprintf(stderr,
             "[server] pflash skip-park: mode=%s → %s "
-            "(need %.2f GiB incl. margin, free %.2f GiB, window %lld tok)\n",
+            "(need %.2f GiB incl. margin, keep-loaded %.2f GiB, free %.2f GiB, "
+            "window %lld tok, query %d tok, vmm_pool=%d)\n",
             skip_park_mode_name(sconfig.pflash_skip_park_mode),
             decision.reason.c_str(),
             decision.required_bytes / double(1ll << 30),
+            decision.keep_loaded_bytes / double(1ll << 30),
             std::max<int64_t>(free_vram, 0) / double(1ll << 30),
-            (long long)decision.window_tokens);
+            (long long)decision.window_tokens, query_tokens, (int)vmm_pool);
     } else {
         sconfig.pflash_skip_park = false;
+        sconfig.pflash_keep_drafter_loaded = false;
         if (pflash_enabled) {
             std::fprintf(stderr,
                 "[server] pflash skip-park: off (remote/upstream drafter or "

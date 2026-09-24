@@ -346,6 +346,7 @@ format and resolution order.
   "skip_park_mode": null,
   "skip_park_estimate_bytes": null,
   "skip_park_free_bytes": null,
+  "drafter_keep_loaded": null,
   "threshold":   null
 }
 ```
@@ -362,6 +363,9 @@ enabled, fields carry the runtime configuration:
 - `skip_park_mode` — `"auto" | "on" | "off"` requested policy
 - `skip_park_estimate_bytes` / `skip_park_free_bytes` — the auto-mode
   footprint estimate (incl. margin) and the free VRAM measured at startup
+- `drafter_keep_loaded` — auto mode only: the estimate plus the target's
+  compute reserve also fits, so `--draft-residency auto` keeps the drafter
+  loaded between requests instead of reloading it per request
 - `bsa_enabled` / `bsa_alpha` / `lm_head_fix` — backend-specific
   PFlash tunables
 

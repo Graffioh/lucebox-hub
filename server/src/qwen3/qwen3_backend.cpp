@@ -6,6 +6,7 @@
 // After all layers, out_norm + lm_head produces logits for the last token.
 
 #include "qwen3_backend.h"
+#include "internal.h"
 #include "pflash/pflash_drafter.h"
 #include "luce.h"
 #include "common/sampler.h"
@@ -967,6 +968,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
                               drafter_ctx_)) {
                 std::fprintf(stderr, "[compress] load failed: %s\n",
                              luce_last_error());
+                r.out_of_memory = luce::common::last_error_is_oom();
                 if (park_window && !was_parked) unpark(ParkTarget::TargetModel);
                 return r;
             }
@@ -983,8 +985,11 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
             score_query_end, req.required_instruction_spans,
             req.query_suffix_candidates, req.history_query_spans,
             req.turn_query_span));
+        r.out_of_memory = !r.ok && luce::common::last_error_is_oom();
 
-        if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+        // A recent out-of-memory window overrides KeepLoaded: VRAM is tight.
+        if (req.residency_action == DraftResidencyAction::ReleaseAfterUse ||
+            skip_park_fallback_.memory_tight()) {
             free_drafter();
         }
 
@@ -992,29 +997,20 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
         return r;
     };
 
-    // Once a skip-park attempt has OOM-failed and the parked retry landed,
-    // pflash_relaxed_ latches: later requests park even when asked to skip.
-    const bool park_window = !req.skip_park || pflash_relaxed_;
-    result = attempt(park_window);
-
-    // Fail-safe fallback: a no-park attempt can still OOM when the drafter
-    // load or its scoring scratch outgrows the startup estimate. Drop any
-    // partial drafter state, park the resident target, retry once.
-    if (!park_window && !result.ok) {
-        std::fprintf(stderr,
-            "[compress] skip-park attempt failed — parking target and "
-            "retrying once\n");
-        // Unconditional free: a failed load_drafter can leave a live backend
-        // in the ctx even though drafter_loaded_ is still false.
-        luce::common::free_drafter(drafter_ctx_);
-        drafter_loaded_ = false;
-        result = attempt(true);
-        if (result.ok) {
-            pflash_relaxed_ = true;
-            std::fprintf(stderr,
-                "[compress] parked retry succeeded — latching park\n");
-        }
-    }
+    const auto classify = [](const CompressResult & r) {
+        return r.ok ? SkipParkWindowOutcome::Ok
+             : r.out_of_memory ? SkipParkWindowOutcome::OutOfMemory
+             : SkipParkWindowOutcome::Failed;
+    };
+    result = run_skip_park_window(
+        req.skip_park, skip_park_fallback_, attempt, classify,
+        [this]() {
+            // Unconditional free: a failed load_drafter can leave a live
+            // backend in the ctx even though drafter_loaded_ is still false.
+            luce::common::free_drafter(drafter_ctx_);
+            drafter_loaded_ = false;
+        },
+        "[compress]");
     return result;
 }
 

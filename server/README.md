@@ -372,7 +372,7 @@ the whole request's device footprint. `/status/json` reports
 | `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
 | `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
-| `--prefill-skip-park [auto\|on\|off]` | `auto` | Keep target and decode draft resident while PFlash runs. `auto` enables it when the drafter GGUF footprint fits measured free VRAM with margin; bare flag = `on` (explicit override, still bounded by the <32GiB/ctx>64K guard). A skip-park window that OOMs retries once with parking and stays parked. |
+| `--prefill-skip-park [auto\|on\|off]` | `auto` | Keep target and decode draft resident while PFlash runs. `auto` enables it when the drafter GGUF footprint fits measured free VRAM with a 25% margin, and also keeps the drafter loaded between requests (`--draft-residency auto`) when that footprint plus a 1.5 GiB target compute reserve fits; bare flag = `on` (explicit, no estimate, drafter residency unchanged). On CUDA builds with the VMM pool, cards under 32 GiB at max ctx > 64K always park (VMM fragmentation guard). A no-park window that runs out of device memory retries once parked, then parks 4 windows (doubling to 64 on repeats) before trying skip-park again; other failures do not retry. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
@@ -463,7 +463,8 @@ checkpoint (the previous turn's generation prompt is replaced), and the new
 query scores against every stored key. Sessions live with the loaded drafter,
 so they pay off with `--draft-residency persistent` (and `--prefill-skip-park`
 where the target and drafter fit together); the default releases the drafter
-after each compression.
+after each compression, unless `--prefill-skip-park auto` found room to keep
+it loaded (the estimate counts the kept sessions).
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through

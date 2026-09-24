@@ -849,7 +849,7 @@ bool load_target_gguf_partial(const std::string & path,
     } else if (ggml_backend_buft_is_meta(buft)) {
         out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
         if (!out.buf) {
-            set_last_error("ggml_backend_alloc_ctx_tensors failed (target TP)");
+            set_last_oom_error("ggml_backend_alloc_ctx_tensors failed (target TP)");
             gguf_free(gctx);
             return false;
         }
@@ -857,7 +857,7 @@ bool load_target_gguf_partial(const std::string & path,
     } else {
         out.buf = ggml_backend_alloc_buffer(backend, alloc_total);
         if (!out.buf) {
-            set_last_error("ggml_backend_alloc_ctx_tensors failed (target)");
+            set_last_oom_error("ggml_backend_alloc_ctx_tensors failed (target)");
             gguf_free(gctx);
             return false;
         }

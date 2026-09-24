@@ -56,6 +56,12 @@ bool load_drafter(const std::string & gguf_path, int gpu_layers,
 
 void free_drafter(DrafterContext & ctx);
 
+// Scoring sessions the drafter keeps for prefix reuse while loaded
+// (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
+// Each holds KV sized for its prompt plus headroom, so it counts toward the
+// drafter's resident footprint (skip-park estimate, common/gguf_inspect.h).
+int pflash_scoring_sessions();
+
 // Free only model weights, keeping the backend alive for reuse.
 // Avoids repeated ggml backend create/destroy during daemon reuse.
 void free_drafter_weights(DrafterContext & ctx);

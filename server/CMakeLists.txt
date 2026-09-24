@@ -603,6 +603,7 @@ add_library(luce_common STATIC
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
+    src/placement/gpu_vmm_pool.cpp
     src/common/backend_plan.cpp
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp

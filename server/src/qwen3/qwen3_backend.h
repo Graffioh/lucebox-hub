@@ -15,6 +15,7 @@
 #include "placement/placement_config.h"
 #include "qwen3_model.h"
 #include "pflash/pflash_drafter.h"
+#include "placement/skip_park_guard.h"
 #include "common/sampler.h"
 
 #include "ggml.h"
@@ -117,9 +118,9 @@ private:
     // Pflash drafter (lazy-loaded, reuses the same model for compress)
     DrafterContext         drafter_ctx_;
     bool                  drafter_loaded_ = false;
-    // Fail-safe latch: set when a skip-park compress failed and the parked
-    // retry succeeded — later requests park even when asked to skip.
-    bool                  pflash_relaxed_ = false;
+    // Skip-park fail-safe: parks a few requests after an out-of-memory
+    // no-park compress recovered with parking (placement/skip_park_guard.h).
+    SkipParkFallback      skip_park_fallback_;
 
     // Sampler
     SamplerCfg            sampler_;

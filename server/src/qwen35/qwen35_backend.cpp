@@ -6,6 +6,7 @@
 #include "common/spec_acceptance.h"
 #include "common/draft_block_size.h"
 #include "common/draft_swa.h"
+#include "placement/gpu_vmm_pool.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -1147,48 +1148,32 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     }
     if (load_request == nullptr) return results;
 
-    auto window_failed = [&requests](
-            const std::vector<CompressResult> & rs) {
+    const auto classify = [&requests](const std::vector<CompressResult> & rs) {
+        auto outcome = SkipParkWindowOutcome::Ok;
         for (size_t i = 0; i < requests.size(); ++i) {
             const auto & r = requests[i];
             if (r.input_ids.empty() || r.drafter_path.empty()) continue;
-            if (i >= rs.size() || !rs[i].ok) return true;
+            if (i >= rs.size()) return SkipParkWindowOutcome::Failed;
+            if (rs[i].ok) continue;
+            if (rs[i].out_of_memory) return SkipParkWindowOutcome::OutOfMemory;
+            outcome = SkipParkWindowOutcome::Failed;
         }
-        return false;
+        return outcome;
     };
-
-    // Once a skip-park window has OOM-failed and the parked retry landed,
-    // pflash_relaxed_ latches: later windows park even when asked to skip.
-    const bool park_window = !load_request->skip_park || pflash_relaxed_;
-    results = run_compress_window(requests, *load_request, park_window);
-
-    // Fail-safe fallback: a no-park window can still OOM when the drafter
-    // load or its scoring scratch outgrows the startup estimate. Drop any
-    // partial drafter state, park the resident models, retry once. The
-    // latch only sets when the parked retry demonstrably fixed it —
-    // deterministic per-request failures don't poison later windows.
-    if (!park_window && window_failed(results)) {
-        std::fprintf(stderr,
-            "[compress] skip-park window failed — parking target+draft "
-            "and retrying once\n");
-        // Drop the drafter fully: free_drafter() handles the loaded case and
-        // the kvflash scorer borrow; the unconditional free below clears a
-        // backend/weights half-initialized by a failed load_drafter.
+    const auto drop_drafter = [this]() {
+        // free_drafter() handles the loaded case and the kvflash scorer
+        // borrow; the unconditional free clears a backend/weights
+        // half-initialized by a failed load_drafter.
         free_drafter();
         luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
-        auto retry = run_compress_window(requests, *load_request,
-                                         /*park_window=*/true);
-        if (!window_failed(retry)) {
-            pflash_relaxed_ = true;
-            std::fprintf(stderr,
-                "[compress] parked retry succeeded — latching park for "
-                "later windows\n");
-        }
-        results = std::move(retry);
-    }
-
-    return results;
+    };
+    return run_skip_park_window(
+        load_request->skip_park, skip_park_fallback_,
+        [&](bool park_window) {
+            return run_compress_window(requests, *load_request, park_window);
+        },
+        classify, drop_drafter, "[compress]");
 }
 
 std::vector<ModelBackend::CompressResult> Qwen35Backend::run_compress_window(
@@ -1196,8 +1181,10 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::run_compress_window(
         const CompressRequest & load_request,
         bool park_window) {
     std::vector<CompressResult> results(requests.size());
+    // A recent out-of-memory window overrides KeepLoaded: VRAM is tight.
     const bool release_after_use =
-        load_request.residency_action == DraftResidencyAction::ReleaseAfterUse;
+        load_request.residency_action == DraftResidencyAction::ReleaseAfterUse ||
+        skip_park_fallback_.memory_tight();
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
     // A FlowKV request may contain many aged messages. Keep this residency
@@ -1230,6 +1217,8 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::run_compress_window(
                           load_request.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          luce_last_error());
+            const bool oom = luce::common::last_error_is_oom();
+            for (auto & result : results) result.out_of_memory = oom;
             if (park_window) {
                 if (!was_target_parked) unpark(ParkTarget::TargetModel);
                 if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
@@ -1263,6 +1252,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::run_compress_window(
             request.query_suffix_candidates, request.history_query_spans,
             request.turn_query_span);
         result.ok = !result.compressed_ids.empty();
+        result.out_of_memory = !result.ok && luce::common::last_error_is_oom();
         if (result.ok) result.kept_spans = pflash_last_kept_spans();
         if (result.ok) {
             const auto & scoring = pflash_last_scoring_stats();
@@ -1323,7 +1313,8 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
         if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
             total_vram = prop.totalGlobalMem;
         const bool allowed = luce::common::skip_park_allowed(
-            skip_park, total_vram, cfg_.device.max_ctx);
+            skip_park, total_vram, cfg_.device.max_ctx,
+            luce::common::gpu_backend_uses_vmm_pool());
         if (skip_park && !allowed) {
             std::fprintf(stderr,
                 "[server] --prefill-skip-park downgraded: <32GB GPU with max_ctx>65536"

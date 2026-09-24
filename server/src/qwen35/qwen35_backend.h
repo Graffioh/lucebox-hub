@@ -26,6 +26,7 @@
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
+#include "placement/skip_park_guard.h"
 #include "qwen35_vision.h"
 #include "pflash/pflash_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
@@ -276,8 +277,9 @@ protected:
 
 private:
     // One compression window (park → load drafter → score → restore) with
-    // the park step optional. compress_batch calls this once, then retries
-    // with park_window=true if the skip-park attempt failed (OOM fail-safe).
+    // the park step optional. compress_batch runs it through
+    // run_skip_park_window, which retries parked after an out-of-memory
+    // no-park attempt.
     std::vector<CompressResult> run_compress_window(
         const std::vector<CompressRequest> & requests,
         const CompressRequest & load_request,
@@ -331,9 +333,9 @@ private:
     // ── Pflash drafter (lazy-loaded) ─────────────────────────────────
     DrafterContext drafter_ctx_;
     bool           drafter_loaded_ = false;
-    // Fail-safe latch: set when a skip-park window failed and the parked
-    // retry succeeded — later windows park even if the request asks to skip.
-    bool           pflash_relaxed_ = false;
+    // Skip-park fail-safe: parks a few windows after an out-of-memory
+    // no-park window recovered with parking (placement/skip_park_guard.h).
+    luce::common::SkipParkFallback skip_park_fallback_;
 
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;

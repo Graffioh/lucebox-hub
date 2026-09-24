@@ -3601,42 +3601,25 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
     }
     if (load_request == nullptr) return results;
 
-    auto window_failed = [&requests, &valid_request](
+    const auto classify = [&requests, &valid_request](
             const std::vector<CompressResult> & rs) {
+        auto outcome = SkipParkWindowOutcome::Ok;
         for (size_t i = 0; i < requests.size(); ++i) {
             if (!valid_request(requests[i])) continue;
-            if (i >= rs.size() || !rs[i].ok) return true;
+            if (i >= rs.size()) return SkipParkWindowOutcome::Failed;
+            if (rs[i].ok) continue;
+            if (rs[i].out_of_memory) return SkipParkWindowOutcome::OutOfMemory;
+            outcome = SkipParkWindowOutcome::Failed;
         }
-        return false;
+        return outcome;
     };
-
-    // Once a skip-park window has OOM-failed and the parked retry landed,
-    // pflash_relaxed_ latches: later windows park even when asked to skip.
-    const bool park_window = !load_request->skip_park || pflash_relaxed_;
-    results = run_compress_window(requests, *load_request, park_window);
-
-    // Fail-safe fallback: a no-park window can still OOM when the drafter
-    // load or its scoring scratch outgrows the startup estimate. Drop any
-    // partial drafter state, park the resident target, retry once. The
-    // latch only sets when the parked retry demonstrably fixed it —
-    // deterministic per-request failures don't poison later windows.
-    if (!park_window && window_failed(results)) {
-        std::fprintf(stderr,
-            "[deepseek4-pflash] skip-park window failed — parking target "
-            "and retrying once\n");
-        release_pflash_drafter();
-        auto retry = run_compress_window(requests, *load_request,
-                                         /*park_window=*/true);
-        if (!window_failed(retry)) {
-            pflash_relaxed_ = true;
-            std::fprintf(stderr,
-                "[deepseek4-pflash] parked retry succeeded — latching park "
-                "for later windows\n");
-        }
-        results = std::move(retry);
-    }
-
-    return results;
+    return run_skip_park_window(
+        load_request->skip_park, skip_park_fallback_,
+        [&](bool park_window) {
+            return run_compress_window(requests, *load_request, park_window);
+        },
+        classify, [this]() { release_pflash_drafter(); },
+        "[deepseek4-pflash]");
 }
 
 std::vector<ModelBackend::CompressResult> DeepSeek4Backend::run_compress_window(
@@ -3671,6 +3654,10 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::run_compress_window(
                           pflash_drafter_ctx_)) {
             std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
                          luce_last_error());
+            const bool oom = luce::common::last_error_is_oom();
+            for (size_t index = 0; index < requests.size(); ++index) {
+                if (valid_request(requests[index])) results[index].out_of_memory = oom;
+            }
             release_pflash_drafter();
             if (park_window && !was_parked) {
                 unpark(ParkTarget::TargetModel);
@@ -3697,6 +3684,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::run_compress_window(
             request.query_suffix_candidates, request.history_query_spans,
             request.turn_query_span);
         result.ok = !result.compressed_ids.empty();
+        result.out_of_memory = !result.ok && luce::common::last_error_is_oom();
         if (result.ok) result.kept_spans = pflash_last_kept_spans();
         if (result.ok) {
             const auto & scoring = pflash_last_scoring_stats();
@@ -3709,8 +3697,10 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::run_compress_window(
         }
     }
 
+    // A recent out-of-memory window overrides KeepLoaded: VRAM is tight.
     if (load_request.residency_action ==
-        DraftResidencyAction::ReleaseAfterUse) {
+            DraftResidencyAction::ReleaseAfterUse ||
+        skip_park_fallback_.memory_tight()) {
         release_pflash_drafter();
     }
     if (park_window && !was_parked &&

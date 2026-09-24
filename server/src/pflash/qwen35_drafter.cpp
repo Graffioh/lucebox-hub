@@ -138,7 +138,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     if (!act_buf) {
         ggml_free(act_ctx);
         free_target_cache(cache);
-        set_last_error("qwen35 drafter activation allocation failed");
+        set_last_oom_error("qwen35 drafter activation allocation failed");
         return {};
     }
 
@@ -202,7 +202,7 @@ std::vector<int32_t> qwen35_score_and_compress(
             ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
             if (!ggml_gallocr_alloc_graph(alloc, gf)) {
                 ggml_free(ctx); ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
-                set_last_error("qwen35 drafter graph allocation failed");
+                set_last_oom_error("qwen35 drafter graph allocation failed");
                 return {};
             }
             if (is_attn) {
@@ -222,7 +222,11 @@ std::vector<int32_t> qwen35_score_and_compress(
             ggml_free(ctx);
             if (st != GGML_STATUS_SUCCESS) {
                 ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
-                set_last_error("qwen35 drafter graph compute failed");
+                if (st == GGML_STATUS_ALLOC_FAILED) {
+                    set_last_oom_error("qwen35 drafter graph compute out of memory");
+                } else {
+                    set_last_error("qwen35 drafter graph compute failed");
+                }
                 return {};
             }
         }
@@ -281,7 +285,7 @@ std::vector<int32_t> qwen35_score_and_compress(
             ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
             if (!ggml_gallocr_alloc_graph(salloc, sgf)) {
                 ggml_gallocr_free(salloc); ggml_free(sctx); ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
-                set_last_error("qwen35 score graph allocation failed");
+                set_last_oom_error("qwen35 score graph allocation failed");
                 return {};
             }
             std::vector<int32_t> pos4((size_t)4 * n_lookahead, 0);
@@ -303,7 +307,11 @@ std::vector<int32_t> qwen35_score_and_compress(
             auto st = ggml_backend_graph_compute(w.backend, sgf);
             if (st != GGML_STATUS_SUCCESS) {
                 ggml_gallocr_free(salloc); ggml_free(sctx); ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
-                set_last_error("qwen35 score graph compute failed");
+                if (st == GGML_STATUS_ALLOC_FAILED) {
+                    set_last_oom_error("qwen35 score graph compute out of memory");
+                } else {
+                    set_last_error("qwen35 score graph compute failed");
+                }
                 return {};
             }
             std::vector<float> tmp((size_t)K_len * n_lookahead * w.n_head);
@@ -688,7 +696,7 @@ Qwen35ScoringSession * acquire_scoring_session(
         // Headroom so the next turns append without reallocating.
         const int capacity = limit == 0 ? S : S + S / 2 + 4096;
         if (!allocate_scoring_session(w, capacity, *target)) {
-            set_last_error("qwen35 scoring session allocation failed");
+            set_last_oom_error("qwen35 scoring session allocation failed");
             return nullptr;
         }
     }
@@ -783,7 +791,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     if (!act_buf) {
         ggml_free(act_ctx);
         session->ids.clear();
-        set_last_error("qwen35 drafter activation allocation failed");
+        set_last_oom_error("qwen35 drafter activation allocation failed");
         return {};
     }
     // Any failure below leaves the session's state half-written: forget its
@@ -796,6 +804,12 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         cleanup();
         session->ids.clear();
         set_last_error(message);
+        return {};
+    };
+    auto fail_oom = [&](const char * message) -> std::vector<int32_t> {
+        cleanup();
+        session->ids.clear();
+        set_last_oom_error(message);
         return {};
     };
 
@@ -869,7 +883,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
             if (!ggml_gallocr_alloc_graph(alloc, gf)) {
                 ggml_free(ctx); ggml_gallocr_free(alloc);
-                return fail("qwen35 drafter graph allocation failed");
+                return fail_oom("qwen35 drafter graph allocation failed");
             }
             if (is_attn) {
                 std::vector<int32_t> p4((size_t)4 * n, 0);
@@ -888,7 +902,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             ggml_free(ctx);
             if (status != GGML_STATUS_SUCCESS) {
                 ggml_gallocr_free(alloc);
-                return fail("qwen35 drafter graph compute failed");
+                return status == GGML_STATUS_ALLOC_FAILED
+                    ? fail_oom("qwen35 drafter graph compute out of memory")
+                    : fail("qwen35 drafter graph compute failed");
             }
             start += n;
             if (!is_attn && start == checkpoint && checkpoint > resume) {
@@ -982,7 +998,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             ? ggml_backend_alloc_ctx_tensors(nctx, w.backend) : nullptr;
         if (use_probe && !nbuf) {
             ggml_free(nctx);
-            return fail("qwen35 probe buffer allocation failed");
+            return fail_oom("qwen35 probe buffer allocation failed");
         }
         const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
         ggml_init_params kip{};
@@ -1025,8 +1041,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             }
         }
         ggml_gallocr_t kalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
-        const bool key_ok = ggml_gallocr_alloc_graph(kalloc, kgf) &&
-            ggml_backend_graph_compute(w.backend, kgf) == GGML_STATUS_SUCCESS;
+        const ggml_status key_status = ggml_gallocr_alloc_graph(kalloc, kgf)
+            ? ggml_backend_graph_compute(w.backend, kgf) : GGML_STATUS_ALLOC_FAILED;
+        const bool key_ok = key_status == GGML_STATUS_SUCCESS;
         ggml_gallocr_free(kalloc);
         ggml_free(kctx);
         if (key_ok && use_probe) {
@@ -1041,7 +1058,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
         if (nbuf) ggml_backend_buffer_free(nbuf);
         ggml_free(nctx);
-        if (!key_ok) return fail("qwen35 key graph compute failed");
+        if (!key_ok) {
+            return key_status == GGML_STATUS_ALLOC_FAILED
+                ? fail_oom("qwen35 key graph allocation failed")
+                : fail("qwen35 key graph compute failed");
+        }
     }
     cleanup();
     // The session now covers this prompt, resumable at the checkpoint and,
@@ -1083,7 +1104,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
         if (!lbuf) {
             ggml_free(lctx);
-            set_last_error("qwen35 score buffer allocation failed");
+            set_last_oom_error("qwen35 score buffer allocation failed");
             return false;
         }
         ggml_backend_tensor_set(x_q, window.rows.data(), 0,
@@ -1155,8 +1176,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ggml_set_output(probs);
         ggml_build_forward_expand(sgf, probs);
         ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
-        const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
-            ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
+        const ggml_status score_status = ggml_gallocr_alloc_graph(salloc, sgf)
+            ? ggml_backend_graph_compute(w.backend, sgf) : GGML_STATUS_ALLOC_FAILED;
+        const bool ok = score_status == GGML_STATUS_SUCCESS;
         std::vector<float> probs_h;
         if (ok) {
             probs_h.resize((size_t)S * nq * H);
@@ -1167,7 +1189,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ggml_backend_buffer_free(lbuf);
         ggml_free(lctx);
         if (!ok) {
-            set_last_error("qwen35 score graph compute failed");
+            if (score_status == GGML_STATUS_ALLOC_FAILED) {
+                set_last_oom_error("qwen35 score graph allocation failed");
+            } else {
+                set_last_error("qwen35 score graph compute failed");
+            }
             return false;
         }
         const size_t nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
@@ -1386,6 +1412,10 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
                                      n_lookahead, pool_kernel, score_query_end,
                                      suffix_kept,
                                      required_instruction_spans);
+}
+
+int pflash_scoring_sessions() {
+    return scoring_session_limit();
 }
 
 } // namespace luce::common

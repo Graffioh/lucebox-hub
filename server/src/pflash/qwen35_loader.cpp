@@ -132,7 +132,11 @@ static bool load_qwen35_scoring_head(const std::string & path,
         ggml_set_name(*contract.destination, contract.name);
     }
     st.head_buf = ggml_backend_alloc_ctx_tensors(st.head_ctx, w.backend);
-    if (!st.head_buf) return fail("scoring head buffer allocation failed");
+    if (!st.head_buf) {
+        fail("scoring head buffer allocation failed");
+        set_last_oom_error("scoring head buffer allocation failed");
+        return false;
+    }
     for (const auto & contract : contracts) {
         ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
         ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
@@ -279,7 +283,11 @@ static bool load_qwen35_segment_probe(const std::string & path,
         st.probe_sub_conv_b = ((const float *) sub_cb_src->data)[0];
     }
     st.probe_buf = ggml_backend_alloc_ctx_tensors(st.probe_ctx, w.backend);
-    if (!st.probe_buf) return fail("segment probe buffer allocation failed");
+    if (!st.probe_buf) {
+        fail("segment probe buffer allocation failed");
+        set_last_oom_error("segment probe buffer allocation failed");
+        return false;
+    }
     for (const auto & contract : contracts) {
         ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
         ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));

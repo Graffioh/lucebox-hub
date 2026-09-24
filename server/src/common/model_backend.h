@@ -305,12 +305,16 @@ struct ModelBackend {
         PFlashTokenSpan turn_query_span{-1, -1};
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
-        bool                 skip_park = false; // true on >=32GB GPUs
+        bool                 skip_park = false; // resolved --prefill-skip-park
         DraftResidencyAction residency_action = DraftResidencyAction::KeepLoaded;
     };
 
     struct CompressResult {
         bool                 ok = false;
+        // Failed because a device allocation failed (drafter load, scorer
+        // buffers). Only this failure kind makes a skip-park window retry
+        // with parking; any other failure is returned as is.
+        bool                 out_of_memory = false;
         std::vector<int32_t> compressed_ids;  // surviving token IDs
         // Strict selection: the input spans behind compressed_ids, ascending.
         // Empty when the backend does not report them (remote drafter).

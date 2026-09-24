@@ -16,6 +16,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
 #include "pflash/pflash_drafter.h"
+#include "placement/skip_park_guard.h"
 #include "deepseek4_vision.h"
 #include "deepseek4_image_prompt.h"
 #include "deepseek4_image_assembly.h"
@@ -163,9 +164,9 @@ private:
     bool                           pflash_drafter_loaded_ = false;
     std::string                    pflash_drafter_path_;
     int                            pflash_drafter_gpu_ = -1;
-    // Fail-safe latch: set when a skip-park window failed and the parked
-    // retry succeeded — later windows park even if the request asks to skip.
-    bool                           pflash_relaxed_ = false;
+    // Skip-park fail-safe: parks a few windows after an out-of-memory
+    // no-park window recovered with parking (placement/skip_park_guard.h).
+    SkipParkFallback               skip_park_fallback_;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
@@ -174,9 +175,9 @@ private:
     void release_spec_drafter(bool mark_parked);
     void release_pflash_drafter();
     // One compression window (sync → park → load drafter → score → restore)
-    // with the park step optional. compress_batch calls this once, then
-    // retries with park_window=true if the skip-park attempt failed (OOM
-    // fail-safe).
+    // with the park step optional. compress_batch runs it through
+    // run_skip_park_window, which retries parked after an out-of-memory
+    // no-park attempt.
     std::vector<CompressResult> run_compress_window(
         const std::vector<CompressRequest> & requests,
         const CompressRequest & load_request,

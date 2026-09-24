@@ -139,6 +139,7 @@ paths:
                       skip_park_mode: null
                       skip_park_estimate_bytes: null
                       skip_park_free_bytes: null
+                      drafter_keep_loaded: null
                       threshold: null
                     prefix_cache:
                       capacity: 0
@@ -644,6 +645,7 @@ components:
         - skip_park_mode
         - skip_park_estimate_bytes
         - skip_park_free_bytes
+        - drafter_keep_loaded
         - threshold
       properties:
         bsa_alpha:
@@ -694,6 +696,13 @@ components:
         skip_park_free_bytes:
           type: ["integer", "null"]
           description: Free VRAM measured on the drafter GPU at startup.
+          example: null
+        drafter_keep_loaded:
+          type: ["boolean", "null"]
+          description: Auto skip-park only — the estimate also fits the
+            drafter kept resident beside the target's compute reserve, so
+            draft-residency `auto` keeps it loaded between requests. False
+            for explicit `on`/`off`.
           example: null
         threshold:
           type: ["integer", "null"]

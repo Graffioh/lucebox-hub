@@ -1446,6 +1446,9 @@ json build_props_body(const ServerConfig & config,
             {"drafter_gguf", nullptr},
             {"skip_park",    nullptr},
             {"skip_park_mode", nullptr},
+            {"skip_park_estimate_bytes", nullptr},
+            {"skip_park_free_bytes", nullptr},
+            {"drafter_keep_loaded", nullptr},
             {"bsa_enabled",  nullptr},
             {"bsa_alpha",    nullptr},
             {"lm_head_fix",  nullptr},
@@ -1473,6 +1476,7 @@ json build_props_body(const ServerConfig & config,
                               : json(config.pflash_drafter_path)},
             {"skip_park",    config.pflash_skip_park},
             {"skip_park_mode", skip_park_mode_name(config.pflash_skip_park_mode)},
+            {"drafter_keep_loaded", config.pflash_keep_drafter_loaded},
             {"skip_park_estimate_bytes",
                 config.pflash_skip_park_required_bytes > 0
                     ? json(config.pflash_skip_park_required_bytes)
@@ -3692,7 +3696,7 @@ void HttpServer::apply_flowkv_compression(
             DraftResidencyUse::PFlashCompress,
             config_.lazy_draft,
             !config_.draft_path.empty(),
-            config_.pflash_skip_park,   // ample_vram: proven co-resident
+            config_.pflash_keep_drafter_loaded,   // ample_vram: auto estimate
         });
 
     std::vector<ModelBackend::CompressRequest> compress_requests;
@@ -4520,7 +4524,7 @@ std::string HttpServer::apply_pflash_compression(
             DraftResidencyUse::PFlashCompress,
             config_.lazy_draft,
             !config_.draft_path.empty(),
-            config_.pflash_skip_park,   // ample_vram: proven co-resident
+            config_.pflash_keep_drafter_loaded,   // ample_vram: auto estimate
         });
     compress_request.residency_action = residency;
 
