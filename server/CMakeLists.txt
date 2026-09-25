@@ -2077,6 +2077,7 @@ if(LUCE_TESTS)
             test/test_anchor_transitive.cpp
             test/test_pflash_drafter_ipc.cpp
             test/test_pflash_selection.cpp
+            test/test_qwen35_causal_mask.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
             test/test_kv_quant.cpp

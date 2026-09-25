@@ -38,22 +38,12 @@ namespace luce::common {
 
 namespace {
 
-static constexpr uint16_t F16_ZERO = 0x0000;
-static constexpr uint16_t F16_NEG_INF = 0xFC00;
-
 static int align_up_i(int x, int a) { return ((x + a - 1) / a) * a; }
 
-static void build_causal_mask_f16(std::vector<uint16_t> & out, int kv_len, int n_tokens, int kv_start) {
-    const int kv_pad = align_up_i(kv_len, 32);
-    const int q_pad = align_up_i(n_tokens, 32);
-    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
-    static_assert(F16_ZERO == 0, "visible mask entries are zero-filled with memset");
-    for (int q = 0; q < n_tokens; ++q) {
-        const int visible = std::min(kv_len, kv_start + q + 1);
-        if (visible > 0) {
-            std::memset(out.data() + (size_t)q * kv_pad, 0, (size_t)visible * sizeof(uint16_t));
-        }
-    }
+// Bytes of build_qwen35_causal_mask's mask, the part of a layer graph that
+// grows with the context.
+static size_t causal_mask_bytes(int kv_start, int n_tokens) {
+    return (size_t)align_up_i(kv_start + n_tokens, 32) * align_up_i(n_tokens, 32) * sizeof(uint16_t);
 }
 
 // create_target_cache honours LUCE_KV_TQ3; the drafter cache never wants
@@ -89,6 +79,34 @@ struct ScopedKvTq3Off {
 };
 
 } // namespace
+
+ggml_tensor * build_qwen35_causal_mask(ggml_context * ctx, ggml_cgraph * gf,
+                                       int kv_start, int n_tokens) {
+    const int kv_pad = align_up_i(kv_start + n_tokens, 32);
+    const int q_pad = align_up_i(n_tokens, 32);
+    // Keys [kv_start, kv_pad): row q is zero through key kv_start + q, then
+    // -inf, the kv padding included; n_tokens + 31 keys at most.
+    const int tail = kv_pad - kv_start;
+    // ggml_fill and ggml_tri take F32 only; the big tensor is written in F16.
+    ggml_tensor * zero = ggml_cast(ctx,
+        ggml_fill_inplace(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 0.0f), GGML_TYPE_F16);
+    ggml_tensor * mask = ggml_repeat_4d(ctx, zero, kv_pad, q_pad, 1, 1);
+    ggml_tensor * diag = ggml_tri(ctx,
+        ggml_fill_inplace(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tail, tail), -INFINITY),
+        GGML_TRI_TYPE_UPPER);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx,
+        ggml_view_2d(ctx, diag, tail, n_tokens, diag->nb[1], 0),
+        ggml_view_2d(ctx, mask, tail, n_tokens, mask->nb[1], (size_t)kv_start * mask->nb[0])));
+    if (q_pad > n_tokens) {
+        ggml_tensor * pad_rows = ggml_fill_inplace(ctx,
+            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv_pad, q_pad - n_tokens), -INFINITY);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, pad_rows,
+            ggml_view_2d(ctx, mask, kv_pad, q_pad - n_tokens, mask->nb[1],
+                         (size_t)n_tokens * mask->nb[1])));
+    }
+    // The attention reads the mask after these copies: they come first in gf.
+    return mask;
+}
 
 std::vector<int32_t> qwen35_score_and_compress(
     TargetWeights & w,
@@ -158,6 +176,67 @@ std::vector<int32_t> qwen35_score_and_compress(
 
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
     const int ubatch = 1024;
+    // Graph of layer il over tokens [start, start + n), writing act_out.
+    // nullptr (error set) on failure.
+    const auto layer_graph = [&](int il, int start, int n, ggml_cgraph *& gf,
+                                 ggml_tensor *& pos) -> ggml_context * {
+        ggml_init_params ip{};
+        ip.mem_size = 512 * 1024 * 1024;
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) {
+            set_last_error("qwen35 drafter layer graph ctx init failed");
+            return nullptr;
+        }
+        gf = ggml_new_graph_custom(ctx, 16384, false);
+        ggml_tensor * inp = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1], (size_t)start * act_in->nb[1]);
+        pos = nullptr;
+        ggml_tensor * mask = nullptr;
+        if (((il + 1) % w.full_attention_interval) == 0) {
+            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+            ggml_set_input(pos);
+            mask = build_qwen35_causal_mask(ctx, gf, start, n);
+        }
+        ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask, start, n, false, 0);
+        ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1], (size_t)start * act_out->nb[1]);
+        if (ggml_nelements(out) != ggml_nelements(dst)) {
+            std::fprintf(stderr,
+                "[qwen35-drafter] layer output shape mismatch il=%d start=%d out=[%lld,%lld,%lld,%lld] dst=[%lld,%lld,%lld,%lld]\n",
+                il, start,
+                (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2], (long long)out->ne[3],
+                (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3]);
+            ggml_free(ctx);
+            set_last_error("qwen35 layer output shape mismatch");
+            return nullptr;
+        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
+        return ctx;
+    };
+    // Size the compute buffer once, for a full-attention layer over the
+    // ubatch with the largest mask: allocating per ubatch would regrow it
+    // with every ubatch of the first attention layer.
+    if (w.full_attention_interval <= w.n_layer) {
+        int worst = 0;
+        for (int start = 0; start < S; start += ubatch) {
+            if (causal_mask_bytes(start, std::min(ubatch, S - start)) >=
+                causal_mask_bytes(worst, std::min(ubatch, S - worst))) worst = start;
+        }
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * pos = nullptr;
+        ggml_context * ctx = layer_graph(w.full_attention_interval - 1, worst,
+                                         std::min(ubatch, S - worst), gf, pos);
+        if (!ctx) {
+            ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
+            return {};
+        }
+        const bool reserved = ggml_gallocr_reserve(alloc, gf);
+        ggml_free(ctx);
+        if (!reserved) {
+            ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
+            set_last_error("qwen35 drafter graph allocation failed");
+            return {};
+        }
+    }
     for (int il = 0; il < w.n_layer; ++il) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         int fa_idx = 0;
@@ -166,40 +245,13 @@ std::vector<int32_t> qwen35_score_and_compress(
         }
         for (int start = 0; start < S; start += ubatch) {
             const int n = std::min(ubatch, S - start);
-            const int kv_len = start + n;
-
-            ggml_init_params ip{};
-            ip.mem_size = 512 * 1024 * 1024;
-            ip.no_alloc = true;
-            ggml_context * ctx = ggml_init(ip);
+            ggml_cgraph * gf = nullptr;
+            ggml_tensor * pos = nullptr;
+            ggml_context * ctx = layer_graph(il, start, n, gf, pos);
             if (!ctx) {
                 ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
-                set_last_error("qwen35 drafter layer graph ctx init failed");
                 return {};
             }
-            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
-            ggml_tensor * inp = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1], (size_t)start * act_in->nb[1]);
-            ggml_tensor * pos = nullptr;
-            ggml_tensor * mask = nullptr;
-            if (is_attn) {
-                pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
-                ggml_set_input(pos);
-                mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, align_up_i(kv_len, 32), align_up_i(n, 32));
-                ggml_set_input(mask);
-            }
-            ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask, start, n, false, 0);
-            ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1], (size_t)start * act_out->nb[1]);
-            if (ggml_nelements(out) != ggml_nelements(dst)) {
-                std::fprintf(stderr,
-                    "[qwen35-drafter] layer output shape mismatch il=%d start=%d out=[%lld,%lld,%lld,%lld] dst=[%lld,%lld,%lld,%lld]\n",
-                    il, start,
-                    (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2], (long long)out->ne[3],
-                    (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3]);
-                ggml_free(ctx); ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
-                set_last_error("qwen35 layer output shape mismatch");
-                return {};
-            }
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
             if (!ggml_gallocr_alloc_graph(alloc, gf)) {
                 ggml_free(ctx); ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf); ggml_free(act_ctx); free_target_cache(cache);
                 set_last_error("qwen35 drafter graph allocation failed");
@@ -214,9 +266,6 @@ std::vector<int32_t> qwen35_score_and_compress(
                     p4[(size_t)2 * n + i] = p;
                 }
                 ggml_backend_tensor_set(pos, p4.data(), 0, p4.size() * sizeof(int32_t));
-                std::vector<uint16_t> m;
-                build_causal_mask_f16(m, kv_len, n, start);
-                ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(uint16_t));
             }
             auto st = ggml_backend_graph_compute(w.backend, gf);
             ggml_free(ctx);
@@ -830,43 +879,80 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     };
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
     const int ubatch = 1024;
-    std::vector<uint16_t> mask_bits;
+    // Ubatches stop at the checkpoint, so the state there can be copied.
+    const auto ubatch_at = [&](int start) {
+        return std::min(ubatch, (start < checkpoint ? checkpoint : S) - start);
+    };
+    // Graph of layer il over tokens [start, start + n), writing act_out.
+    // nullptr (error set) on failure.
+    const auto layer_graph = [&](int il, int start, int n, ggml_cgraph *& gf,
+                                 ggml_tensor *& pos) -> ggml_context * {
+        ggml_init_params ip{};
+        ip.mem_size = 512 * 1024 * 1024;
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) {
+            set_last_error("qwen35 drafter layer graph ctx init failed");
+            return nullptr;
+        }
+        gf = ggml_new_graph_custom(ctx, 16384, false);
+        ggml_tensor * inp = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1],
+                                         (size_t)(start - resume) * act_in->nb[1]);
+        pos = nullptr;
+        ggml_tensor * mask = nullptr;
+        if (((il + 1) % w.full_attention_interval) == 0) {
+            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+            ggml_set_input(pos);
+            mask = build_qwen35_causal_mask(ctx, gf, start, n);
+        }
+        ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask,
+                                               start, n, false, 0);
+        ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1],
+                                         (size_t)(start - resume) * act_out->nb[1]);
+        if (ggml_nelements(out) != ggml_nelements(dst)) {
+            ggml_free(ctx);
+            set_last_error("qwen35 layer output shape mismatch");
+            return nullptr;
+        }
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
+        return ctx;
+    };
+    const auto fail_graph = [&]() -> std::vector<int32_t> {
+        ggml_gallocr_free(alloc);
+        cleanup();
+        session->ids.clear();
+        return {};
+    };
+    // Size the compute buffer once, for a full-attention layer over the
+    // ubatch with the largest mask: allocating per ubatch would regrow it
+    // with every ubatch of the first attention layer.
+    if (n_new > 0 && w.full_attention_interval <= kQwen35HeadBlock) {
+        int worst = resume;
+        for (int start = resume; start < S; start += ubatch_at(start)) {
+            if (causal_mask_bytes(start, ubatch_at(start)) >=
+                causal_mask_bytes(worst, ubatch_at(worst))) worst = start;
+        }
+        ggml_cgraph * gf = nullptr;
+        ggml_tensor * pos = nullptr;
+        ggml_context * ctx = layer_graph(w.full_attention_interval - 1, worst,
+                                         ubatch_at(worst), gf, pos);
+        if (!ctx) return fail_graph();
+        const bool reserved = ggml_gallocr_reserve(alloc, gf);
+        ggml_free(ctx);
+        if (!reserved) {
+            ggml_gallocr_free(alloc);
+            return fail("qwen35 drafter graph allocation failed");
+        }
+    }
     for (int il = 0; il < kQwen35HeadBlock; ++il) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         if (!is_attn && checkpoint == resume) snapshot_layer(il);
         for (int start = resume; start < S;) {
-            const int stop = start < checkpoint ? checkpoint : S;
-            const int n = std::min(ubatch, stop - start);
-            const int kv_len = start + n;
-            ggml_init_params ip{};
-            ip.mem_size = 512 * 1024 * 1024;
-            ip.no_alloc = true;
-            ggml_context * ctx = ggml_init(ip);
-            if (!ctx) {
-                ggml_gallocr_free(alloc);
-                return fail("qwen35 drafter layer graph ctx init failed");
-            }
-            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
-            ggml_tensor * inp = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1],
-                                             (size_t)(start - resume) * act_in->nb[1]);
+            const int n = ubatch_at(start);
+            ggml_cgraph * gf = nullptr;
             ggml_tensor * pos = nullptr;
-            ggml_tensor * mask = nullptr;
-            if (is_attn) {
-                pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
-                ggml_set_input(pos);
-                mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
-                                          align_up_i(kv_len, 32), align_up_i(n, 32));
-                ggml_set_input(mask);
-            }
-            ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask,
-                                                   start, n, false, 0);
-            ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1],
-                                             (size_t)(start - resume) * act_out->nb[1]);
-            if (ggml_nelements(out) != ggml_nelements(dst)) {
-                ggml_free(ctx); ggml_gallocr_free(alloc);
-                return fail("qwen35 layer output shape mismatch");
-            }
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
+            ggml_context * ctx = layer_graph(il, start, n, gf, pos);
+            if (!ctx) return fail_graph();
             if (!ggml_gallocr_alloc_graph(alloc, gf)) {
                 ggml_free(ctx); ggml_gallocr_free(alloc);
                 return fail("qwen35 drafter graph allocation failed");
@@ -880,9 +966,6 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                     p4[(size_t)2 * n + i] = p;
                 }
                 ggml_backend_tensor_set(pos, p4.data(), 0, p4.size() * sizeof(int32_t));
-                build_causal_mask_f16(mask_bits, kv_len, n, start);
-                ggml_backend_tensor_set(mask, mask_bits.data(), 0,
-                                        mask_bits.size() * sizeof(uint16_t));
             }
             const auto status = ggml_backend_graph_compute(w.backend, gf);
             ggml_free(ctx);
