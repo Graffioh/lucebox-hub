@@ -1081,28 +1081,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) 
     unlink(path.c_str());
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_recall_by_lift_takes_clear_attention_only) {
-    const std::vector<std::pair<PFlashTokenSpan, double>> lifts{
-        {{0, 10}, 40.0},     // clearly attended, not in view
-        {{10, 20}, 2.0},     // background
-        {{20, 30}, 90.0},    // clearly attended, already in view
-        {{30, 60}, 12.0},    // attended, half in view
-        {{60, 70}, 25.0},
-    };
-    const std::vector<PFlashTokenSpan> in_view{{20, 45}};
-    auto recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0);
-    TEST_ASSERT(recalled.size() == 2);   // [0,10) and [45,70) merged
-    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 10);
-    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
-    // A lower bar takes the background segment too.
-    recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 1.0);
-    TEST_ASSERT(recalled.size() == 2);   // [0,20) and [45,70)
-    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 20);
-    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
-    // Nothing clears a high bar.
-    TEST_ASSERT(http_detail::pflash_recall_by_lift(lifts, in_view, 100.0).empty());
-}
-
 TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
     const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
     const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
