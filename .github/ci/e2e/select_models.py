@@ -3,7 +3,11 @@
 
 Changed paths come on stdin, one per line. A path under a model's own sources
 selects that model; a path in shared server code selects every model; anything
-else (docs, scripts, other models) selects nothing.
+else (docs, scripts, other models) selects nothing. With --fallback-all, used
+for a PR a maintainer labelled `e2e`, an empty selection runs every model: the
+label is an explicit request, so a PR that only touches another model's code
+still gets both runs. Other-model paths still keep a mixed PR (e.g. laguna +
+qwen35) to the models it touches, and keep merges to main from re-running them.
 
 Each matrix entry carries everything its job needs: the GPU on lucebox3, the
 model files (in the models directory) and the server flags.

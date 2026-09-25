@@ -25,11 +25,12 @@ any user can read.
 
 ## Baselines
 
-The nightly run on main uploads each model's result as the artifact
-`model-e2e-baseline-<model>-<device>` (kept 90 days) unless it fails. Every job
-compares with the newest one. To refresh a baseline by hand, e.g. after a change
-that is meant to alter the output, run the workflow on main with
-`update_baseline` ticked. Until the first baseline exists, jobs still fail on
+Every merge to main runs the models whose code changed since their baseline
+and uploads each result as the artifact `model-e2e-baseline-<model>-<device>`
+(kept 90 days) unless it fails. Every job compares with the newest one, so a
+merged change that alters the output becomes the reference for the next PRs. To
+refresh a baseline by hand, e.g. after a ROCm upgrade, run the workflow on main
+with `update_baseline` ticked. Until the first baseline exists, jobs still fail on
 crashes, hangs and failed checks but cannot detect changed output.
 
 ## Benchmarking by hand on lucebox3

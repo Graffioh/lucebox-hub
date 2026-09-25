@@ -17,8 +17,10 @@ name: Model e2e
 #     PR touches (select_models.py), or every model when it touches neither DS4,
 #     Qwen nor shared server code. To test new pushes, remove the label and add
 #     it again;
-#   - nightly on main, which refreshes the baselines, and on manual dispatch
-#     (refreshes them when `update_baseline` is ticked on main).
+#   - on every merge to main, for the models whose code changed since their
+#     baseline. A run that does not fail becomes the new baseline;
+#   - on manual dispatch (refreshes the baselines when `update_baseline` is
+#     ticked on main).
 #
 # Baselines: baseline runs on main upload their result as the artifact
 # `model-e2e-baseline-<model>-<device>`, and every job compares with the newest
@@ -35,7 +37,7 @@ name: Model e2e
 #
 # SECURITY: same model as ci.yml. Fork PRs run only after a maintainer approves
 # the run, and only users with triage access can add the `e2e` label. Baselines
-# are only taken from scheduled or dispatched runs on main, so PR code cannot
+# are only taken from pushes to or dispatched runs on main, so PR code cannot
 # replace them. The build directory and remembered passes persist on lucebox3
 # (~/.cache/lucebox-e2e), so approved PR code could tamper with them. Clear that
 # directory if you suspect it.
@@ -46,8 +48,8 @@ on:
   pull_request:
     branches: [main]
     types: [labeled]
-  schedule:
-    - cron: '17 3 * * *'
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       models:
@@ -61,7 +63,9 @@ on:
         default: false
 
 # Re-adding `e2e` replaces a PR's running e2e. The label is part of the group so
-# that adding any other label (a run whose jobs all skip) cancels nothing.
+# that adding any other label (a run whose jobs all skip) cancels nothing. Runs
+# on main never cancel a running one; a newer merge may replace a waiting one,
+# which is fine because it runs everything changed since the baselines.
 concurrency:
   group: model-e2e-${{ github.ref }}-${{ github.event.label.name || github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -102,9 +106,12 @@ jobs:
             workflow_dispatch)
               matrix=$(python3 "$select" --mode "$DISPATCH_MODELS")
               ;;
-            *) matrix=$(python3 "$select" --mode all) ;;
+            push) matrix=$(python3 "$select" --mode all) ;;
           esac
-          matrix=$(python3 .github/ci/e2e/find_baseline.py --repo "$GITHUB_REPOSITORY" <<<"$matrix")
+          only_changed=()
+          if [ "$EVENT" = push ]; then only_changed=(--only-changed "$GITHUB_SHA"); fi
+          matrix=$(python3 .github/ci/e2e/find_baseline.py --repo "$GITHUB_REPOSITORY" \
+            "${only_changed[@]}" <<<"$matrix")
           echo "Selected: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "any=$(jq '.include | length > 0' <<<"$matrix")" >> "$GITHUB_OUTPUT"
@@ -127,7 +134,7 @@ jobs:
       HIP_VISIBLE_DEVICES: ${{ matrix.hip_index }}
       SERVER_ARGS: ${{ matrix.server_args }}
       OUT_DIR: ${{ github.workspace }}/e2e-out
-      UPDATE_BASELINE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || inputs.update_baseline == true) }}
+      UPDATE_BASELINE: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.update_baseline == true) }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 

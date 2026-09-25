@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 import run_model_e2e
-from find_baseline import add_baselines
+from find_baseline import add_baselines, keep_changed
 from run_model_e2e import evaluate, kernel_lines_since, load_prompts, main, run_check
 from select_models import matrix, models_for
 
@@ -432,19 +432,26 @@ def test_matrix_carries_each_models_gpu_and_files() -> None:
 REPO = "Luce-Org/lucebox"
 
 
-def fake_api(artifacts: list[dict], runs: dict[int, dict]):
+def fake_api(
+    artifacts: list[dict], runs: dict[int, dict], diffs: dict[str, list[str]] | None = None
+):
     def get(path: str) -> dict:
         if "/actions/artifacts?" in path:
             name = path.split("name=")[1].split("&")[0]
             return {"artifacts": [a for a in artifacts if a["name"] == name]}
-        return runs[int(path.rsplit("/", 1)[1])]
+        if "/compare/" in path:
+            base = path.rsplit("/", 1)[1].split("...")[0]
+            return {"files": [{"filename": f} for f in (diffs or {})[base]]}
+        run_id = int(path.rsplit("/", 1)[1])
+        return {**runs[run_id], "id": run_id}
 
     return get
 
 
-def main_run(event: str = "schedule", **overrides: object) -> dict:
+def main_run(event: str = "push", sha: str = "base", **overrides: object) -> dict:
     return {
         "event": event,
+        "head_sha": sha,
         "head_branch": "main",
         "head_repository": {"full_name": REPO},
         "path": ".github/workflows/model-e2e.yml",
@@ -476,6 +483,24 @@ def test_baseline_is_the_newest_from_a_trusted_main_run() -> None:
     }
     got = add_baselines(matrix(["ds4", "qwen"]), fake_api(artifacts, runs), REPO)
     assert {e["model"]: e["baseline_run"] for e in got["include"]} == {"ds4": "", "qwen": "2"}
+
+
+@pytest.mark.parametrize(
+    ("changed", "kept"),
+    [
+        (["server/src/qwen35/qwen35_target_graph.cpp"], ["ds4", "qwen"]),
+        (["docs/x.md"], ["ds4"]),
+        ([f"docs/{i}.md" for i in range(300)], ["ds4", "qwen"]),
+    ],
+)
+def test_merges_rerun_models_changed_since_their_baseline(
+    changed: list[str], kept: list[str]
+) -> None:
+    # qwen has a baseline at commit "base"; ds4 has none yet, so it always runs.
+    artifacts = [artifact(1, "2026-09-01T03:00:00Z")]
+    api = fake_api(artifacts, {1: main_run()}, {"base": changed})
+    got = keep_changed(add_baselines(matrix(["ds4", "qwen"]), api, REPO), api, REPO, "head")
+    assert [e["model"] for e in got["include"]] == kept
 
 
 def test_evaluate_warns_when_the_baseline_ran_on_another_rocm() -> None:
