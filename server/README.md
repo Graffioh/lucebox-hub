@@ -429,13 +429,11 @@ prefill appends a follow-up; from `PFLASH_CHAT_COMPRESS_NEW_TOKENS` (default
 16384) tokens of new material (a pasted document, a large tool output) only
 what the fresh selection keeps of it is appended, and the view before it
 stays cached. `PFLASH_CHAT_RECALL=0` turns recall off: a small follow-up is
-then served without running the drafter at all. Recall takes the segments
-the new question clearly attends to: attention lift (mass per token relative
-to uniform attention) of at least `PFLASH_CHAT_RECALL_MIN_LIFT` (default 2),
-so a content-free follow-up ("which documents support that?") recalls next
-to nothing instead of filling the budget with noise beside the question. A
-question that needs more than a third of a fresh selection starts a new view
-from that selection instead. Kept pieces that were not adjacent in the prompt are joined by a
+then served without running the drafter at all. Recall takes what a fresh
+selection for the new question keeps that the view lacks: a question on the
+view's topic misses little and is served by appending it, and a question
+that needs more than a third of a fresh selection -- the conversation moved
+to other material -- starts a new view from that selection instead. Kept pieces that were not adjacent in the prompt are joined by a
 paragraph break when neither side has one (`PFLASH_SELECT_PARAGRAPH_JOIN=0`
 turns it off; the breaks do not count against the token ceiling).
 `PFLASH_VIEW_TRACE_PATH`
