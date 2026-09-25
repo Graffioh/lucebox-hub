@@ -101,6 +101,14 @@ void free_qwen35_drafter_state(DrafterContext & ctx);
 
 // Defined in qwen35_drafter.cpp.
 //
+// Causal flash-attention mask of one ubatch of n_tokens queries at kv_start,
+// computed by the graph on the device: [align32(kv_start + n_tokens),
+// align32(n_tokens)] F16, row q < n_tokens zero over keys
+// [0, kv_start + q + 1) and -inf after, rows past n_tokens -inf throughout.
+// Its writes are expanded into gf here, ahead of the attention that reads it.
+ggml_tensor * build_qwen35_causal_mask(ggml_context * ctx, ggml_cgraph * gf,
+                                       int kv_start, int n_tokens);
+
 // The legacy all-layer running-max scorer, on the Qwen3.5 architecture.
 std::vector<int32_t> qwen35_score_and_compress(
     TargetWeights & w,
