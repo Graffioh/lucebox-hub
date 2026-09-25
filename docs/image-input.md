@@ -150,16 +150,29 @@ luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
 ```
 
 Its image blocks need whole-block bidirectional prefill, which the batched
-engine's 16-row step cannot run. Image requests admitted since the last step
-are therefore prefilled up to their last token together, in shared
-layer-major sparse passes into per-request staging caches (each layer's
-experts are read once for all of them); that state is copied into each
-request's paged slot and the last token prefills in the batch, so the answers
-decode alongside everyone else. On the Strix Halo with the encoder on the
-R9700, four concurrent image answers of 256 tokens finish in 35 s (29 tok/s in
-total), two images plus two text requests at 31 tok/s; four text requests
-reach 38 tok/s. Image requests beyond the free slots wait in the queue. `/props` reports the
-effective capability in `capabilities.image_input_supported` after backend
+engine's 16-row step cannot run. An image request is therefore prefilled up to
+its last token into its slot's staging cache on the layer-major sparse path,
+then copied into its paged slot, and the last token prefills in the batch, so
+the answer decodes alongside everyone else. Every layer must see a whole image
+block at once, so the block cannot be split by rows; it is split by layers
+instead. While other requests are decoding, a staged pass takes about 256 rows
+(a whole image block, which may be more) shared by the pending image requests
+and runs 6 of its 43 layers per batched step, so live streams decode after
+every slice. The result is identical to running the pass in one go. With
+nothing decoding, a pass takes up to 1,024 rows and all its layers at once, so
+the requests share each layer's expert reads. With `--mmproj-device`, the
+encoder works through admitted requests on its own GPU and never stalls the
+batch. Measured on the Strix Halo with the encoder on the R9700: two text
+streams decoding while three one-image requests and one eight-image request
+arrive pause at most 0.67 s between tokens; four concurrent image answers of
+256 tokens finish in 37.5 s (27 tok/s in total).
+
+The staging caches, one per slot, are allocated at startup and logged
+(`staging caches 286 MB` for 4 slots at `--max-ctx 8192`). Image requests
+beyond the free slots wait in the queue. Under KV pressure the scheduler never
+parks an image request for recompute (token ids cannot rebuild image rows); it
+suspends or parks a text request instead. `/props` reports the effective
+capability in `capabilities.image_input_supported` after backend
 initialization.
 
 ## Qwen3.5 / Qwen3.8
