@@ -4785,11 +4785,9 @@ bool HttpServer::serve_pflash_chat_view(
     // Recall: what a fresh selection for the new question keeps that the
     // view does not hold. Only a new user turn brings a new question; an
     // agent step (assistant call plus tool output) appends without
-    // recalling. A question on the view's topic misses little and is served
-    // by appending it; a question that needs more than a third of a fresh
-    // selection (the conversation moved to other material) starts a new view
-    // from that selection instead: past that, prefilling the fresh prompt
-    // costs about the same and serves the material in order.
+    // recalling. What is missing is appended, whatever its size, so the
+    // cached view is never thrown away for a new topic; the view starts over
+    // from the fresh selection only when it outgrows it (below).
     std::vector<PFlashTokenSpan> recalled;
     if (compressed && recall) {
         auto in_view = view.spans;
@@ -4797,13 +4795,6 @@ bool HttpServer::serve_pflash_chat_view(
         in_view = http_detail::canonicalize_pflash_token_spans(std::move(in_view));
         const auto missing =
             http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
-        size_t recall_size = 0;
-        for (const auto & span : missing) {
-            recall_size += (size_t) (span.end - span.begin);
-        }
-        if (3 * recall_size > fresh->size()) {
-            return serve_fresh("rebuild", view.turns + 1);
-        }
         // Whole kept pieces: a passage the view holds only part of comes
         // back in one piece, in order, not as a fragment far from the rest.
         for (const auto & span : *kept_spans) {
