@@ -1094,6 +1094,192 @@ TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) 
     unlink(path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_struct_units_parse_list_content) {
+    const json messages = json::array({
+        {{"role", "system"}, {"content", "system rules"}},
+        {{"role", "developer"}, {"content", "developer rules"}},
+        {{"role", "user"}, {"content", "plain message"}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "Intro\n\n"}},
+            {{"type", "image_url"}, {"image_url", {{"url", "ignored"}}}},
+            {{"type", "input_text"}, {"text", "[DOC-1]\nalpha\n\n"}},
+            {{"type", "text"}, {"text", ""}},
+            {{"type", "output_text"}, {"text", "Question: which?"}},
+        })}},
+        {{"role", "assistant"}, {"content", nullptr}},
+        {{"role", "tool"}, {"content", "tool output"}, {"tool_call_id", "c1"}},
+        {{"role", "tool"}, {"content", json::array({
+            {{"type", "text"}, {"text", "tool part"}}})}},
+        {{"type", "function_call"}, {"name", "read"}, {"arguments", "{}"}},
+        {{"type", "function_call_output"}, {"call_id", "c2"}, {"output", "responses output"}},
+    });
+    const auto units = http_detail::pflash_struct_units(messages);
+    const std::vector<std::pair<std::string, std::string>> expected{
+        {"message", "plain message"},
+        {"part", "Intro\n\n"},
+        {"part", "[DOC-1]\nalpha\n\n"},
+        {"part", "Question: which?"},
+        {"tool", "tool output"},
+        {"tool", "tool part"},
+        {"tool", "responses output"},
+    };
+    TEST_ASSERT(units.size() == expected.size());
+    for (size_t index = 0; index < units.size() && index < expected.size(); ++index) {
+        TEST_ASSERT_MSG(units[index].kind == expected[index].first, units[index].kind);
+        TEST_ASSERT_MSG(units[index].text == expected[index].second, units[index].text);
+    }
+    // The rendered message joins the text parts with no separator, so the
+    // parts sit back to back in the prompt, in order.
+    ToolMemory tool_memory;
+    const auto normalized = normalize_chat_messages(
+        messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    TEST_ASSERT(normalized.size() >= 4);
+    if (normalized.size() >= 4) {
+        TEST_ASSERT(normalized[3].content == "Intro\n\n[DOC-1]\nalpha\n\nQuestion: which?");
+    }
+    TEST_ASSERT(http_detail::pflash_struct_units(json("raw text")).empty());
+}
+
+namespace {
+
+struct PflashStructPrompt {
+    std::string path;
+    std::string rendered;
+    std::vector<int32_t> ids;
+    std::vector<http_detail::PflashStructUnit> units;
+};
+
+// Renders ``messages`` through the Qwen template (as the server does) and
+// tokenizes it with a byte-level fixture (one token per character).
+PflashStructPrompt pflash_struct_prompt(const json & messages, Tokenizer & tok) {
+    PflashStructPrompt out;
+    ToolMemory tool_memory;
+    const auto normalized = normalize_chat_messages(
+        messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    out.rendered = render_chat_template(
+        normalized, ChatFormat::QWEN3, /*add_generation_prompt=*/true, false);
+    out.path = write_pflash_bpe_tokenizer_fixture({}, out.rendered);
+    if (tok.load_from_gguf(out.path.c_str())) out.ids = tok.encode(out.rendered);
+    out.units = http_detail::pflash_struct_units(messages);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE(ServerUnitFixture, test_pflash_struct_starts_cover_messages_parts_and_tools) {
+    const json messages = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "Read these.\n\n"}},
+            {{"type", "text"}, {"text", "[DOC-1]\nalpha text\n\n"}},
+            {{"type", "text"}, {"text", "[DOC-2]\nbeta text\n\n"}},
+            {{"type", "text"}, {"text", "Question: which one?"}},
+        })}},
+        {{"role", "assistant"}, {"content", "Let me look.\nOne moment."}},
+        {{"role", "tool"}, {"content", "def main():\n    pass"}, {"tool_call_id", "c1"}},
+        {{"role", "tool"}, {"content", "second result\nline"}, {"tool_call_id", "c2"}},
+        {{"role", "user"}, {"content", "And now?"}},
+    });
+    Tokenizer tok;
+    const auto prompt = pflash_struct_prompt(messages, tok);
+    TEST_ASSERT(!prompt.ids.empty());
+    TEST_ASSERT(prompt.units.size() == 8);
+    const auto starts = http_detail::pflash_struct_starts(
+        tok, prompt.ids, prompt.units, {});
+    const std::vector<std::string> heads{
+        "Read these.", "[DOC-1]", "[DOC-2]", "Question: which one?",
+        "Let me look.", "def main():", "second result", "And now?"};
+    TEST_ASSERT_MSG(starts.size() == heads.size(), std::to_string(starts.size()));
+    for (size_t index = 0; index < starts.size() && index < heads.size(); ++index) {
+        const int start = starts[index];
+        const int end = (std::min)((int) prompt.ids.size(),
+                                   start + (int) heads[index].size());
+        const std::string at = tok.decode(
+            {prompt.ids.begin() + start, prompt.ids.begin() + end});
+        TEST_ASSERT_MSG(at == heads[index], at);
+        if (index > 0) TEST_ASSERT(starts[index] > starts[index - 1]);
+    }
+    // Each tool result starts at its own content, inside the shared user
+    // turn the template wraps tool responses in.
+    if (starts.size() == heads.size()) {
+        const std::string before = tok.decode(
+            {prompt.ids.begin() + starts[5] - 16, prompt.ids.begin() + starts[5]});
+        TEST_ASSERT_MSG(before == "<tool_response>\n", before);
+    }
+
+    // A start inside an excluded span (kept anyway) is dropped.
+    if (starts.size() == heads.size()) {
+        const auto kept = http_detail::pflash_struct_starts(
+            tok, prompt.ids, prompt.units, {{starts[7], (int) prompt.ids.size()}});
+        TEST_ASSERT(kept.size() == heads.size() - 1);
+        TEST_ASSERT(std::find(kept.begin(), kept.end(), starts[7]) == kept.end());
+    }
+    unlink(prompt.path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_struct_starts_leave_a_single_message_alone) {
+    // One message without parts: one unit, no start, the request is
+    // compressed exactly as before.
+    {
+        const json messages = json::array({
+            {{"role", "system"}, {"content", "You are helpful."}},
+            {{"role", "user"}, {"content", "[DOC-1]\nalpha\n\n[DOC-2]\nbeta\n\nQuestion: which?"}},
+        });
+        Tokenizer tok;
+        const auto prompt = pflash_struct_prompt(messages, tok);
+        TEST_ASSERT(!prompt.ids.empty());
+        TEST_ASSERT(prompt.units.size() == 1);
+        TEST_ASSERT(http_detail::pflash_struct_starts(
+            tok, prompt.ids, prompt.units, {}).empty());
+        unlink(prompt.path.c_str());
+    }
+    // The same text as parts: a start per part.
+    {
+        const json messages = json::array({
+            {{"role", "user"}, {"content", json::array({
+                {{"type", "text"}, {"text", "[DOC-1]\nalpha\n\n"}},
+                {{"type", "text"}, {"text", "[DOC-2]\nbeta\n\n"}},
+                {{"type", "text"}, {"text", "Question: which?"}},
+            })}},
+        });
+        Tokenizer tok;
+        const auto prompt = pflash_struct_prompt(messages, tok);
+        const auto starts = http_detail::pflash_struct_starts(
+            tok, prompt.ids, prompt.units, {});
+        TEST_ASSERT(starts.size() == 3);
+        // Two units, one of them kept anyway: a lone start is none.
+        if (starts.size() == 3) {
+            const auto lone = http_detail::pflash_struct_starts(
+                tok, prompt.ids, {prompt.units[0], prompt.units[2]},
+                {{starts[2], (int) prompt.ids.size()}});
+            TEST_ASSERT(lone.empty());
+        }
+        unlink(prompt.path.c_str());
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_struct_unit_offsets_search_in_order) {
+    using Unit = http_detail::PflashStructUnit;
+    // A later unit is never found inside an earlier one's verbatim text,
+    // and a unit the template changed is skipped without moving the search.
+    const std::string text = "<a>\nalpha beta\nbeta\n</a><b>\n  gamma\n</b>";
+    const auto offsets = http_detail::pflash_struct_unit_offsets(text, {
+        Unit{"message", "alpha beta\nbeta"},
+        Unit{"message", "beta"},
+        Unit{"message", "not rendered"},
+        Unit{"message", "\n  gamma"},
+        Unit{"message", "   "},
+    });
+    TEST_ASSERT(offsets.size() == 5);
+    if (offsets.size() == 5) {
+        TEST_ASSERT(offsets[0] == text.find("alpha"));
+        TEST_ASSERT(offsets[1] == std::string::npos);
+        TEST_ASSERT(offsets[2] == std::string::npos);
+        TEST_ASSERT(offsets[3] == text.find("gamma"));
+        TEST_ASSERT(offsets[4] == std::string::npos);
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
     const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
     const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
@@ -7217,6 +7403,105 @@ TEST_CASE(ServerUnitFixture,
     // Its tokens are charged on top of 5 % of the droppable rest.
     TEST_ASSERT(request.keep_ratio > (double) system_end / input);
     TEST_ASSERT(request.keep_ratio < 1.0f);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_struct_headers_reach_the_compress_request) {
+    // A single user message whose documents come as text parts: with the
+    // switch on the drafter gets a start per document part; off, or with
+    // the same text as one string, it gets none.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    std::vector<std::string> parts{"Read the documents.\n\n"};
+    for (int doc = 1; doc <= 3; ++doc) {
+        std::string body;
+        for (int i = 0; i < 30; ++i) body += "Sure. ";
+        parts.push_back("[DOC-" + std::to_string(doc) + "]\n" + body + "\n\n");
+    }
+    parts.push_back("Question: What is the answer?");
+    std::string joined;
+    json content = json::array();
+    for (const auto & part : parts) {
+        joined += part;
+        content.push_back({{"type", "text"}, {"text", part}});
+    }
+    const std::string rendered = render_chat_template(
+        {{"user", joined, ""}}, ChatFormat::QWEN3,
+        /*add_generation_prompt=*/true, /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", ".", " ", "Question", ":"}, rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    const auto run = [&] (const json & message_content, const char * parser,
+                          bool on, std::string & error) {
+        luce_test::ScopedEnvVar structure{
+            "PFLASH_SELECT_STRUCT_HEADERS", on ? "1" : nullptr};
+        luce_test::ScopedEnvVar query_parser{"PFLASH_SELECT_QUERY_PARSER", parser};
+        auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+        MockPflashBudgetBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.pflash_keep_ratio = 0.3f;
+        config.prefix_cache_cap = 0;
+        config.prefill_cache_cap = 0;
+        {
+            HttpServer server(engine, tokenizer, config);
+            server.set_drafter_tokenizer(&tokenizer);
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            request.messages = json::array({
+                {{"role", "user"}, {"content", message_content}}});
+            request.prompt_tokens = tokenizer.encode(rendered);
+            if (std::string(parser) == "latest_user") {
+                request.pflash_query = "What is the answer?";
+            }
+            error = HttpServerTestAccess::apply_pflash_compression(server, request);
+        }
+        TEST_ASSERT(backend.compress_calls == 1);
+        return backend.last_request;
+    };
+    for (const char * parser : {"latest_user", "arbitrary_tail"}) {
+        std::string error;
+        const auto on = run(content, parser, true, error);
+        TEST_ASSERT_MSG(error.empty(), error);
+        // The preamble, the three documents and the question's "Question: "
+        // (the question itself is pinned): every start opens its part.
+        std::vector<std::string> heads;
+        for (const int start : on.struct_starts) {
+            const int end = (std::min)((int) on.input_ids.size(), start + 7);
+            heads.push_back(tokenizer.decode(
+                {on.input_ids.begin() + start, on.input_ids.begin() + end}));
+        }
+        const std::vector<std::string> expected{
+            "Read th", "[DOC-1]", "[DOC-2]", "[DOC-3]", "Questio"};
+        std::string seen;
+        for (const auto & head : heads) seen += "[" + head + "]";
+        bool match = heads.size() == expected.size();
+        for (size_t index = 0; match && index < heads.size(); ++index) {
+            match = heads[index].compare(0, expected[index].size(), expected[index]) == 0;
+        }
+        TEST_ASSERT_MSG(match, std::string(parser) + " starts=" + seen);
+        for (const int start : on.struct_starts) {
+            for (const auto & span : on.required_instruction_spans) {
+                TEST_ASSERT(!(start >= span.begin && start < span.end));
+            }
+        }
+        // Off: nothing, and the request is otherwise the same.
+        const auto off = run(content, parser, false, error);
+        TEST_ASSERT(error.empty());
+        TEST_ASSERT(off.struct_starts.empty());
+        TEST_ASSERT(off.input_ids == on.input_ids);
+        TEST_ASSERT(off.required_instruction_spans == on.required_instruction_spans);
+        TEST_ASSERT(off.keep_ratio == on.keep_ratio);
+        // The same text as one string: a single unit, no start.
+        const auto single = run(json(joined), parser, true, error);
+        TEST_ASSERT(error.empty());
+        TEST_ASSERT(single.struct_starts.empty());
+        TEST_ASSERT(single.input_ids == on.input_ids);
+    }
     unlink(path.c_str());
 }
 

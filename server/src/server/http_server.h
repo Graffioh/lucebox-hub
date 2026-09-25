@@ -334,6 +334,39 @@ std::string pflash_join_kept_spans(
     const std::vector<PFlashTokenSpan> & spans);
 int pflash_chat_compress_new_tokens() noexcept;
 
+// Request-structure headers (PFLASH_SELECT_STRUCT_HEADERS=1). A structural
+// unit is a text the request itself delimits: a message's string content, a
+// text part of a list content (``{"type":"text","text":...}``, also
+// input_text/output_text; the server joins parts with no separator, as the
+// Qwen chat templates do), or a tool result (a ``tool`` message, a Responses
+// ``function_call_output``). System and developer messages are pinned
+// instructions and give none. In request order.
+struct PflashStructUnit {
+    std::string kind;   // "message", "part" or "tool"
+    std::string text;
+};
+std::vector<PflashStructUnit> pflash_struct_units(const nlohmann::json & messages);
+
+// Where each unit starts in the rendered prompt text: the first occurrence,
+// at or after the previous unit, of the unit's first line (from its first
+// non-space character, at most 96 bytes); std::string::npos when the
+// template changed it beyond recognition. A unit found verbatim moves the
+// search past its whole text.
+std::vector<size_t> pflash_struct_unit_offsets(
+    const std::string & text,
+    const std::vector<PflashStructUnit> & units);
+
+// The units' start tokens in ``ids`` (the token holding each unit's first
+// character), ascending, without those inside an ``excluded`` span (kept
+// spans, the query window, the kept suffix). Fewer than two starts give
+// none: a lone unit (a single message without parts) has no neighbour to be
+// told apart from, and the request is compressed as before.
+std::vector<int> pflash_struct_starts(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & ids,
+    const std::vector<PflashStructUnit> & units,
+    const std::vector<PFlashTokenSpan> & excluded);
+
 
 // The parts of ``spans`` that ``minus`` does not cover. Both canonical.
 std::vector<PFlashTokenSpan> pflash_subtract_token_spans(

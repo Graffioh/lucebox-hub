@@ -137,6 +137,16 @@ struct PFlashSelectionConfig {
     bool container_headers = false;
     int container_header_max = 48;
     bool cut_markers = false;
+    // Request-structure headers (PFLASH_SELECT_STRUCT_HEADERS=1): the same
+    // header rule and budget refit, with record starts taken from the
+    // request itself -- where each message, text content part and tool
+    // result begins -- instead of (or, with container headers on too,
+    // besides) the probe's record-start head. Off by default.
+    bool struct_headers = false;
+    // Per request, from the server: those starts, in the drafter's token
+    // positions, ascending, none inside a kept span. Empty unless the switch
+    // is on and the request has at least two units in the compressed region.
+    std::vector<int> struct_starts;
     // Per process, filled by the drafter: the cut marker's token ids.
     std::vector<int32_t> cut_marker_ids;
 };
@@ -150,6 +160,7 @@ inline constexpr const char * kPFlashCutMarkerText = "\n[...]\n";
 // resolve_pflash_selection).
 bool pflash_container_headers_requested() noexcept;
 bool pflash_cut_markers_requested() noexcept;
+bool pflash_struct_headers_requested() noexcept;
 
 // Container starts from per-token start probabilities (the probe's
 // record-start head: document, file, email, session), decoded like unit
@@ -174,7 +185,18 @@ struct PFlashContainers {
     std::vector<int> starts;
     std::vector<luce::common::PFlashTokenSpan> extents;
     std::vector<luce::common::PFlashTokenSpan> headers;
+    // Where the starts came from, for the trace (set by the caller when
+    // request-structure starts are merged in; with none, every start is a
+    // probe record start): the probe's record starts and the
+    // request-structure starts.
+    std::vector<int> record_starts;
+    std::vector<int> struct_starts;
 };
+
+// Record starts from two sources (the probe's record head, the request's
+// structure), merged: ascending, duplicates once.
+std::vector<int> pflash_union_starts(const std::vector<int> & a,
+                                     const std::vector<int> & b);
 PFlashContainers pflash_container_headers(
     const std::vector<int32_t> & ids,
     const std::vector<int> & starts,

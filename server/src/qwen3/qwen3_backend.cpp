@@ -978,7 +978,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
         /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
         score_query_end, req.required_instruction_spans,
         req.query_suffix_candidates, req.history_query_spans,
-            req.turn_query_span));
+            req.turn_query_span, req.struct_starts));
 
     if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
         free_drafter();

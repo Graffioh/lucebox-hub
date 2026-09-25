@@ -157,6 +157,22 @@ void write_compression_trace(
         if (trace_fields->header_tokens >= 0) {
             std::fprintf(file, ",\"header_tokens\":%d", trace_fields->header_tokens);
         }
+        if (trace_fields->struct_starts) {
+            std::fputs(",\"struct_starts\":[", file);
+            for (size_t index = 0; index < trace_fields->struct_starts->size(); ++index) {
+                std::fprintf(file, "%s%d", index ? "," : "",
+                             (*trace_fields->struct_starts)[index]);
+            }
+            std::fputc(']', file);
+        }
+        if (trace_fields->struct_headers_added) {
+            std::fputs(",\"struct_headers_added\":[", file);
+            for (size_t index = 0; index < trace_fields->struct_headers_added->size(); ++index) {
+                const auto & span = (*trace_fields->struct_headers_added)[index];
+                std::fprintf(file, "%s[%d,%d]", index ? "," : "", span.begin, span.end);
+            }
+            std::fputc(']', file);
+        }
         if (trace_fields->cut_markers >= 0) {
             std::fprintf(file, ",\"cut_markers\":%d", trace_fields->cut_markers);
         }
@@ -346,9 +362,10 @@ std::vector<int32_t> select_pflash_chunks(
         return {};
     }
 
-    // Assembly experiments (container headers, cut markers): off by
-    // default, and then nothing below changes.
-    const bool with_headers = config.container_headers && containers != nullptr;
+    // Assembly experiments (container headers, request-structure headers,
+    // cut markers): off by default, and then nothing below changes.
+    const bool with_headers = (config.container_headers || config.struct_headers) &&
+        containers != nullptr;
     const bool with_markers = config.cut_markers && !config.cut_marker_ids.empty();
     luce::pflash::PFlashAssemblyResult assembly;
     if (with_headers || with_markers) {
@@ -370,6 +387,16 @@ std::vector<int32_t> select_pflash_chunks(
     const bool assembled = with_headers || with_markers;
     const std::vector<size_t> & final_ordinals =
         assembled ? assembly.ordinals : selected.ordinals;
+    // The added headers that open a request-structure unit.
+    static const std::vector<int> no_starts;
+    const std::vector<int> & struct_starts =
+        with_headers ? containers->struct_starts : no_starts;
+    std::vector<PFlashTokenSpan> struct_headers_added;
+    for (const auto & header : assembly.headers_added) {
+        if (std::binary_search(struct_starts.begin(), struct_starts.end(), header.begin)) {
+            struct_headers_added.push_back(header);
+        }
+    }
 
     std::vector<uint8_t> selected_mask((size_t) n_chunks, 0);
     std::vector<uint8_t> mandatory_mask((size_t) n_chunks, 0);
@@ -446,6 +473,11 @@ std::vector<int32_t> select_pflash_chunks(
             assembly.dropped.size(), assembly.passes,
             assembly.retained_tokens, selector_budget);
     }
+    if (config.struct_headers) {
+        std::fprintf(stderr,
+            "[pflash-assembly] struct_starts=%zu struct_headers_added=%zu\n",
+            struct_starts.size(), struct_headers_added.size());
+    }
     std::fflush(stderr);
 
     if (write_trace) {
@@ -469,9 +501,18 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.top_k =
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
         if (with_headers) {
-            strict_fields.record_starts = &containers->starts;
+            // The probe's record starts: every start unless the request's
+            // structure gave some too.
+            if (config.container_headers) {
+                strict_fields.record_starts = containers->struct_starts.empty()
+                    ? &containers->starts : &containers->record_starts;
+            }
             strict_fields.headers_added = &assembly.headers_added;
             strict_fields.header_tokens = assembly.header_tokens;
+        }
+        if (config.struct_headers) {
+            strict_fields.struct_starts = &struct_starts;
+            strict_fields.struct_headers_added = &struct_headers_added;
         }
         if (with_markers) strict_fields.cut_markers = assembly.cut_markers;
         if (assembled) strict_fields.assembly_dropped = &assembly.dropped;

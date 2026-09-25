@@ -671,6 +671,115 @@ std::string pflash_join_kept_spans(
     return out;
 }
 
+std::vector<PflashStructUnit> pflash_struct_units(const json & messages) {
+    std::vector<PflashStructUnit> units;
+    if (!messages.is_array()) return units;
+    const auto text_of = [] (const json & value) {
+        if (value.is_string()) return value.get<std::string>();
+        return value.is_null() ? std::string() : value.dump();
+    };
+    for (const auto & message : messages) {
+        if (!message.is_object()) continue;
+        const auto type = message.find("type");
+        const std::string item_type = type != message.end() && type->is_string()
+            ? type->get<std::string>() : std::string("message");
+        if (item_type == "function_call") continue;
+        if (item_type == "function_call_output") {
+            const auto output = message.find("output");
+            if (output != message.end()) {
+                std::string text = text_of(*output);
+                if (!text.empty()) units.push_back({"tool", std::move(text)});
+            }
+            continue;
+        }
+        const auto role_it = message.find("role");
+        const std::string role = role_it != message.end() && role_it->is_string()
+            ? role_it->get<std::string>() : std::string("user");
+        if (role == "system" || role == "developer") continue;
+        const bool tool = role == "tool";
+        const auto content = message.find("content");
+        if (content == message.end()) continue;
+        if (content->is_string()) {
+            std::string text = content->get<std::string>();
+            if (!text.empty()) {
+                units.push_back({tool ? "tool" : "message", std::move(text)});
+            }
+        } else if (content->is_array()) {
+            for (const auto & part : *content) {
+                if (!part.is_object()) continue;
+                const auto part_type = part.find("type");
+                if (part_type == part.end() || !part_type->is_string()) continue;
+                const std::string ptype = part_type->get<std::string>();
+                if (ptype != "text" && ptype != "input_text" &&
+                    ptype != "output_text") {
+                    continue;
+                }
+                const auto text_it = part.find("text");
+                if (text_it == part.end() || !text_it->is_string()) continue;
+                std::string text = text_it->get<std::string>();
+                if (!text.empty()) {
+                    units.push_back({tool ? "tool" : "part", std::move(text)});
+                }
+            }
+        }
+    }
+    return units;
+}
+
+std::vector<size_t> pflash_struct_unit_offsets(
+        const std::string & text,
+        const std::vector<PflashStructUnit> & units) {
+    constexpr size_t kNeedleBytes = 96;
+    std::vector<size_t> offsets;
+    offsets.reserve(units.size());
+    size_t cursor = 0;
+    for (const auto & unit : units) {
+        const size_t lead = unit.text.find_first_not_of(" \t\r\n");
+        if (lead == std::string::npos) {
+            offsets.push_back(std::string::npos);
+            continue;
+        }
+        const size_t line_end = unit.text.find('\n', lead);
+        const size_t needle_end = (std::min)(
+            line_end == std::string::npos ? unit.text.size() : line_end,
+            lead + kNeedleBytes);
+        const std::string needle = unit.text.substr(lead, needle_end - lead);
+        const size_t at = text.find(needle, cursor);
+        offsets.push_back(at);
+        if (at == std::string::npos) continue;
+        const size_t rest = unit.text.size() - lead;
+        cursor = text.compare(at, rest, unit.text, lead, rest) == 0
+            ? at + rest : at + needle.size();
+    }
+    return offsets;
+}
+
+std::vector<int> pflash_struct_starts(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & ids,
+        const std::vector<PflashStructUnit> & units,
+        const std::vector<PFlashTokenSpan> & excluded) {
+    std::vector<int> starts;
+    if (units.size() < 2 || ids.empty()) return starts;
+    const DecodedPrompt decoded = decode_prompt_with_offsets(tokenizer, ids);
+    for (const size_t at : pflash_struct_unit_offsets(decoded.text, units)) {
+        if (at == std::string::npos || at >= decoded.text.size()) continue;
+        const int token = token_at_offset(decoded, at);
+        bool inside = false;
+        for (const auto & span : excluded) {
+            if (token >= span.begin && token < span.end) {
+                inside = true;
+                break;
+            }
+        }
+        if (!inside) starts.push_back(token);
+    }
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    if (starts.size() < 2) starts.clear();
+    return starts;
+}
+
 bool pflash_chat_recall() noexcept {
     const char * raw = std::getenv("PFLASH_CHAT_RECALL");
     return !(raw && std::string(raw) == "0");
@@ -4422,6 +4531,41 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.query_suffix_candidates = query_suffix_candidates;
     compress_request.history_query_spans = history_query_spans;
     compress_request.turn_query_span = turn_query_span;
+    // Request-structure headers (PFLASH_SELECT_STRUCT_HEADERS=1): where each
+    // message, text content part and tool result begins, from the request
+    // itself; the drafter keeps the first line of every unit it keeps
+    // content from. Units inside what is kept anyway give no start.
+    if (experiment.selection_active && experiment.struct_headers &&
+        messages_input && query_window.valid()) {
+        const int input_tokens = (int) compress_request.input_ids.size();
+        std::vector<PFlashTokenSpan> excluded =
+            compress_request.required_instruction_spans;
+        excluded.push_back(
+            {query_window.end - query_window.tokens, query_window.end});
+        if (!query_suffix_candidates && query_window.end < input_tokens) {
+            excluded.push_back({query_window.end, input_tokens});
+        }
+        try {
+            const auto units = http_detail::pflash_struct_units(req.messages);
+            compress_request.struct_starts = http_detail::pflash_struct_starts(
+                *drafter_tokenizer_, compress_request.input_ids, units, excluded);
+            size_t parts = 0;
+            size_t tools = 0;
+            for (const auto & unit : units) {
+                parts += unit.kind == "part";
+                tools += unit.kind == "tool";
+            }
+            std::fprintf(stderr,
+                "[pflash-struct] units=%zu (messages=%zu parts=%zu tools=%zu) "
+                "starts=%zu\n",
+                units.size(), units.size() - parts - tools, parts, tools,
+                compress_request.struct_starts.size());
+            std::fflush(stderr);
+        } catch (const std::exception & error) {
+            return std::string("PFlash request-structure mapping failed: ") +
+                error.what();
+        }
+    }
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (experiment.selection_active && query_window.valid()) {

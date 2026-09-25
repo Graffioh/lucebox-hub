@@ -108,7 +108,8 @@ std::vector<int32_t> drafter_score_and_compress(
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     bool query_suffix_candidates,
     const std::vector<PFlashTokenSpan> & history_queries,
-    PFlashTokenSpan turn_query) {
+    PFlashTokenSpan turn_query,
+    const std::vector<int> & struct_starts) {
     pflash_clear_kept_spans();
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
@@ -139,6 +140,7 @@ std::vector<int32_t> drafter_score_and_compress(
             turn_query.end <= (int) ids.size()) {
             experiment.turn_query = turn_query;
         }
+        if (experiment.struct_headers) experiment.struct_starts = struct_starts;
     }
     if (!experiment.selection_active && !required_instruction_spans.empty()) {
         set_last_error(

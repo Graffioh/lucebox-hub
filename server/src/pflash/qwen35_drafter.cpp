@@ -1367,6 +1367,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             containers = luce::pflash::pflash_container_headers(
                 ids, starts, excluded, st.newline_vocab,
                 experiment.container_header_max);
+            containers.record_starts = containers.starts;
             std::fprintf(stderr,
                 "[qwen35-segment-probe] %zu record starts in the context "
                 "(threshold %.2f, header cap %d tokens)\n",
@@ -1375,6 +1376,46 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
         std::fflush(stderr);
     }
+
+    // Request-structure headers: record starts from the request itself (the
+    // server located every message, content part and tool result), with any
+    // probe or none, merged with the probe's record starts when both are on.
+    // Starts the server gave inside the query window, an instruction span or
+    // the kept suffix are skipped here too. Not for the two-scorer pass.
+    std::vector<int> struct_starts;
+    if (experiment.struct_headers && token_mass_out == nullptr) {
+        const int query_begin = query_start;
+        std::vector<PFlashTokenSpan> excluded{{query_begin, query_end}};
+        if (!experiment.query_suffix_candidates && query_end < S) {
+            excluded.push_back({query_end, S});
+        }
+        excluded.insert(excluded.end(), required_instruction_spans.begin(),
+                        required_instruction_spans.end());
+        for (const int start : experiment.struct_starts) {
+            if (start < 0 || start >= S) continue;
+            bool inside = false;
+            for (const auto & span : excluded) {
+                if (start >= span.begin && start < span.end) { inside = true; break; }
+            }
+            if (!inside) struct_starts.push_back(start);
+        }
+        struct_starts = luce::pflash::pflash_union_starts(struct_starts, {});
+        if (!struct_starts.empty()) {
+            const std::vector<int> record_starts = containers.record_starts;
+            containers = luce::pflash::pflash_container_headers(
+                ids, luce::pflash::pflash_union_starts(record_starts, struct_starts),
+                excluded, st.newline_vocab, experiment.container_header_max);
+            containers.record_starts = record_starts;
+            containers.struct_starts = struct_starts;
+        }
+        std::fprintf(stderr,
+            "[qwen35-struct] %zu request-structure starts in the context "
+            "(%zu given, %zu probe record starts, header cap %d tokens)\n",
+            struct_starts.size(), experiment.struct_starts.size(),
+            containers.record_starts.size(), experiment.container_header_max);
+        std::fflush(stderr);
+    }
+    const bool use_containers = use_record || !struct_starts.empty();
 
     if (profile) {
         prof.valid = true;
@@ -1410,7 +1451,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         /*direct_mass=*/true, /*write_trace=*/true,
         segments.empty() ? nullptr : &segments, density,
         /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
-        use_record ? &containers : nullptr);
+        use_containers ? &containers : nullptr);
 }
 
 std::vector<int32_t> qwen35_drafter_score_and_compress(

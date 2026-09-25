@@ -77,6 +77,9 @@ void free_drafter_weights(DrafterContext & ctx);
 //                    recent first, mixed into the scores at halving weights
 //   turn_query   strict selection only: the latest user turn's tail, mixed
 //                    in at the query's own weight
+//   struct_starts  strict selection with PFLASH_SELECT_STRUCT_HEADERS=1
+//                    only: where the request's messages, content parts and
+//                    tool results begin (record starts for the header rule)
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -91,6 +94,7 @@ std::vector<int32_t> drafter_score_and_compress(
         required_instruction_spans = {},
     bool   query_suffix_candidates = false,
     const std::vector<PFlashTokenSpan> & history_queries = {},
-    PFlashTokenSpan turn_query = {-1, -1});
+    PFlashTokenSpan turn_query = {-1, -1},
+    const std::vector<int> & struct_starts = {});
 
 } // namespace luce::common

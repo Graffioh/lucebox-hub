@@ -116,6 +116,10 @@ struct PFlashTraceFields {
     int header_tokens = -1;
     int cut_markers = -1;
     const std::vector<size_t> * assembly_dropped = nullptr;
+    // Request-structure headers (PFLASH_SELECT_STRUCT_HEADERS=1 only): the
+    // starts the request gave, and the header spans added from them.
+    const std::vector<int> * struct_starts = nullptr;
+    const std::vector<PFlashTokenSpan> * struct_headers_added = nullptr;
     // PFLASH_DRAFTER_PROFILE=1 only.
     const PFlashDrafterProfile * drafter_profile = nullptr;
 };

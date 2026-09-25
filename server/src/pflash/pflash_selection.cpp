@@ -29,6 +29,7 @@ constexpr const char * kSplitEnv = "PFLASH_SELECT_SPLIT";
 constexpr const char * kContainerHeadersEnv = "PFLASH_SELECT_CONTAINER_HEADERS";
 constexpr const char * kContainerHeaderMaxEnv = "PFLASH_SELECT_CONTAINER_HEADER_MAX";
 constexpr const char * kCutMarkerEnv = "PFLASH_ASSEMBLY_CUT_MARKER";
+constexpr const char * kStructHeadersEnv = "PFLASH_SELECT_STRUCT_HEADERS";
 
 // "1" on, unset or "0" off, anything else invalid.
 enum class Switch { Off, On, Invalid };
@@ -84,6 +85,10 @@ bool pflash_container_headers_requested() noexcept {
 
 bool pflash_cut_markers_requested() noexcept {
     return parse_switch(std::getenv(kCutMarkerEnv)) == Switch::On;
+}
+
+bool pflash_struct_headers_requested() noexcept {
+    return parse_switch(std::getenv(kStructHeadersEnv)) == Switch::On;
 }
 
 bool has_pflash_selection_environment() noexcept {
@@ -462,8 +467,14 @@ bool resolve_pflash_selection(
         error = std::string(kCutMarkerEnv) + " must be 0 or 1";
         return false;
     }
+    const Switch structure = parse_switch(std::getenv(kStructHeadersEnv));
+    if (structure == Switch::Invalid) {
+        error = std::string(kStructHeadersEnv) + " must be 0 or 1";
+        return false;
+    }
     config.container_headers = headers == Switch::On;
     config.cut_markers = markers == Switch::On;
+    config.struct_headers = structure == Switch::On;
     if (const char * raw = std::getenv(kContainerHeaderMaxEnv)) {
         if (!parse_int(raw, config.container_header_max) ||
             config.container_header_max < 1 ||
@@ -683,6 +694,15 @@ std::vector<int> pflash_container_starts(
         starts.push_back(token);
     }
     return starts;
+}
+
+std::vector<int> pflash_union_starts(const std::vector<int> & a,
+                                     const std::vector<int> & b) {
+    std::vector<int> out = a;
+    out.insert(out.end(), b.begin(), b.end());
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
 }
 
 PFlashContainers pflash_container_headers(

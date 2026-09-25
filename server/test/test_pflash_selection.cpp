@@ -1273,3 +1273,120 @@ TEST_CASE(PFlashSelectionFixture, drafter_profile_reaches_the_trace_only_when_re
     REQUIRE(read_last_line(trace) == plain_line);
     std::remove(trace.c_str());
 }
+
+// ---------------------------------------------------------------------------
+// Request-structure headers (PFLASH_SELECT_STRUCT_HEADERS=1).
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr const char * kStructHeadersEnv = "PFLASH_SELECT_STRUCT_HEADERS";
+} // namespace
+
+TEST_CASE(PFlashSelectionFixture, struct_headers_switch_defaults_off_and_resolves_or_fails) {
+    CleanPFlashEnv clean;
+    luce_test::ScopedEnvVar structure{kStructHeadersEnv, nullptr};
+    set_env(kModeEnv, "budget_only");
+    REQUIRE(!resolve_or_fail(32768, 1024).struct_headers);
+    REQUIRE(!pflash_struct_headers_requested());
+    set_env(kStructHeadersEnv, "0");
+    REQUIRE(!resolve_or_fail(32768, 1024).struct_headers);
+    set_env(kStructHeadersEnv, "1");
+    const auto config = resolve_or_fail(32768, 1024);
+    REQUIRE(config.struct_headers);
+    REQUIRE(!config.container_headers);
+    REQUIRE(config.struct_starts.empty());
+    REQUIRE(pflash_struct_headers_requested());
+    // The switch alone never configures selection.
+    set_env(kModeEnv, nullptr);
+    REQUIRE(!resolve_or_fail(32768, 1024).configured);
+    PFlashSelectionConfig invalid;
+    std::string error;
+    for (const char * bad : {"2", "on", ""}) {
+        set_env(kStructHeadersEnv, bad);
+        REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+        REQUIRE(error.find(kStructHeadersEnv) != std::string::npos);
+    }
+}
+
+TEST_CASE(PFlashSelectionFixture, struct_starts_merge_with_record_starts) {
+    REQUIRE((pflash_union_starts({26, 10}, {10, 3, 40}) == std::vector<int>{3, 10, 26, 40}));
+    REQUIRE(pflash_union_starts({}, {}).empty());
+    REQUIRE((pflash_union_starts({}, {7, 7}) == std::vector<int>{7}));
+}
+
+TEST_CASE(PFlashSelectionFixture, struct_headers_off_leave_selection_and_trace_unchanged) {
+    AssemblyFixture f;
+    const std::string trace = temp_trace_path("struct_off");
+    std::remove(trace.c_str());
+    luce_test::ScopedEnvVar trace_env{kTraceEnv, trace.c_str()};
+    const auto plain = f.run(f.config());
+    const auto plain_spans = luce::common::pflash_last_kept_spans();
+    const std::string plain_trace = read_last_line(trace);
+
+    // Starts handed in, switch off: identical ids, spans and trace.
+    auto config = f.config();
+    config.struct_starts = {10, 26};
+    auto containers = f.containers();
+    containers.struct_starts = {10, 26};
+    REQUIRE(f.run(config, &containers) == plain);
+    REQUIRE(luce::common::pflash_last_kept_spans() == plain_spans);
+    REQUIRE(read_last_line(trace) == plain_trace);
+    REQUIRE(plain_trace.find("struct_") == std::string::npos);
+
+    // Switch on without starts (a single message): the same selection and
+    // ids; the trace only gains the two empty fields.
+    config.struct_headers = true;
+    config.struct_starts.clear();
+    REQUIRE(f.run(config) == plain);
+    REQUIRE(luce::common::pflash_last_kept_spans() == plain_spans);
+    std::string line = read_last_line(trace);
+    const std::string fields = ",\"struct_starts\":[],\"struct_headers_added\":[]";
+    const size_t at = line.find(fields);
+    REQUIRE(at != std::string::npos);
+    line.erase(at, fields.size());
+    REQUIRE(line == plain_trace);
+    std::remove(trace.c_str());
+}
+
+TEST_CASE(PFlashSelectionFixture, struct_headers_are_added_within_budget) {
+    AssemblyFixture f;
+    const std::string trace = temp_trace_path("struct_on");
+    std::remove(trace.c_str());
+    luce_test::ScopedEnvVar trace_env{kTraceEnv, trace.c_str()};
+    auto config = f.config();
+    config.struct_headers = true;
+    // Units start at 10 and 26 (as the server located them); header cap 3.
+    auto containers = f.containers();
+    containers.struct_starts = {10, 26};
+    // Selection 1,3,4,7 + query = 20 = the budget. Headers [10,12) and
+    // [26,29) add 4: chunk 7 goes (and container 26's header with it),
+    // 16 + 2 = 18 fits.
+    const auto out = f.run(config, &containers);
+    REQUIRE(out == concat({f.slice(4, 8), f.slice(10, 20), f.slice(36, 40)}));
+    REQUIRE((luce::common::pflash_last_kept_spans() ==
+             std::vector<PFlashTokenSpan>{{4, 8}, {10, 20}, {36, 40}}));
+    REQUIRE((int) out.size() <= 20);
+    const std::string line = read_last_line(trace);
+    REQUIRE(line.find("\"struct_starts\":[10,26]") != std::string::npos);
+    REQUIRE(line.find("\"struct_headers_added\":[[10,12]]") != std::string::npos);
+    REQUIRE(line.find("\"headers_added\":[[10,12]]") != std::string::npos);
+    REQUIRE(line.find("\"header_tokens\":2") != std::string::npos);
+    REQUIRE(line.find("\"assembly_dropped\":[7]") != std::string::npos);
+    REQUIRE(line.find("\"retained_tokens\":18") != std::string::npos);
+    // Container headers off: no probe record starts in the trace.
+    REQUIRE(line.find("record_starts") == std::string::npos);
+
+    // Both switches: the probe's record starts and the request's are traced
+    // apart; a header counts as structural when a unit opens it.
+    config.container_headers = true;
+    PFlashContainers merged = pflash_container_headers(
+        f.ids, pflash_union_starts({26}, {10}), {{36, 40}}, f.newline_vocab, 3);
+    merged.record_starts = {26};
+    merged.struct_starts = {10};
+    f.run(config, &merged);
+    const std::string both = read_last_line(trace);
+    REQUIRE(both.find("\"record_starts\":[26]") != std::string::npos);
+    REQUIRE(both.find("\"struct_starts\":[10]") != std::string::npos);
+    REQUIRE(both.find("\"struct_headers_added\":[[10,12]]") != std::string::npos);
+    std::remove(trace.c_str());
+}

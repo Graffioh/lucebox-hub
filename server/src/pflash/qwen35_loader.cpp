@@ -468,7 +468,10 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             std::fflush(stderr);
         }
     }
-    if (st->probe_record_loaded || luce::pflash::pflash_cut_markers_requested()) {
+    // Request-structure headers need the newline vocabulary whatever the
+    // probe (or with none).
+    if (st->probe_record_loaded || luce::pflash::pflash_cut_markers_requested() ||
+        luce::pflash::pflash_struct_headers_requested()) {
         if (!load_qwen35_assembly_vocab(gguf_path, *st)) {
             // Fail closed: an assembly switch the runtime cannot honour would
             // silently turn an experiment arm into the baseline.
@@ -481,6 +484,13 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             delete st;
             return false;
         }
+    }
+    if (luce::pflash::pflash_struct_headers_requested()) {
+        std::fprintf(stderr,
+            "[qwen35-drafter] request-structure headers on: record starts from "
+            "the request's messages, content parts and tool results%s\n",
+            st->probe_record_loaded ? ", merged with the probe's record starts" : "");
+        std::fflush(stderr);
     }
     if (head_path) {
         if (!*head_path || !load_qwen35_scoring_head(head_path, *st)) {
