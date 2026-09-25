@@ -1879,7 +1879,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    config.disk_cache_cold_max_tokens}, backend_)
 {
     config_.image_input_enabled = backend_.supports_images() &&
-        config_.pflash_upstream_base.empty() && !backend_.seq_engine();
+        config_.pflash_upstream_base.empty() &&
+        (!backend_.seq_engine() || backend_.seq_engine()->supports_images());
     if (backend_.supports_images() && !config_.image_input_enabled) {
         std::fprintf(stderr,
             "[server] WARNING: a vision projector is loaded but image input is off: it is "
@@ -3126,10 +3127,13 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         if (!render_and_tokenize_request(fd, render_messages, req)) return true;
 
         std::string image_error;
-        if (!backend_.prepare_images(req.prompt_tokens, std::move(encoded_images),
+        const ImagePrepareStatus image_status = backend_.prepare_images(
+                req.prompt_tokens, std::move(encoded_images),
                 uint64_t(std::max(0, config_.max_ctx)), uint64_t(std::max(0, req.max_output)),
-                req.images, image_error)) {
-            send_error(fd, 400, image_error);
+                req.images, image_error);
+        if (image_status != ImagePrepareStatus::ok) {
+            // A full image gate is capacity, not a bad request: clients retry 503.
+            send_error(fd, image_status == ImagePrepareStatus::busy ? 503 : 400, image_error);
             return true;
         }
 
@@ -5755,7 +5759,9 @@ void HttpServer::prepare_generation_inputs(
 
     inputs.request.prompt = prepared.tokens;
     inputs.request.images = prepared.images;
-    inputs.request.force_ar_decode = bool(prepared.images);
+    // Image requests may speculate; each backend decides (Qwen3.5 verifies at
+    // image-shifted rotary positions, DeepSeek4 drafts from the text after
+    // the last image).
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();

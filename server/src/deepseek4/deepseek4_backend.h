@@ -25,9 +25,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace luce::common {
@@ -74,12 +79,12 @@ public:
     void print_ready_banner() const override;
     bool supports_images() const override { return image_capable_ && vision_ != nullptr; }
     std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
-    bool prepare_images(std::vector<int32_t> & tokens,
-                        std::vector<EncodedImage> images,
-                        uint64_t context_capacity,
-                        uint64_t output_reserve,
-                        ImagePromptHandle & payload,
-                        std::string & error) const override;
+    ImagePrepareStatus prepare_images(std::vector<int32_t> & tokens,
+                                      std::vector<EncodedImage> images,
+                                      uint64_t context_capacity,
+                                      uint64_t output_reserve,
+                                      ImagePromptHandle & payload,
+                                      std::string & error) const override;
 
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
@@ -131,7 +136,21 @@ private:
     bool                   image_capable_ = false;
     bool                   cache_has_images_ = false;
     std::unique_ptr<vision::VisionRuntime> vision_;
-    vision::ImageRequestGate image_request_gate_;
+    // Owned backend for the vision encoder when --mmproj-device names a GPU
+    // other than the target's; null when the encoder shares backend_.
+    ggml_backend_t         vision_backend_ = nullptr;
+    // Encoder worker on vision_backend_: encodes queued image requests in
+    // order and publishes each image as it lands, so neither the scheduler
+    // nor prefill waits for a whole request. Started on first use.
+    std::thread            encode_worker_;
+    std::mutex             encode_mutex_;
+    std::condition_variable encode_ready_;
+    std::deque<std::shared_ptr<const DeepSeek4ImagePrompt>> encode_queue_;
+    std::atomic<bool>      encode_stop_{false};  // also read by the worker's cancel check
+    vision::ImageSentinels image_sentinels_;
+    // Batched image serving: one single-request staging cache per slot
+    // (slot 0 uses cache_), allocated at startup.
+    std::vector<std::unique_ptr<DeepSeek4Cache>> image_staging_caches_;
     vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler
@@ -190,12 +209,43 @@ private:
                                            int snapshot_capture_to);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
+    // prefix_tokens > 0 prefills only that many leading tokens (the batched
+    // image admission leaves the last prompt token to the paged engine).
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
-                   const DeepSeek4ImagePrompt * images = nullptr);
+                   const DeepSeek4ImagePrompt * images = nullptr,
+                   int prefix_tokens = 0);
     bool load_vision();
     bool init_single_gpu_vision();
-    bool materialize_images(const DeepSeek4ImagePrompt & images,
+    // Encodes one image with the vision runtime (caller serialises use).
+    bool encode_one_image(const vision::PromptImage & image, vision::ImageRaster & raster,
+                          std::string & error);
+    // Queues an image request on the encoder worker (--mmproj-device only).
+    void enqueue_image_encode(std::shared_ptr<const DeepSeek4ImagePrompt> images);
+    void encode_worker_loop();
+    void cancel_image_encode(const ImagePromptPayload & images) const;
+    // Stops the encoder worker (failing queued requests), then frees vision_.
+    void release_vision();
+    // Batched serving. A staged prefill fills one request's first `prefix`
+    // tokens into its slot's staging cache over several steps, in shared
+    // layer-major passes (expert weights read once per pass for all of them)
+    // that the engine advances a few layers per step.
+    using StagedPrefill = DeepSeek4StagedPrefill;
+    DeepSeek4Cache * image_staging_cache(int slot);
+    // Starts encoding an admitted image request: queued on the encoder
+    // worker with --mmproj-device, otherwise encoded here.
+    bool encode_image_request(const std::vector<int32_t> & prompt, const ImagePromptHandle & images,
+                              std::string & error);
+    bool begin_staged_prefill(StagedPrefill & item);
+    // Starts one shared pass over the ready, unfinished items, about
+    // `row_budget` rows in total (a whole image block may exceed it); `rows`
+    // gets each item's share. False when no item is ready (or all failed).
+    bool begin_staged_pass(const std::vector<StagedPrefill *> & items, int row_budget,
+                           DeepSeek4PrefillPass & pass, std::vector<int> & rows);
+    // Waits up to `timeout_ms` for the next rows of an item to have their
+    // images encoded, so an otherwise idle scheduler does not spin.
+    void wait_staged_ready(const StagedPrefill & item, int row_budget, int timeout_ms) const;
+    bool materialize_images(const std::shared_ptr<const DeepSeek4ImagePrompt> & images,
                             const DaemonIO & io, std::string & error);
 
     // Generate after either a fresh prefill or a restored prefix. kv_offset is
