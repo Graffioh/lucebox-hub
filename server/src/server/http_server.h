@@ -339,6 +339,16 @@ std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
     const std::vector<PFlashTokenSpan> & spans,
     const std::vector<PFlashTokenSpan> & minus);
 
+// The segments a new question leans on most, to restate next to it: the
+// candidates the fresh selection kept (inside canonical ``kept``) that end
+// before ``limit``, by lift, highest first, while they fit in ``budget``
+// tokens, skipping those ``skip`` already covers. In prompt order.
+std::vector<PFlashTokenSpan> pflash_restate_spans(
+    const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
+    const std::vector<PFlashTokenSpan> & kept,
+    int limit, int budget,
+    const std::vector<PFlashTokenSpan> & skip);
+
 // Text of a recalled segment made safe to quote inside a user turn: chat
 // control markers are removed, with the role-name line that follows a
 // generic role marker ("<|im_start|>assistant\n"), and the result is trimmed.
@@ -676,6 +686,7 @@ private:
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<int32_t> * fresh,
         const std::vector<PFlashTokenSpan> * kept_spans,
+        const std::vector<std::pair<PFlashTokenSpan, double>> * lifts,
         std::vector<int32_t> & served,
         int & snapshot_cut,
         nlohmann::json & stats);

@@ -313,8 +313,10 @@ std::vector<int32_t> select_pflash_chunks(
     g_last_candidate_lifts.clear();
     if (direct_mass) {
         // Head mass sums to one over the keys, so uniform attention gives
-        // each token 1/input of it.
+        // each token 1/input of it. Structurally required candidates are
+        // kept whatever they score, so only the droppable ones get a lift.
         for (const auto & candidate : candidates) {
+            if (candidate.mandatory) continue;
             double mass = 0.0;
             for (int token = candidate.begin; token < candidate.end; ++token) {
                 mass += token_scores[(size_t) token];

@@ -1093,6 +1093,26 @@ TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
     TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {{0, 60}}).empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_restate_spans) {
+    const std::vector<std::pair<PFlashTokenSpan, double>> lifts{
+        {{0, 10}, 1.0}, {{10, 20}, 9.0}, {{20, 30}, 5.0}, {{30, 40}, 8.0},
+        {{40, 50}, 7.0}, {{60, 70}, 99.0}};
+    // Kept: everything but 60..70; the latest turn starts at 50.
+    const std::vector<PFlashTokenSpan> kept{{0, 50}};
+    // Highest lift first while they fit, returned in prompt order.
+    auto out = http_detail::pflash_restate_spans(lifts, kept, 50, 25, {});
+    TEST_ASSERT(out.size() == 2);
+    TEST_ASSERT(out[0].begin == 10 && out[0].end == 20);
+    TEST_ASSERT(out[1].begin == 30 && out[1].end == 40);
+    // What recall already brings is not restated; the next best takes its place.
+    out = http_detail::pflash_restate_spans(lifts, kept, 50, 25, {{10, 20}});
+    TEST_ASSERT(out.size() == 1);
+    TEST_ASSERT(out[0].begin == 30 && out[0].end == 50);
+    // Nothing past the limit, nothing the selection dropped.
+    TEST_ASSERT(http_detail::pflash_restate_spans(lifts, kept, 50, 1000, {}).back().end == 50);
+    TEST_ASSERT(http_detail::pflash_restate_spans(lifts, kept, 50, 5, {}).empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_recall_excerpt_strips_chat_markers) {
     const std::string text =
         "tail of a fact<|im_end|>\n<|im_start|>assistant\nSure, noted."

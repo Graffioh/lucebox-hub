@@ -706,6 +706,38 @@ std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
     return out;
 }
 
+std::vector<PFlashTokenSpan> pflash_restate_spans(
+        const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
+        const std::vector<PFlashTokenSpan> & kept,
+        int limit, int budget,
+        const std::vector<PFlashTokenSpan> & skip) {
+    const auto covered = [] (const std::vector<PFlashTokenSpan> & spans,
+                             const PFlashTokenSpan & span) {
+        for (const auto & s : spans) {
+            if (s.begin <= span.begin && span.end <= s.end) return true;
+        }
+        return false;
+    };
+    std::vector<std::pair<PFlashTokenSpan, double>> ranked;
+    for (const auto & [span, lift] : lifts) {
+        if (span.end <= limit && covered(kept, span) && !covered(skip, span)) {
+            ranked.push_back({span, lift});
+        }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [] (const auto & a, const auto & b) {
+        return a.second > b.second;
+    });
+    std::vector<PFlashTokenSpan> out;
+    int used = 0;
+    for (const auto & [span, lift] : ranked) {
+        const int size = span.end - span.begin;
+        if (used + size > budget) break;
+        used += size;
+        out.push_back(span);
+    }
+    return canonicalize_pflash_token_spans(std::move(out));
+}
+
 std::string pflash_recall_excerpt(
         const std::string & text,
         const std::vector<std::string> & role_markers,
@@ -4515,7 +4547,7 @@ std::string HttpServer::apply_pflash_compression(
         json view_stats;
         if (serve_pflash_chat_view(
                 req, compress_request.input_ids, chat_turn, nullptr, nullptr,
-                served, prepared.snapshot_cut, view_stats)) {
+                nullptr, served, prepared.snapshot_cut, view_stats)) {
             prepared.tokens = std::move(served);
             prepared.compressed = true;
             prepared.pflash_stats = {
@@ -4664,7 +4696,7 @@ std::string HttpServer::apply_pflash_compression(
         std::vector<int32_t> served;
         if (serve_pflash_chat_view(
                 req, compress_request.input_ids, chat_turn, &final_tokens,
-                &result.kept_spans, served,
+                &result.kept_spans, &result.candidate_lifts, served,
                 prepared.snapshot_cut, prepared.pflash_stats["view"])) {
             final_tokens = std::move(served);
         }
@@ -4701,6 +4733,7 @@ bool HttpServer::serve_pflash_chat_view(
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<int32_t> * fresh,
         const std::vector<PFlashTokenSpan> * kept_spans,
+        const std::vector<std::pair<PFlashTokenSpan, double>> * lifts,
         std::vector<int32_t> & served,
         int & snapshot_cut,
         json & stats) {
@@ -4809,9 +4842,19 @@ bool HttpServer::serve_pflash_chat_view(
             return serve_fresh("rebuild", view.turns + 1);
         }
     }
+    // Restate: the segments the new question leans on most close the recall
+    // block even when the view holds them, so its strongest evidence sits
+    // next to the question and not only thousands of tokens back.
+    constexpr int kRestateTokens = 512;
+    std::vector<PFlashTokenSpan> restated;
+    if (compressed && recall && lifts != nullptr) {
+        restated = http_detail::pflash_restate_spans(
+            *lifts, *kept_spans, view.drafter_gen_begin, kRestateTokens, recalled);
+    }
     std::string recall_block;
     int recalled_tokens = 0;
-    if (!recalled.empty()) {
+    int restated_tokens = 0;
+    if (!recalled.empty() || !restated.empty()) {
         ChatMarkers markers;
         std::vector<std::string> role_markers;
         std::vector<std::string> end_markers;
@@ -4832,17 +4875,22 @@ bool HttpServer::serve_pflash_chat_view(
                 markers.family != "laguna";
         }
         std::string excerpts;
-        for (const auto & span : recalled) {
-            const std::string excerpt = http_detail::pflash_recall_excerpt(
-                drafter_tokenizer_->decode(std::vector<int32_t>(
-                    drafter_ids.begin() + span.begin,
-                    drafter_ids.begin() + span.end)),
-                role_markers, end_markers, generic_roles);
-            if (excerpt.empty()) continue;
-            if (!excerpts.empty()) excerpts += "\n\n";
-            excerpts += excerpt;
-            recalled_tokens += span.end - span.begin;
-        }
+        const auto quote = [&] (const std::vector<PFlashTokenSpan> & spans,
+                                int & tokens) {
+            for (const auto & span : spans) {
+                const std::string excerpt = http_detail::pflash_recall_excerpt(
+                    drafter_tokenizer_->decode(std::vector<int32_t>(
+                        drafter_ids.begin() + span.begin,
+                        drafter_ids.begin() + span.end)),
+                    role_markers, end_markers, generic_roles);
+                if (excerpt.empty()) continue;
+                if (!excerpts.empty()) excerpts += "\n\n";
+                excerpts += excerpt;
+                tokens += span.end - span.begin;
+            }
+        };
+        quote(recalled, recalled_tokens);
+        quote(restated, restated_tokens);
         if (!excerpts.empty()) {
             recall_block = "[Earlier in this conversation]\n" + excerpts +
                 "\n[End of earlier excerpts]\n\n";
@@ -4914,15 +4962,16 @@ bool HttpServer::serve_pflash_chat_view(
     const char * mode = compress_new ? "continue-compressed" : "continue";
     std::fprintf(stderr,
         "[pflash-view] %s turn=%d served=%zu reused=%d new=%d delta=%zu "
-        "recalled=%d fresh=%d\n",
+        "recalled=%d restated=%d fresh=%d\n",
         mode, next.turns, served.size(), view.view_gen_begin, new_tokens,
-        delta_tokens.size(), recalled_tokens,
+        delta_tokens.size(), recalled_tokens, restated_tokens,
         compressed ? (int) fresh->size() : -1);
     std::fflush(stderr);
     stats = {{"mode", mode}, {"turn", next.turns},
              {"served_tokens", served.size()}, {"reused_tokens", view.view_gen_begin},
              {"new_tokens", new_tokens}, {"delta_tokens", delta_tokens.size()},
-             {"recalled_tokens", recalled_tokens}};
+             {"recalled_tokens", recalled_tokens},
+             {"restated_tokens", restated_tokens}};
     if (compressed) stats["fresh_tokens"] = fresh->size();
     pflash_views_.remember(std::move(next));
     return true;
