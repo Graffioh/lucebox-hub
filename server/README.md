@@ -419,9 +419,9 @@ generation prompt), PFlash serves that view plus the new turns instead of a
 fresh compression, so the target restores its prefix-cache snapshot of the
 view (taken at the start of its generation prompt) and prefills only what is
 new. Segments the fresh selection keeps for the new question that the view
-lacks are recalled as excerpts at the start of the new user turn. When the
-view grows past twice the fresh prompt, or past the context, the fresh prompt
-starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
+lacks are recalled as excerpts at the start of the new user turn; segments
+the view already holds are not sent again. When the view would outgrow the
+context, the fresh prompt starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
 turn.
 
 What a turn adds is appended verbatim while it is small, the way full
@@ -432,7 +432,7 @@ stays cached. `PFLASH_CHAT_RECALL=0` turns recall off: a small follow-up is
 then served without running the drafter at all. Recall takes what a fresh
 selection for the new question keeps that the view lacks: a question on the
 view's topic misses little and is served by appending it, and a question
-that needs more than a third of a fresh selection -- the conversation moved
+that misses more than half of a fresh selection -- the conversation moved
 to other material -- starts a new view from that selection instead. Kept pieces that were not adjacent in the prompt are joined by a
 paragraph break when neither side has one (`PFLASH_SELECT_PARAGRAPH_JOIN=0`
 turns it off; the breaks do not count against the token ceiling).
