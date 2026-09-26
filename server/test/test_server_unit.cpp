@@ -7359,8 +7359,11 @@ TEST_CASE(ServerUnitFixture,
 
     std::string system;
     for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    std::string gamma;
+    for (int i = 0; i < 200; ++i) gamma += " gamma";
     const std::string document =
-        "alpha facts live here. filler filler filler. beta facts live here.";
+        "alpha facts live here. filler filler filler. beta facts live here." +
+        gamma + ".";
     const std::vector<ChatMessage> turn1{
         {"system", system, ""},
         {"user", document + " Question one?", ""},
@@ -7368,6 +7371,9 @@ TEST_CASE(ServerUnitFixture,
     auto turn2 = turn1;
     turn2.push_back({"assistant", "Answer one.", ""});
     turn2.push_back({"user", "Question two?", ""});
+    auto turn3 = turn2;
+    turn3.push_back({"assistant", "Answer two.", ""});
+    turn3.push_back({"user", "Question three?", ""});
     const auto render = [] (const std::vector<ChatMessage> & messages) {
         return render_chat_template(messages, ChatFormat::QWEN3,
                                     /*add_generation_prompt=*/true,
@@ -7382,9 +7388,9 @@ TEST_CASE(ServerUnitFixture,
     };
     const std::string path = write_pflash_bpe_tokenizer_fixture(
         {"alpha", " facts", "beta", " live", " here", ".", " filler",
-         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "Question", " one", " two", " three", "?", "Answer", " gamma", "user", "assistant",
          "system", "\n", "You", " are", " helpful"},
-        render(turn2) +
+        render(turn3) +
             "[Earlier in this conversation]\n[End of earlier excerpts]\n");
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
@@ -7409,6 +7415,7 @@ TEST_CASE(ServerUnitFixture,
     std::vector<int32_t> served1;
     std::vector<int32_t> served2;
     std::vector<int32_t> served3;
+    std::vector<int32_t> served4;
     std::vector<std::string> modes;
     {
         HttpServer server(engine, tokenizer, config);
@@ -7436,9 +7443,13 @@ TEST_CASE(ServerUnitFixture,
                         (int) (served.size() - generation.size()));
         };
         run(turn1, served1);
-        wanted = "beta facts";   // the new query wants what turn 1 dropped
+        // The new query wants what turn 1 dropped, in one passage with what
+        // turn 1 kept.
+        wanted = "alpha facts live here. filler filler filler. beta facts";
         run(turn2, served2);
         run(turn2, served3);     // a retry serves the same view
+        wanted = gamma.c_str() + 1;   // other material: most of it is missing
+        run(turn3, served4);
     }
     const std::string text1 = tokenizer.decode(served1);
     const std::string text2 = tokenizer.decode(served2);
@@ -7459,10 +7470,18 @@ TEST_CASE(ServerUnitFixture,
     const size_t question = text2.find("Question two?");
     TEST_ASSERT(answer != std::string::npos);
     TEST_ASSERT(recall != std::string::npos && recall > answer);
-    TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
     TEST_ASSERT(question != std::string::npos && question > recall);
+    // The passage comes back whole, not as the fragment the view lacks.
+    TEST_ASSERT(text2.find("alpha facts live here. filler filler filler. beta facts",
+                           recall) != std::string::npos);
     TEST_ASSERT(served3 == served2);
-    TEST_ASSERT(modes == std::vector<std::string>({"fresh", "continue", "repeat"}));
+    // A question that misses most of a fresh selection starts a new view.
+    const std::string text4 = tokenizer.decode(served4);
+    TEST_ASSERT(text4.find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(text4.find(" gamma gamma") != std::string::npos);
+    TEST_ASSERT(text4.find("beta facts") == std::string::npos);
+    TEST_ASSERT(modes == std::vector<std::string>(
+        {"fresh", "continue", "repeat", "rebuild"}));
     unlink(path.c_str());
 }
 

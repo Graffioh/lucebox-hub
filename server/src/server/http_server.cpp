@@ -4789,9 +4789,11 @@ bool HttpServer::serve_pflash_chat_view(
     // Recall: what a fresh selection for the new question keeps that the
     // view does not hold. Only a new user turn brings a new question; an
     // agent step (assistant call plus tool output) appends without
-    // recalling. What is missing is appended, whatever its size, so the
-    // cached view is never thrown away for a new topic; the view starts over
-    // from the fresh selection only when it outgrows it (below).
+    // recalling. What is missing is appended, so the view keeps what earlier
+    // turns recalled. A question that misses more than half of a fresh
+    // selection (the conversation moved to other material) starts a new view
+    // from that selection instead: past that, prefilling the fresh prompt
+    // from the start costs about as much as appending.
     std::vector<PFlashTokenSpan> recalled;
     if (compressed && recall) {
         auto in_view = view.spans;
@@ -4799,6 +4801,13 @@ bool HttpServer::serve_pflash_chat_view(
         in_view = http_detail::canonicalize_pflash_token_spans(std::move(in_view));
         const auto missing =
             http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
+        size_t missing_size = 0;
+        for (const auto & part : missing) {
+            missing_size += (size_t) (part.end - part.begin);
+        }
+        if (2 * missing_size > fresh->size()) {
+            return serve_fresh("rebuild", view.turns + 1);
+        }
         // Whole kept pieces: a passage the view holds only part of comes
         // back in one piece, in order, not as a fragment far from the rest.
         for (const auto & span : *kept_spans) {
@@ -4897,12 +4906,11 @@ bool HttpServer::serve_pflash_chat_view(
     if (!ends_with_generation(served)) {
         return compressed && serve_fresh("fresh", 1);
     }
-    // Rebuild when the view outgrew what a fresh selection keeps, or the
-    // context: the fresh prompt starts a new view, prefilled from scratch.
+    // Rebuild when the view outgrew the context: the fresh prompt starts a
+    // new view, prefilled from scratch.
     const bool too_long = config_.max_ctx > 0 &&
         (int) served.size() + req.max_output > config_.max_ctx;
-    const bool outgrown = compressed && served.size() > 2 * fresh->size();
-    if (too_long || outgrown) {
+    if (too_long) {
         return compressed && serve_fresh("rebuild", view.turns + 1);
     }
 
