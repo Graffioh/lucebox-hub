@@ -152,6 +152,7 @@ Untagged variables are operational tuning knobs.
 | `LUCE_PREFILL_DRAFTER` | Drafter participation during prefill. |
 | `LUCE_PREFILL_KEEP` | Keep prefill cache across requests. |
 | `LUCE_PREFILL_CACHE_SLOTS` / `LUCE_PREFIX_CACHE_SLOTS` | Optional prefill/prefix cache slot override. When unset, the container preserves the native server defaults (prefix: 32; exact prefill: 0). Set either value to `0` for an explicit opt-out. |
+| `LUCE_PREFIX_CACHE_MAX_MIB` | Container-entrypoint equivalent of `--prefix-cache-max-mib`; the native `luce_server` binary does not read it. When unset, the server default `auto` applies. |
 | `LUCE_PREFILL_POOL_TRIM_TOKENS` | Opt-in interval for trimming cached legacy CUDA/HIP pool allocations between completed Qwen3.5 prefill chunks. Useful when a single long, shape-changing prefill would otherwise exhaust VRAM before request cleanup. |
 | `LUCE_PREFILL_CACHE_TEST_LOG` / `LUCE_PREFILL_CACHE_TEST_PORT` | 🧪 **test/bench** Prefill-cache test harness. |
 | `LUCE_LAYER_PREFILL` / `LUCE_PREFILL_UBATCH` | Layer-split prefill / prefill micro-batch. |

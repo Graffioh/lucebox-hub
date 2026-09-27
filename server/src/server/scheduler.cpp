@@ -479,7 +479,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 restore_policy_slot,
                 [&engine](int target_cut) {
                     return engine.estimate_prefix_store_bytes(target_cut);
-                });
+                },
+                req.ends_with_tool_result);
             if (capture_reservation.active()) {
                 const uint64_t capture_id = next_prefix_capture_id++;
                 if (next_prefix_capture_id == 0)

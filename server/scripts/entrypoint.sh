@@ -28,7 +28,7 @@
 #   LUCE_CACHE_TYPE_K/V       KV cache types
 #   LUCE_PREFILL_MODE         off|auto|always PFlash compression (default: off)
 #   LUCE_PREFILL_KEEP, LUCE_PREFILL_THRESHOLD, LUCE_PREFILL_DRAFTER
-#   LUCE_PREFIX_CACHE_SLOTS, LUCE_PREFILL_CACHE_SLOTS
+#   LUCE_PREFIX_CACHE_SLOTS, LUCE_PREFIX_CACHE_MAX_MIB, LUCE_PREFILL_CACHE_SLOTS
 #   LUCE_DEFAULT_MAX_TOKENS, LUCE_MODEL_NAME, LUCE_THINK_MAX, LUCE_FA_WINDOW,
 #   LUCE_MMPROJ
 # Other LUCE_* variables reach luce_server unchanged.
@@ -328,6 +328,7 @@ CMD=("$LUCE_SERVER_BIN" "$LUCE_TARGET"
 # Cache defaults belong to luce_server: omitting the variable keeps the native
 # default, and explicit values (including 0) are forwarded.
 [ -n "${LUCE_PREFIX_CACHE_SLOTS:-}" ] && CMD+=(--prefix-cache-slots "$LUCE_PREFIX_CACHE_SLOTS")
+[ -n "${LUCE_PREFIX_CACHE_MAX_MIB:-}" ] && CMD+=(--prefix-cache-max-mib "$LUCE_PREFIX_CACHE_MAX_MIB")
 [ -n "${LUCE_PREFILL_CACHE_SLOTS:-}" ] && CMD+=(--prefill-cache-slots "$LUCE_PREFILL_CACHE_SLOTS")
 
 if [ -n "$DRAFT_ARG" ]; then

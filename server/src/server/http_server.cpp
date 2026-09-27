@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -1230,6 +1231,57 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
+// Memory the auto budget takes a quarter of: what is available once the
+// model has loaded (a container's cgroup v2 limit included; Windows too),
+// else total physical memory where the probe cannot read it.
+static size_t budgetable_memory_bytes() {
+    if (const auto available = available_kv_offload_memory()) return *available;
+#if !defined(_WIN32)
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0) return (size_t)pages * (size_t)page_size;
+#endif
+    return 0;
+}
+
+PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
+                                              const ModelBackend & backend) {
+    PrefixCacheBudget out;
+    // No prefix cache, nothing to bound (e.g. single-sequence paged serving).
+    if (config.prefix_cache_cap <= 0) return out;
+    if (config.concurrent_paged_prefix_cache) {
+        out.bytes = config.concurrent_prefix_cache_max_bytes;
+        return out;
+    }
+    out.automatic =
+        config.prefix_cache_max_bytes == ServerConfig::kPrefixCacheBudgetAuto;
+    const size_t full_context_bytes =
+        backend.snapshot_bytes_estimate(std::numeric_limits<int>::max());
+    out.sized = full_context_bytes > 0;
+    if (!out.sized) {
+        // The cache cannot check a capture it cannot size, so a requested
+        // limit would never apply. Auto stays unlimited, as before.
+        if (!out.automatic && config.prefix_cache_max_bytes != 0) {
+            out.error = "--prefix-cache-max-mib needs a backend that can size "
+                        "prefix snapshots (Qwen or DeepSeek4 single-sequence "
+                        "serving); this one cannot. Use --prefix-cache-slots "
+                        "to bound memory.";
+        }
+        return out;
+    }
+    if (!out.automatic) {
+        out.bytes = config.prefix_cache_max_bytes;
+        return out;
+    }
+    // Room for three snapshots at the backend's full context: the
+    // system/tools head, the conversation's restore point, and the capture
+    // in flight. Never more than a quarter of the memory available.
+    out.bytes = full_context_bytes * 3;
+    const size_t memory = budgetable_memory_bytes();
+    if (memory > 0) out.bytes = std::min(out.bytes, memory / 4);
+    return out;
+}
+
 HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
@@ -1239,8 +1291,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
     , prefix_cache_(config.prefix_cache_cap, tokenizer,
-          config.concurrent_paged_prefix_cache
-              ? config.concurrent_prefix_cache_max_bytes : 0)
+          resolve_prefix_cache_budget(config, engine.backend()).bytes)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -1259,6 +1310,9 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
+    // Single-sequence commits prune superseded snapshots (see
+    // trim_snapshots_after_commit); the paged scheduler does not.
+    prefix_cache_.set_prunes_superseded(!config.concurrent_paged_prefix_cache);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -2461,6 +2515,9 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
 
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
+        req.ends_with_tool_result = !chat_messages.empty() &&
+            (chat_messages.back().role == "tool" ||
+             chat_messages.back().role == "function");
         // Reasoning must be applied BEFORE rendering: the template injects
         // the empty <think>\n\n</think>\n\n block when thinking is disabled.
         apply_request_reasoning(body, config_, req);
@@ -3775,12 +3832,21 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         // the deepest slot on linearly-growing conversations.
         const int restore_source_slot =
             cache.using_restore ? cache.cache_slot : -1;
+        // Prefill resumes at the backend's restored position, and a save
+        // lands at least one snapshot step past it.
+        const int reachable_from =
+            (cache.using_restore ? cache.prefix_len : 0) +
+            backend_.snapshot_granularity();
         cache.snap_reservation = prefix_cache_.reserve_inline_snap(
             effective_prompt,
             cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
             forced_cut,
-            restore_source_slot);
+            restore_source_slot,
+            [this](int target_cut) {
+                return backend_.snapshot_bytes_estimate(target_cut);
+            },
+            req.ends_with_tool_result, reachable_from);
         cache.snap_slot = cache.snap_reservation.slot();
         cache.snap_cut = cache.snap_reservation.target_cut();
     };
@@ -3889,11 +3955,19 @@ void HttpServer::finalize_generation_cache(
                 std::fprintf(stderr,
                     "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
                     cache.snap_cut, saved_position, cache.snap_slot);
-                cache.snap_reservation.commit_at(
-                    effective_prompt, saved_position);
-                // Track the same prefix published by the in-memory cache.
-                // Some backends may save short of the requested cut, so the
-                // shutdown key must not claim rows the snapshot lacks.
+                // Key the entry at the requested cut even when Qwen saved at
+                // an earlier chunk boundary. Matching the longer prefix still
+                // guarantees the saved rows, the restore resumes at the
+                // backend's own position, and the next request's deepen
+                // decision sees the requested cut as covered. Keying at the
+                // saved position re-targets the same cut on every request
+                // and the restore point never moves past it.
+                cache.snap_reservation.commit(
+                    effective_prompt,
+                    backend_.snapshot_bytes_estimate(saved_position));
+                trim_snapshots_after_commit(cache.snap_slot);
+                // The shutdown/disk key is exact: it must not claim rows the
+                // snapshot lacks.
                 slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
                     effective_prompt.begin(),
                     effective_prompt.begin() + saved_position);
@@ -3957,6 +4031,17 @@ void HttpServer::forget_inline_slot_metadata(int slot) {
     if (slot < 0) return;
     agent_turn_cache_slots_.erase(slot);
     slot_tokens_.erase(slot);
+}
+
+void HttpServer::trim_snapshots_after_commit(int slot) {
+    const auto release = [this](const std::vector<int> & slots) {
+        for (const int released : slots) {
+            forget_inline_slot_metadata(released);
+            backend_.snapshot_free(released);
+        }
+    };
+    release(prefix_cache_.prune_superseded_ancestors(slot));
+    release(prefix_cache_.enforce_resident_budget(slot));
 }
 
 void HttpServer::remember_agent_turn(
@@ -4045,8 +4130,13 @@ void HttpServer::remember_agent_turn(
     }
 
     const int canonical_end = (int) canonical_tokens.size();
+    // The replay saves at the end of its prefill, which every backend can do
+    // whatever its snapshot granularity.
     auto reservation = prefix_cache_.reserve_inline_snap(
-        canonical_tokens, source_pos, false, canonical_end, source_slot);
+        canonical_tokens, source_pos, false, canonical_end, source_slot,
+        [this](int target_cut) {
+            return backend_.snapshot_bytes_estimate(target_cut);
+        });
     // No safe victim (only the restore source and/or protected pins remain)
     // or no useful boundary: nothing to replay into.
     if (!reservation.active() ||
@@ -4073,7 +4163,10 @@ void HttpServer::remember_agent_turn(
     const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
         ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
-        reservation.commit_at(canonical_tokens, saved_pos);
+        reservation.commit_at(
+            canonical_tokens, saved_pos,
+            backend_.snapshot_bytes_estimate(saved_pos));
+        trim_snapshots_after_commit(slot);
         canonical_tokens.resize((size_t) saved_pos);
         slot_tokens_[slot] = std::move(canonical_tokens);
         agent_turn_cache_slots_.insert(slot);
@@ -4493,6 +4586,10 @@ void HttpServer::process_job(ServerJob * job) {
             old_keep, new_keep, ema, result.accept_rate);
     }
 
+    // Finalizing may prune the restore source, and its agent-turn mark with
+    // it, once a deeper snapshot lands.
+    const bool restored_agent_turn =
+        agent_turn_cache_slots_.count(cache_slot) != 0;
     finalize_generation_cache(
         req, prepared, cache, result, completion_tokens,
         visible_output_seen, client_disconnected);
@@ -4569,8 +4666,7 @@ void HttpServer::process_job(ServerJob * job) {
     const int cached_prefix_tokens = (std::clamp)(
         result.restored_prefix_tokens, 0, effective_prompt_tokens);
     const bool cache_hit = cached_prefix_tokens > 0;
-    const bool agent_turn_cache_hit = cache_hit &&
-        agent_turn_cache_slots_.count(cache_slot) != 0;
+    const bool agent_turn_cache_hit = cache_hit && restored_agent_turn;
     GenTimings gen_timings{
         result.prefill_s,
         result.decode_s,

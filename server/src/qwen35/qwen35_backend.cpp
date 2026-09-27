@@ -1036,6 +1036,19 @@ int Qwen35Backend::snapshot_cur_pos(int slot) const {
     return prefix_snapshots_[slot].cur_pos;
 }
 
+int Qwen35Backend::snapshot_granularity() const {
+    // do_prefill() saves at the start of the chunk holding the requested cut
+    // and never at the restore point itself.
+    return qwen35_prefill_ubatch(512);
+}
+
+size_t Qwen35Backend::snapshot_bytes_estimate(int tokens) const {
+    // Paged serving keeps no single-sequence snapshots.
+    if (cfg_.paged_attention || !snap_backend_ || tokens <= 0) return 0;
+    return estimate_target_cache_snapshot_bytes(
+        w_, cache_, tokens, ggml_backend_get_default_buffer_type(snap_backend_));
+}
+
 ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     SnapshotRef ref;
     if (slot < 0 || slot >= PREFIX_SLOTS) return ref;

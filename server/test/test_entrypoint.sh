@@ -78,13 +78,14 @@ last_value() {  # value after the last occurrence of a flag
 
 # ── native cache defaults stay with luce_server ─────────────────────────────
 out="$(run_entrypoint --)"
-for flag in --prefix-cache-slots --prefill-cache-slots; do
+for flag in --prefix-cache-slots --prefill-cache-slots --prefix-cache-max-mib; do
     has_flag "$out" "$flag" && fail "entrypoint overrides the native cache default with $flag"
 done
 out="$(run_entrypoint LUCE_PREFIX_CACHE_SLOTS=0 --)"
 has_pair "$out" --prefix-cache-slots 0 || fail "explicit LUCE_PREFIX_CACHE_SLOTS=0 dropped"
-out="$(run_entrypoint LUCE_PREFIX_CACHE_SLOTS=4 LUCE_PREFILL_CACHE_SLOTS=2 -- serve)"
+out="$(run_entrypoint LUCE_PREFIX_CACHE_SLOTS=4 LUCE_PREFIX_CACHE_MAX_MIB=8192 LUCE_PREFILL_CACHE_SLOTS=2 -- serve)"
 has_pair "$out" --prefix-cache-slots 4 || fail "LUCE_PREFIX_CACHE_SLOTS not forwarded"
+has_pair "$out" --prefix-cache-max-mib 8192 || fail "LUCE_PREFIX_CACHE_MAX_MIB not forwarded"
 has_pair "$out" --prefill-cache-slots 2 || fail "LUCE_PREFILL_CACHE_SLOTS not forwarded"
 
 # ── no arguments serves, with auto device selection by default ─────────────

@@ -135,6 +135,8 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    size_t snapshot_bytes_estimate(int tokens) const override;
+    int snapshot_granularity() const override;
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,

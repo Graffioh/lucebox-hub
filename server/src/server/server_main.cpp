@@ -78,6 +78,31 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
     return !out.empty();
 }
 
+// Parses a non-negative MiB count into bytes; rejects values that do not
+// fit in addressable memory.
+static bool parse_mib(const char * value, size_t & out_bytes) {
+    const char * end = value + std::strlen(value);
+    uint64_t mib = 0;
+    const auto parsed = std::from_chars(value, end, mib);
+    constexpr uint64_t bytes_per_mib = 1024ull * 1024ull;
+    if (parsed.ec != std::errc{} || parsed.ptr != end ||
+        mib > (uint64_t)std::numeric_limits<size_t>::max() / bytes_per_mib) {
+        return false;
+    }
+    out_bytes = (size_t)(mib * bytes_per_mib);
+    return true;
+}
+
+// parse_mib, or `auto_bytes` for the literal "auto".
+static bool parse_mib_or_auto(const char * value, size_t auto_bytes,
+                              size_t & out_bytes) {
+    if (std::strcmp(value, "auto") == 0) {
+        out_bytes = auto_bytes;
+        return true;
+    }
+    return parse_mib(value, out_bytes);
+}
+
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
         "Usage: %s <model.gguf> [options]\n"
@@ -160,6 +185,13 @@ static void print_usage(const char * prog) {
         "                       memory. DeepSeek4 reserves --max-ctx per slot.\n"
         "  --model-name <name>  Model name for /v1/models (default: luce)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --prefix-cache-max-mib <auto|MiB>\n"
+        "                       Resident RAM limit for prefix snapshots (default:\n"
+        "                       auto = three snapshots at --max-ctx, at most 1/4 of\n"
+        "                       available memory; 0 unlimited). Qwen and DeepSeek4\n"
+        "                       single-sequence only (not DeepSeek4 mixed-backend\n"
+        "                       splits): other backends stay unlimited under auto\n"
+        "                       and reject an explicit limit\n"
         "  --concurrent-prefix-cache-max-mib <MiB>\n"
         "                       Resident RAM limit for copied concurrent paged\n"
         "                       checkpoints (default: 4096; 0 unlimited)\n"
@@ -541,20 +573,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--decode-kv-offload-mb") == 0 && i + 1 < argc) {
-            const char * value = argv[++i];
-            if (std::strcmp(value, "auto") == 0) {
-                sconfig.decode_kv_offload_bytes = kAutoKvOffloadBytes;
-                continue;
-            }
-            const char * end = value + std::strlen(value);
-            size_t mib = 0;
-            const auto parsed = std::from_chars(value, end, mib);
-            if (parsed.ec != std::errc{} || parsed.ptr != end ||
-                mib > (std::numeric_limits<size_t>::max)() / (1024 * 1024)) {
+            if (!parse_mib_or_auto(argv[++i], kAutoKvOffloadBytes,
+                                   sconfig.decode_kv_offload_bytes)) {
                 std::fprintf(stderr, "[server] --decode-kv-offload-mb requires a nonnegative integer within byte range\n");
                 return 2;
             }
-            sconfig.decode_kv_offload_bytes = mib * 1024 * 1024;
         } else if (std::strcmp(argv[i], "--max-concurrency") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
@@ -598,28 +621,23 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(
                        argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr,
-                    "[server] --concurrent-prefix-cache-max-mib requires "
-                    "a value\n");
-                return 2;
-            }
-            const char * value = argv[++i];
-            const char * end = value + std::strlen(value);
-            uint64_t mib = 0;
-            const auto parsed = std::from_chars(value, end, mib);
-            constexpr uint64_t bytes_per_mib = 1024ull * 1024ull;
-            if (parsed.ec != std::errc{} || parsed.ptr != end ||
-                mib > (uint64_t)std::numeric_limits<size_t>::max() /
-                    bytes_per_mib) {
+            if (i + 1 >= argc ||
+                !parse_mib(argv[++i], sconfig.concurrent_prefix_cache_max_bytes)) {
                 std::fprintf(stderr,
                     "[server] --concurrent-prefix-cache-max-mib must be a "
                     "non-negative "
                     "integer that fits in addressable memory\n");
                 return 2;
             }
-            sconfig.concurrent_prefix_cache_max_bytes =
-                (size_t)(mib * bytes_per_mib);
+        } else if (std::strcmp(argv[i], "--prefix-cache-max-mib") == 0) {
+            if (i + 1 >= argc ||
+                !parse_mib_or_auto(argv[++i], ServerConfig::kPrefixCacheBudgetAuto,
+                                   sconfig.prefix_cache_max_bytes)) {
+                std::fprintf(stderr,
+                    "[server] --prefix-cache-max-mib must be auto or a "
+                    "non-negative integer that fits in addressable memory\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
@@ -1693,16 +1711,33 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n",
                  backend_speculation.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
-    if (sconfig.concurrent_paged_prefix_cache) {
-        if (sconfig.concurrent_prefix_cache_max_bytes == 0) {
-            std::fprintf(stderr,
-                "[server] │  prefix_cache_ram= unlimited\n");
-        } else {
-            std::fprintf(stderr,
-                "[server] │  prefix_cache_ram= %zu MiB resident limit\n",
-                sconfig.concurrent_prefix_cache_max_bytes /
-                    (1024 * 1024));
-        }
+    const PrefixCacheBudget prefix_ram =
+        resolve_prefix_cache_budget(sconfig, *backend);
+    if (!prefix_ram.error.empty()) {
+        std::fprintf(stderr, "[server] %s\n", prefix_ram.error.c_str());
+        return 2;
+    }
+    if (sconfig.concurrent_paged_prefix_cache &&
+        sconfig.prefix_cache_max_bytes != ServerConfig::kPrefixCacheBudgetAuto) {
+        std::fprintf(stderr,
+            "[server] --prefix-cache-max-mib has no effect with concurrent "
+            "serving; use --concurrent-prefix-cache-max-mib\n");
+    }
+    // Store the resolved value: auto depends on the memory available now,
+    // and the budget printed here must be the one the server enforces.
+    if (!sconfig.concurrent_paged_prefix_cache) {
+        sconfig.prefix_cache_max_bytes = prefix_ram.bytes;
+    }
+    if (sconfig.prefix_cache_cap <= 0) {
+        std::fprintf(stderr, "[server] │  prefix_cache_ram= n/a (prefix cache off)\n");
+    } else if (prefix_ram.bytes == 0) {
+        std::fprintf(stderr, "[server] │  prefix_cache_ram= unlimited%s\n",
+                     prefix_ram.sized ? "" : " (backend cannot size snapshots)");
+    } else {
+        std::fprintf(stderr,
+            "[server] │  prefix_cache_ram= %zu MiB resident limit%s\n",
+            prefix_ram.bytes / (1024 * 1024),
+            prefix_ram.automatic ? " (auto)" : "");
     }
     std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
                  sconfig.agent_turn_cache ? "ON" : "off");

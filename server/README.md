@@ -305,6 +305,7 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kvflash-policy drafter\|lru\|qk` | `drafter` | Choose the KVFlash residency policy. |
 | `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
+| `--prefix-cache-max-mib <auto\|MiB>` | `auto` | Resident RAM limit for single-sequence prefix snapshots (Qwen and DeepSeek4); `auto` keeps room for three snapshots at `--max-ctx`, at most a quarter of available memory; `0` is unlimited. See [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md#configuration). |
 | `--concurrent-prefix-cache-max-mib <MiB>` | `4096` | Resident RAM limit for copied concurrent paged prefix checkpoints; `0` is unlimited. |
 | `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |

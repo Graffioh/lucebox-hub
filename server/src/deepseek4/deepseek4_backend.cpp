@@ -23,6 +23,7 @@
 #endif
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
@@ -3829,6 +3830,42 @@ bool DeepSeek4Backend::snapshot_used(int slot) const {
 int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return snapshots_[slot].cur_pos;
+}
+
+size_t DeepSeek4Backend::snapshot_bytes_estimate(int tokens) const {
+    // Paged serving keeps no single-sequence snapshots.
+    if (cfg_.paged_attention || !cache_.ctx || !snap_backend_ || tokens <= 0) {
+        return 0;
+    }
+    // snapshot_save() stores the last logits and at most n_swa rows of DSpark
+    // features, in the snapshot buffer and again in snapshot_aux_.
+    const size_t n_logits = (size_t) std::max(0, w_.n_vocab);
+    const size_t n_features = spec_drafter_
+        ? (size_t) std::min(tokens, std::max(0, w_.n_swa)) *
+              (size_t) spec_drafter_->n_target_layers * (size_t) w_.n_embd
+        : 0;
+    static const float kDeclared = 0.0f;  // declare reads sizes, never data
+    DeepSeek4SnapshotAux aux;
+    aux.logits = n_logits ? &kDeclared : nullptr;
+    aux.n_logits = n_logits;
+    aux.spec_feat = n_features ? &kDeclared : nullptr;
+    aux.n_spec_feat = n_features;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() *
+                  (deepseek4_snapshot_tensor_count(cache_.n_layer, true) + 4) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return 0;
+    DeepSeek4Snapshot layout;
+    size_t bytes = 0;
+    if (deepseek4_snapshot_declare_at(ctx, cache_, tokens, w_.compress_ratios,
+                                      0, cache_.n_layer, nullptr, &aux, layout)) {
+        bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(snap_backend_));
+    }
+    ggml_free(ctx);
+    return bytes ? bytes + (n_logits + n_features) * sizeof(float) : 0;
 }
 
 ModelBackend::SnapshotRef DeepSeek4Backend::snapshot_ref(int slot) const {

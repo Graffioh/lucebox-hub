@@ -198,14 +198,29 @@ struct ModelBackend {
     virtual SeqEngine * seq_engine() { return nullptr; }
 
     // ── Snapshots ────────────────────────────────────────────────────
-    // With right-sized CPU-resident snapshots, each slot costs only
-    // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.
+    // Snapshots are right-sized to cur_pos and live in system RAM on
+    // discrete GPUs. Hybrid models also copy their full recurrent state, so
+    // each snapshot has a large fixed cost (see docs/PREFIX_CACHE.md).
     static constexpr int kMaxSlots = 64;
 
     virtual bool snapshot_save(int slot) = 0;
     virtual void snapshot_free(int slot) = 0;
     virtual bool snapshot_used(int slot) const = 0;
     virtual int  snapshot_cur_pos(int slot) const = 0;
+
+    // Snapshots land on multiples of this many positions past the restore
+    // point, so a cut closer than one step to it cannot be saved. Qwen saves
+    // only at prefill chunk starts; exact-position backends return 1.
+    virtual int snapshot_granularity() const { return 1; }
+
+    // System-memory bytes a snapshot of the first `tokens` positions would
+    // take; positions beyond the cache capacity are clamped to it. Returns
+    // 0 when the backend cannot estimate, which disables the prefix cache's
+    // resident-memory budget for this backend.
+    virtual size_t snapshot_bytes_estimate(int tokens) const {
+        (void)tokens;
+        return 0;
+    }
 
     // RESTORE <slot> <prompt_path> <n_gen> — restore snapshot + generate.
     // Backend handles the diff-prefill and decode internally.
