@@ -2669,7 +2669,15 @@ static void test_hybrid_prefill_chunk_tokens() {
     std::fprintf(stderr, "  test_hybrid_prefill_chunk_tokens ...");
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 0) == 2048);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4096) == 2048);
+    // Unqualified placements keep the 1K long-context guard.
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(2048, 4097) == 1024);
+    // The qualified R9700 + Strix Halo placement caps long contexts at 2K.
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 4097, 0, kDs4QualifiedLongContextChunk) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    8192, 18432, 0, kDs4QualifiedLongContextChunk) == 2048);
+    TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(
+                    2048, 4096, 0, kDs4QualifiedLongContextChunk) == 2048);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(1024, 8192) == 1024);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(512, 8192) == 512);
     TEST_ASSERT(deepseek4_hybrid_prefill_chunk_tokens(0, 8192) == 1);
@@ -3037,12 +3045,32 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
                 for (int accepted = 0; accepted <= q; ++accepted) {
                     load(initial, copy_backend != nullptr);
                     deepseek4_spec_rollback_save(cache, rollback, pos, q, copy_backend, pinned);
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+                    {
+                        // Mirrors device_rollback_enabled(): only an exact
+                        // "0" turns device staging off.
+                        const char * device_env = std::getenv("LUCE_DS4_DEVICE_ROLLBACK");
+                        const bool device_off = device_env && std::strcmp(device_env, "0") == 0;
+                        if (copy_backend && ggml_backend_is_cuda(copy_backend) && !device_off &&
+                            pos == 0 && q == 1 && accepted == 0) {
+                            TEST_ASSERT(rollback.uses_device_copy);
+                        }
+                    }
+#endif
                     if (pinned && pos == 0 && q == 1 && accepted == 0) {
-                        const auto host_type = ggml_backend_dev_host_buffer_type(
-                            ggml_backend_get_device(backend));
-                        TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
-                        TEST_ASSERT(rollback.pinned_buf &&
-                            ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                        // Device staging takes precedence on a GPU backend
+                        // that holds every rollback tensor; pinned host
+                        // staging is the fallback.
+                        if (rollback.uses_device_copy) {
+                            // Device staging never creates the pinned buffer.
+                            TEST_ASSERT(!rollback.pinned_buf);
+                        } else {
+                            const auto host_type = ggml_backend_dev_host_buffer_type(
+                                ggml_backend_get_device(backend));
+                            TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
+                            TEST_ASSERT(rollback.pinned_buf &&
+                                ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                        }
                     }
                     auto verified = initial;
                     advance(verified, pos, q);

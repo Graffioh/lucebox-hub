@@ -1,4 +1,59 @@
 cmake_minimum_required(VERSION 3.21)  # 3.21 adds first-class HIP language support (project(LANGUAGES ... HIP))
+# The options were called DFLASH27B_* (DFLASH_GPU_SAMPLER) before the luce
+# rename. A build directory configured under the old names (or an old -D
+# command line) would otherwise fall back to the defaults without a word: CUDA
+# instead of HIP, gfx1151 instead of the configured GPU. Adopt each old value
+# once, when the new option is unset, empty, or still at its declared default
+# below, then drop the old entry. Keep these defaults in sync with the
+# declarations.
+foreach(_luce_entry
+        "DFLASH27B_GPU_BACKEND=cuda" "DFLASH27B_ENABLE_MIXED_CUDA_HIP=OFF"
+        "DFLASH27B_CUDA_ARCHITECTURES=86" "DFLASH27B_HIP_ARCHITECTURES="
+        "DFLASH27B_COVERAGE=OFF" "DFLASH27B_FA_ALL_QUANTS=ON"
+        "DFLASH27B_ROCMFP2_AFFINE=OFF" "DFLASH27B_HIP_SM80_EQUIV=OFF"
+        "DFLASH27B_USE_BLACKWELL_CONSUMER_FIX=OFF" "DFLASH_GPU_SAMPLER=ON"
+        "DFLASH27B_TESTS=ON" "DFLASH27B_SERVER=ON")
+    string(REGEX MATCH "^(DFLASH27B_|DFLASH_)([^=]+)=(.*)$" _luce_match
+        "${_luce_entry}")
+    set(_luce_old "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+    set(_luce_new "LUCE_${CMAKE_MATCH_2}")
+    set(_luce_default "${CMAKE_MATCH_3}")
+    if(DEFINED CACHE{${_luce_old}})
+        if(NOT DEFINED CACHE{${_luce_new}}
+           OR "$CACHE{${_luce_new}}" STREQUAL ""
+           OR "$CACHE{${_luce_new}}" STREQUAL "${_luce_default}")
+            if(NOT "$CACHE{${_luce_old}}" STREQUAL "$CACHE{${_luce_new}}")
+                if(DEFINED CACHE{${_luce_new}})
+                    get_property(_luce_type CACHE ${_luce_new} PROPERTY TYPE)
+                else()
+                    get_property(_luce_type CACHE ${_luce_old} PROPERTY TYPE)
+                endif()
+                if(_luce_type STREQUAL "UNINITIALIZED")
+                    if(_luce_default MATCHES "^(ON|OFF)$")
+                        set(_luce_type BOOL)
+                    else()
+                        set(_luce_type STRING)
+                    endif()
+                endif()
+                set(${_luce_new} "$CACHE{${_luce_old}}" CACHE ${_luce_type} "" FORCE)
+                message(WARNING
+                    "${_luce_old} is renamed ${_luce_new}; using "
+                    "${_luce_new}=$CACHE{${_luce_old}}")
+            endif()
+        elseif(NOT "$CACHE{${_luce_old}}" STREQUAL "$CACHE{${_luce_new}}")
+            message(WARNING
+                "${_luce_old}=$CACHE{${_luce_old}} is ignored: "
+                "${_luce_new}=$CACHE{${_luce_new}} is already set")
+        endif()
+        unset(${_luce_old} CACHE)
+    endif()
+endforeach()
+unset(_luce_entry)
+unset(_luce_match)
+unset(_luce_old)
+unset(_luce_new)
+unset(_luce_default)
+unset(_luce_type)
 set(LUCE_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip")
 set_property(CACHE LUCE_GPU_BACKEND PROPERTY STRINGS cuda hip)
 option(LUCE_ENABLE_MIXED_CUDA_HIP
@@ -1258,6 +1313,22 @@ if(LUCE_TESTS)
         target_link_libraries(test_deepseek4_hc_cuda PRIVATE luce_common ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_hc_cuda)
     endif()
+    # Helper copies must not break another thread's graph capture (several
+    # models served by one process).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_capture_safe_copies.cpp")
+        add_executable(test_capture_safe_copies test/test_capture_safe_copies.cpp)
+        target_include_directories(test_capture_safe_copies PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(LUCE_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_capture_safe_copies PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+            target_link_libraries(test_capture_safe_copies PRIVATE hip::host)
+        else()
+            target_compile_definitions(test_capture_safe_copies PRIVATE LUCE_BACKEND_CUDA=1)
+            target_link_libraries(test_capture_safe_copies PRIVATE CUDA::cudart)
+        endif()
+        target_link_libraries(test_capture_safe_copies PRIVATE luce_common Threads::Threads)
+        # Registered through the CppUnit list below.
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_mmid_grouped_cuda.cpp")
         add_executable(test_deepseek4_mmid_grouped_cuda test/test_deepseek4_mmid_grouped_cuda.cpp)
         if(LUCE_GPU_BACKEND STREQUAL "hip")
@@ -1318,6 +1389,19 @@ if(LUCE_TESTS)
         target_link_libraries(test_ds4_moe_combine_cuda PRIVATE
             ggml-cpu ggml ${LUCE_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
+    endif()
+    # Host-only test of the ggml-cuda batched copy: plain C++ on both the CUDA
+    # and HIP builds. Registered through the CppUnit list below.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_copy_batch.cpp")
+        add_executable(test_cuda_copy_batch test/test_cuda_copy_batch.cpp)
+        target_include_directories(test_cuda_copy_batch PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_cuda_copy_batch PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
+        # Same cases with graph copy batching switched off.
+        add_test(NAME test_cuda_copy_batch_disabled COMMAND test_cuda_copy_batch)
+        set_tests_properties(test_cuda_copy_batch_disabled PROPERTIES
+            SKIP_RETURN_CODE 77
+            ENVIRONMENT "GGML_CUDA_DISABLE_COPY_BATCH=1")
     endif()
     if(LUCE_GPU_BACKEND STREQUAL "hip")
         add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
@@ -2070,6 +2154,7 @@ if(LUCE_TESTS)
             test/test_spec_acceptance.cpp
             test/test_ds4_env.cpp
             test/test_kvflash_ubatch.cpp
+            test/test_qwen35_mask_upload.cpp
             test/test_adaptive_keep_ratio.cpp
             test/test_skip_park_guard.cpp
             test/test_bandit_integration.cpp
@@ -2167,6 +2252,12 @@ if(LUCE_TESTS)
             unset(_server_unit_ctest_generated)
             unset(_server_unit_ctest_include)
         endif()
+        # The Qwen35 mask upload cases again with the full-width kill switch
+        # (read once per process, so it needs its own run).
+        add_test(NAME server_unit_qwen35_mask_full_width
+            COMMAND test_server_unit Qwen35MaskUploadFixture)
+        set_tests_properties(server_unit_qwen35_mask_full_width PROPERTIES
+            ENVIRONMENT "LUCE_QWEN35_MASK_FULL_WIDTH=1")
         unset(_server_unit_sources)
         list(APPEND _raw_unit_test_targets test_server_unit)
     endif()
@@ -2309,6 +2400,7 @@ if(LUCE_TESTS)
         test_ggml_cluster_allreduce
         test_qwen35_tensor_parallel
         test_deepseek4_hc_cuda
+        test_capture_safe_copies
         test_flashprefill_kernels
         test_cuda_comm_api
         test_mmq_streamk_iq4_xs
@@ -2318,7 +2410,8 @@ if(LUCE_TESTS)
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
-        test_rocmfp_mix_glu_fusable)
+        test_rocmfp_mix_glu_fusable
+        test_cuda_copy_batch)
     foreach(_cppunit_target IN LISTS _new_cppunit_test_targets)
         if(TARGET ${_cppunit_target})
             target_sources(${_cppunit_target} PRIVATE test/test_unit_main.cpp)

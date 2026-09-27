@@ -22,10 +22,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_FA256_WMMA_MAX_KV` | 32768 | KV length above which the head-256 tensor-core route switches from the rocWMMA kernel to the raw-MMA kernel in `GGML_HIP_ROCWMMA_FATTN` builds (measured crossover on gfx1201). |
 | `LUCE_PAGED_WMMA` | unset (0) | BURN-IN: =1 routes paged full-attention layers (RDNA4, head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Differential-tested against the decode kernel; single-prompt TTFT -21% at 12K and -42% at 44K, batched 8K-pool prefill slightly ahead. |
 | `GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS` | unset | DEBUG: force the paged-attention context partition count (both routes) to bisect partition-overlap and overhead behaviour. |
+| `LUCE_QWEN35_MASK_FULL_WIDTH` | unset | KILL SWITCH (burn-in): =1 restores the full max_ctx-wide causal-mask upload on the Qwen3.5/3.6/3.8 prefill and verify paths. By default only the columns flash attention reads (the live window rounded up to 256, plus one 256 stride) are built and copied. |
 | `LUCE_PREFILL_UBATCH` | backend-dependent (512 in `qwen35_backend.cpp`; 16/384 in `layer_split_daemon.cpp`; `cfg_.chunk` in `qwen35_layer_split_adapter.cpp`) | Prefill ubatch. Under pooled kvflash prefill it is rounded down to a multiple of the pager chunk (never below one chunk) and clamped to the pool, instead of being forced to one chunk per ubatch. |
 | `LUCE_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `LUCE_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
 | `LUCE_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces LUCE_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
+| `GGML_CUDA_DISABLE_COPY_BATCH` | unset | KILL SWITCH (burn-in): set to issue one device memcpy per plain CPY node again. By default ggml-cuda gathers runs of consecutive same-type contiguous CPY nodes with independent byte ranges into one batched copy launch. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `LUCE_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
@@ -60,6 +62,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `LUCE_DS4_TP_FUSED_CACHE_SLOTS` | 8, 24 with `LUCE_DS4_Q5_VERIFY` | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
+| `LUCE_DS4_DEVICE_ROLLBACK` | 1 | KILL SWITCH (burn-in): =0 restores the per-row DS4 speculative-rollback copies (blocking host copies by default, stream-ordered with `LUCE_DS4_ASYNC_ROLLBACK=1`, pinned host staging with `LUCE_DS4_PINNED_ROLLBACK=1`). By default, when the verifier runs on a CUDA/HIP backend that holds every rollback tensor, save and apply stage in device memory with one batched copy each (`ggml_backend_cuda_copy_batch_async`), whatever the async/pinned switches say. |
 | `LUCE_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `LUCE_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
 | `LUCE_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
@@ -88,6 +91,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` / `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
 | `LUCE_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 | `LUCE_ROCMFP2_ROW4` | 1 on gfx1151 for q>2; legacy two-row kernel elsewhere | BURN-IN KILL SWITCH: =0 restores two-row-per-wave ROCmFP2 verification kernels. |
+| `LUCE_MULTI_MODEL_GRAPHS` | unset | =1 keeps GPU graph capture on when one process serves several model blocks (`--load-balancing`). By default the server sets `GGML_CUDA_DISABLE_GRAPHS=1` there, because concurrent captures from different model workers invalidate each other. |
 
 ## Full inventory (generated)
 
@@ -103,7 +107,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `LUCE_LM_HEAD_FIX` - http_server.cpp
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
+- `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
+- `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048 on R9700 + Strix Halo, 1024 elsewhere)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
+- `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_K_TAU` - mmid_adaptive_k.h
 - `LUCE_ADAPTIVE_SPEC_WIDTH` - adaptive_spec_width.h
@@ -138,6 +145,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_DS4_HYBRID_PREFILL_GPU_HC` - deepseek4_graph.cpp
 - `LUCE_DS4_Q5_VERIFY` - deepseek4_backend.cpp, deepseek4_dspark_spec.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp (gfx1151 DSpark default =1: five-row fused verifier and the 24-slot cache; =0 restores the q<=4 verifier)
 - `LUCE_DS4_PINNED_ROLLBACK` - deepseek4_dspark_spec.cpp (gfx1151 DSpark default =1: pinned host rollback state; =0 restores pageable copies)
+- `LUCE_DS4_DEVICE_ROLLBACK` - deepseek4/deepseek4_dspark_spec.cpp
+- `LUCE_DS4_ASYNC_ROLLBACK` - deepseek4_dspark_spec.cpp (=1: stream-ordered per-row rollback copies when device staging is off)
 - `LUCE_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `LUCE_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `LUCE_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
@@ -292,6 +301,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
 - `LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
 - `LUCE_MOE_TP_BACKEND` - deepseek4_backend.cpp
+- `LUCE_MULTI_MODEL_GRAPHS` - server_main.cpp
 - `LUCE_NO_MASK` - laguna_backend.cpp
 - `LUCE_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `LUCE_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp
@@ -348,7 +358,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_FA256_WMMA_MAX_KV` - fattn.cu (ggml-cuda) (rocWMMA/raw-MMA crossover KV length in flag builds)
 - `GGML_HIP_ROCWMMA_FATTN` - server/CMakeLists.txt (BUILD OPTION, not an env var: compiles the rocWMMA fattn kernel; required by `LUCE_FA256_WMMA` and the sub-32K head-256 prefill route)
 - `GGML_CUDA_BATCH_PEER_COPIES` - ggml-cuda.cu (ggml-cuda), deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
+- `GGML_CUDA_DISABLE_COPY_BATCH` - ggml-cuda.cu (ggml-cuda)
 - `GGML_CUDA_GRAPH_MAX_KEYS` - common.cuh (ggml-cuda)
+- `GGML_CUDA_DISABLE_GRAPHS` - common.cuh (ggml-cuda), server_main.cpp (any value disables CUDA/HIP graph capture; the server sets it to 1 when one process serves more than one model block, see `LUCE_MULTI_MODEL_GRAPHS`)
 - `GGML_CUDA_MLA_DENSE_HIGH_RATIO` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_DENSE_WMMA` - fattn.cu, deepseek4_backend.cpp, deepseek4_graph.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
