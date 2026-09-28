@@ -314,25 +314,63 @@ static void ggml_cuda_mul_mat_q_impl(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // LUCE_MMQ_Q8_MEMO=1: the MMVQ q8_1 memo for MMQ tiles. Sibling
+        // matmuls of one evaluation that read the same src1 node (FFN gate
+        // and up, attention projections) share one quantization; the key adds
+        // the tile layout, which depends on src0's type. Same conditions as
+        // the MMVQ memo: an allocated src1, no concurrent streams.
+        static const bool mmq_q8_memo_on = []() {
+            const char * e = getenv("LUCE_MMQ_Q8_MEMO");
+            return e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+        }();
+        const bool use_q8_memo = mmq_q8_memo_on && !grouped_src && !use_native_mxfp4 &&
+            src1->buffer != nullptr && ctx.stream_context().concurrent_events.empty();
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        char * src1_q8_1_ptr = nullptr;
+        bool quantized = false;
+        if (use_q8_memo) {
+            for (const auto & e : ctx.luce_q8_memo) {
+                if (e.layout == 1 && e.src1_node == (const void *) src1 &&
+                    e.src1_data == (const void *) src1_d && e.src0_type == (int) src0->type &&
+                    e.ne[0] == ne10 && e.ne[1] == ne11 && e.ne[2] == ne12 && e.ne[3] == ne13) {
+                    src1_q8_1_ptr = e.buf->ptr;
+                    quantized = true;
+                    break;
+                }
+            }
+            if (!quantized) {
+                ggml_backend_cuda_context::luce_q8_memo_entry ent;
+                ent.src1_node = (const void *) src1;
+                ent.src1_data = (const void *) src1_d;
+                ent.src0_type = (int) src0->type;
+                ent.layout = 1;
+                ent.ne[0] = ne10; ent.ne[1] = ne11; ent.ne[2] = ne12; ent.ne[3] = ne13;
+                ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
+                src1_q8_1_ptr = ent.buf->ptr;
+                ctx.luce_q8_memo.push_back(std::move(ent));
+            }
+        } else {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+            src1_q8_1_ptr = src1_q8_1.ptr;
+        }
 
-        {
+        if (!quantized) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (grouped_src) {
                 quantize_mmq_q8_1_grouped_cuda(
-                    src1_d, src1_q8_1.get(), src0->type,
+                    src1_d, src1_q8_1_ptr, src0->type,
                     ne10, grouped_width,
                     grouped_row_stride, grouped_plane_stride,
                     ne10_padded, ne11, stream);
             } else if (use_native_mxfp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_mxfp4_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -347,7 +385,7 @@ static void ggml_cuda_mul_mat_q_impl(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr,
+            src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr,
             mix_codebooks, mix_modes, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

@@ -1443,6 +1443,7 @@ struct ggml_backend_cuda_context {
         const void * src1_node   = nullptr;  // ggml_tensor identity within the eval
         const void * src1_data   = nullptr;
         int          src0_type   = 0;
+        int          layout      = 0;        // 0: MMVQ q8_1 rows, 1: MMQ tiles
         int64_t      ne[4]       = {0, 0, 0, 0};
         std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
     };
