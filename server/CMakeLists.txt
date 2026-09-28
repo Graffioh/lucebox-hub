@@ -1914,6 +1914,27 @@ if(LUCE_TESTS)
         endif()
     endif()
 
+    # PFlash fold replay: the runtime's fold selection over recorded traces
+    # (CPU only; the drafter GGUF supplies the vocabulary).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_fold_replay.cpp")
+        add_executable(pflash_fold_replay test/pflash_fold_replay.cpp)
+        target_include_directories(pflash_fold_replay PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+        if(LUCE_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(pflash_fold_replay PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(pflash_fold_replay PRIVATE
+                LUCE_BACKEND_CUDA=1
+                LUCE_CUDA_MIN_SM=${_luce_cuda_min_sm})
+        endif()
+        target_link_libraries(pflash_fold_replay PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+        if(LUCE_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(pflash_fold_replay PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(pflash_fold_replay PRIVATE hip::host)
+        endif()
+    endif()
+
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     # Shared image input: request transport and JPEG/PNG decoding.
     add_executable(test_image_input test/test_image_input.cpp src/server/image_input.cpp)
