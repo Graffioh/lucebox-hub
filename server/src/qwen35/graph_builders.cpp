@@ -383,8 +383,14 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments,
     int n_prefill_segments,
     int n_logits_rows,
-    bool compact_slots) {
+    bool compact_slots,
+    bool capture_chain_replay) {
     step_graph_free(sg);
+    if (capture_chain_replay &&
+        (capture_delta_intermediate || paged_attention || n_seqs != 1 ||
+         n_prefill_tokens != 0 || compact_slots)) {
+        return false;
+    }
 
     // Compact n_seqs is a decode graph bucket width, not the physical
     // slot count. active_slot_ids maps live rows to cache columns and uses -1
@@ -648,6 +654,7 @@ bool build_target_step(
     gi.kv_start                   = kv_start;
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
+    gi.capture_chain_replay       = capture_chain_replay;
     gi.capture_moe_router         = capture_moe_router;
     gi.fa_window                  = fa_window;
     gi.logits_tail_rows           = logits_tail_rows;

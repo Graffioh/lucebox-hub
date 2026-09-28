@@ -759,6 +759,213 @@ bool run_grouped_chain_case(ggml_backend_t backend) {
     return ok;
 }
 
+// Single-sequence chain verify with rollback by replay (Qwen35DFlashTarget
+// chain replay) against the per-token checkpoint path it replaces. The
+// checkpoint verify writes the state after every token into a persistent
+// buffer and rollback copies entry k-1; the replay verify leaves the base
+// state alone and the commit applies the first k logged transitions. Both
+// verifies must produce identical attention output, and every accepted
+// prefix must land on the checkpointed state within STATE_TOLERANCE.
+bool run_chain_checkpoint_parity_case(ggml_backend_t backend, int tokens,
+                                      bool raw_gates) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "chain replay vs checkpoint T=%d%s",
+                  tokens, raw_gates ? " raw" : "");
+    std::mt19937 rng(20260928u + 7u*(unsigned) tokens + (raw_gates ? 1u : 0u));
+    std::uniform_real_distribution<float> small(-0.25f, 0.25f);
+    std::uniform_real_distribution<float> state_dist(-0.06f, 0.06f);
+    std::uniform_real_distribution<float> gate_dist(0.82f, 0.98f);
+    std::uniform_real_distribution<float> beta_dist(0.15f, 0.85f);
+    std::uniform_real_distribution<float> raw_dist(-1.5f, 1.5f);
+
+    std::vector<float> q((size_t) S*KEY_HEADS*tokens);
+    std::vector<float> k(q.size());
+    std::vector<float> v((size_t) S*H*tokens);
+    std::vector<float> g((size_t) H*tokens);
+    std::vector<float> beta((size_t) H*tokens);
+    std::vector<float> state((size_t) S*S*H);
+    std::vector<float> gates((size_t) 2*H);
+    for (float & value : q) value = small(rng);
+    for (float & value : v) value = small(rng);
+    for (float & value : state) value = state_dist(rng);
+    // Unit-norm keys, as the l2-normalized production keys.
+    for (int token = 0; token < tokens; ++token) {
+        for (int head = 0; head < KEY_HEADS; ++head) {
+            float * row = k.data() + ((size_t) token*KEY_HEADS + head)*S;
+            float norm2 = 0.0f;
+            for (int i = 0; i < S; ++i) {
+                row[i] = small(rng);
+                norm2 += row[i]*row[i];
+            }
+            const float inv = 1.0f/std::sqrt(norm2);
+            for (int i = 0; i < S; ++i) row[i] *= inv;
+        }
+    }
+    for (float & value : g) {
+        value = raw_gates ? raw_dist(rng) : std::log(gate_dist(rng));
+    }
+    for (float & value : beta) {
+        value = raw_gates ? raw_dist(rng) : beta_dist(rng);
+    }
+    for (int head = 0; head < H; ++head) {
+        gates[(size_t) head] = raw_dist(rng);            // dt_bias
+        gates[(size_t) H + head] = -std::exp(raw_dist(rng)); // A
+    }
+
+    ggml_init_params params{};
+    params.mem_size = 8*1024*1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    auto input = [&](int64_t a, int64_t b, int64_t c) {
+        return ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a, b, c, 1);
+    };
+    ggml_tensor * tq = input(S, KEY_HEADS, tokens);
+    ggml_tensor * tk = input(S, KEY_HEADS, tokens);
+    ggml_tensor * tv = input(S, H, tokens);
+    ggml_tensor * tg = input(1, H, tokens);
+    ggml_tensor * tbeta = input(1, H, tokens);
+    ggml_tensor * checkpoint_state = input(S, S, H);
+    ggml_tensor * replay_base = input(S, S, H);
+    ggml_tensor * committed = input(S, S, H);
+    ggml_tensor * checkpoints = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S, S, H, tokens);
+    ggml_tensor * gate_ba = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2*H);
+    ggml_tensor * conv_input = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, CONV_WINDOW + tokens, CONV_CHANNELS, 1, 1);
+    ggml_tensor * conv_state = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, CONV_WINDOW, CONV_CHANNELS, 1, 1);
+    ggml_tensor * accepted = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    // Checkpoint verify: per-token states persisted through src[7], as the
+    // graph builder's persist_inter route does.
+    ggml_tensor * checkpoint_result = ggml_gated_delta_net(
+        ctx, tq, tk, tv, tg, tbeta, checkpoint_state);
+    checkpoint_result->src[7] = checkpoints;
+    if (raw_gates) ggml_gated_delta_net_set_raw_gates(checkpoint_result, gate_ba);
+    ggml_tensor * checkpoint_out = ggml_cont(ctx, ggml_view_1d(
+        ctx, checkpoint_result, (int64_t) S*H*tokens, 0));
+    ggml_set_output(checkpoint_out);
+
+    // Replay verify: no intermediates, no state write, compact replay log.
+    ggml_tensor * replay_result = ggml_gated_delta_net(
+        ctx, tq, tk, tv, tg, tbeta, replay_base);
+    if (raw_gates) ggml_gated_delta_net_set_raw_gates(replay_result, gate_ba);
+    ggml_gated_delta_net_set_skip_intermediate(replay_result, true);
+    ggml_tensor * replay_log =
+        ggml_gated_delta_net_capture_replay_log(ctx, replay_result);
+    ggml_set_output(replay_log);
+    ggml_tensor * replay_out = ggml_cont(ctx, ggml_view_1d(
+        ctx, replay_result, (int64_t) S*H*tokens, 0));
+    ggml_set_output(replay_out);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, checkpoint_out);
+    ggml_build_forward_expand(graph, replay_log);
+    ggml_build_forward_expand(graph, replay_out);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+    auto upload = [](ggml_tensor * tensor, const void * data, size_t bytes) {
+        ggml_backend_tensor_set(tensor, data, 0, bytes);
+    };
+    upload(tq, q.data(), q.size()*sizeof(float));
+    upload(tk, k.data(), k.size()*sizeof(float));
+    upload(tv, v.data(), v.size()*sizeof(float));
+    upload(tg, g.data(), g.size()*sizeof(float));
+    upload(tbeta, beta.data(), beta.size()*sizeof(float));
+    upload(gate_ba, gates.data(), gates.size()*sizeof(float));
+    upload(checkpoint_state, state.data(), state.size()*sizeof(float));
+    upload(replay_base, state.data(), state.size()*sizeof(float));
+    std::vector<float> conv_values((size_t) (CONV_WINDOW + tokens)*CONV_CHANNELS);
+    for (size_t i = 0; i < conv_values.size(); ++i) conv_values[i] = 0.001f*(float) i;
+    upload(conv_input, conv_values.data(), conv_values.size()*sizeof(float));
+    const int32_t slot = 0;
+    upload(slots, &slot, sizeof(slot));
+
+    bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+
+    std::vector<float> out_checkpoint((size_t) S*H*tokens);
+    std::vector<float> out_replay(out_checkpoint.size());
+    std::vector<float> base_after(state.size());
+    if (ok) {
+        ggml_backend_tensor_get(checkpoint_out, out_checkpoint.data(), 0,
+                                out_checkpoint.size()*sizeof(float));
+        ggml_backend_tensor_get(replay_out, out_replay.data(), 0,
+                                out_replay.size()*sizeof(float));
+        ggml_backend_tensor_get(replay_base, base_after.data(), 0,
+                                base_after.size()*sizeof(float));
+        if (std::memcmp(out_checkpoint.data(), out_replay.data(),
+                        out_checkpoint.size()*sizeof(float)) != 0) {
+            std::fprintf(stderr, "%s: attention output differs\n", name);
+            ok = false;
+        }
+        if (base_after != state) {
+            std::fprintf(stderr, "%s: replay verify wrote the base state\n", name);
+            ok = false;
+        }
+    }
+
+    size_t bit_mismatches = 0;
+    float max_error = 0.0f;
+    std::vector<float> expected(state.size());
+    std::vector<float> actual(state.size());
+    std::vector<float> conv_actual((size_t) CONV_WINDOW*CONV_CHANNELS);
+    const std::vector<float> conv_zero(conv_actual.size(), -1.0f);
+    for (int prefix = 1; ok && prefix <= tokens; ++prefix) {
+        upload(committed, state.data(), state.size()*sizeof(float));
+        upload(conv_state, conv_zero.data(), conv_zero.size()*sizeof(float));
+        const int32_t count = prefix;
+        upload(accepted, &count, sizeof(count));
+        ok = commit_many_one_layer(replay_log, committed, conv_input,
+                                   conv_state, accepted, slots);
+        if (!ok) {
+            std::fprintf(stderr, "%s: commit rejected prefix %d\n", name, prefix);
+            break;
+        }
+        ggml_backend_tensor_get(committed, actual.data(), 0,
+                                actual.size()*sizeof(float));
+        ggml_backend_tensor_get(checkpoints, expected.data(),
+                                (size_t) (prefix - 1)*checkpoints->nb[3],
+                                expected.size()*sizeof(float));
+        char label[96];
+        std::snprintf(label, sizeof(label), "%s prefix %d", name, prefix);
+        ok = compare_vectors(label, actual, expected, STATE_TOLERANCE);
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (std::memcmp(&actual[i], &expected[i], sizeof(float)) != 0) {
+                ++bit_mismatches;
+                max_error = std::max(max_error,
+                                     std::fabs(actual[i] - expected[i]));
+            }
+        }
+        // The durable conv window is the K-1 inputs ending at the prefix.
+        ggml_backend_tensor_get(conv_state, conv_actual.data(), 0,
+                                conv_actual.size()*sizeof(float));
+        for (int channel = 0; ok && channel < CONV_CHANNELS; ++channel) {
+            for (int i = 0; i < CONV_WINDOW; ++i) {
+                const float want = conv_values[(size_t) channel*(CONV_WINDOW + tokens) +
+                                               prefix + i];
+                if (conv_actual[(size_t) channel*CONV_WINDOW + i] != want) {
+                    std::fprintf(stderr, "%s: conv window prefix %d channel %d\n",
+                                 name, prefix, channel);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    std::printf("gdn %-36s: %s (state bit mismatches %zu, max |diff| %.3g)\n",
+                name, ok ? "PASS" : "FAIL", bit_mismatches, (double) max_error);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
 bool test_replay_log_capture_owns_storage(ggml_backend_t backend) {
     constexpr int state_size = 16;
     constexpr int heads = 1;
@@ -1009,6 +1216,10 @@ int main(int argc, char ** argv) {
     ok = run_case(backend, false, true, "grouped") && ok;
     ok = run_case(backend, true, false, "generic") && ok;
     ok = run_grouped_chain_case(backend) && ok;
+    for (const int tokens : {2, 8, 16}) {
+        ok = run_chain_checkpoint_parity_case(backend, tokens, false) && ok;
+        ok = run_chain_checkpoint_parity_case(backend, tokens, true) && ok;
+    }
     unsetenv("LUCE_GDN_FORCE_GROUPED_COLS");
     setenv("LUCE_GDN_NO_GROUPED_COLS", "1", 1);
     ok = run_case(backend, false, false, "scalar") && ok;

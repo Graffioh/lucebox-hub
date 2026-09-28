@@ -46,6 +46,7 @@ public:
     bool supports_fast_rollback() const override;
     bool exact_fast_rollback() const override { return specla_active(); }
     bool rollback_failure_is_recoverable() const override { return !specla_active(); }
+    bool chain_verify_defers_state() const override { return chain_replay_active(); }
     bool rollback_to(int base_pos, int commit_n) override;
     bool finish_speculative_state() override;
 
@@ -122,6 +123,22 @@ private:
     // SpecLA chain commit: DeltaConstruct over the accepted prefix plus a
     // fused shift/append of raw convolution factors.
     bool rollback_to_specla(int base_pos, int commit_n);
+
+    // Chain replay: a capturing multi-token verify reads the durable SSM and
+    // conv state without writing it, and records a compact per-token replay
+    // log plus the conv window. rollback_to() then advances the state over
+    // the accepted prefix only, so verify neither snapshots the state nor
+    // writes per-token checkpoints. LUCE_GDN_CHAIN_REPLAY=0 restores the
+    // checkpoint path.
+    bool chain_replay_active() const;
+    bool rollback_to_chain_replay(int base_pos, int commit_n);
+    bool ensure_chain_commit_tensors();
+    // Set by a chain-replay verify until its prefix is committed or dropped.
+    bool chain_replay_pending_ = false;
+    ggml_context *        chain_commit_ctx_      = nullptr;
+    ggml_backend_buffer_t chain_commit_buffer_   = nullptr;
+    ggml_tensor *         chain_commit_accepted_ = nullptr;  // [1] i32
+    ggml_tensor *         chain_commit_slots_    = nullptr;  // [1] i32
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;

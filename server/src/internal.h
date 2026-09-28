@@ -839,6 +839,10 @@ struct DeltaNetCapture {
     // tree conv input can advance accepted recurrent prefixes without a
     // second target-model forward. These are graph-owned outputs.
     ggml_tensor * replay_log              = nullptr;
+    // Single-sequence chain verify that leaves durable SSM/conv state
+    // untouched: the graph exposes replay_log and conv_input as graph
+    // outputs and rollback replays the accepted prefix onto the state.
+    bool          chain_replay            = false;
 
     // SpecLA factor capture (docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
@@ -881,6 +885,7 @@ struct QwenGraphInputs {
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
     bool          capture_tree_commit = false; // compact recurrent replay log + tree features
+    bool          capture_chain_replay = false; // chain verify: replay log instead of state writes
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     int           logits_tail_rows = 0; // compute logits only for last n rows; 0 = all

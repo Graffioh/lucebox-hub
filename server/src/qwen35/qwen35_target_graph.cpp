@@ -1582,6 +1582,14 @@ static ggml_tensor * build_delta_net_block(
         specla_max_parallel_chains > 0;
     GGML_ASSERT(!(use_specla_factorized || use_specla_hld) ||
                 (n_seqs == 1 && !ragged && !active_slot_ids));
+    // Chain replay verify reads the durable SSM/conv state and never writes
+    // it. The replay log and the [history | x] conv window are graph
+    // outputs; rollback applies only the accepted prefix to the state.
+    const bool chain_replay = cap && cap->chain_replay;
+    GGML_ASSERT(!chain_replay ||
+                (n_seqs == 1 && !ragged && !active_slot_ids && !parent_ids &&
+                 !cap->ssm_intermediate_states && !cap->conv_input &&
+                 !use_specla_factorized && !use_specla_hld));
 
     // ── Whole-batch projections ─────────────────────────────────────
     // qkv_mixed = wqkv @ cur           [10240, n_tokens]
@@ -1721,9 +1729,9 @@ static ggml_tensor * build_delta_net_block(
     // Replay log commit composes transitions in token order. Its fixed-chain
     // capture therefore uses plain recurrence; parent IDs still drive tree
     // convolution and attention.
-    const bool capture_chain_commit = seg_cap && seg_tree;
+    const bool capture_chain_commit = seg_cap && (seg_tree || chain_replay);
     const bool can_skip_gdn_intermediate =
-        skip_gdn_intermediate && !seg_parent_ids && !seg_cap;
+        skip_gdn_intermediate && !seg_parent_ids && (!seg_cap || chain_replay);
     // Plain one-token decode has no in-graph consumer of the updated state:
     // the next graph evaluation is the first read. Write the final state
     // directly into its persistent slab and avoid materializing/copying a
@@ -1733,7 +1741,7 @@ static ggml_tensor * build_delta_net_block(
     const bool dense_chain = !ragged && !active_slot_ids && !seg_tree;
     const bool inplace_state = (seg_active && !seg_tree) ||
         (allow_inplace_state && can_skip_gdn_intermediate &&
-         !ragged && n_seq_tokens == 1);
+         !chain_replay && !ragged && n_seq_tokens == 1);
 
     // qkv_2d may be a strided view of the stacked (z | qkv) projection, so
     // slice it with an explicit 3D view rather than a reshape.
@@ -1745,13 +1753,15 @@ static ggml_tensor * build_delta_net_block(
         qkv_mixed = contig(qkv_mixed);   // the SpecLA conv kernels raw-index x
     }
     const bool use_chunked = chunked_env_on && can_skip_gdn_intermediate &&
-        !ragged && !active_slot_ids && !seg_tree &&
+        !chain_replay && !ragged && !active_slot_ids && !seg_tree &&
         !use_specla_factorized && !use_specla_hld && n_seq_tokens > 1;
     const bool fused_plain = fused_kernels_env && fused_kernel_backend &&
         dense_chain &&
         !parent_ids && !seg_parent_ids && !use_specla_factorized &&
         !use_specla_hld;
-    const bool fused_conv = fused_plain;
+    // The fused conv step writes the history back; chain replay keeps the
+    // unfused window so the durable conv state stays read-only.
+    const bool fused_conv = fused_plain && !chain_replay;
     // Concurrent verify (mapped tree segment committed from the replay log):
     // the dense chain's fusions on kernels that read the mapped base state
     // in place. One tree-window conv step replaces the history gather,
@@ -1910,7 +1920,7 @@ static ggml_tensor * build_delta_net_block(
             ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
         }
 
-        if (seg_cap && seg_tree && !seg_cap->conv_input) {
+        if (seg_cap && (seg_tree || chain_replay) && !seg_cap->conv_input) {
             seg_cap->conv_input = conv_input;
             ggml_set_output(seg_cap->conv_input);
         }
@@ -1933,7 +1943,7 @@ static ggml_tensor * build_delta_net_block(
             ggml_build_forward_expand(
                 gf, ggml_set_rows_masked(
                         ctx, all_conv, compact_last, seg.active_ids));
-          } else if (!seg_tree) {
+          } else if (!seg_tree && !chain_replay) {
             ggml_build_forward_expand(
                 gf, ggml_cpy(ctx, last_conv, seg.conv_st));
           }
@@ -2173,7 +2183,7 @@ static ggml_tensor * build_delta_net_block(
         S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * r_elt,
         0);
-    if (!inplace_state && !seg_tree) {
+    if (!inplace_state && !seg_tree && !chain_replay) {
         ggml_tensor * new_state = ggml_view_4d(ctx, result,
             S_v, S_v, H_v, seg_seqs,
             S_v * r_elt,
@@ -2388,7 +2398,12 @@ QwenGraphOutputs build_qwen35_graph(
     // If the caller requested capture, size the output list to the total delta-
     // net layer count so we can index by dn_idx as we iterate the layers.
     QwenGraphOutputs og_early{};
-    if (in.capture_delta_intermediate || in.capture_tree_commit) {
+    GGML_ASSERT(!in.capture_chain_replay ||
+                (!in.capture_delta_intermediate && !in.capture_tree_commit &&
+                 in.n_seqs == 1 && in.n_prefill_segments == 0 &&
+                 !in.active_slot_ids && !in.parent_ids));
+    if (in.capture_delta_intermediate || in.capture_tree_commit ||
+        in.capture_chain_replay) {
         const int n_full_attn = w.n_layer / w.full_attention_interval;
         const int n_delta     = w.n_layer - n_full_attn;
         og_early.delta_captures.resize(n_delta);
@@ -2475,8 +2490,10 @@ QwenGraphOutputs build_qwen35_graph(
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
-            if (in.capture_delta_intermediate || in.capture_tree_commit) {
+            if (in.capture_delta_intermediate || in.capture_tree_commit ||
+                in.capture_chain_replay) {
                 cap_ptr = &og_early.delta_captures[dn_idx];
+                cap_ptr->chain_replay = in.capture_chain_replay;
                 // Point at the persistent per-layer cache buffers so
                 // build_delta_net_block can ggml_cpy into them during graph
                 // execution. The caller (test_dflash.cpp spec loop) reads from

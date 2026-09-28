@@ -14,6 +14,7 @@
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
 // builds (e.g. gfx1151) fail with "cudaStream_t undeclared".
 #include "common/gpu_runtime_compat.h"
+#include "ggml-cuda.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -218,6 +219,8 @@ bool copy_meta_recurrent_state(const std::vector<ggml_tensor *> & ssm_source,
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
     step_graph_destroy(proj_sg_);
+    if (chain_commit_buffer_) ggml_backend_buffer_free(chain_commit_buffer_);
+    if (chain_commit_ctx_) ggml_free(chain_commit_ctx_);
 }
 
 Qwen35DFlashTarget::Qwen35DFlashTarget(
@@ -263,7 +266,15 @@ bool Qwen35DFlashTarget::verify_batch(
     // kvflash's set_rows KV-write is mutually exclusive with delta-intermediate
     // capture (graph_builders gates use_kv_write_rows on !capture_delta_intermediate);
     // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
-    const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
+    // A one-token verify keeps the in-place state update: it is always
+    // accepted, so deferring it would only add a commit.
+    const bool chain_replay = capture_ssm_intermediates && n_tokens > 1 &&
+                              chain_replay_active();
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates &&
+                            pager_ == nullptr && !chain_replay;
+    // Durable recurrent state is untouched from here on until the accepted
+    // prefix is committed, including when the verify below fails.
+    chain_replay_pending_ = chain_replay;
 
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
@@ -273,7 +284,18 @@ bool Qwen35DFlashTarget::verify_batch(
                            /*logits_tail_rows=*/0,
                            kq_stride_pad_,
                            /*capture_moe_router=*/false,
-                           /*kvflash_mask=*/pool)) {
+                           /*kvflash_mask=*/pool,
+                           /*capture_qk=*/false,
+                           /*paged_attention=*/false,
+                           /*n_seqs=*/1,
+                           /*seq_slot=*/0,
+                           /*paged_max_kv_len=*/0,
+                           /*n_prefill_tokens=*/0,
+                           /*prefill_segments=*/nullptr,
+                           /*n_prefill_segments=*/0,
+                           /*n_logits_rows=*/0,
+                           /*compact_slots=*/false,
+                           /*capture_chain_replay=*/chain_replay)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
@@ -846,6 +868,82 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     return true;
 }
 
+bool Qwen35DFlashTarget::chain_replay_active() const {
+    static const bool enabled = []() {
+        const char * e = std::getenv("LUCE_GDN_CHAIN_REPLAY");
+        return e == nullptr || e[0] == '\0' || std::strcmp(e, "0") != 0;
+    }();
+    // BailingMoE3's KDA block has no replay-log capture.
+    if (!enabled || !fast_rollback_ || pager_ != nullptr || specla_active() ||
+        w_.is_bailingmoe3 || cache_.ssm_state.empty() ||
+        cache_.conv_state.size() != cache_.ssm_state.size()) {
+        return false;
+    }
+    for (size_t il = 0; il < cache_.ssm_state.size(); ++il) {
+        if (!cache_.ssm_state[il] || !cache_.conv_state[il]) return false;
+    }
+    // Tensor-parallel meta tensors keep their per-rank checkpoint rollback.
+    return !is_meta_tensor(cache_.ssm_state.front());
+}
+
+bool Qwen35DFlashTarget::ensure_chain_commit_tensors() {
+    if (chain_commit_buffer_) return true;
+    ggml_init_params params{};
+    params.mem_size = 2 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    chain_commit_ctx_ = ggml_init(params);
+    if (!chain_commit_ctx_) return false;
+    chain_commit_accepted_ = ggml_new_tensor_1d(chain_commit_ctx_, GGML_TYPE_I32, 1);
+    chain_commit_slots_ = ggml_new_tensor_1d(chain_commit_ctx_, GGML_TYPE_I32, 1);
+    ggml_set_name(chain_commit_accepted_, "chain_commit_accepted");
+    ggml_set_name(chain_commit_slots_, "chain_commit_slots");
+    chain_commit_buffer_ = ggml_backend_alloc_ctx_tensors(chain_commit_ctx_, backend_);
+    if (!chain_commit_buffer_) {
+        ggml_free(chain_commit_ctx_);
+        chain_commit_ctx_ = nullptr;
+        return false;
+    }
+    // verify_batch always runs against slot 0.
+    const int32_t slot = 0;
+    ggml_backend_tensor_set(chain_commit_slots_, &slot, 0, sizeof(slot));
+    return true;
+}
+
+bool Qwen35DFlashTarget::rollback_to_chain_replay(int base_pos, int commit_n) {
+    const int q_len = cache_.cur_pos - base_pos;
+    const size_t n_delta = cache_.ssm_state.size();
+    if (commit_n <= 0 || commit_n > q_len ||
+        sg_.delta_captures.size() != n_delta ||
+        !ensure_chain_commit_tensors()) {
+        return false;
+    }
+    std::vector<const ggml_tensor *> replay_logs(n_delta);
+    std::vector<ggml_tensor *> states(n_delta);
+    std::vector<const ggml_tensor *> conv_inputs(n_delta);
+    std::vector<ggml_tensor *> conv_states(n_delta);
+    for (size_t il = 0; il < n_delta; ++il) {
+        const DeltaNetCapture & cap = sg_.delta_captures[il];
+        if (!cap.replay_log || !cap.conv_input) return false;
+        replay_logs[il] = cap.replay_log;
+        states[il] = cache_.ssm_state[il];
+        conv_inputs[il] = cap.conv_input;
+        conv_states[il] = cache_.conv_state[il];
+    }
+    const int32_t accepted = commit_n;
+    ggml_backend_tensor_set(chain_commit_accepted_, &accepted, 0, sizeof(accepted));
+    // Validates every layer before the first write; a false return leaves
+    // the durable state as the verify found it.
+    if (!ggml_backend_cuda_gdn_replay_log_commit_many(
+            replay_logs.data(), states.data(), conv_inputs.data(),
+            conv_states.data(), static_cast<int>(n_delta),
+            chain_commit_accepted_, chain_commit_slots_)) {
+        return false;
+    }
+    chain_replay_pending_ = false;
+    cache_.cur_pos = base_pos + commit_n;
+    return true;
+}
+
 bool Qwen35DFlashTarget::snapshot_kv() {
     // SpecLA applies only the already-committed pending path to durable state
     // during verify; current candidates remain in the factor bank. There is
@@ -860,6 +958,12 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
+    if (chain_replay_pending_) {
+        // The last verify never wrote the durable state: dropping its
+        // uncommitted prefix is the whole restore.
+        chain_replay_pending_ = false;
+        return true;
+    }
     if (specla_active()) {
         // A successful SpecLA verify has already folded the *previous*
         // accepted factors into the durable state, while the factors produced
@@ -918,6 +1022,17 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             std::fprintf(stderr, "rollback_to: no delta_captures\n");
         }
         return false;
+    }
+
+    // Chain replay left the state before the verify; commit even when the
+    // whole window matched.
+    if (chain_replay_pending_) {
+        const bool committed = rollback_to_chain_replay(base_pos, commit_n);
+        if (!committed && kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: chain replay commit failed commit_n=%d\n",
+                         commit_n);
+        }
+        return committed;
     }
 
     // SpecLA kept the current candidates out of durable state, so acceptance

@@ -3856,7 +3856,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         //    A plain-decode step verifies only the (always accepted) seed, so
         //    it never rolls back: skip the snapshot copy — unless an armed
         //    emit-phase hook could still force a restore+replay this step.
-        const bool step_has_snapshot = !ar_step || replay_hooks_armed;
+        //    A deferred-state verify leaves the recurrent state untouched
+        //    until rollback_to() commits the accepted prefix, so it needs no
+        //    snapshot either.
+        const bool defers_state =
+            !ar_step && draft_tok.size() > 1 &&
+            target->chain_verify_defers_state();
+        const bool step_has_snapshot =
+            (!ar_step && !defers_state) || replay_hooks_armed;
         const auto profile_snapshot_start = profile_start();
         if (step_has_snapshot && !target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
@@ -3871,7 +3878,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             std::fprintf(stderr, "spec-decode: verify failed\n");
             // Only restore when this step actually took the snapshot;
             // otherwise the copy-back would be up to a whole burst stale.
-            if (step_has_snapshot) target->restore_kv();
+            // A deferred-state restore only drops the uncommitted verify.
+            if (step_has_snapshot || defers_state) target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3888,7 +3896,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (sampled_verify) {
             if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                if (step_has_snapshot) target->restore_kv();
+                if (step_has_snapshot || defers_state) target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
@@ -3973,9 +3981,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         //    than the cost of deferring the bonus to the next step. TP uses
         //    device-local rollback; other paths use the configurable policy.
         rollback_diag.record_accept(accept_n);
+        // A deferred-state commit replays only the accepted prefix, so it is
+        // cheaper than a replay forward at every accept count.
         const bool use_fast_rollback =
             target->supports_fast_rollback() &&
-            (accept_n >= rollback_policy.fast_rollback_threshold);
+            (defers_state ||
+             accept_n >= rollback_policy.fast_rollback_threshold);
 
         int replay_last_tok = -1;
         bool fast_rolled_back = false;
