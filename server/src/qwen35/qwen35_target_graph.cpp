@@ -1294,8 +1294,19 @@ static ggml_tensor * build_full_attn_block(
     // TQ3_0 path: the cache is zero-initialised, so padded rows contribute
     // exp(-row_max) ~ 0 to the (mask-less) softmax denominator.
     const bool  step_invariant = kv_write_rows != nullptr;
+    // LUCE_VERIFY_KV_PAD256=1: masked multi-token verify also spans a
+    // 256-multiple. The mask already holds -inf past the causal edge for one
+    // extra 256 stride, so the result is unchanged, and the aligned span lets
+    // flash attention share each K/V tile across the query heads of a KV head
+    // (ggml-cuda's gqa_opt) instead of reading it once per query head.
+    static const bool verify_pad_env = [] {
+        const char * e = std::getenv("LUCE_VERIFY_KV_PAD256");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    const bool verify_pad = verify_pad_env && attn_mask != nullptr &&
+                            kv_write_rows == nullptr && n_tokens > 1 && n_tokens <= 32;
     const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0 ||
-                               step_invariant) ? 256 : 1;
+                               step_invariant || verify_pad) ? 256 : 1;
     // Round a KV span up to the FA stride.
     const auto padded_kv_len = [&](int len) {
         return ((len + fattn_stride - 1) / fattn_stride) * fattn_stride;
@@ -1426,6 +1437,9 @@ static ggml_tensor * build_full_attn_block(
         if (step_invariant) {
             // Never view past the read tensor (its rows may not be 256-aligned).
             win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
+        }
+        if (verify_pad) {
+            win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1] - win_start);
         }
         // kvflash: KV lives at pool SLOTS, and the caller's mask is built in
         // slot space over the whole pool. Slot indices are not bounded by the
@@ -1759,9 +1773,12 @@ static ggml_tensor * build_delta_net_block(
         dense_chain &&
         !parent_ids && !seg_parent_ids && !use_specla_factorized &&
         !use_specla_hld;
-    // The fused conv step writes the history back; chain replay keeps the
-    // unfused window so the durable conv state stays read-only.
+    // The fused conv step writes the history back; chain replay instead
+    // runs the read-only tree-window step along chain parents (or the
+    // unfused window when its inputs are absent).
     const bool fused_conv = fused_plain && !chain_replay;
+    const bool chain_conv_fused = chain_replay && fused_plain &&
+        cap->chain_conv_slots && cap->chain_conv_parents;
     // Concurrent verify (mapped tree segment committed from the replay log):
     // the dense chain's fusions on kernels that read the mapped base state
     // in place. One tree-window conv step replaces the history gather,
@@ -1826,12 +1843,16 @@ static ggml_tensor * build_delta_net_block(
             conv_channels, n_seq_tokens, 1,
             (size_t)conv_channels*f32,
             (size_t)conv_channels*n_seq_tokens*f32, 0);
-    } else if (verify_fused) {
+    } else if (verify_fused || chain_conv_fused) {
         // One kernel assembles [history | x] per mapped slot along the tree
         // parents and applies silu; the window it writes is the replay-log
         // commit's input. The persistent history stays read-only.
-        ggml_tensor * packed = ggml_ssm_conv_tree_step(
-            ctx, qkv_mixed, L.ssm_conv1d, seg.conv_st, seg.state_ids, seg_parent_ids);
+        ggml_tensor * packed = chain_conv_fused
+            ? ggml_ssm_conv_tree_step(ctx, qkv_mixed, L.ssm_conv1d,
+                  ggml_reshape_3d(ctx, seg.conv_st, w.ssm_d_conv - 1, conv_channels, 1),
+                  cap->chain_conv_slots, cap->chain_conv_parents)
+            : ggml_ssm_conv_tree_step(
+                  ctx, qkv_mixed, L.ssm_conv1d, seg.conv_st, seg.state_ids, seg_parent_ids);
         const size_t f32 = sizeof(float);
         const int64_t window = (int64_t)(w.ssm_d_conv - 1) + n_seq_tokens;
         conv_out = ggml_view_3d(ctx, packed, conv_channels, n_seq_tokens, seg_seqs,
@@ -2494,6 +2515,8 @@ QwenGraphOutputs build_qwen35_graph(
                 in.capture_chain_replay) {
                 cap_ptr = &og_early.delta_captures[dn_idx];
                 cap_ptr->chain_replay = in.capture_chain_replay;
+                cap_ptr->chain_conv_slots = in.chain_conv_slots;
+                cap_ptr->chain_conv_parents = in.chain_conv_parents;
                 // Point at the persistent per-layer cache buffers so
                 // build_delta_net_block can ggml_cpy into them during graph
                 // execution. The caller (test_dflash.cpp spec loop) reads from

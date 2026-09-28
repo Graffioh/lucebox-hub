@@ -655,6 +655,16 @@ bool build_target_step(
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.capture_chain_replay       = capture_chain_replay;
+    if (capture_chain_replay) {
+        sg.chain_conv_slots = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+        sg.chain_conv_parents = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.chain_conv_slots, "chain_conv_slots");
+        ggml_set_name(sg.chain_conv_parents, "chain_conv_parents");
+        ggml_set_input(sg.chain_conv_slots);
+        ggml_set_input(sg.chain_conv_parents);
+        gi.chain_conv_slots = sg.chain_conv_slots;
+        gi.chain_conv_parents = sg.chain_conv_parents;
+    }
     gi.capture_moe_router         = capture_moe_router;
     gi.fa_window                  = fa_window;
     gi.logits_tail_rows           = logits_tail_rows;
@@ -699,6 +709,14 @@ bool build_target_step(
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
     if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
+    if (sg.chain_conv_slots) {
+        const int32_t slot = 0;
+        std::vector<int32_t> parents((size_t)n_tokens);
+        for (int t = 0; t < n_tokens; ++t) parents[(size_t)t] = t - 1;
+        ggml_backend_tensor_set(sg.chain_conv_slots, &slot, 0, sizeof(slot));
+        ggml_backend_tensor_set(sg.chain_conv_parents, parents.data(), 0,
+                                parents.size() * sizeof(int32_t));
+    }
     if (sg.specla_hld) {
         ggml_backend_tensor_set(sg.specla_hld, hld_schedule.packed.data(), 0,
             hld_schedule.packed.size()*sizeof(int32_t));

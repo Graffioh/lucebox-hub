@@ -843,6 +843,9 @@ struct DeltaNetCapture {
     // untouched: the graph exposes replay_log and conv_input as graph
     // outputs and rollback replays the accepted prefix onto the state.
     bool          chain_replay            = false;
+    // Optional fused conv inputs for chain replay (see StepGraph).
+    ggml_tensor * chain_conv_slots        = nullptr;
+    ggml_tensor * chain_conv_parents      = nullptr;
 
     // SpecLA factor capture (docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
@@ -886,6 +889,8 @@ struct QwenGraphInputs {
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
     bool          capture_tree_commit = false; // compact recurrent replay log + tree features
     bool          capture_chain_replay = false; // chain verify: replay log instead of state writes
+    ggml_tensor * chain_conv_slots = nullptr;   // [1] i32, fused chain-replay conv
+    ggml_tensor * chain_conv_parents = nullptr; // [n_tokens] i32 chain parents
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     int           logits_tail_rows = 0; // compute logits only for last n rows; 0 = all

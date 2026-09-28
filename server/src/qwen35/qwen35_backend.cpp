@@ -16,6 +16,7 @@
 #include "attn_masks.h"
 #include "prefill_helpers.h"
 #include "common/sampler.h"
+#include <unordered_map>
 #ifdef LUCE_HAVE_GPU_SAMPLER
 #include "common/geometric_sampler_cuda.h"
 #include <random>
@@ -2786,6 +2787,55 @@ static Qwen35AdaptiveSpecPolicy qwen35_adaptive_spec_policy() {
     return kPolicy;
 }
 
+namespace {
+
+bool sampled_verify_topk_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LUCE_SAMPLED_VERIFY_TOPK");
+        return e && e[0] != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+// The smallest GPU candidate width that holds the sampler's top_k, or 0.
+int sampled_verify_topk_width(int top_k) {
+    for (int k : {8, 16, 20, 24, 32}) {
+        if (top_k <= k) return k;
+    }
+    return 0;
+}
+
+// {row, id, repeat, count} per penalized (row, id), matching sample_logits:
+// row i samples with history = out_tokens, the seed draft_tok[0], then the
+// drafts draft_tok[1..i] accepted before it; both penalties read the last
+// rep_window tokens of that history.
+std::vector<int32_t> sampled_verify_penalties(const SamplerCfg & cfg,
+                                              const std::vector<int32_t> & out_tokens,
+                                              const std::vector<int32_t> & draft_tok,
+                                              int rows) {
+    std::vector<int32_t> entries;
+    const bool rep = cfg.rep_pen > 1.0f;
+    const bool additive = cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f;
+    if (!rep && !additive) return entries;
+    std::vector<int32_t> history = out_tokens;
+    history.push_back(draft_tok[0]);
+    std::unordered_map<int32_t, int32_t> counts;
+    for (int row = 0; row < rows; row++) {
+        if (row > 0) history.push_back(draft_tok[(size_t)row]);
+        const int win = std::min((int)history.size(), cfg.rep_window);
+        counts.clear();
+        for (int j = (int)history.size() - win; j < (int)history.size(); j++) {
+            counts[history[(size_t)j]]++;
+        }
+        for (const auto & [id, count] : counts) {
+            entries.insert(entries.end(), {row, id, rep ? 1 : 0, additive ? count : 0});
+        }
+    }
+    return entries;
+}
+
+}  // namespace
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -3893,7 +3943,51 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // token (it is already a valid target sample at that position).
         int accept_n = 1;
         int bonus_tok = -1;
-        if (sampled_verify) {
+        // LUCE_SAMPLED_VERIFY_TOPK=1: with a top_k sampler, apply each row's
+        // penalties on the device and read back only the top-k candidates
+        // instead of v_len full-vocabulary rows; sample_logits_topk then runs
+        // the same chain and the same single draw per row.
+        // Every row is read: the next seed samples row commit_n - 1 again,
+        // whose penalized candidates these already are.
+        bool sampled_from_topk = false;
+        int topk_width = 0;
+        std::vector<float> topk_logits;
+        std::vector<int32_t> topk_ids;
+        if (sampled_verify && v_len > 1 && sampled_verify_topk_enabled() &&
+            sampler_.temp > 0.0f && sampler_.top_k > 0) {
+            const int k = sampled_verify_topk_width(sampler_.top_k);
+            if (k > 0) {
+                const std::vector<int32_t> penalties =
+                    sampled_verify_penalties(sampler_, out_tokens, draft_tok, v_len);
+                std::vector<float> & top_logits = topk_logits;
+                std::vector<int32_t> & top_ids = topk_ids;
+                if (target->read_verify_topk(v_len, k, penalties, sampler_.rep_pen,
+                                             sampler_.freq_pen, sampler_.pres_pen,
+                                             top_logits, top_ids)) {
+                    topk_width = k;
+                    for (int i = 0; i < v_len - 1; i++) {
+                        const int s = sample_logits_topk(
+                            top_logits.data() + (size_t)i * k, top_ids.data() + (size_t)i * k,
+                            k, sampler_, sampler_rng_);
+                        if (draft_tok[i + 1] == s) {
+                            accept_n++;
+                        } else {
+                            bonus_tok = s;
+                            break;
+                        }
+                    }
+                    sampled_from_topk = true;
+                } else if (!penalties.empty()) {
+                    // The penalties may already sit in the device logits, so
+                    // the full-row fallback below would read them twice.
+                    std::fprintf(stderr, "spec-decode: sampled top-k verify failed\n");
+                    if (step_has_snapshot || defers_state) target->restore_kv();
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+        }
+        if (sampled_verify && !sampled_from_topk) {
             if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                 if (step_has_snapshot || defers_state) target->restore_kv();
@@ -4194,7 +4288,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // distribution. replay_last_tok is the argmax — seeding with it
             // injects one greedy token per step, which biases the output and
             // locks long generations into repetition loops.
-            if (sampled_verify && !replay_tok.empty() &&
+            const int seed_row = (int)replay_tok.size() - 1;
+            if (sampled_from_topk && fast_rolled_back && !replay_tok.empty() &&
+                emitted == (int)replay_tok.size() && seed_row < v_len) {
+                // Row seed_row's walk history is out_tokens as emitted.
+                last_tok = sample_logits_topk(
+                    topk_logits.data() + (size_t)seed_row * topk_width,
+                    topk_ids.data() + (size_t)seed_row * topk_width,
+                    topk_width, sampler_, sampler_rng_);
+            } else if (sampled_from_topk && fast_rolled_back) {
+                // Stopping early (EOS, budget, cancel): no next step reads it.
+                last_tok = replay_last_tok;
+            } else if (sampled_verify && !replay_tok.empty() &&
                 target->read_verify_logits((int)replay_tok.size(), verify_logits)) {
                 const int vocab_v =
                     (int)(verify_logits.size() / replay_tok.size());

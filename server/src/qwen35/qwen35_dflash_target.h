@@ -40,6 +40,11 @@ public:
                       bool capture_ssm_intermediates = false) override;
 
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override;
+    bool read_verify_topk(int n_tokens, int k,
+                          const std::vector<int32_t> & penalties,
+                          float rep_pen, float freq_pen, float pres_pen,
+                          std::vector<float> & top_logits,
+                          std::vector<int32_t> & top_ids) override;
 
     bool snapshot_kv() override;
     bool restore_kv() override;
@@ -133,6 +138,11 @@ private:
     bool chain_replay_active() const;
     bool rollback_to_chain_replay(int base_pos, int commit_n);
     bool ensure_chain_commit_tensors();
+    // The chain commit is enqueued on the target backend's stream without a
+    // host sync. Paths that touch recurrent state from another stream or the
+    // host call this first.
+    void sync_chain_commit();
+    bool chain_commit_in_flight_ = false;
     // Set by a chain-replay verify until its prefix is committed or dropped.
     bool chain_replay_pending_ = false;
     ggml_context *        chain_commit_ctx_      = nullptr;

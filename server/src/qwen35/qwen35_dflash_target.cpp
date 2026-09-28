@@ -16,6 +16,7 @@
 #include "common/gpu_runtime_compat.h"
 #include "ggml-cuda.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -26,6 +27,42 @@ extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
 namespace luce::common {
 namespace {
+
+// LUCE_TP_PROFILE=1: where a verify_batch call spends its wall time
+// (graph build, input uploads, graph compute, argmax readback), printed
+// every 64 calls.
+struct VerifyPhaseTimer {
+    using clock = std::chrono::steady_clock;
+    static bool enabled() {
+        static const bool on = [] {
+            const char * e = std::getenv("LUCE_TP_PROFILE");
+            return e && std::strcmp(e, "0") != 0;
+        }();
+        return on;
+    }
+    clock::time_point start = enabled() ? clock::now() : clock::time_point{};
+    clock::time_point marks[4]{};
+    void mark(int i) { if (enabled()) marks[i] = clock::now(); }
+    void finish(int nodes) {
+        if (!enabled()) return;
+        static double total[4] = {};
+        static long calls = 0;
+        static long node_sum = 0;
+        clock::time_point prev = start;
+        for (int i = 0; i < 4; ++i) {
+            total[i] += std::chrono::duration<double>(marks[i] - prev).count();
+            prev = marks[i];
+        }
+        node_sum += nodes;
+        if (++calls % 64 == 0) {
+            std::fprintf(stderr,
+                "[verify-profile] calls=%ld per call ms: build=%.3f upload=%.3f "
+                "compute=%.3f readback=%.3f nodes=%ld\n",
+                calls, 1e3 * total[0] / calls, 1e3 * total[1] / calls,
+                1e3 * total[2] / calls, 1e3 * total[3] / calls, node_sum / calls);
+        }
+    }
+};
 
 bool is_meta_tensor(const ggml_tensor * tensor) {
     GGML_ASSERT(tensor != nullptr);
@@ -244,6 +281,10 @@ bool Qwen35DFlashTarget::verify_batch(
         bool capture_ssm_intermediates) {
     const int n_tokens = (int)tokens.size();
     if (n_tokens <= 0) return false;
+    VerifyPhaseTimer timer;
+    // Input uploads use another stream and may reuse the graph buffers the
+    // previous commit still reads.
+    sync_chain_commit();
 
     const int hidden = w_.n_embd;
     const bool pool = pager_ != nullptr;
@@ -299,6 +340,7 @@ bool Qwen35DFlashTarget::verify_batch(
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
     }
+    timer.mark(0);
     if (pool && !sg_.kv_write_rows) {
         std::fprintf(stderr, "verify_batch: kvflash requires set_rows path\n");
         return false;
@@ -369,17 +411,21 @@ bool Qwen35DFlashTarget::verify_batch(
                                          base_pos, kq_stride_pad_, win_start);
     }
 
+    timer.mark(1);
     auto st = ggml_backend_graph_compute(backend_, sg_.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
         return false;
     }
+    timer.mark(2);
 
     // Read argmax results from GPU.
     std::vector<int32_t> argmax_buf(n_tokens);
     ggml_backend_tensor_get(sg_.argmax_tokens, argmax_buf.data(), 0,
                             sizeof(int32_t) * n_tokens);
     last_tok = argmax_buf[n_tokens - 1];
+    timer.mark(3);
+    timer.finish(ggml_graph_n_nodes(sg_.gf));
 
     if (all_argmax) {
         *all_argmax = std::move(argmax_buf);
@@ -397,6 +443,33 @@ bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & o
     ggml_backend_tensor_get(sg_.logits, out.data(), 0,
                             sizeof(float) * out.size());
     return true;
+}
+
+bool Qwen35DFlashTarget::read_verify_topk(int n_tokens, int k,
+                                          const std::vector<int32_t> & penalties,
+                                          float rep_pen, float freq_pen, float pres_pen,
+                                          std::vector<float> & top_logits,
+                                          std::vector<int32_t> & top_ids) {
+    if (!sg_.logits || !sg_.logits->data || n_tokens <= 0 ||
+        n_tokens > (int)sg_.logits->ne[1] || !ggml_is_contiguous(sg_.logits) ||
+        sg_.logits->type != GGML_TYPE_F32 || penalties.size() % 4 != 0) {
+        return false;
+    }
+#ifdef LUCE_HAVE_DRAFT_TOPK
+    static_assert(sizeof(GeometricPenalty) == 4 * sizeof(int32_t));
+    const int vocab = (int)sg_.logits->ne[0];
+    top_logits.resize((size_t)n_tokens * k);
+    top_ids.resize((size_t)n_tokens * k);
+    return geometric_extract_topk_logits_cuda(
+        sg_.logits->data, n_tokens, vocab, k,
+        reinterpret_cast<const GeometricPenalty *>(penalties.data()),
+        (int)(penalties.size() / 4), rep_pen, freq_pen, pres_pen,
+        top_logits.data(), top_ids.data());
+#else
+    (void)k; (void)rep_pen; (void)freq_pen; (void)pres_pen;
+    (void)top_logits; (void)top_ids;
+    return false;
+#endif
 }
 
 bool Qwen35DFlashTarget::supports_tree_verify() const {
@@ -580,6 +653,7 @@ bool Qwen35DFlashTarget::rollback_to_tree(
         int committed,
         const DDTree & tree,
         const std::vector<int> & accepted_dfs) {
+    sync_chain_commit();
     if (!fast_rollback_) return false;
     const int commit_n = (int)accepted_dfs.size();
     if (commit_n <= 0) return false;
@@ -913,8 +987,7 @@ bool Qwen35DFlashTarget::rollback_to_chain_replay(int base_pos, int commit_n) {
     const int q_len = cache_.cur_pos - base_pos;
     const size_t n_delta = cache_.ssm_state.size();
     if (commit_n <= 0 || commit_n > q_len ||
-        sg_.delta_captures.size() != n_delta ||
-        !ensure_chain_commit_tensors()) {
+        sg_.delta_captures.size() != n_delta) {
         return false;
     }
     std::vector<const ggml_tensor *> replay_logs(n_delta);
@@ -929,22 +1002,39 @@ bool Qwen35DFlashTarget::rollback_to_chain_replay(int base_pos, int commit_n) {
         conv_inputs[il] = cap.conv_input;
         conv_states[il] = cache_.conv_state[il];
     }
-    const int32_t accepted = commit_n;
-    ggml_backend_tensor_set(chain_commit_accepted_, &accepted, 0, sizeof(accepted));
-    // Validates every layer before the first write; a false return leaves
-    // the durable state as the verify found it.
-    if (!ggml_backend_cuda_gdn_replay_log_commit_many(
-            replay_logs.data(), states.data(), conv_inputs.data(),
-            conv_states.data(), static_cast<int>(n_delta),
-            chain_commit_accepted_, chain_commit_slots_)) {
-        return false;
+    // One launch per kind on the target stream, validated on the host; the
+    // next verify is stream-ordered behind it.
+    if (ggml_backend_cuda_gdn_replay_log_commit_chain(
+            backend_, replay_logs.data(), states.data(), conv_inputs.data(),
+            conv_states.data(), static_cast<int>(n_delta), commit_n, /*slot=*/0)) {
+        chain_commit_in_flight_ = true;
+    } else {
+        // Other shapes: the synchronous commit, which validates every layer
+        // before the first write, so a false return leaves the state as the
+        // verify found it.
+        const int32_t accepted = commit_n;
+        if (!ensure_chain_commit_tensors()) return false;
+        ggml_backend_tensor_set(chain_commit_accepted_, &accepted, 0, sizeof(accepted));
+        if (!ggml_backend_cuda_gdn_replay_log_commit_many(
+                replay_logs.data(), states.data(), conv_inputs.data(),
+                conv_states.data(), static_cast<int>(n_delta),
+                chain_commit_accepted_, chain_commit_slots_)) {
+            return false;
+        }
     }
     chain_replay_pending_ = false;
     cache_.cur_pos = base_pos + commit_n;
     return true;
 }
 
+void Qwen35DFlashTarget::sync_chain_commit() {
+    if (!chain_commit_in_flight_) return;
+    ggml_backend_synchronize(backend_);
+    chain_commit_in_flight_ = false;
+}
+
 bool Qwen35DFlashTarget::snapshot_kv() {
+    sync_chain_commit();
     // SpecLA applies only the already-committed pending path to durable state
     // during verify; current candidates remain in the factor bank. There is
     // therefore no speculative durable mutation to snapshot or undo.
@@ -958,6 +1048,7 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
+    sync_chain_commit();
     if (chain_replay_pending_) {
         // The last verify never wrote the durable state: dropping its
         // uncommitted prefix is the whole restore.
@@ -1260,6 +1351,7 @@ bool Qwen35DFlashTarget::rollback_to_specla(int base_pos, int commit_n) {
 }
 
 bool Qwen35DFlashTarget::finish_speculative_state() {
+    sync_chain_commit();
     if (!specla_active() || cache_.specla_pending_count == 0) return true;
     if (!cache_.factor_k_all || !cache_.factor_v_new_all ||
         !cache_.factor_g_ps_all || !cache_.conv_factor_all ||
