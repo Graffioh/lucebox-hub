@@ -437,25 +437,47 @@ PFlashQueryBlocks pflash_query_blocks(const std::string & t, PFlashTextSpan mess
 }
 
 std::vector<PFlashTextSpan> pflash_message_bodies(const std::string & text) {
-    static const char * kStart = "<|im_start|>";
-    static const char * kEnd = "<|im_end|>";
+    // Only structural markers split: pasted text may quote them literally.
+    // A start marker opens a line and is followed by its role word and a
+    // newline; an end marker is followed by a start marker on the next line
+    // (or ends the text).
+    static const std::string kStart = "<|im_start|>";
+    static const std::string kEnd = "<|im_end|>";
+    const auto start_at = [&](size_t p) -> size_t {   // role line end + 1, or npos
+        if (text.compare(p, kStart.size(), kStart) != 0) return npos;
+        if (p > 0 && text[p - 1] != '\n') return npos;
+        size_t i = p + kStart.size();
+        const size_t role = i;
+        while (i < text.size() && (std::isalpha((unsigned char) text[i]) || text[i] == '_')) ++i;
+        if (i == role || i >= text.size() || text[i] != '\n') return npos;
+        return i + 1;
+    };
+    const auto end_at = [&](size_t p) {
+        if (text.compare(p, kEnd.size(), kEnd) != 0) return false;
+        size_t i = p + kEnd.size();
+        if (i < text.size() && text[i] == '\n') ++i;
+        return i >= text.size() || start_at(i) != npos;
+    };
     std::vector<PFlashTextSpan> bodies;
+    size_t begin = 0;
     size_t pos = 0;
     while (pos < text.size()) {
-        const size_t s = text.find(kStart, pos);
-        const size_t e = text.find(kEnd, pos);
-        const size_t marker = std::min(s, e);
-        const size_t stop = marker == npos ? text.size() : marker;
-        if (stop > pos) bodies.push_back({pos, stop});
+        const size_t marker = text.find("<|im_", pos);
         if (marker == npos) break;
-        if (marker == s) {
-            // Skip the role line.
-            const size_t nl = text.find('\n', s);
-            pos = nl == npos ? text.size() : nl + 1;
-        } else {
-            pos = e + std::strlen(kEnd);
+        const size_t body = start_at(marker);
+        if (body != npos) {
+            if (marker > begin) bodies.push_back({begin, marker});
+            begin = pos = body;
+            continue;
         }
+        if (end_at(marker)) {
+            if (marker > begin) bodies.push_back({begin, marker});
+            begin = pos = marker + kEnd.size();
+            continue;
+        }
+        pos = marker + 1;
     }
+    if (text.size() > begin) bodies.push_back({begin, text.size()});
     return bodies;
 }
 
@@ -1016,6 +1038,417 @@ PFlashFoldResult select_pflash_fold_for_ids(
     auto result = select_pflash_fold(candidates, blocks, policy);
     if (info) *info = std::move(structure);
     if (token_blocks) *token_blocks = blocks;
+    return result;
+}
+
+// ── adaptive levels ────────────────────────────────────────────────────
+
+namespace {
+
+// A record header for the adaptive levels: record_header, minus caption and
+// reference families ("Figure 3:", "Table 2.", "Line 7:") and numbers that
+// run on into a value ("Wall time 6.9 s").
+bool record_start(const std::string & t, const Line & line, RecordHeader & out) {
+    if (t[line.first] == '#') return false;  // a heading is a section, not a record
+    if (!record_header(t, line, out)) return false;
+    if (out.key[0] == '[') return false;     // "[12] Author ..." is a reference list
+    for (const char * word : {"Figure ", "Fig ", "Table ", "Tab ", "Equation ", "Eq ",
+                              "Algorithm ", "Listing ", "Lemma ", "Theorem ", "Definition ",
+                              "Proposition ", "Corollary ", "Example ", "Step ", "Line ",
+                              "Note ", "Page ", "Version "}) {
+        if (out.key.compare(0, std::strlen(word), word) == 0) return false;
+    }
+    // The delimiter ends the line or is followed by a space.
+    size_t i = line.first;
+    while (i < line.end && !std::isdigit((unsigned char) t[i])) ++i;
+    while (i < line.end && std::isdigit((unsigned char) t[i])) ++i;
+    while (i < line.end && is_space(t[i])) ++i;
+    return i + 1 >= line.end || is_space(t[i + 1]);
+}
+
+bool role_marker(const std::string & t, const Line & line) {
+    if (line.first != line.begin) return false;
+    for (const char * role : {"User", "Assistant", "Human", "AI", "user", "assistant",
+                              "USER", "ASSISTANT"}) {
+        const size_t n = std::strlen(role);
+        if (!starts_with(t, line.begin, line.end, role)) continue;
+        size_t i = line.begin + n;
+        if (i < line.end && is_space(t[i]) && t[i] != '\t') ++i;
+        if (i < line.end && t[i] == ':') return true;
+    }
+    return false;
+}
+
+bool bracket_label(const std::string & t, const Line & line) {
+    if (line.first != line.begin || t[line.begin] != '[') return false;
+    size_t last = line.end;
+    while (last > line.begin && (t[last - 1] == ' ' || t[last - 1] == '\t')) --last;
+    if (last - line.begin < 3 || t[last - 1] != ']') return false;
+    const size_t inner = last - 1 - (line.begin + 1);
+    if (inner < 1 || inner > 200) return false;
+    for (size_t i = line.begin + 1; i + 1 < last; ++i) {
+        if (t[i] == ']') return false;
+    }
+    return true;
+}
+
+// Blocks of [a, b) that start at each marked line (the text before the
+// first mark is not a block).
+void split_at(const std::vector<size_t> & marks, size_t b, std::vector<PFlashTextSpan> & out) {
+    for (size_t j = 0; j < marks.size(); ++j) {
+        out.push_back({marks[j], j + 1 < marks.size() ? marks[j + 1] : b});
+    }
+}
+
+void adaptive_segment_levels(const std::string & t, const std::vector<Line> & lines,
+                             PFlashTextSpan seg, const std::vector<PFlashTextSpan> & code_cov,
+                             std::vector<PFlashTextSpan> & out) {
+    // Fences.
+    std::vector<PFlashTextSpan> fences;
+    size_t open = npos;
+    for (const Line & line : lines) {
+        if (line.begin < seg.begin || line.begin >= seg.end) continue;
+        if (line.first != line.begin) continue;
+        const bool fence = starts_with(t, line.begin, line.end, "```") ||
+                           starts_with(t, line.begin, line.end, "~~~");
+        if (!fence) continue;
+        if (open == npos) {
+            open = line.begin;
+        } else {
+            fences.push_back({open, line.end});
+            open = npos;
+        }
+    }
+    out.insert(out.end(), fences.begin(), fences.end());
+    // Nested markdown sections outside fences and code.
+    std::vector<std::pair<size_t, int>> heads;
+    for (const Line & line : lines) {
+        if (line.begin < seg.begin || line.begin >= seg.end) continue;
+        if (covered(fences, line.begin) || covered(code_cov, line.begin)) continue;
+        const int level = heading_level(t, line);
+        if (level > 0) heads.push_back({line.begin, level});
+    }
+    std::vector<PFlashTextSpan> sections;
+    for (size_t j = 0; j < heads.size(); ++j) {
+        size_t end = seg.end;
+        for (size_t k = j + 1; k < heads.size(); ++k) {
+            if (heads[k].second <= heads[j].second) { end = heads[k].first; break; }
+        }
+        sections.push_back({heads[j].first, end});
+    }
+    out.insert(out.end(), sections.begin(), sections.end());
+    // Turns, in the segment and in each leaf section.
+    std::vector<PFlashTextSpan> ranges{seg};
+    const auto leaves = sorted_unique(sections);
+    ranges.insert(ranges.end(), leaves.begin(), leaves.end());
+    for (const auto & r : ranges) {
+        std::vector<size_t> marks;
+        for (const Line & line : lines) {
+            if (line.begin < r.begin || line.begin >= r.end) continue;
+            if (role_marker(t, line)) marks.push_back(line.begin);
+        }
+        if (marks.size() >= 2) split_at(marks, r.end, out);
+    }
+}
+
+void adaptive_body_levels(const std::string & t, PFlashTextSpan body,
+                          std::vector<PFlashTextSpan> & out) {
+    const auto lines = lines_of(t, body);
+    auto code = pflash_python_blocks(t, body);
+    const auto braces = pflash_brace_blocks(t, body);
+    code.insert(code.end(), braces.begin(), braces.end());
+    code = sorted_unique(std::move(code));
+    const auto code_cov = coverage_of(code);
+    out.insert(out.end(), code.begin(), code.end());
+
+    // Record headers: the widest numbered family (outside code), "File:"
+    // lines, and whole-line bracket labels.
+    std::map<std::string, std::vector<RecordHeader>> families;
+    std::vector<size_t> brackets;
+    std::vector<size_t> files;
+    for (const Line & line : lines) {
+        if (line.first == line.end) continue;
+        if (line.first == line.begin && starts_with(t, line.begin, line.end, "File: ")) {
+            files.push_back(line.begin);
+            continue;
+        }
+        if (bracket_label(t, line)) {
+            brackets.push_back(line.begin);
+            continue;
+        }
+        if (covered(code_cov, line.begin)) continue;
+        RecordHeader header;
+        if (record_start(t, line, header)) families[header.key].push_back(header);
+    }
+    const std::vector<RecordHeader> * best = nullptr;
+    size_t best_width = 0;
+    for (const auto & [key, headers] : families) {
+        std::set<long> numbers;
+        for (const auto & h : headers) numbers.insert(h.number);
+        if (numbers.size() < 3) continue;
+        // Records are numbered in sequence (0 or 1, 2, 3, ...): at least half
+        // the steps between distinct numbers are +1 and the first is <= 2
+        // (table rows such as "Model 50 / 100 / 500" are not records).
+        int unit_steps = 0;
+        for (auto it = std::next(numbers.begin()); it != numbers.end(); ++it) {
+            unit_steps += *it - *std::prev(it) == 1 ? 1 : 0;
+        }
+        if (*numbers.begin() > 2 || unit_steps * 2 < (int) numbers.size() - 1) continue;
+        const size_t width = headers.back().line - headers.front().line;
+        if (!best || width > best_width || (width == best_width && headers.size() > best->size())) {
+            best = &headers;
+            best_width = width;
+        }
+    }
+    std::vector<size_t> marks(files);
+    marks.insert(marks.end(), brackets.begin(), brackets.end());
+    if (best) {
+        for (const auto & h : *best) marks.push_back(h.line);
+        // The family's label without a number ("Document: <title>" next to
+        // "Document 3:") starts a record too.
+        const std::string & key = best->front().key;
+        const size_t word_end = key.find_last_of(' ');
+        const std::string label = key.substr(0, word_end) + ":";
+        if (word_end != std::string::npos && key.back() == ':') {
+            for (const Line & line : lines) {
+                if (line.first == line.begin && starts_with(t, line.begin, line.end, label.c_str()) &&
+                    line.begin + label.size() < line.end && t[line.begin + label.size()] == ' ' &&
+                    !covered(code_cov, line.begin)) {
+                    marks.push_back(line.begin);
+                }
+            }
+        }
+    }
+    std::sort(marks.begin(), marks.end());
+    marks.erase(std::unique(marks.begin(), marks.end()), marks.end());
+    std::vector<PFlashTextSpan> records;
+    split_at(marks, body.end, records);
+    out.insert(out.end(), records.begin(), records.end());
+    // Inside each record (and the text before the first): fences, sections,
+    // turns; a "File:" record holds code only.
+    std::vector<PFlashTextSpan> segments;
+    if (marks.empty() || marks.front() > body.begin) {
+        segments.push_back({body.begin, marks.empty() ? body.end : marks.front()});
+    }
+    segments.insert(segments.end(), records.begin(), records.end());
+    for (const auto & seg : segments) {
+        if (starts_with(t, seg.begin, seg.end, "File: ")) continue;
+        adaptive_segment_levels(t, lines, seg, code_cov, out);
+    }
+    // Paragraphs: blank-line blocks (a block ends before the newline that
+    // closes its last line); a long one gives its lines.
+    size_t j = 0;
+    while (j < lines.size()) {
+        if (lines[j].first == lines[j].end) { ++j; continue; }
+        size_t k = j;
+        while (k < lines.size() && lines[k].first != lines[k].end) ++k;
+        const PFlashTextSpan block{lines[j].begin, lines[k - 1].end};
+        if (block.end - block.begin <= kPFlashFoldParagraphBytes) {
+            out.push_back(block);
+        } else {
+            for (size_t m = j; m < k; ++m) {
+                if (lines[m].end > lines[m].begin &&
+                    lines[m].end - lines[m].begin <= kPFlashFoldParagraphBytes) {
+                    out.push_back({lines[m].begin, lines[m].end});
+                }
+            }
+        }
+        j = k;
+    }
+}
+
+} // namespace
+
+std::vector<PFlashTextSpan> pflash_adaptive_levels(const std::string & text) {
+    std::vector<PFlashTextSpan> out;
+    for (const auto & body : pflash_message_bodies(text)) adaptive_body_levels(text, body, out);
+    return sorted_unique(std::move(out));
+}
+
+std::vector<PFlashTokenSpan> pflash_adaptive_token_levels(
+        const std::vector<PFlashTextSpan> & levels, const std::vector<size_t> & token_begin) {
+    std::vector<PFlashTokenSpan> out;
+    for (const auto & l : levels) {
+        const int tb = (int) (std::lower_bound(token_begin.begin(), token_begin.end(), l.begin) -
+                              token_begin.begin());
+        const int te = (int) (std::lower_bound(token_begin.begin(), token_begin.end(), l.end) -
+                              token_begin.begin());
+        if (te > tb) out.push_back({tb, te});
+    }
+    std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
+        return a.begin != b.begin ? a.begin < b.begin : a.end < b.end;
+    });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+PFlashFoldResult select_pflash_adaptive(
+        const std::vector<PFlashSelectionCandidate> & candidates,
+        const std::vector<PFlashTokenSpan> & levels,
+        const PFlashAdaptivePolicy & policy) {
+    PFlashFoldResult result;
+    if (policy.token_budget <= 0 || policy.k <= 0 || policy.cap <= 0 || policy.head < 0 ||
+        policy.head > policy.cap || !(policy.tau > 0.0 && policy.tau <= 1.0)) {
+        result.error = "PFlash adaptive needs a positive budget, k and cap, head <= cap and tau in (0, 1]";
+        return result;
+    }
+    std::vector<const PFlashSelectionCandidate *> units;
+    int limit = 0;
+    for (const auto & c : candidates) {
+        if (c.begin < 0 || c.end <= c.begin || !std::isfinite(c.score)) {
+            result.error = "PFlash candidate range or score is invalid";
+            return result;
+        }
+        units.push_back(&c);
+        limit = std::max(limit, c.end);
+    }
+    std::sort(units.begin(), units.end(), [](const auto * a, const auto * b) {
+        return a->begin < b->begin;
+    });
+    std::set<size_t> ordinals;
+    for (size_t i = 0; i < units.size(); ++i) {
+        if ((i > 0 && units[i - 1]->end > units[i]->begin) ||
+            !ordinals.insert(units[i]->ordinal).second) {
+            result.error = "PFlash candidates must be unique and non-overlapping";
+            return result;
+        }
+    }
+    for (const auto & l : levels) limit = std::max(limit, l.end);
+    const auto density = [](const PFlashSelectionCandidate * c) { return std::max(0.0, c->score); };
+
+    // Mass of a level: optional units whose midpoint lies in it (prefix sums
+    // in document order).
+    std::vector<int> mids;
+    std::vector<double> acc{0.0};
+    for (const auto * c : units) {
+        if (c->mandatory) continue;
+        mids.push_back((c->begin + c->end - 1) / 2);
+        acc.push_back(acc.back() + density(c) * (double) (c->end - c->begin));
+    }
+    const auto mass = [&](int tb, int te) {
+        const size_t a = std::lower_bound(mids.begin(), mids.end(), tb) - mids.begin();
+        const size_t b = std::lower_bound(mids.begin(), mids.end(), te) - mids.begin();
+        return acc[b] - acc[a];
+    };
+    std::vector<PFlashTokenSpan> spans(levels);
+    std::sort(spans.begin(), spans.end(), [](const auto & a, const auto & b) {
+        const int la = a.end - a.begin, lb = b.end - b.begin;
+        return la != lb ? la < lb : a.begin < b.begin;
+    });
+    spans.erase(std::unique(spans.begin(), spans.end()), spans.end());
+
+    std::vector<uint8_t> kept((size_t) limit, 0);
+    int used = 0;
+    for (const auto * c : units) {
+        if (!c->mandatory) continue;
+        used += c->end - c->begin;
+        std::fill(kept.begin() + c->begin, kept.begin() + c->end, 1);
+    }
+    if (used > policy.token_budget) {
+        result.stop = PFlashSelectionStop::MandatoryQueryExceedsBudget;
+        result.error = "mandatory PFlash retention tokens exceed the token budget";
+        return result;
+    }
+    std::vector<const PFlashSelectionCandidate *> order;
+    for (const auto * c : units) if (!c->mandatory) order.push_back(c);
+    std::sort(order.begin(), order.end(), [&](const auto * a, const auto * b) {
+        const double da = density(a), db = density(b);
+        if (da != db) return da > db;
+        return a->ordinal < b->ordinal;
+    });
+
+    int taken = 0;
+    result.stop = PFlashSelectionStop::CandidatesExhausted;
+    for (const auto * anchor : order) {
+        if (taken >= policy.k) {
+            result.stop = PFlashSelectionStop::TopKReached;
+            break;
+        }
+        const int ub = anchor->begin, ue = anchor->end;
+        bool whole = true;
+        for (int p = ub; p < ue && whole; ++p) whole = kept[(size_t) p] != 0;
+        if (whole) continue;
+        // The chain: enclosing levels, each strictly longer than the last.
+        const int mid = (ub + ue - 1) / 2;
+        std::vector<std::pair<int, int>> region{{ub, ue}};
+        double cur_mass = density(anchor) * (double) (ue - ub);
+        int last = ue - ub;
+        bool promoted = false;
+        bool capped = false;
+        for (const auto & s : spans) {
+            if (!(s.begin <= mid && mid < s.end) || s.end - s.begin <= last) continue;
+            last = s.end - s.begin;
+            const double m = mass(s.begin, s.end);
+            if (m <= 0.0 || cur_mass / m >= policy.tau) break;
+            if (s.end - s.begin > policy.cap) {
+                region.push_back({s.begin, s.begin + policy.head});
+                capped = true;
+                break;
+            }
+            region.push_back({s.begin, s.end});
+            cur_mass = m;
+            promoted = true;
+        }
+        int add = 0;
+        for (const auto & r : region) {
+            for (int p = r.first; p < r.second && p < limit; ++p) {
+                if (!kept[(size_t) p]) {
+                    kept[(size_t) p] = 2;   // tentatively counted once
+                    ++add;
+                }
+            }
+        }
+        if (used + add > policy.token_budget) {
+            for (auto & v : kept) if (v == 2) v = 0;
+            ++result.skipped;
+            continue;
+        }
+        for (auto & v : kept) if (v == 2) v = 1;
+        used += add;
+        ++taken;
+        result.anchors.push_back(anchor->ordinal);
+        result.contained += promoted ? 1 : 0;
+        result.capped += capped ? 1 : 0;
+    }
+    if (result.stop != PFlashSelectionStop::TopKReached && result.skipped > 0) {
+        result.stop = PFlashSelectionStop::BudgetReached;
+    }
+    for (int p = 0; p < limit; ++p) {
+        if (!kept[(size_t) p]) continue;
+        if (!result.kept.empty() && result.kept.back().end == p) {
+            ++result.kept.back().end;
+        } else {
+            result.kept.push_back({p, p + 1});
+        }
+    }
+    result.retained_tokens = used;
+    result.ok = true;
+    return result;
+}
+
+PFlashFoldResult select_pflash_adaptive_for_ids(
+        const luce::common::Tokenizer & vocab,
+        const std::vector<int32_t> & ids,
+        const std::vector<PFlashSelectionCandidate> & candidates,
+        const PFlashSelectionConfig & config,
+        int token_budget,
+        std::vector<PFlashTokenSpan> * token_levels) {
+    std::string text;
+    std::vector<size_t> token_begin;
+    token_begin.reserve(ids.size());
+    for (const int32_t id : ids) {
+        token_begin.push_back(text.size());
+        text += vocab.token_text(id);
+    }
+    const auto levels = pflash_adaptive_token_levels(pflash_adaptive_levels(text), token_begin);
+    PFlashAdaptivePolicy policy;
+    policy.token_budget = token_budget;
+    policy.k = config.adaptive_k;
+    policy.tau = config.adaptive_tau;
+    policy.cap = config.fold_cap;
+    policy.head = config.fold_head;
+    auto result = select_pflash_adaptive(candidates, levels, policy);
+    if (token_levels) *token_levels = levels;
     return result;
 }
 

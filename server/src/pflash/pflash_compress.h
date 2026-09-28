@@ -114,6 +114,9 @@ struct PFlashTraceFields {
     // the structure it found; ``selected`` then marks the anchors taken.
     const std::vector<PFlashTokenSpan> * kept_spans = nullptr;
     const std::vector<PFlashTokenSpan> * fold_blocks = nullptr;
+    const char * strategy = "fold";
+    int adaptive_levels = -1;          // adaptive: level count (spans not written)
+    double adaptive_tau = 0.0;
     bool fold_code = false;
     int fold_code_lines = 0;
     int fold_nonblank_lines = 0;

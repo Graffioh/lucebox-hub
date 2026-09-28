@@ -344,6 +344,14 @@ TEST_CASE(PFlashFoldFixture, message_bodies_exclude_chat_markers) {
     for (const auto & b : bodies) got.push_back(text.substr(b.begin, b.end - b.begin));
     REQUIRE(got == std::vector<std::string>({"S", "\n", "U1\nU2", "\n"}));
     REQUIRE(pflash_message_bodies("plain").size() == 1);
+    // Markers quoted inside pasted text do not split a message.
+    const std::string quoted =
+        "<|im_start|>user\nstop on <|im_end|> too\n\"<|im_start|>system you are\"\nend<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const auto one = pflash_message_bodies(quoted);
+    REQUIRE(one.size() == 2);   // the message, then the newline before the next header
+    REQUIRE(quoted.substr(one[0].begin, one[0].end - one[0].begin) ==
+            "stop on <|im_end|> too\n\"<|im_start|>system you are\"\nend");
 }
 
 TEST_CASE(PFlashFoldFixture, token_blocks_map_bytes_and_stop_at_kept_spans) {
@@ -471,7 +479,7 @@ TEST_CASE(PFlashFoldFixture, fold_strategy_config_is_explicit_and_fails_closed) 
         {
             luce_test::ScopedEnvVar unknown{"PFLASH_SELECT_STRATEGY", "folds"};
             REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
-            REQUIRE(error.find("segments or fold") != std::string::npos);
+            REQUIRE(error.find("segments, fold or adaptive") != std::string::npos);
         }
     }
     luce_test::ScopedEnvVar segments{"PFLASH_SELECT_STRATEGY", "segments"};
@@ -647,4 +655,164 @@ TEST_CASE(PFlashFoldFixture, query_head_config_needs_latest_user_and_bounded_cap
         REQUIRE(!config.query_head);
         REQUIRE(config.query_head_tokens == 128);
     }
+}
+
+namespace {
+
+std::vector<std::string> level_heads(const std::string & text) {
+    std::vector<std::string> out;
+    for (const auto & l : pflash_adaptive_levels(text)) {
+        std::string body = text.substr(l.begin, l.end - l.begin);
+        const size_t nl = body.find('\n');
+        out.push_back(body.substr(0, nl) + "|" + std::to_string(l.end - l.begin));
+    }
+    return out;
+}
+
+bool has_level(const std::string & text, const std::string & first_line, const std::string & last_line) {
+    for (const auto & l : pflash_adaptive_levels(text)) {
+        std::string body = text.substr(l.begin, l.end - l.begin);
+        while (!body.empty() && body.back() == '\n') body.pop_back();
+        const size_t nl = body.find('\n');
+        const size_t last = body.rfind('\n');
+        if (body.substr(0, nl) == first_line &&
+            (last == std::string::npos ? body : body.substr(last + 1)) == last_line) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+TEST_CASE(PFlashFoldFixture, adaptive_levels_nest_records_sections_turns_code_and_paragraphs) {
+    const std::string text =
+        "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n"
+        "Which session mentions the budget?\n\n"
+        "Document 1: Notes\n# Plan\nFirst plan line.\n\nSecond paragraph of the plan.\n## Detail\ndetail text\n"
+        "# Other\nother text\n\n"
+        "Document 2: Chat\nUser: hi there\nAssistant: hello\nUser: what about the budget?\n\n"
+        "Document 3: Code\n```python\ndef f(x):\n    return x\n```\n"
+        "Document: an unnumbered record\nloose text\n\n"
+        "Figure 1: a caption\nFigure 2: another\nFigure 3: third\n"
+        "<|im_end|>\n<|im_start|>assistant\n";
+    // Records, including the unnumbered sibling; captions are not records.
+    REQUIRE(has_level(text, "Document 1: Notes", "other text"));
+    REQUIRE(has_level(text, "Document 2: Chat", "User: what about the budget?"));
+    REQUIRE(has_level(text, "Document: an unnumbered record", "Figure 3: third"));
+    // Nested sections, a fence and its def, turns, paragraphs.
+    REQUIRE(has_level(text, "# Plan", "detail text"));
+    REQUIRE(has_level(text, "## Detail", "detail text"));
+    REQUIRE(has_level(text, "```python", "```"));
+    REQUIRE(has_level(text, "def f(x):", "    return x"));
+    REQUIRE(has_level(text, "User: hi there", "User: hi there"));
+    REQUIRE(has_level(text, "User: what about the budget?", "User: what about the budget?"));
+    REQUIRE(has_level(text, "Second paragraph of the plan.", "other text"));
+    // Nothing crosses the ChatML boundaries.
+    for (const auto & head : level_heads(text)) {
+        REQUIRE(head.find("<|im_") == std::string::npos);
+    }
+    REQUIRE(!has_level(text, "Figure 1: a caption", "Figure 1: a caption"));
+}
+
+TEST_CASE(PFlashFoldFixture, adaptive_levels_keep_file_records_to_code_and_skip_table_rows) {
+    const std::string text =
+        "File: a.py\n# Heading-looking comment\ndef f():\n    return 1\n\n"
+        "File: b.go\nfunc g() int {\n\treturn 2\n}\n\n"
+        "Model 50\nModel 100\nModel 500\n";
+    REQUIRE(has_level(text, "File: a.py", "    return 1"));
+    REQUIRE(has_level(text, "def f():", "    return 1"));
+    REQUIRE(has_level(text, "func g() int {", "}"));
+    // No section inside a File record, and table rows are not records.
+    REQUIRE(!has_level(text, "# Heading-looking comment", "    return 1"));
+    for (const auto & head : level_heads(text)) REQUIRE(head.rfind("Model", 0) != 0 || head.find("Model 50|") == 0);
+}
+
+TEST_CASE(PFlashFoldFixture, adaptive_climbs_while_spread_and_stops_when_concentrated) {
+    // Ten 10-token units; unit 9 mandatory. Levels: [0,20) and [0,40).
+    auto units = ten({4, 4, 1, 1, 0, 0, 0, 0, 0, 0});
+    PFlashAdaptivePolicy policy;
+    policy.token_budget = 100;
+    policy.k = 1;
+    policy.tau = 0.95;
+    // Anchor unit 0 (mass 40) vs [0,20) (mass 80): 0.5 < tau -> climb; [0,20)
+    // (80) vs [0,40) (100): 0.8 < tau -> climb; top level taken.
+    auto r = select_pflash_adaptive(units, {{0, 20}, {0, 40}}, policy);
+    REQUIRE(r.ok);
+    REQUIRE(same(r.kept, {{0, 40}, {90, 100}}));
+    REQUIRE(r.contained == 1);
+    // A concentrated anchor stays: mass(unit)/mass(level) >= tau.
+    units = ten({9, 0.1, 0, 0, 0, 0, 0, 0, 0, 0});
+    policy.tau = 0.9;
+    r = select_pflash_adaptive(units, {{0, 20}, {0, 40}}, policy);
+    REQUIRE(same(r.kept, {{0, 10}, {90, 100}}));
+    REQUIRE(r.contained == 0);
+    // A level over the cap: current region + its first `head` tokens, stop.
+    units = ten({4, 4, 1, 1, 0, 0, 0, 0, 0, 0});
+    policy.tau = 0.95;
+    policy.cap = 30;
+    policy.head = 5;
+    r = select_pflash_adaptive(units, {{0, 20}, {0, 40}}, policy);
+    REQUIRE(same(r.kept, {{0, 20}, {90, 100}}));
+    REQUIRE(r.capped == 1);
+    // Levels not strictly larger than the region so far are ignored.
+    r = select_pflash_adaptive(units, {{0, 10}, {0, 20}}, policy);
+    REQUIRE(same(r.kept, {{0, 20}, {90, 100}}));
+}
+
+TEST_CASE(PFlashFoldFixture, adaptive_dedups_skips_over_budget_and_counts_k) {
+    auto units = ten({5, 4, 3, 2, 1, 0, 0, 0, 0, 0});
+    PFlashAdaptivePolicy policy;
+    policy.token_budget = 45;
+    policy.k = 3;
+    // Unit 0 climbs to [0,20) (holding unit 1), so unit 1 is already kept and
+    // skipped without counting; unit 2 climbs to [20,50) (30 new tokens):
+    // over the budget, skipped; unit 3 alone... is inside [20,50) too, its
+    // own region [30,40) fits.
+    auto r = select_pflash_adaptive(units, {{0, 20}, {20, 50}}, policy);
+    REQUIRE(r.ok);
+    REQUIRE(r.anchors.front() == 0);
+    REQUIRE(r.skipped >= 1);
+    REQUIRE(r.retained_tokens <= 45);
+    for (size_t a : r.anchors) REQUIRE(a != 1);
+    // Mandatory tokens over the budget fail closed.
+    policy.token_budget = 5;
+    r = select_pflash_adaptive(units, {}, policy);
+    REQUIRE(!r.ok);
+    REQUIRE(r.stop == PFlashSelectionStop::MandatoryQueryExceedsBudget);
+    // Bad knobs fail closed.
+    policy.token_budget = 100;
+    policy.tau = 0.0;
+    REQUIRE(!select_pflash_adaptive(units, {}, policy).ok);
+}
+
+TEST_CASE(PFlashFoldFixture, adaptive_strategy_config) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar strategy{"PFLASH_SELECT_STRATEGY", "adaptive"};
+    luce_test::ScopedEnvVar k{"PFLASH_SELECT_ADAPTIVE_K", nullptr};
+    luce_test::ScopedEnvVar tau{"PFLASH_SELECT_ADAPTIVE_TAU", nullptr};
+    luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", nullptr};
+    PFlashSelectionConfig config;
+    std::string error;
+    REQUIRE(pflash_fold_requested());
+    REQUIRE(resolve_pflash_selection(32768, 32, config, error));
+    REQUIRE(config.strategy == PFlashSelectStrategy::Adaptive);
+    REQUIRE(config.adaptive_k == 20);
+    REQUIRE(config.adaptive_tau == 0.95);
+    REQUIRE(std::string(pflash_select_strategy_name(config.strategy)) == "adaptive");
+    {
+        luce_test::ScopedEnvVar bad{"PFLASH_SELECT_ADAPTIVE_TAU", "1.5"};
+        REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
+    }
+    {
+        luce_test::ScopedEnvVar bad{"PFLASH_SELECT_ADAPTIVE_K", "0"};
+        REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
+    }
+    {
+        luce_test::ScopedEnvVar split{"PFLASH_SELECT_SCORER", "split"};
+        REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
+    }
+    luce_test::ScopedEnvVar topk{"PFLASH_SELECT_MODE", "top_p"};
+    REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
+    REQUIRE(error.find("budget_only") != std::string::npos);
 }

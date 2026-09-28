@@ -142,15 +142,19 @@ void write_compression_trace(
         }
         if (trace_fields->kept_spans) {
             std::fprintf(file,
-                ",\"strategy\":\"fold\",\"fold_code\":%s,\"fold_code_lines\":%d,"
+                ",\"strategy\":\"%s\",\"fold_code\":%s,\"fold_code_lines\":%d,"
                 "\"fold_nonblank_lines\":%d,\"fold_code_blocks\":%d,"
                 "\"fold_text_source\":\"%s\",\"fold_skipped\":%d,"
                 "\"fold_capped\":%d,\"fold_contained\":%d",
-                trace_fields->fold_code ? "true" : "false",
+                trace_fields->strategy, trace_fields->fold_code ? "true" : "false",
                 trace_fields->fold_code_lines, trace_fields->fold_nonblank_lines,
                 trace_fields->fold_code_blocks, trace_fields->fold_text_source,
                 trace_fields->fold_skipped, trace_fields->fold_capped,
                 trace_fields->fold_contained);
+            if (trace_fields->adaptive_levels >= 0) {
+                std::fprintf(file, ",\"adaptive_levels\":%d,\"adaptive_tau\":%.6g",
+                             trace_fields->adaptive_levels, trace_fields->adaptive_tau);
+            }
             const std::pair<const char *, const std::vector<PFlashTokenSpan> *> lists[] = {
                 {"kept_spans", trace_fields->kept_spans},
                 {"fold_blocks", trace_fields->fold_blocks},
@@ -312,24 +316,31 @@ std::vector<int32_t> select_pflash_chunks(
         }
     }
 
-    if (config.strategy == luce::pflash::PFlashSelectStrategy::Fold) {
+    if (config.strategy != luce::pflash::PFlashSelectStrategy::Segments) {
+        // Fold and adaptive read the prompt's structure from the drafter's
+        // own vocabulary.
+        const bool adaptive = config.strategy == luce::pflash::PFlashSelectStrategy::Adaptive;
+        const char * strategy = luce::pflash::pflash_select_strategy_name(config.strategy);
         if (split || !fold_vocab) {
-            const char * message = "PFlash fold selection needs the Qwen3.5 head "
-                                   "scorer and the drafter vocabulary";
+            const std::string message = std::string("PFlash ") + strategy +
+                " selection needs the Qwen3.5 head scorer and the drafter vocabulary";
             set_last_error(message);
-            std::fprintf(stderr, "[pflash-select] ERROR fold: %s\n", message);
+            std::fprintf(stderr, "[pflash-select] ERROR %s: %s\n", strategy, message.c_str());
             std::fflush(stderr);
             return {};
         }
         const auto started = std::chrono::steady_clock::now();
         luce::pflash::PFlashFoldStructure structure;
         std::vector<PFlashTokenSpan> blocks;
-        const auto fold = luce::pflash::select_pflash_fold_for_ids(
-            *fold_vocab, ids, candidates, config, selector_budget, &structure, &blocks);
+        const auto fold = adaptive
+            ? luce::pflash::select_pflash_adaptive_for_ids(
+                  *fold_vocab, ids, candidates, config, selector_budget, &blocks)
+            : luce::pflash::select_pflash_fold_for_ids(
+                  *fold_vocab, ids, candidates, config, selector_budget, &structure, &blocks);
         if (!fold.ok) {
-            set_last_error("PFlash fold selection failed: " + fold.error);
-            std::fprintf(stderr, "[pflash-select] ERROR fold budget=%d: %s\n",
-                         selector_budget, fold.error.c_str());
+            set_last_error(std::string("PFlash ") + strategy + " selection failed: " + fold.error);
+            std::fprintf(stderr, "[pflash-select] ERROR %s budget=%d: %s\n",
+                         strategy, selector_budget, fold.error.c_str());
             std::fflush(stderr);
             return {};
         }
@@ -346,18 +357,30 @@ std::vector<int32_t> select_pflash_chunks(
                 kept_mass += token_scores[(size_t) token];
             }
         }
-        std::fprintf(stderr,
-            "[pflash-select] selected strategy=fold route=%s code_lines=%d/%d "
-            "code_blocks=%zu text=%s blocks=%zu segments=%s budget=%d "
-            "selected_tokens=%zu anchors=%zu/%d contained=%d capped=%d skipped=%d "
-            "stop=%s structure_ms=%.1f\n",
-            structure.code_like ? "code" : "text", structure.code_lines,
-            structure.nonblank_lines, structure.code_blocks, structure.text_source,
-            blocks.size(), segments ? "probe" : "fixed", selector_budget,
-            output.size(), fold.anchors.size(), config.fold_k, fold.contained,
-            fold.capped, fold.skipped, luce::pflash::pflash_selection_stop_name(fold.stop),
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - started).count());
+        const double structure_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count();
+        if (adaptive) {
+            std::fprintf(stderr,
+                "[pflash-select] selected strategy=adaptive levels=%zu segments=%s budget=%d "
+                "selected_tokens=%zu anchors=%zu/%d tau=%.3f promoted=%d capped=%d skipped=%d "
+                "stop=%s structure_ms=%.1f\n",
+                blocks.size(), segments ? "probe" : "fixed", selector_budget, output.size(),
+                fold.anchors.size(), config.adaptive_k, config.adaptive_tau, fold.contained,
+                fold.capped, fold.skipped, luce::pflash::pflash_selection_stop_name(fold.stop),
+                structure_ms);
+        } else {
+            std::fprintf(stderr,
+                "[pflash-select] selected strategy=fold route=%s code_lines=%d/%d "
+                "code_blocks=%zu text=%s blocks=%zu segments=%s budget=%d "
+                "selected_tokens=%zu anchors=%zu/%d contained=%d capped=%d skipped=%d "
+                "stop=%s structure_ms=%.1f\n",
+                structure.code_like ? "code" : "text", structure.code_lines,
+                structure.nonblank_lines, structure.code_blocks, structure.text_source,
+                blocks.size(), segments ? "probe" : "fixed", selector_budget,
+                output.size(), fold.anchors.size(), config.fold_k, fold.contained,
+                fold.capped, fold.skipped, luce::pflash::pflash_selection_stop_name(fold.stop),
+                structure_ms);
+        }
         std::fflush(stderr);
         if (write_trace) {
             std::vector<uint8_t> anchor_mask((size_t) n_chunks, 0);
@@ -375,7 +398,10 @@ std::vector<int32_t> select_pflash_chunks(
             fields.candidate_score = density ? "density" : "sum";
             fields.scorer = luce::pflash::pflash_scorer_name(config.scorer);
             fields.kept_spans = &fold.kept;
-            fields.fold_blocks = &blocks;
+            fields.strategy = strategy;
+            fields.fold_blocks = adaptive ? nullptr : &blocks;
+            fields.adaptive_levels = adaptive ? (int) blocks.size() : -1;
+            fields.adaptive_tau = config.adaptive_tau;
             fields.fold_code = structure.code_like;
             fields.fold_code_lines = structure.code_lines;
             fields.fold_nonblank_lines = structure.nonblank_lines;

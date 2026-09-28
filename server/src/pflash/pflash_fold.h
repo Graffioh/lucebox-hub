@@ -172,4 +172,67 @@ PFlashFoldResult select_pflash_fold_for_ids(
     PFlashFoldStructure * info = nullptr,
     std::vector<luce::common::PFlashTokenSpan> * token_blocks = nullptr);
 
+// Adaptive selection (PFLASH_SELECT_STRATEGY=adaptive): every structural
+// level of the prompt, nested, per ChatML message body:
+//   records     from a record header to the next one: the widest numbered
+//               family ("Document 3:", at least three numbers in sequence
+//               from 0-2, outside code and headings; not caption or
+//               reference families such as "Figure 2:", "Table 3.",
+//               "[12] Author"; the family's label without a number, as in
+//               "Document: <title>", starts a record too), "File: <path>"
+//               lines, and whole-line "[label]" lines; the text before the
+//               first header is not a record
+//   (levels never cross a ChatML message boundary; markers quoted inside a
+//   message do not count as boundaries)
+//   code        Python-like def/class and C-like function/type blocks
+//               (inside a "File:" record, nothing else is looked for)
+//   fences      markdown ```/~~~ fenced blocks
+//   sections    markdown headings outside fences and code, nested (a heading
+//               runs to the next heading of its level or above)
+//   turns       "User:" / "Assistant:" / "Human:" / "AI:" line starts, two or
+//               more in a record or a leaf section, each to the next
+//   paragraphs  blank-line blocks up to 6000 bytes (a longer block gives its
+//               lines up to 6000 bytes)
+// Spans are [line start, block end) in bytes; duplicates removed.
+std::vector<PFlashTextSpan> pflash_adaptive_levels(const std::string & text);
+
+// Levels in token coordinates: [first token starting at or after begin,
+// first token starting at or after end); empty spans dropped, duplicates
+// removed.
+std::vector<luce::common::PFlashTokenSpan> pflash_adaptive_token_levels(
+    const std::vector<PFlashTextSpan> & levels, const std::vector<size_t> & token_begin);
+
+struct PFlashAdaptivePolicy {
+    int token_budget = 0;
+    int k = 20;
+    double tau = 0.95;
+    int cap = 1500;
+    int head = 150;
+};
+
+// Adaptive granularity by score concentration. Anchors are the optional
+// candidates by density (ordinal tie-break). An anchor already fully kept is
+// skipped. From the anchor's own segment the region climbs its chain of
+// enclosing levels (each strictly longer than the one below): with
+// mass(level) = sum of density x length over the optional candidates whose
+// midpoint lies in it, the climb stops when mass(current) / mass(next) >= tau
+// (or the next level has no mass); a next level over ``cap`` tokens is
+// never taken whole -- the region becomes the current one plus that level's
+// first ``head`` tokens, and the climb stops. A region whose new tokens do
+// not fit the budget is skipped; ``k`` regions are kept, mandatory
+// candidates always. ``anchors`` lists the anchors taken, ``contained`` how
+// many were promoted above their segment, ``capped`` how many hit the cap.
+PFlashFoldResult select_pflash_adaptive(
+    const std::vector<PFlashSelectionCandidate> & candidates,
+    const std::vector<luce::common::PFlashTokenSpan> & levels,
+    const PFlashAdaptivePolicy & policy);
+
+PFlashFoldResult select_pflash_adaptive_for_ids(
+    const luce::common::Tokenizer & vocab,
+    const std::vector<int32_t> & ids,
+    const std::vector<PFlashSelectionCandidate> & candidates,
+    const PFlashSelectionConfig & config,
+    int token_budget,
+    std::vector<luce::common::PFlashTokenSpan> * token_levels = nullptr);
+
 } // namespace luce::pflash

@@ -30,6 +30,8 @@ constexpr const char * kFoldKEnv = "PFLASH_SELECT_FOLD_K";
 constexpr const char * kFoldCapEnv = "PFLASH_SELECT_FOLD_CAP";
 constexpr const char * kFoldHeadEnv = "PFLASH_SELECT_FOLD_HEAD";
 constexpr const char * kFoldParagraphsEnv = "PFLASH_SELECT_FOLD_PARAGRAPHS";
+constexpr const char * kAdaptiveKEnv = "PFLASH_SELECT_ADAPTIVE_K";
+constexpr const char * kAdaptiveTauEnv = "PFLASH_SELECT_ADAPTIVE_TAU";
 constexpr const char * kQueryHeadEnv = "PFLASH_SELECT_QUERY_HEAD";
 constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
 constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
@@ -91,7 +93,7 @@ bool has_pflash_selection_environment() noexcept {
 
 bool pflash_fold_requested() noexcept {
     const char * raw = std::getenv(kStrategyEnv);
-    return raw && std::strcmp(raw, "fold") == 0;
+    return raw && (std::strcmp(raw, "fold") == 0 || std::strcmp(raw, "adaptive") == 0);
 }
 
 bool pflash_chunk_is_structurally_required(
@@ -450,8 +452,23 @@ bool resolve_pflash_selection(
     if (strategy_raw) {
         if (std::strcmp(strategy_raw, "fold") == 0) {
             config.strategy = PFlashSelectStrategy::Fold;
+        } else if (std::strcmp(strategy_raw, "adaptive") == 0) {
+            config.strategy = PFlashSelectStrategy::Adaptive;
         } else if (std::strcmp(strategy_raw, "segments") != 0) {
-            error = std::string(kStrategyEnv) + " must be segments or fold";
+            error = std::string(kStrategyEnv) + " must be segments, fold or adaptive";
+            return false;
+        }
+    }
+    if (const char * raw = std::getenv(kAdaptiveKEnv)) {
+        if (!parse_int(raw, config.adaptive_k) || config.adaptive_k < 1) {
+            error = std::string(kAdaptiveKEnv) + " must be a positive integer";
+            return false;
+        }
+    }
+    if (const char * raw = std::getenv(kAdaptiveTauEnv)) {
+        if (!parse_double(raw, config.adaptive_tau) ||
+            !(config.adaptive_tau > 0.0 && config.adaptive_tau <= 1.0)) {
+            error = std::string(kAdaptiveTauEnv) + " must be in (0, 1]";
             return false;
         }
     }
@@ -499,16 +516,17 @@ bool resolve_pflash_selection(
         }
         config.fold_paragraphs = raw[0] == '1';
     }
-    if (config.strategy == PFlashSelectStrategy::Fold) {
-        // Fold spends the budget itself: it needs the budget rule and one
-        // scorer, and a head no longer than the cap.
+    if (config.strategy != PFlashSelectStrategy::Segments) {
+        // Fold and adaptive spend the budget themselves: they need the budget
+        // rule and one scorer, and a head no longer than the cap.
+        const std::string name = pflash_select_strategy_name(config.strategy);
         if (config.mode != PFlashSelectionMode::BudgetOnly) {
-            error = std::string(kStrategyEnv) + "=fold needs " +
+            error = std::string(kStrategyEnv) + "=" + name + " needs " +
                 std::string(kModeEnv) + "=budget_only";
             return false;
         }
         if (config.scorer != PFlashScorer::Head) {
-            error = std::string(kStrategyEnv) + "=fold needs the head scorer";
+            error = std::string(kStrategyEnv) + "=" + name + " needs the head scorer";
             return false;
         }
         if (config.fold_head > config.fold_cap) {
@@ -666,6 +684,7 @@ const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept
     switch (strategy) {
         case PFlashSelectStrategy::Segments: return "segments";
         case PFlashSelectStrategy::Fold: return "fold";
+        case PFlashSelectStrategy::Adaptive: return "adaptive";
     }
     return "unknown";
 }

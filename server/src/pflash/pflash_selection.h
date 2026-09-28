@@ -99,7 +99,9 @@ enum class PFlashScorer { Head, Legacy, Split };
 // How the kept spans are formed: whole segments in score order (today), or
 // fold -- anchors completed to their enclosing code or text block
 // (pflash_fold.h), routed by prompt type.
-enum class PFlashSelectStrategy { Segments, Fold };
+// adaptive -- anchors grown through the prompt's nested levels while the
+// score is spread (pflash_fold.h, select_pflash_adaptive).
+enum class PFlashSelectStrategy { Segments, Fold, Adaptive };
 
 struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
@@ -122,6 +124,11 @@ struct PFlashSelectionConfig {
     int fold_head = 150;
     // Fold only: blank-line paragraphs as the last-resort text blocks.
     bool fold_paragraphs = true;
+    // Adaptive only: regions kept, and the concentration threshold (a
+    // region stops climbing when mass(current) / mass(next level) >= tau).
+    // The block cap and head are fold_cap and fold_head.
+    int adaptive_k = 20;
+    double adaptive_tau = 0.95;
     bool configured = false;
     bool selection_active = false;
     // Per request, never from the environment: the tokens after the query
@@ -187,8 +194,9 @@ const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept;
 const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept;
 const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept;
 
-// PFLASH_SELECT_STRATEGY=fold, read once: the drafter loads its vocabulary
-// at load time only when fold may be requested.
+// PFLASH_SELECT_STRATEGY=fold or adaptive, read once: the drafter loads its
+// vocabulary at load time only when a structure-reading strategy may be
+// requested.
 bool pflash_fold_requested() noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an

@@ -6,6 +6,9 @@
 //       One JSON line per trace line: the fold selection the runtime makes
 //       from the trace's input_ids, segments, chunk_scores (density),
 //       forced_chunks and token_budget, with PFLASH_SELECT_FOLD_* knobs.
+//       With PFLASH_SELECT_STRATEGY=adaptive the adaptive selection instead;
+//       a line carrying "levels" ([[begin, end)] token spans) runs the
+//       adaptive rule on those levels (port check, no structure detection).
 //   pflash_fold_replay <drafter.gguf> text <rows.jsonl>
 //       One JSON line per {"id", "prompt"} row: the structure and route of
 //       the raw prompt text (no template, no selection).
@@ -55,7 +58,8 @@ int replay_traces(const luce::common::Tokenizer & vocab, int argc, char ** argv,
         int index = 0;
         while (std::getline(in, line)) {
             const json t = json::parse(line);
-            const auto ids = t.at("input_ids").get<std::vector<int32_t>>();
+            const auto ids = t.contains("input_ids")
+                ? t.at("input_ids").get<std::vector<int32_t>>() : std::vector<int32_t>{};
             const auto & segments = t.at("segments");
             const auto & scores = t.at("chunk_scores");
             std::vector<uint8_t> forced(segments.size(), 0);
@@ -68,14 +72,29 @@ int replay_traces(const luce::common::Tokenizer & vocab, int argc, char ** argv,
             }
             PFlashFoldStructure structure;
             std::vector<PFlashTokenSpan> blocks;
-            const auto result = select_pflash_fold_for_ids(
-                vocab, ids, candidates, config, t.at("token_budget").get<int>(),
-                &structure, &blocks);
+            const int budget = t.at("token_budget").get<int>();
+            PFlashFoldResult result;
+            if (t.contains("levels")) {
+                // Port check: the caller's own levels (token spans).
+                for (const auto & l : t.at("levels")) blocks.push_back({l[0].get<int>(), l[1].get<int>()});
+                PFlashAdaptivePolicy policy;
+                policy.token_budget = budget;
+                policy.k = config.adaptive_k;
+                policy.tau = config.adaptive_tau;
+                policy.cap = config.fold_cap;
+                policy.head = config.fold_head;
+                result = select_pflash_adaptive(candidates, blocks, policy);
+            } else if (config.strategy == PFlashSelectStrategy::Adaptive) {
+                result = select_pflash_adaptive_for_ids(vocab, ids, candidates, config, budget, &blocks);
+            } else {
+                result = select_pflash_fold_for_ids(vocab, ids, candidates, config, budget,
+                                                    &structure, &blocks);
+            }
             json out = {{"file", argv[a]}, {"line", index++}, {"ok", result.ok},
                         {"error", result.error}, {"kept", spans_json(result.kept)},
                         {"anchors", result.anchors}, {"retained", result.retained_tokens},
                         {"skipped", result.skipped}, {"capped", result.capped},
-                        {"contained", result.contained},
+                        {"contained", result.contained}, {"promoted", result.contained},
                         {"stop", pflash_selection_stop_name(result.stop)},
                         {"blocks", spans_json(blocks)},
                         {"structure", structure_json(structure)}};
