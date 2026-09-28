@@ -332,7 +332,109 @@ bool line_in(const std::vector<PFlashTextSpan> & coverage, const Line & line) {
     return covered(coverage, line.begin);
 }
 
+bool starts_with(const std::string & t, size_t i, size_t end, const char * prefix) {
+    const size_t n = std::strlen(prefix);
+    return i + n <= end && t.compare(i, n, prefix) == 0;
+}
+
+// A line that reads as pasted material rather than the user's own prose.
+bool paste_line(const std::string & t, const Line & line) {
+    const size_t i = line.first;
+    const size_t end = line.end;
+    if (i == end) return false;
+    if (line.first - line.begin >= 4 || (line.first > line.begin && t[line.begin] == '\t')) {
+        return true;                                     // indented code or data
+    }
+    const char c = t[i];
+    if (starts_with(t, i, end, "```") || starts_with(t, i, end, "~~~")) return true;
+    if (c == '#') {
+        size_t j = i;
+        while (j < end && t[j] == '#') ++j;
+        if (j - i <= 6 && j < end && t[j] == ' ') return true;       // heading
+        if (starts_with(t, i, end, "#include") || starts_with(t, i, end, "#!") ||
+            starts_with(t, i, end, "#define") || starts_with(t, i, end, "#[")) {
+            return true;
+        }
+    }
+    if (std::strchr("{[|", c)) return true;              // JSON, arrays, tables, "[user]"
+    if (c == '<' && i + 1 < end &&
+        (std::isalpha((unsigned char) t[i + 1]) || std::strchr("/!?", t[i + 1]))) {
+        return true;                                     // markup
+    }
+    size_t k = i;
+    while (k < end && std::strchr("-=*_~", t[k])) ++k;
+    if (k - i >= 3 && k == end) return true;             // separator rule
+    for (const char * prefix : {"File:", "Path:", "Source:", "Repository:", "Package:",
+                                "import ", "package ", "func ", "fn ",
+                                "//", "/*", "$ ", ">>> ", "@"}) {
+        if (starts_with(t, i, end, prefix)) return true;
+    }
+    if (python_header(t, i, end)) return true;
+    size_t last = end;
+    while (last > i && is_space(t[last - 1])) --last;
+    if (last > i && std::strchr("{};", t[last - 1])) return true;   // code-shaped
+    RecordHeader header;
+    return record_header(t, line, header);
+}
+
 } // namespace
+
+PFlashQueryBlocks pflash_query_blocks(const std::string & t, PFlashTextSpan message) {
+    PFlashQueryBlocks out;
+    const auto lines = lines_of(t, message);
+    if (lines.empty()) return out;
+    const size_t total = message.end - message.begin;
+    const auto trimmed = [&](size_t from, size_t to) -> PFlashTextSpan {
+        // Lines [from, to) without leading and trailing blank lines.
+        while (from < to && lines[from].first == lines[from].end) ++from;
+        while (to > from && lines[to - 1].first == lines[to - 1].end) --to;
+        if (from >= to) return {};
+        size_t end = lines[to - 1].end;
+        while (end > lines[to - 1].first && is_space(t[end - 1])) --end;
+        return {lines[from].first, end};
+    };
+    size_t first_paste = lines.size();
+    size_t last_paste = lines.size();
+    for (size_t j = 0; j < lines.size(); ++j) {
+        if (!paste_line(t, lines[j])) continue;
+        if (first_paste == lines.size()) first_paste = j;
+        last_paste = j;
+    }
+    out.structured = first_paste < lines.size();
+    const auto small = [&](PFlashTextSpan s) { return (s.end - s.begin) * 2 <= total; };
+    if (out.structured) {
+        const PFlashTextSpan head = trimmed(0, first_paste);
+        if (head.end > head.begin && small(head)) {
+            out.head = head;
+            out.head_rule = "paste";
+        }
+        size_t para = lines.size();
+        while (para > 0 && lines[para - 1].first == lines[para - 1].end) --para;
+        size_t start = para;
+        while (start > 0 && lines[start - 1].first != lines[start - 1].end) --start;
+        if (start > last_paste && start < para) {
+            const PFlashTextSpan tail = trimmed(start, para);
+            if (tail.end > tail.begin && small(tail)) out.tail = tail;
+        }
+        return out;
+    }
+    // No paste-like line: a short opening question before a long text.
+    size_t para = 0;
+    while (para < lines.size() && lines[para].first == lines[para].end) ++para;
+    size_t stop = para;
+    while (stop < lines.size() && lines[stop].first != lines[stop].end) ++stop;
+    const PFlashTextSpan head = trimmed(para, stop);
+    if (head.end > head.begin && stop < lines.size() &&
+        (head.end - head.begin) * 9 <= total) {
+        size_t last = head.end;
+        while (last > head.begin && is_space(t[last - 1])) --last;
+        if (last > head.begin && t[last - 1] == '?') {
+            out.head = head;
+            out.head_rule = "question";
+        }
+    }
+    return out;
+}
 
 std::vector<PFlashTextSpan> pflash_message_bodies(const std::string & text) {
     static const char * kStart = "<|im_start|>";

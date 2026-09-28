@@ -527,3 +527,124 @@ TEST_CASE(PFlashFoldFixture, select_chunks_folds_through_the_drafter_vocabulary)
     // Without the vocabulary fold fails closed.
     REQUIRE(run(nullptr).empty());
 }
+
+namespace {
+
+std::string block_text(const std::string & text, PFlashTextSpan s) {
+    return text.substr(s.begin, s.end - s.begin);
+}
+
+std::string pasted_paper() {
+    std::string out = "## Paper: A Study\n\n";
+    for (int i = 0; i < 40; ++i) {
+        out += "Paragraph " + std::to_string(i) + " of the paper describes the method in detail.\n\n";
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE(PFlashFoldFixture, query_blocks_find_the_question_before_the_paste) {
+    const std::string text = "Which KV budget does the paper use on LiveCodeBench?\n\n"
+                             "Here is the material I'm working with.\n\n" + pasted_paper();
+    const auto blocks = pflash_query_blocks(text, whole(text));
+    REQUIRE(blocks.structured);
+    REQUIRE(std::string(blocks.head_rule) == "paste");
+    REQUIRE(block_text(text, blocks.head) ==
+            "Which KV budget does the paper use on LiveCodeBench?\n\n"
+            "Here is the material I'm working with.");
+    // The paste ends in its own prose: that paragraph is the tail block.
+    REQUIRE(block_text(text, blocks.tail) ==
+            "Paragraph 39 of the paper describes the method in detail.");
+}
+
+TEST_CASE(PFlashFoldFixture, query_blocks_find_the_question_after_and_on_both_sides) {
+    const std::string after = pasted_paper() + "What does paragraph 3 describe?\n";
+    auto blocks = pflash_query_blocks(after, whole(after));
+    REQUIRE(blocks.structured);
+    REQUIRE(blocks.head.end == blocks.head.begin);          // opens with the paste
+    REQUIRE(block_text(after, blocks.tail) == "What does paragraph 3 describe?");
+
+    const std::string both = "I am comparing two methods.\n\n```python\ndef f():\n    return 1\n```\n\n"
+        "Which one is faster, and why?\n";
+    const std::string padded = both + std::string();   // short but structured
+    blocks = pflash_query_blocks(padded, whole(padded));
+    REQUIRE(block_text(padded, blocks.head) == "I am comparing two methods.");
+    REQUIRE(block_text(padded, blocks.tail) == "Which one is faster, and why?");
+}
+
+TEST_CASE(PFlashFoldFixture, query_blocks_keep_a_long_question_and_leave_plain_text_alone) {
+    // A long question (a few hundred words) is still one head block; the
+    // server caps it at its first and last cap/2 tokens.
+    std::string question;
+    for (int i = 0; i < 60; ++i) question += "Consider constraint number " + std::to_string(i) + " carefully. ";
+    question += "Which setting satisfies all of them?";
+    std::string paste;
+    for (int i = 0; i < 6; ++i) paste += pasted_paper();
+    const std::string text = question + "\n\n" + paste;
+    auto blocks = pflash_query_blocks(text, whole(text));
+    REQUIRE(block_text(text, blocks.head) == question);
+
+    // No paste structure and no opening question: nothing changes.
+    std::string plain;
+    for (int i = 0; i < 50; ++i) plain += "A plain sentence of a long letter, line " + std::to_string(i) + ".\n";
+    blocks = pflash_query_blocks(plain, whole(plain));
+    REQUIRE(!blocks.structured);
+    REQUIRE(blocks.head.end == blocks.head.begin);
+    REQUIRE(blocks.tail.end == blocks.tail.begin);
+
+    // A plain prose paste after an opening question: the question is the head.
+    const std::string asked = "Who wrote the letter?\n\n" + plain;
+    blocks = pflash_query_blocks(asked, whole(asked));
+    REQUIRE(!blocks.structured);
+    REQUIRE(std::string(blocks.head_rule) == "question");
+    REQUIRE(block_text(asked, blocks.head) == "Who wrote the letter?");
+    REQUIRE(blocks.tail.end == blocks.tail.begin);
+}
+
+TEST_CASE(PFlashFoldFixture, query_blocks_give_code_only_messages_no_blocks) {
+    std::string code;
+    for (int i = 0; i < 20; ++i) {
+        code += "def f" + std::to_string(i) + "(x):\n    return x + " + std::to_string(i) + "\n\n";
+    }
+    const auto blocks = pflash_query_blocks(code, whole(code));
+    REQUIRE(blocks.structured);
+    REQUIRE(blocks.head.end == blocks.head.begin);
+    REQUIRE(blocks.tail.end == blocks.tail.begin);
+    // JSON data is pasted material too.
+    std::string data = "Summarise these records for me please.\n\n[\n";
+    for (int i = 0; i < 10; ++i) data += "  {\"id\": " + std::to_string(i) + ", \"ok\": true},\n";
+    data += "]\n";
+    const auto json_blocks = pflash_query_blocks(data, whole(data));
+    REQUIRE(block_text(data, json_blocks.head) == "Summarise these records for me please.");
+    REQUIRE(json_blocks.tail.end == json_blocks.tail.begin);
+}
+
+TEST_CASE(PFlashFoldFixture, query_head_config_needs_latest_user_and_bounded_caps) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", nullptr};
+    luce_test::ScopedEnvVar head{"PFLASH_SELECT_QUERY_HEAD", "1"};
+    luce_test::ScopedEnvVar head_tokens{"PFLASH_SELECT_QUERY_HEAD_TOKENS", nullptr};
+    luce_test::ScopedEnvVar tail_tokens{"PFLASH_SELECT_QUERY_TAIL_TOKENS", nullptr};
+    PFlashSelectionConfig config;
+    std::string error;
+    // The chat tail parser has no user-message boundary to read.
+    REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
+    REQUIRE(error.find("latest_user") != std::string::npos);
+    luce_test::ScopedEnvVar latest{"PFLASH_SELECT_QUERY_PARSER", "latest_user"};
+    REQUIRE(resolve_pflash_selection(32768, 32, config, error));
+    REQUIRE(config.query_head);
+    REQUIRE(config.query_head_tokens == 256);
+    REQUIRE(config.query_tail_tokens == 256);
+    {
+        luce_test::ScopedEnvVar big{"PFLASH_SELECT_QUERY_TAIL_TOKENS", "1024"};
+        REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
+    }
+    {
+        luce_test::ScopedEnvVar off{"PFLASH_SELECT_QUERY_HEAD", "0"};
+        luce_test::ScopedEnvVar caps{"PFLASH_SELECT_QUERY_HEAD_TOKENS", "128"};
+        REQUIRE(resolve_pflash_selection(32768, 32, config, error));
+        REQUIRE(!config.query_head);
+        REQUIRE(config.query_head_tokens == 128);
+    }
+}

@@ -95,6 +95,29 @@ struct PFlashFoldStructure {
 
 PFlashFoldStructure pflash_fold_structure(const std::string & text, bool paragraphs = true);
 
+// Query blocks of a user message (PFLASH_SELECT_QUERY_HEAD=1): where the
+// user's own prose sits around pasted material.
+//   head  the leading prose block, from the message start to the first
+//         paste-like line (a code fence, a markdown heading, a separator
+//         rule, a record/file header, a tag, JSON/table data, an indented or
+//         code-shaped line), trimmed; empty when the message opens with
+//         pasted material. Without any paste-like line, a short first
+//         paragraph ending in '?' before a text at least eight times longer
+//         is the head too (a question before a plain prose paste).
+//   tail  the last blank-line paragraph when it follows the last paste-like
+//         line and has none itself; empty otherwise.
+// ``structured`` says a paste-like line was found; without one only the
+// '?' head rule applies and the tail stays empty. A block holding more than
+// half the text is not a question block and is left empty.
+struct PFlashQueryBlocks {
+    bool structured = false;
+    PFlashTextSpan head;
+    PFlashTextSpan tail;
+    const char * head_rule = "none";   // paste, question, none
+};
+
+PFlashQueryBlocks pflash_query_blocks(const std::string & text, PFlashTextSpan message);
+
 // Token span covering byte span [begin, end): from the token holding
 // ``begin`` through the token holding ``end - 1``. ``token_begin`` holds
 // each token's first byte, ascending.

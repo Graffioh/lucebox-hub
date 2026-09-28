@@ -303,6 +303,9 @@ struct ModelBackend {
         // The latest user turn's tail, a second query window at full weight
         // (prompt-end chat queries; {-1, -1} otherwise).
         PFlashTokenSpan turn_query_span{-1, -1};
+        // PFLASH_SELECT_QUERY_HEAD=1: the user's prose blocks around pasted
+        // material, extra query windows at full weight (also kept verbatim).
+        std::vector<PFlashTokenSpan> extra_query_spans;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

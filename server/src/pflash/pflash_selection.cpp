@@ -30,6 +30,9 @@ constexpr const char * kFoldKEnv = "PFLASH_SELECT_FOLD_K";
 constexpr const char * kFoldCapEnv = "PFLASH_SELECT_FOLD_CAP";
 constexpr const char * kFoldHeadEnv = "PFLASH_SELECT_FOLD_HEAD";
 constexpr const char * kFoldParagraphsEnv = "PFLASH_SELECT_FOLD_PARAGRAPHS";
+constexpr const char * kQueryHeadEnv = "PFLASH_SELECT_QUERY_HEAD";
+constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
+constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -82,7 +85,8 @@ bool has_pflash_selection_environment() noexcept {
            std::getenv(kSelectEnv) != nullptr ||
            std::getenv(kScorerEnv) != nullptr ||
            std::getenv(kSplitEnv) != nullptr ||
-           std::getenv(kStrategyEnv) != nullptr;
+           std::getenv(kStrategyEnv) != nullptr ||
+           std::getenv(kQueryHeadEnv) != nullptr;
 }
 
 bool pflash_fold_requested() noexcept {
@@ -333,11 +337,12 @@ bool resolve_pflash_selection(
     const char * scorer_raw = std::getenv(kScorerEnv);
     const char * split_raw = std::getenv(kSplitEnv);
     const char * strategy_raw = std::getenv(kStrategyEnv);
+    const char * query_head_raw = std::getenv(kQueryHeadEnv);
 
     PFlashSelectionConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
         query_parser_raw || top_p_raw || top_k_raw || segments_raw ||
-        select_raw || scorer_raw || split_raw || strategy_raw;
+        select_raw || scorer_raw || split_raw || strategy_raw || query_head_raw;
     if (scorer_raw) {
         if (std::strcmp(scorer_raw, "head") == 0) {
             config.scorer = PFlashScorer::Head;
@@ -462,6 +467,30 @@ bool resolve_pflash_selection(
                 std::to_string(knob.min);
             return false;
         }
+    }
+    if (query_head_raw) {
+        if (std::strcmp(query_head_raw, "0") != 0 && std::strcmp(query_head_raw, "1") != 0) {
+            error = std::string(kQueryHeadEnv) + " must be 0 or 1";
+            return false;
+        }
+        config.query_head = query_head_raw[0] == '1';
+    }
+    const struct { const char * name; int * value; } query_caps[] = {
+        {kQueryHeadTokensEnv, &config.query_head_tokens},
+        {kQueryTailTokensEnv, &config.query_tail_tokens},
+    };
+    for (const auto & cap : query_caps) {
+        const char * raw = std::getenv(cap.name);
+        if (raw && (!parse_int(raw, *cap.value) || *cap.value < 2 || *cap.value > 512)) {
+            error = std::string(cap.name) + " must be an integer in [2, 512]";
+            return false;
+        }
+    }
+    if (config.query_head && (config.query_parser != PFlashQueryParser::SemanticUser ||
+                              config.mode == PFlashSelectionMode::Legacy)) {
+        error = std::string(kQueryHeadEnv) + "=1 needs strict selection with " +
+            std::string(kQueryParserEnv) + "=latest_user";
+        return false;
     }
     if (const char * raw = std::getenv(kFoldParagraphsEnv)) {
         if (std::strcmp(raw, "0") != 0 && std::strcmp(raw, "1") != 0) {

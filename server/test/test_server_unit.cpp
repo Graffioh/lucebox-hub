@@ -11402,3 +11402,60 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image
     TEST_ASSERT(!prepare_request_images(forged, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
     TEST_ASSERT(normalized.is_null() && images.empty());
 }
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_head_plan_windows_and_caps) {
+    // One token per character: token counts equal character counts.
+    std::string question;
+    for (int i = 0; i < 12; ++i) question += "Is setting " + std::to_string(i) + " fine? ";
+    std::string paste = "## Paper\n\n";
+    for (int i = 0; i < 30; ++i) paste += "Body text line " + std::to_string(i) + " of the paper.\n\n";
+    const std::string after = "Which line mentions the number twenty?";
+    const std::string content = question + "\n\n" + paste + after;
+    const std::string rendered = "<|im_start|>user\n" + content + "<|im_end|>\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture({}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    std::vector<int32_t> ids;
+    ids.push_back(tok.token_to_id("<|im_start|>"));
+    for (char ch : std::string("user\n") + content) {
+        ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
+    }
+    const int begin = 6;                       // after "<|im_start|>user\n"
+    const int end = begin + (int) content.size();
+    TEST_ASSERT(tok.decode({ids.begin() + begin, ids.begin() + end}) == content);
+
+    // Caps above both blocks: the head whole, the tail as the query window.
+    auto plan = http_detail::pflash_query_head_plan(tok, ids, begin, end, 512, 512);
+    TEST_ASSERT(plan.structured && plan.head_rule == "paste");
+    TEST_ASSERT(plan.extra.size() == 1);
+    const std::string q = question.substr(0, question.size() - 1);   // trimmed
+    TEST_ASSERT(tok.decode({ids.begin() + plan.extra[0].begin, ids.begin() + plan.extra[0].end}) == q);
+    TEST_ASSERT(tok.decode({ids.begin() + plan.tail.begin, ids.begin() + plan.tail.end}) == after);
+    TEST_ASSERT(plan.tail.end == end);
+
+    // A head over its cap: first and last cap/2 tokens; a tail over its cap:
+    // the query window is its last cap/2 tokens, its first cap/2 an extra.
+    plan = http_detail::pflash_query_head_plan(tok, ids, begin, end, 40, 20);
+    TEST_ASSERT(plan.extra.size() == 3);
+    TEST_ASSERT(plan.extra[0].begin == begin && plan.extra[0].end == begin + 20);
+    TEST_ASSERT(plan.extra[1].end == begin + (int) q.size() &&
+                plan.extra[1].end - plan.extra[1].begin == 20);
+    TEST_ASSERT(plan.tail.end == end && plan.tail.end - plan.tail.begin == 10);
+    TEST_ASSERT(plan.extra[2].begin == end - (int) after.size() &&
+                plan.extra[2].end - plan.extra[2].begin == 10);
+
+    // A stock preamble under 16 tokens is not a question; a plain message
+    // keeps today's window.
+    const std::string stock = "Here it is.\n\n" + paste + after;
+    std::vector<int32_t> stock_ids;
+    for (char ch : stock) stock_ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
+    plan = http_detail::pflash_query_head_plan(tok, stock_ids, 0, (int) stock_ids.size(), 256, 256);
+    TEST_ASSERT(plan.extra.empty() && plan.head_tokens == 0);
+    TEST_ASSERT(plan.tail.begin >= 0);
+    std::vector<int32_t> plain_ids;
+    for (char ch : std::string("just a short plain message without any structure at all"))
+        plain_ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
+    plan = http_detail::pflash_query_head_plan(tok, plain_ids, 0, (int) plain_ids.size(), 256, 256);
+    TEST_ASSERT(!plan.structured && plan.extra.empty() && plan.tail.begin < 0);
+}

@@ -122,6 +122,8 @@ struct PFlashTraceFields {
     int fold_skipped = 0;
     int fold_capped = 0;
     int fold_contained = 0;
+    // Query head: the extra query windows scored next to the query.
+    const std::vector<PFlashTokenSpan> * extra_queries = nullptr;
 };
 
 void write_compression_trace(

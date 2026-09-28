@@ -132,6 +132,14 @@ void write_compression_trace(
             }
             std::fputc(']', file);
         }
+        if (trace_fields->extra_queries && !trace_fields->extra_queries->empty()) {
+            std::fputs(",\"extra_queries\":[", file);
+            for (size_t index = 0; index < trace_fields->extra_queries->size(); ++index) {
+                const auto & span = (*trace_fields->extra_queries)[index];
+                std::fprintf(file, "%s[%d,%d]", index ? "," : "", span.begin, span.end);
+            }
+            std::fputc(']', file);
+        }
         if (trace_fields->kept_spans) {
             std::fprintf(file,
                 ",\"strategy\":\"fold\",\"fold_code\":%s,\"fold_code_lines\":%d,"
@@ -376,6 +384,7 @@ std::vector<int32_t> select_pflash_chunks(
             fields.fold_skipped = fold.skipped;
             fields.fold_capped = fold.capped;
             fields.fold_contained = fold.contained;
+            fields.extra_queries = &config.extra_queries;
             write_compression_trace(
                 input_tokens, keep_ratio, segments ? 0 : config.chunk_size, query_tokens,
                 pool_kernel, (int) fold.anchors.size(), chunk_means, anchor_mask,
@@ -476,6 +485,7 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
         strict_fields.top_k =
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
+        strict_fields.extra_queries = &config.extra_queries;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

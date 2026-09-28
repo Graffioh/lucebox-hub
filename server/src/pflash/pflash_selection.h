@@ -139,6 +139,17 @@ struct PFlashSelectionConfig {
     // strings (an identifier, a function description) the last token does
     // not carry.
     luce::common::PFlashTokenSpan turn_query{-1, -1};
+    // PFLASH_SELECT_QUERY_HEAD=1 (latest_user parser): the question may sit
+    // before pasted material. The server scores the user's leading prose
+    // block (capped at ``query_head_tokens``) and the trailing prose block
+    // (capped at ``query_tail_tokens``) as query windows; a block over its
+    // cap contributes its first and last cap/2 tokens.
+    bool query_head = false;
+    int query_head_tokens = 256;
+    int query_tail_tokens = 256;
+    // Per request: those extra windows, scored at full weight next to the
+    // query window and kept verbatim.
+    std::vector<luce::common::PFlashTokenSpan> extra_queries;
 };
 
 // Segment probe: cut the context before every token whose boundary score is

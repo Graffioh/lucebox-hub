@@ -9,6 +9,9 @@
 //   pflash_fold_replay <drafter.gguf> text <rows.jsonl>
 //       One JSON line per {"id", "prompt"} row: the structure and route of
 //       the raw prompt text (no template, no selection).
+//   pflash_fold_replay <drafter.gguf> query <rows.jsonl>
+//       One JSON line per {"id", "text"} user message: its query blocks
+//       (PFLASH_SELECT_QUERY_HEAD) with token counts.
 
 #include "pflash/pflash_fold.h"
 #include "pflash/pflash_selection.h"
@@ -101,18 +104,43 @@ int replay_text(int argc, char ** argv) {
     return 0;
 }
 
+// {"id", "text"} rows: the query blocks of a user message, with token counts.
+int replay_query(const luce::common::Tokenizer & vocab, int argc, char ** argv) {
+    for (int a = 3; a < argc; ++a) {
+        std::ifstream in(argv[a]);
+        std::string line;
+        while (std::getline(in, line)) {
+            const json row = json::parse(line);
+            const std::string text = row.at("text").get<std::string>();
+            const auto blocks = pflash_query_blocks(text, {0, text.size()});
+            const auto block = [&](PFlashTextSpan s) {
+                const std::string piece = text.substr(s.begin, s.end - s.begin);
+                return json{{"bytes", {s.begin, s.end}},
+                            {"tokens", s.end > s.begin ? vocab.encode(piece).size() : 0},
+                            {"text", piece}};
+            };
+            json out = {{"id", row.value("id", std::string())}, {"structured", blocks.structured},
+                        {"head_rule", blocks.head_rule}, {"head", block(blocks.head)},
+                        {"tail", block(blocks.tail)}, {"message_tokens", vocab.encode(text).size()}};
+            std::cout << out.dump() << "\n";
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
-            "usage: pflash_fold_replay <drafter.gguf> traces|text <file.jsonl>...\n");
+            "usage: pflash_fold_replay <drafter.gguf> traces|text|query <file.jsonl>...\n");
         return 2;
     }
     const std::string mode = argv[2];
     if (mode == "text") return replay_text(argc, argv);
     luce::common::Tokenizer vocab;
     if (!vocab.load_from_gguf(argv[1])) return 1;
+    if (mode == "query") return replay_query(vocab, argc, argv);
     PFlashSelectionConfig config;
     std::string error;
     if (!resolve_pflash_selection(1, 32, config, error)) {

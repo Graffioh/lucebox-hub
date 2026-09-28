@@ -409,6 +409,31 @@ PFlashTokenSpan pflash_decoded_text_span(
     int end,
     const std::string & needle);
 
+// PFLASH_SELECT_QUERY_HEAD=1: query windows from the structure of the
+// latest user content ``prompt[content_begin, content_end)`` (see
+// pflash_query_blocks). ``extra`` holds the leading prose block (or its
+// first and last head_cap/2 tokens when longer) and, for a trailing block
+// longer than tail_cap, its first tail_cap/2 tokens; ``tail`` is the main
+// query window -- the trailing prose block, or its last tail_cap/2 tokens --
+// or {-1, -1} to keep today's window. A block under 16 tokens is ignored (a
+// stock line such as "Here is the material."), so a short trailing block
+// keeps today's window.
+struct PflashQueryHeadPlan {
+    std::vector<PFlashTokenSpan> extra;
+    PFlashTokenSpan tail{-1, -1};
+    std::string head_rule = "none";
+    bool structured = false;
+    int head_tokens = 0;
+    int tail_tokens = 0;
+};
+PflashQueryHeadPlan pflash_query_head_plan(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & prompt,
+    int content_begin,
+    int content_end,
+    int head_cap,
+    int tail_cap);
+
 // The chat turn the scorer query comes from, located by the model's own
 // chat control markers in the rendered prompt rather than message
 // bookkeeping: the latest user turn (tool output wrapped in a user turn does

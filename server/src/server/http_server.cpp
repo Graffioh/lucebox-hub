@@ -28,6 +28,7 @@
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
+#include "pflash/pflash_fold.h"
 #include "pflash/pflash_selection.h"
 #include "freeze_history.h"
 
@@ -271,6 +272,65 @@ PflashQueryWindow pflash_tail_query_window(
     }
     result.tokens = (std::min)(max_tokens, result.end - query_begin);
     return result;
+}
+
+PflashQueryHeadPlan pflash_query_head_plan(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & prompt,
+        int content_begin,
+        int content_end,
+        int head_cap,
+        int tail_cap) {
+    PflashQueryHeadPlan plan;
+    if (content_begin < 0 || content_end <= content_begin ||
+        content_end > (int) prompt.size() || head_cap < 2 || tail_cap < 2) {
+        return plan;
+    }
+    std::string text;
+    std::vector<size_t> offsets;
+    offsets.reserve((size_t) (content_end - content_begin));
+    for (int index = content_begin; index < content_end; ++index) {
+        offsets.push_back(text.size());
+        text += tokenizer.token_text(prompt[(size_t) index]);
+    }
+    const auto blocks = luce::pflash::pflash_query_blocks(text, {0, text.size()});
+    plan.structured = blocks.structured;
+    // A block this short is a stock line ("Here is the material.", "Answer
+    // with the letter.") rather than the question.
+    constexpr int kMinBlock = 16;
+    const auto tokens_of = [&](luce::pflash::PFlashTextSpan span) {
+        PFlashTokenSpan t = luce::pflash::pflash_text_to_token_span(offsets, span);
+        return PFlashTokenSpan{t.begin + content_begin, t.end + content_begin};
+    };
+    // A block over its cap contributes its first and last cap/2 tokens.
+    const auto pieces = [](PFlashTokenSpan block, int cap) {
+        std::vector<PFlashTokenSpan> out;
+        if (block.end - block.begin <= cap) {
+            out.push_back(block);
+        } else {
+            out.push_back({block.begin, block.begin + cap / 2});
+            out.push_back({block.end - cap / 2, block.end});
+        }
+        return out;
+    };
+    if (blocks.head.end > blocks.head.begin) {
+        const PFlashTokenSpan head = tokens_of(blocks.head);
+        if (head.end - head.begin >= kMinBlock) {
+            plan.head_rule = blocks.head_rule;
+            plan.head_tokens = head.end - head.begin;
+            for (const auto & piece : pieces(head, head_cap)) plan.extra.push_back(piece);
+        }
+    }
+    if (blocks.tail.end > blocks.tail.begin) {
+        const PFlashTokenSpan tail = tokens_of(blocks.tail);
+        if (tail.end - tail.begin >= kMinBlock) {
+            plan.tail_tokens = tail.end - tail.begin;
+            const auto parts = pieces(tail, tail_cap);
+            plan.tail = parts.back();
+            if (parts.size() > 1) plan.extra.push_back(parts.front());
+        }
+    }
+    return plan;
 }
 
 PFlashTokenSpan pflash_decoded_text_span(
@@ -4336,6 +4396,54 @@ std::string HttpServer::apply_pflash_compression(
         }
     }
 
+    // Query head (PFLASH_SELECT_QUERY_HEAD=1): the user's own prose around
+    // pasted material -- a question before the paste, the one after it --
+    // becomes query windows, kept verbatim. The trailing prose block replaces
+    // the fixed-width tail window; without paste structure nothing changes.
+    std::vector<PFlashTokenSpan> extra_query_spans;
+    if (experiment.selection_active && experiment.query_head &&
+        req.pflash_query.empty() && query_window.valid() &&
+        query_content_begin >= 0 && query_content_end > query_content_begin) {
+        const auto plan = http_detail::pflash_query_head_plan(
+            *drafter_tokenizer_, drafter_ids, query_content_begin,
+            query_content_end, experiment.query_head_tokens,
+            experiment.query_tail_tokens);
+        if (plan.tail.begin >= 0 && plan.tail.end > plan.tail.begin) {
+            query_window.end = plan.tail.end;
+            query_window.tokens = plan.tail.end - plan.tail.begin;
+            query_window.trailing_trimmed = 0;
+            expected_query_ids.assign(drafter_ids.begin() + plan.tail.begin,
+                                      drafter_ids.begin() + plan.tail.end);
+        }
+        const int query_begin = query_window.end - query_window.tokens;
+        for (const auto & span : plan.extra) {
+            if (span.end <= query_begin && span.end > span.begin) {
+                extra_query_spans.push_back(span);
+            }
+        }
+        if (!extra_query_spans.empty()) {
+            auto pinned = required_instruction_spans;
+            pinned.insert(pinned.end(), extra_query_spans.begin(), extra_query_spans.end());
+            pinned = http_detail::canonicalize_pflash_token_spans(std::move(pinned));
+            std::string pin_error;
+            if (!luce::pflash::validate_pflash_instruction_spans(
+                    pinned, (int) drafter_ids.size(), pin_error)) {
+                return "PFlash query head mapping failed: " + pin_error;
+            }
+            required_instruction_spans = std::move(pinned);
+        }
+        std::string windows;
+        for (const auto & span : extra_query_spans) {
+            windows += " [" + std::to_string(span.begin) + "," + std::to_string(span.end) + ")";
+        }
+        std::fprintf(stderr,
+            "[pflash-query-head] structured=%d head=%s/%d tail=%d query=[%d,%d) extra=%zu%s\n",
+            (int) plan.structured, plan.head_rule.c_str(), plan.head_tokens,
+            plan.tail_tokens, query_begin, query_window.end,
+            extra_query_spans.size(), windows.c_str());
+        std::fflush(stderr);
+    }
+
     // Strict selection spends the keep ratio on the droppable tokens only:
     // what it keeps anyway (instructions, tools, the query and its turn's
     // envelope, the generation prompt) is already cheap -- a stable system
@@ -4417,6 +4525,7 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.query_suffix_candidates = query_suffix_candidates;
     compress_request.history_query_spans = history_query_spans;
     compress_request.turn_query_span = turn_query_span;
+    compress_request.extra_query_spans = extra_query_spans;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (experiment.selection_active && query_window.valid()) {
@@ -4462,6 +4571,13 @@ std::string HttpServer::apply_pflash_compression(
                 {"history_queries", history_query_spans.size()},
                 {"turn_query_begin", turn_query_span.begin},
                 {"turn_query_end", turn_query_span.end},
+                {"extra_query_spans", [&] {
+                    json spans = json::array();
+                    for (const auto & span : extra_query_spans) {
+                        spans.push_back({span.begin, span.end});
+                    }
+                    return spans;
+                }()},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},

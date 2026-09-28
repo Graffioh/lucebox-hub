@@ -1029,6 +1029,17 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 windows.push_back(std::move(tail));
             }
         }
+        // The user's prose around pasted material (query head), at the
+        // query's own weight.
+        for (const auto & span : experiment.extra_queries) {
+            if (span.end > query_start || span.end - span.begin < 1) continue;
+            ScoredWindow extra;
+            extra.begin = span.begin;
+            extra.end = span.end;
+            if (rows_for(span.begin, span.end, extra.rows)) {
+                windows.push_back(std::move(extra));
+            }
+        }
         double weight = 1.0;
         for (const auto & span : experiment.history_queries) {
             weight *= 0.5;
