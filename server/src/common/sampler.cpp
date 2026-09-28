@@ -104,6 +104,63 @@ int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uni
 
 }  // namespace
 
+namespace {
+
+// Everything after the top_k cut: softmax(temp), top_p, draw. Shared by the
+// full-vocab chain and sample_logits_topk.
+int sample_from_candidates(std::vector<std::pair<float, int>> & cand,
+                           const SamplerCfg & cfg, bool need_top_k,
+                           bool need_top_p, double r_uniform) {
+    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
+    const float maxv_logit = need_top_k
+        ? cand.front().first
+        : std::max_element(cand.begin(), cand.end(),
+                           [](auto & a, auto & b){ return a.first < b.first; })->first;
+    const float maxv = maxv_logit * inv_t;
+
+    if (need_top_p && !need_top_k) {
+        // Nucleus cutoff over the full (untruncated) vocab. Z is the true
+        // full-vocab softmax denominator (one O(vocab) exp() pass, needed
+        // regardless to know the absolute mass threshold).
+        double Z = 0.0;
+        for (auto & c : cand) Z += std::exp((double)c.first * inv_t - maxv);
+        const double target = (double)cfg.top_p * Z;
+        const size_t cut = nucleus_cutoff(cand, target, [&](auto & c) {
+            return std::exp((double)c.first * inv_t - maxv);
+        });
+        cand.resize(cut);
+    }
+
+    double Z = 0.0;
+    std::vector<float> probs(cand.size());
+    for (size_t i = 0; i < cand.size(); i++) {
+        probs[i] = std::exp(cand[i].first * inv_t - maxv);
+        Z       += probs[i];
+    }
+    for (auto & p : probs) p = (float)(p / Z);
+
+    // top_k+top_p combined: cut the already top_k-truncated (and thus
+    // already-sorted) subset further to the top_p nucleus within it.
+    if (need_top_p && need_top_k) {
+        double cum = 0.0;
+        size_t cut = probs.size();
+        for (size_t i = 0; i < probs.size(); i++) {
+            cum += probs[i];
+            if (cum >= cfg.top_p) { cut = i + 1; break; }
+        }
+        probs.resize(cut); cand.resize(cut);
+    }
+
+    // Draw from the final candidate set. Same CDF walk as draw_from_weights
+    // above (it renormalizes internally, which is a no-op cost here since
+    // probs already sums to ~1) — reuse it instead of re-deriving the same
+    // loop a second time.
+    for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
+    return draw_from_weights(cand, r_uniform);
+}
+
+}  // namespace
+
 int sample_logits(const float * logits_in,
                   int vocab,
                   const SamplerCfg & cfg,
@@ -206,52 +263,21 @@ int sample_logits(const float * logits_in,
         cand.resize(cfg.top_k);
     }
 
-    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
-    const float maxv_logit = need_top_k
-        ? cand.front().first
-        : std::max_element(cand.begin(), cand.end(),
-                           [](auto & a, auto & b){ return a.first < b.first; })->first;
-    const float maxv = maxv_logit * inv_t;
+    return sample_from_candidates(cand, cfg, need_top_k, need_top_p, r_uniform);
+}
 
-    if (need_top_p && !need_top_k) {
-        // Nucleus cutoff over the full (untruncated) vocab. Z is the true
-        // full-vocab softmax denominator (one O(vocab) exp() pass, needed
-        // regardless to know the absolute mass threshold).
-        double Z = 0.0;
-        for (auto & c : cand) Z += std::exp((double)c.first * inv_t - maxv);
-        const double target = (double)cfg.top_p * Z;
-        const size_t cut = nucleus_cutoff(cand, target, [&](auto & c) {
-            return std::exp((double)c.first * inv_t - maxv);
-        });
-        cand.resize(cut);
-    }
-
-    double Z = 0.0;
-    std::vector<float> probs(cand.size());
-    for (size_t i = 0; i < cand.size(); i++) {
-        probs[i] = std::exp(cand[i].first * inv_t - maxv);
-        Z       += probs[i];
-    }
-    for (auto & p : probs) p = (float)(p / Z);
-
-    // top_k+top_p combined: cut the already top_k-truncated (and thus
-    // already-sorted) subset further to the top_p nucleus within it.
-    if (need_top_p && need_top_k) {
-        double cum = 0.0;
-        size_t cut = probs.size();
-        for (size_t i = 0; i < probs.size(); i++) {
-            cum += probs[i];
-            if (cum >= cfg.top_p) { cut = i + 1; break; }
-        }
-        probs.resize(cut); cand.resize(cut);
-    }
-
-    // Draw from the final candidate set. Same CDF walk as draw_from_weights
-    // above (it renormalizes internally, which is a no-op cost here since
-    // probs already sums to ~1) — reuse it instead of re-deriving the same
-    // loop a second time.
-    for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
-    return draw_from_weights(cand, r_uniform);
+int sample_logits_topk(const float * top_logits,
+                       const int32_t * top_ids,
+                       int n,
+                       const SamplerCfg & cfg,
+                       std::mt19937_64 & rng) {
+    if (!(cfg.temp > 0.0f) || cfg.top_k <= 0 || cfg.top_k > n) return -1;
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    const double r_uniform = u(rng);
+    std::vector<std::pair<float, int>> cand((size_t)cfg.top_k);
+    for (int i = 0; i < cfg.top_k; i++) cand[(size_t)i] = {top_logits[i], (int)top_ids[i]};
+    const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
+    return sample_from_candidates(cand, cfg, /*need_top_k=*/true, need_top_p, r_uniform);
 }
 
 bool parse_sampler_token(std::string & line, SamplerCfg & out) {

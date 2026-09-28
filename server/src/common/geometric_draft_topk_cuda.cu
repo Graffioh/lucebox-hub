@@ -13,7 +13,7 @@ namespace luce::common {
 
 namespace {
 
-constexpr int kMaxK    = 16;    // ddtree_K is 8, the DFlash 2 selector uses 16; K>kMaxK → CPU fallback
+constexpr int kMaxK    = 32;    // ddtree_K is 8, the DFlash 2 selector uses 16, sampled verify up to 32
 constexpr int kBlock   = 256;   // threads per block (power of two for the reduction)
 constexpr int kMaxSplit = 128;  // max vocab splits per position (combine-block cap)
 
@@ -79,7 +79,7 @@ __device__ __forceinline__ void merge_topk(const float * av, const int * ai,
 // VEC selects 16-byte float4 loads (one coalesced transaction per 4 logits) —
 // only used when every row's base pointer is 16-byte aligned (vocab % 4 == 0
 // and an aligned tensor); otherwise the scalar path is used.
-template <int K, bool VEC>
+template <int K, bool VEC, int BLOCK = kBlock>
 __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
                                    int vocab, float inv_t, int split,
                                    float * __restrict__ part_max,
@@ -105,7 +105,7 @@ __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
         const int b4 = s * chunk4;
         const int e4 = min(b4 + chunk4, vocab4);
         const float4 * __restrict__ li4 = reinterpret_cast<const float4 *>(li);
-        for (int j4 = b4 + tid; j4 < e4; j4 += kBlock) {
+        for (int j4 = b4 + tid; j4 < e4; j4 += BLOCK) {
             const float4 f = li4[j4];
             const int base = j4 << 2;
             LUCE_TOPK_CONSUME(f.x, base + 0);
@@ -116,22 +116,22 @@ __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
         // Tail elements past the last full float4 (only when vocab % 4 != 0);
         // the last split owns them so no id is scanned twice.
         if (s == split - 1) {
-            for (int j = (vocab4 << 2) + tid; j < vocab; j += kBlock)
+            for (int j = (vocab4 << 2) + tid; j < vocab; j += BLOCK)
                 LUCE_TOPK_CONSUME(li[j], j);
         }
     } else {
         const int chunk = (vocab + split - 1) / split;
         const int begin = s * chunk;
         const int end   = min(begin + chunk, vocab);
-        for (int j = begin + tid; j < end; j += kBlock)
+        for (int j = begin + tid; j < end; j += BLOCK)
             LUCE_TOPK_CONSUME(li[j], j);
     }
 
-    // ---- block reduction over kBlock threads ------------------------------
-    __shared__ float s_max[kBlock];
-    __shared__ float s_sum[kBlock];
-    __shared__ float s_topv[kBlock * K];
-    __shared__ int32_t s_topi[kBlock * K];
+    // ---- block reduction over BLOCK threads ------------------------------
+    __shared__ float s_max[BLOCK];
+    __shared__ float s_sum[BLOCK];
+    __shared__ float s_topv[BLOCK * K];
+    __shared__ int32_t s_topi[BLOCK * K];
 
     s_max[tid] = lmax;
     s_sum[tid] = lsum;
@@ -142,7 +142,7 @@ __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
     }
     __syncthreads();
 
-    for (int stride = kBlock / 2; stride > 0; stride >>= 1) {
+    for (int stride = BLOCK / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             const float am = s_max[tid],          as = s_sum[tid];
             const float bm = s_max[tid + stride], bs = s_sum[tid + stride];
@@ -181,7 +181,7 @@ __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
 // Grid: n_positions blocks of blockDim = pow2_ceil(split) threads. Thread t
 // loads partial t (or an identity when t >= split), then a shared-memory tree
 // reduction merges all partials. log_prob[k] = top_v[k] - log_z.
-template <int K>
+template <int K, bool RAW = false>
 __global__ void geometric_draft_topk_combine(const float * __restrict__ part_max,
                                    const float * __restrict__ part_sum,
                                    const float * __restrict__ part_v,
@@ -242,7 +242,7 @@ __global__ void geometric_draft_topk_combine(const float * __restrict__ part_max
         const float log_z = s_max[0] + logf(s_sum[0]);
 #pragma unroll
         for (int k = 0; k < K; k++) {
-            out_lp[(size_t)row * K + k]  = s_topv[k] - log_z;
+            out_lp[(size_t)row * K + k]  = RAW ? s_topv[k] : s_topv[k] - log_z;
             out_ids[(size_t)row * K + k] = s_topi[k];
         }
     }
@@ -423,6 +423,131 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                          k_ms, c_ms, n_positions, vocab, split);
             cudaEventDestroy(e_k0); cudaEventDestroy(e_k1); cudaEventDestroy(e_c1);
         }
+    }
+    if (!ok) cudaGetLastError();
+    if (dev != prev) cudaSetDevice(prev);
+    return ok;
+}
+
+namespace {
+
+// One thread per (row, id) penalty entry. The float operations and their
+// order are those of sample_logits' CPU chain, with explicitly rounded
+// intrinsics so the compiler cannot contract them into an FMA.
+__global__ void geometric_apply_penalties(float * __restrict__ logits, int vocab,
+                                          const GeometricPenalty * __restrict__ entries,
+                                          int n_entries, float rep_pen,
+                                          float freq_pen, float pres_pen) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_entries) return;
+    const GeometricPenalty p = entries[e];
+    float * x = logits + (size_t)p.row * vocab + p.id;
+    float v = *x;
+    if (p.repeat) {
+        v = v > 0.0f ? __fdiv_rn(v, rep_pen) : __fmul_rn(v, rep_pen);
+    }
+    if (p.count > 0) {
+        v = __fsub_rn(v, __fmul_rn(freq_pen, (float)p.count));
+        v = __fsub_rn(v, pres_pen);
+    }
+    *x = v;
+}
+
+thread_local GeometricPenalty * penalty_scratch = nullptr;
+thread_local size_t penalty_cap = 0;
+thread_local int penalty_device = -1;
+
+}  // namespace
+
+bool geometric_extract_topk_logits_cuda(void * d_logits, int n_positions, int vocab, int K,
+                                        const GeometricPenalty * penalties, int n_penalties,
+                                        float rep_pen, float freq_pen, float pres_pen,
+                                        float * out_logits, int32_t * out_token_ids) {
+    if (!d_logits || !out_logits || !out_token_ids || n_positions <= 0 || vocab <= 0 ||
+        K > vocab || !geometric_topk_logits_cuda_supports_k(K) ||
+        (n_penalties > 0 && !penalties)) {
+        return false;
+    }
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, d_logits) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (attr.type != cudaMemoryTypeDevice) return false;
+    int prev = 0;
+    cudaGetDevice(&prev);
+    const int dev = attr.device;
+    if (dev != prev) cudaSetDevice(dev);
+
+    bool ok = true;
+    if (n_penalties > 0) {
+        if (penalty_device != dev || penalty_cap < (size_t)n_penalties) {
+            if (penalty_scratch) {
+                cudaSetDevice(penalty_device);
+                cudaFree(penalty_scratch);
+                cudaSetDevice(dev);
+            }
+            penalty_scratch = nullptr;
+            penalty_cap = 0;
+            const size_t cap = (size_t)n_penalties * 2;
+            if (cudaMalloc(&penalty_scratch, cap * sizeof(GeometricPenalty)) == cudaSuccess) {
+                penalty_cap = cap;
+                penalty_device = dev;
+            } else {
+                penalty_scratch = nullptr;
+                ok = false;
+            }
+        }
+        ok = ok && cudaMemcpy(penalty_scratch, penalties,
+                              (size_t)n_penalties * sizeof(GeometricPenalty),
+                              cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) {
+            geometric_apply_penalties<<<(n_penalties + 255) / 256, 256>>>(
+                static_cast<float *>(d_logits), vocab, penalty_scratch, n_penalties,
+                rep_pen, freq_pen, pres_pen);
+        }
+    }
+
+    const int    split   = pick_split(vocab, n_positions);
+    const size_t n       = (size_t)n_positions * K;
+    const size_t n_parts = (size_t)n_positions * split;
+    if (ok && ensure_scratch(dev, n, n_parts)) {
+        // Raw logits: scaling by exactly 1 leaves every value unchanged, and
+        // the combine skips the log-normalizer. 128-thread blocks keep the
+        // K-wide shared reduction lists under the static shared-memory limit.
+        constexpr int kRawBlock = 128;
+        const dim3 grid1(n_positions, split);
+        const int  comb_block = pow2_ceil(split);
+        const float * lp_in = static_cast<const float *>(d_logits);
+        const bool use_vec = (vocab % 4 == 0) &&
+                             (reinterpret_cast<uintptr_t>(lp_in) % 16 == 0);
+#define LUCE_TOPK_RAW_LAUNCH(KV, VEC)                                                      \
+            geometric_draft_topk_partial<KV, VEC, kRawBlock><<<grid1, kRawBlock>>>(        \
+                lp_in, vocab, 1.0f, split,                                                  \
+                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi);                \
+            geometric_draft_topk_combine<KV, true><<<n_positions, comb_block>>>(           \
+                scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi,                 \
+                split, scratch.d_lp, scratch.d_ids);
+#define LUCE_TOPK_RAW_CASE(KV)                                                             \
+            case KV:                                                                        \
+                if (use_vec) { LUCE_TOPK_RAW_LAUNCH(KV, true) }                            \
+                else         { LUCE_TOPK_RAW_LAUNCH(KV, false) }                           \
+                break;
+        switch (K) {
+            LUCE_TOPK_RAW_CASE(8) LUCE_TOPK_RAW_CASE(16) LUCE_TOPK_RAW_CASE(20)
+            LUCE_TOPK_RAW_CASE(24) LUCE_TOPK_RAW_CASE(32)
+            default: ok = false; break;
+        }
+#undef LUCE_TOPK_RAW_CASE
+#undef LUCE_TOPK_RAW_LAUNCH
+        ok = ok && cudaGetLastError() == cudaSuccess &&
+             cudaDeviceSynchronize() == cudaSuccess &&
+             cudaMemcpy(out_logits, scratch.d_lp, n * sizeof(float),
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             cudaMemcpy(out_token_ids, scratch.d_ids, n * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost) == cudaSuccess;
+    } else {
+        ok = false;
     }
     if (!ok) cudaGetLastError();
     if (dev != prev) cudaSetDevice(prev);

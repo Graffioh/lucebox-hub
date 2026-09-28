@@ -38,4 +38,25 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
                              int32_t * out_token_ids,
                              float temperature);
 
+// Sampled-verify candidates: apply sample_logits' repetition / frequency /
+// presence penalties IN PLACE to the device logits (one entry per penalized
+// (row, id)), then copy back each row's K largest raw logits, descending,
+// ties toward the lower id. With K >= the sampler's top_k this is the
+// candidate set sample_logits keeps after its top_k cut.
+struct GeometricPenalty {
+    int32_t row;
+    int32_t id;
+    int32_t repeat;   // in the repetition-penalty window
+    int32_t count;    // occurrences for the frequency/presence penalty (0 = none)
+};
+
+inline constexpr bool geometric_topk_logits_cuda_supports_k(int K) noexcept {
+    return K == 8 || K == 16 || K == 20 || K == 24 || K == 32;
+}
+
+bool geometric_extract_topk_logits_cuda(void * d_logits, int n_positions, int vocab, int K,
+                                        const GeometricPenalty * penalties, int n_penalties,
+                                        float rep_pen, float freq_pen, float pres_pen,
+                                        float * out_logits, int32_t * out_token_ids);
+
 }  // namespace luce::common
