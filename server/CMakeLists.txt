@@ -495,6 +495,7 @@ add_library(luce_common STATIC
     src/draft/draft_graph.cpp
     src/pflash/anchor_scan.cpp
     src/pflash/pflash_selection.cpp
+    src/pflash/pflash_fold.cpp
     src/pflash/pflash_drafter.cpp
     src/pflash/pflash_compress.cpp
     src/pflash/qwen35_drafter.cpp
@@ -2077,6 +2078,7 @@ if(LUCE_TESTS)
             test/test_anchor_transitive.cpp
             test/test_pflash_drafter_ipc.cpp
             test/test_pflash_selection.cpp
+            test/test_pflash_fold.cpp
             test/test_qwen35_causal_mask.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp

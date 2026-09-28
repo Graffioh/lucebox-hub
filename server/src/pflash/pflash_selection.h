@@ -96,6 +96,10 @@ enum class PFlashCandidateScore { Auto, Sum, Density };
 // original all-layer running-max scorer, or both with a split budget (the
 // head fills ``split_fraction`` of the budget first, the other scorer the rest).
 enum class PFlashScorer { Head, Legacy, Split };
+// How the kept spans are formed: whole segments in score order (today), or
+// fold -- anchors completed to their enclosing code or text block
+// (pflash_fold.h), routed by prompt type.
+enum class PFlashSelectStrategy { Segments, Fold };
 
 struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
@@ -110,6 +114,14 @@ struct PFlashSelectionConfig {
     PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
     PFlashScorer scorer = PFlashScorer::Head;
     double split_fraction = 0.5;
+    PFlashSelectStrategy strategy = PFlashSelectStrategy::Segments;
+    // Fold only: completions kept, block size above which a completion keeps
+    // the block's first ``fold_head`` tokens plus the anchor.
+    int fold_k = 20;
+    int fold_cap = 1500;
+    int fold_head = 150;
+    // Fold only: blank-line paragraphs as the last-resort text blocks.
+    bool fold_paragraphs = true;
     bool configured = false;
     bool selection_active = false;
     // Per request, never from the environment: the tokens after the query
@@ -162,6 +174,11 @@ PFlashSelectionResult select_pflash_split(
 const char * pflash_scorer_name(PFlashScorer scorer) noexcept;
 const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept;
 const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept;
+const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept;
+
+// PFLASH_SELECT_STRATEGY=fold, read once: the drafter loads its vocabulary
+// at load time only when fold may be requested.
+bool pflash_fold_requested() noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an
 // empty or invalid experiment variable cannot silently fall back to legacy.

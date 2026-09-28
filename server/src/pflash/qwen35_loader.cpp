@@ -348,6 +348,21 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             return false;
         }
     }
+    if (luce::pflash::pflash_fold_requested()) {
+        st->fold_vocab = std::make_unique<Tokenizer>();
+        if (!st->fold_vocab->load_from_gguf(gguf_path.c_str())) {
+            set_last_error("PFLASH_SELECT_STRATEGY=fold: drafter vocabulary load failed");
+            std::fprintf(stderr,
+                "[qwen35-drafter] ERROR: fold selection needs the drafter "
+                "vocabulary, refusing to serve without it\n");
+            std::fflush(stderr);
+            free_qwen35_head(*st);
+            free_qwen35_segment_probe(*st);
+            free_target_weights(st->weights);
+            delete st;
+            return false;
+        }
+    }
     out.state = st;
     out.loaded = true;
     std::fprintf(stderr,

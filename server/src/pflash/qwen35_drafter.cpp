@@ -1378,7 +1378,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, experiment, required_instruction_spans,
         /*direct_mass=*/true, /*write_trace=*/true,
-        segments.empty() ? nullptr : &segments, density);
+        segments.empty() ? nullptr : &segments, density,
+        /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
+        st.fold_vocab.get());
 }
 
 std::vector<int32_t> qwen35_drafter_score_and_compress(

@@ -7,7 +7,10 @@
 //   - PFlashTraceFields / write_compression_trace
 //                              JSONL compression trace (PFLASH_TRACE_PATH)
 //   - select_pflash_chunks     per-token scores -> candidates -> strict
-//                              selection -> merged output ids (+ trace)
+//                              selection -> merged output ids (+ trace);
+//                              with PFLASH_SELECT_STRATEGY=fold the fold
+//                              rule (pflash_fold.h) over the drafter's
+//                              decoded prompt (``fold_vocab``)
 
 #pragma once
 
@@ -21,6 +24,8 @@
 #include <vector>
 
 namespace luce::common {
+
+class Tokenizer;
 
 int env_int(const char * name, int fallback);
 float env_float(const char * name, float def);
@@ -105,6 +110,18 @@ struct PFlashTraceFields {
     const std::vector<double> * other_chunk_scores = nullptr;
     // Rank-mode ceiling: the K that applied, 0 outside top_k mode.
     int top_k = 0;
+    // Fold strategy: the kept spans (arbitrary token ranges), the route and
+    // the structure it found; ``selected`` then marks the anchors taken.
+    const std::vector<PFlashTokenSpan> * kept_spans = nullptr;
+    const std::vector<PFlashTokenSpan> * fold_blocks = nullptr;
+    bool fold_code = false;
+    int fold_code_lines = 0;
+    int fold_nonblank_lines = 0;
+    int fold_code_blocks = 0;
+    const char * fold_text_source = "none";
+    int fold_skipped = 0;
+    int fold_capped = 0;
+    int fold_contained = 0;
 };
 
 void write_compression_trace(
@@ -163,6 +180,7 @@ std::vector<int32_t> select_pflash_chunks(
         const std::vector<PFlashTokenSpan> * segments = nullptr,
         bool density = false,
         const std::vector<float> * other_token_scores = nullptr,
-        double split_fraction = 0.0);
+        double split_fraction = 0.0,
+        const Tokenizer * fold_vocab = nullptr);
 
 } // namespace luce::common

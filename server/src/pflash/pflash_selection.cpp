@@ -25,6 +25,11 @@ constexpr const char * kSegmentsEnv = "PFLASH_SELECT_SEGMENTS";
 constexpr const char * kSelectEnv = "PFLASH_SELECT_SCORE";
 constexpr const char * kScorerEnv = "PFLASH_SELECT_SCORER";
 constexpr const char * kSplitEnv = "PFLASH_SELECT_SPLIT";
+constexpr const char * kStrategyEnv = "PFLASH_SELECT_STRATEGY";
+constexpr const char * kFoldKEnv = "PFLASH_SELECT_FOLD_K";
+constexpr const char * kFoldCapEnv = "PFLASH_SELECT_FOLD_CAP";
+constexpr const char * kFoldHeadEnv = "PFLASH_SELECT_FOLD_HEAD";
+constexpr const char * kFoldParagraphsEnv = "PFLASH_SELECT_FOLD_PARAGRAPHS";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -76,7 +81,13 @@ bool has_pflash_selection_environment() noexcept {
            std::getenv(kSegmentsEnv) != nullptr ||
            std::getenv(kSelectEnv) != nullptr ||
            std::getenv(kScorerEnv) != nullptr ||
-           std::getenv(kSplitEnv) != nullptr;
+           std::getenv(kSplitEnv) != nullptr ||
+           std::getenv(kStrategyEnv) != nullptr;
+}
+
+bool pflash_fold_requested() noexcept {
+    const char * raw = std::getenv(kStrategyEnv);
+    return raw && std::strcmp(raw, "fold") == 0;
 }
 
 bool pflash_chunk_is_structurally_required(
@@ -321,11 +332,12 @@ bool resolve_pflash_selection(
     const char * select_raw = std::getenv(kSelectEnv);
     const char * scorer_raw = std::getenv(kScorerEnv);
     const char * split_raw = std::getenv(kSplitEnv);
+    const char * strategy_raw = std::getenv(kStrategyEnv);
 
     PFlashSelectionConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
         query_parser_raw || top_p_raw || top_k_raw || segments_raw ||
-        select_raw || scorer_raw || split_raw;
+        select_raw || scorer_raw || split_raw || strategy_raw;
     if (scorer_raw) {
         if (std::strcmp(scorer_raw, "head") == 0) {
             config.scorer = PFlashScorer::Head;
@@ -428,6 +440,53 @@ bool resolve_pflash_selection(
         error = std::string(kTopKEnv) + " is required when " +
             std::string(kModeEnv) + " is top_k";
         return false;
+    }
+
+    if (strategy_raw) {
+        if (std::strcmp(strategy_raw, "fold") == 0) {
+            config.strategy = PFlashSelectStrategy::Fold;
+        } else if (std::strcmp(strategy_raw, "segments") != 0) {
+            error = std::string(kStrategyEnv) + " must be segments or fold";
+            return false;
+        }
+    }
+    const struct { const char * name; int * value; int min; } fold_knobs[] = {
+        {kFoldKEnv, &config.fold_k, 1},
+        {kFoldCapEnv, &config.fold_cap, 1},
+        {kFoldHeadEnv, &config.fold_head, 0},
+    };
+    for (const auto & knob : fold_knobs) {
+        const char * raw = std::getenv(knob.name);
+        if (raw && (!parse_int(raw, *knob.value) || *knob.value < knob.min)) {
+            error = std::string(knob.name) + " must be an integer >= " +
+                std::to_string(knob.min);
+            return false;
+        }
+    }
+    if (const char * raw = std::getenv(kFoldParagraphsEnv)) {
+        if (std::strcmp(raw, "0") != 0 && std::strcmp(raw, "1") != 0) {
+            error = std::string(kFoldParagraphsEnv) + " must be 0 or 1";
+            return false;
+        }
+        config.fold_paragraphs = raw[0] == '1';
+    }
+    if (config.strategy == PFlashSelectStrategy::Fold) {
+        // Fold spends the budget itself: it needs the budget rule and one
+        // scorer, and a head no longer than the cap.
+        if (config.mode != PFlashSelectionMode::BudgetOnly) {
+            error = std::string(kStrategyEnv) + "=fold needs " +
+                std::string(kModeEnv) + "=budget_only";
+            return false;
+        }
+        if (config.scorer != PFlashScorer::Head) {
+            error = std::string(kStrategyEnv) + "=fold needs the head scorer";
+            return false;
+        }
+        if (config.fold_head > config.fold_cap) {
+            error = std::string(kFoldHeadEnv) + " must not exceed " +
+                std::string(kFoldCapEnv);
+            return false;
+        }
     }
 
     out = config;
@@ -570,6 +629,14 @@ const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept 
         case PFlashSegmentation::Auto: return "auto";
         case PFlashSegmentation::Fixed: return "fixed";
         case PFlashSegmentation::Probe: return "probe";
+    }
+    return "unknown";
+}
+
+const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept {
+    switch (strategy) {
+        case PFlashSelectStrategy::Segments: return "segments";
+        case PFlashSelectStrategy::Fold: return "fold";
     }
     return "unknown";
 }

@@ -11,6 +11,7 @@
 #include "pflash_selection.h"
 #include "common/pflash_types.h"
 #include "internal.h"
+#include "server/tokenizer.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -90,6 +91,9 @@ struct Qwen35DrafterState {
     bool                  probe_loaded = false;
     // Strict scorer sessions, least recently used evicted
     // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
+    // PFLASH_SELECT_STRATEGY=fold: the drafter's own vocabulary, to read
+    // the prompt's structure from its token ids.
+    std::unique_ptr<Tokenizer> fold_vocab;
     std::vector<std::unique_ptr<Qwen35ScoringSession>> sessions;
     uint64_t              session_clock = 0;
 };
