@@ -183,6 +183,23 @@ GGML_BACKEND_API bool ggml_backend_cuda_gdn_replay_log_commit_many(
         const struct ggml_tensor * accepted_prefixes,
         const struct ggml_tensor * active_slot_ids);
 
+// Single-sequence chain commit: advance `slot` of every layer's recurrent
+// state by the first `accepted` logged transitions and refresh its conv
+// history, stream-ordered on `backend`'s compute stream without a host sync
+// or device reads. Shapes are validated on the host before anything is
+// enqueued; supports the scalar-gate S=128 replay log with at most 16 tokens
+// (returns false otherwise, without side effects). Same per-element
+// arithmetic as ggml_backend_cuda_gdn_replay_log_commit_many.
+GGML_BACKEND_API bool ggml_backend_cuda_gdn_replay_log_commit_chain(
+        ggml_backend_t backend,
+        const struct ggml_tensor * const * replay_logs,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        int accepted,
+        int slot);
+
 // Promote accepted packed-tree K/V scratch rows into pager-owned rows.
 GGML_BACKEND_API bool ggml_backend_cuda_tree_cache_commit_many(
         struct ggml_tensor * const * caches, int n_caches,

@@ -767,10 +767,10 @@ bool run_grouped_chain_case(ggml_backend_t backend) {
 // verifies must produce identical attention output, and every accepted
 // prefix must land on the checkpointed state within STATE_TOLERANCE.
 bool run_chain_checkpoint_parity_case(ggml_backend_t backend, int tokens,
-                                      bool raw_gates) {
+                                      bool raw_gates, bool chain_api) {
     char name[64];
-    std::snprintf(name, sizeof(name), "chain replay vs checkpoint T=%d%s",
-                  tokens, raw_gates ? " raw" : "");
+    std::snprintf(name, sizeof(name), "chain %s vs checkpoint T=%d%s",
+                  chain_api ? "commit" : "replay", tokens, raw_gates ? " raw" : "");
     std::mt19937 rng(20260928u + 7u*(unsigned) tokens + (raw_gates ? 1u : 0u));
     std::uniform_real_distribution<float> small(-0.25f, 0.25f);
     std::uniform_real_distribution<float> state_dist(-0.06f, 0.06f);
@@ -921,8 +921,19 @@ bool run_chain_checkpoint_parity_case(ggml_backend_t backend, int tokens,
         upload(conv_state, conv_zero.data(), conv_zero.size()*sizeof(float));
         const int32_t count = prefix;
         upload(accepted, &count, sizeof(count));
-        ok = commit_many_one_layer(replay_log, committed, conv_input,
-                                   conv_state, accepted, slots);
+        if (chain_api) {
+            const ggml_tensor * logs[] = {replay_log};
+            ggml_tensor * states_arr[] = {committed};
+            const ggml_tensor * conv_inputs_arr[] = {conv_input};
+            ggml_tensor * conv_states_arr[] = {conv_state};
+            ok = ggml_backend_cuda_gdn_replay_log_commit_chain(
+                backend, logs, states_arr, conv_inputs_arr, conv_states_arr,
+                1, prefix, 0);
+            ggml_backend_synchronize(backend);
+        } else {
+            ok = commit_many_one_layer(replay_log, committed, conv_input,
+                                       conv_state, accepted, slots);
+        }
         if (!ok) {
             std::fprintf(stderr, "%s: commit rejected prefix %d\n", name, prefix);
             break;
@@ -1217,8 +1228,10 @@ int main(int argc, char ** argv) {
     ok = run_case(backend, true, false, "generic") && ok;
     ok = run_grouped_chain_case(backend) && ok;
     for (const int tokens : {2, 8, 16}) {
-        ok = run_chain_checkpoint_parity_case(backend, tokens, false) && ok;
-        ok = run_chain_checkpoint_parity_case(backend, tokens, true) && ok;
+        for (const bool chain_api : {false, true}) {
+            ok = run_chain_checkpoint_parity_case(backend, tokens, false, chain_api) && ok;
+            ok = run_chain_checkpoint_parity_case(backend, tokens, true, chain_api) && ok;
+        }
     }
     unsetenv("LUCE_GDN_FORCE_GROUPED_COLS");
     setenv("LUCE_GDN_NO_GROUPED_COLS", "1", 1);
