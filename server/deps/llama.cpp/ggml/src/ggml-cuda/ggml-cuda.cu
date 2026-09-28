@@ -5226,6 +5226,32 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
+                    static const bool gated_norm_fuse = [] {
+                        const char * e = getenv("LUCE_GDN_GATED_NORM_FUSE");
+                        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+                    }();
+                    if (gated_norm_fuse && node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes) {
+                        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+                        ggml_tensor * silu_node = cgraph->nodes[i + 2];
+                        ggml_tensor * gate_mul = cgraph->nodes[i + 3];
+                        const bool pattern =
+                            mul_node->op == GGML_OP_MUL &&
+                            (mul_node->src[0] == node || mul_node->src[1] == node) &&
+                            silu_node->op == GGML_OP_UNARY &&
+                            ggml_get_unary_op(silu_node) == GGML_UNARY_OP_SILU &&
+                            gate_mul->op == GGML_OP_MUL &&
+                            ((gate_mul->src[0] == mul_node && gate_mul->src[1] == silu_node) ||
+                             (gate_mul->src[0] == silu_node && gate_mul->src[1] == mul_node)) &&
+                            ggml_node_has_n_uses(cgraph, i, 1) &&
+                            ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+                            ggml_node_has_n_uses(cgraph, i + 2, 1);
+                        if (pattern && ggml_cuda_op_rms_norm_mul_silu_gate(
+                                *cuda_ctx, node, mul_node, silu_node, gate_mul)) {
+                            i += 3;
+                            continue;
+                        }
+                    }
+
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
                         ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
                         i += 2;

@@ -25,3 +25,9 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // dflash: residual ADD + RMS_NORM + MUL fusion (see norm.cu)
 void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add_tensor, ggml_tensor * rms_tensor, ggml_tensor * mul_tensor);
+
+// dflash: RMS_NORM + MUL + UNARY(SILU) + MUL gated output norm (see norm.cu).
+// Returns false without launching when the shapes are unsupported.
+bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_node,
+                                         ggml_tensor * mul_node, ggml_tensor * silu_node,
+                                         ggml_tensor * gate_mul_node);
