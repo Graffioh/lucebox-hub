@@ -1,9 +1,16 @@
 #include "CppUnitTestFramework.hpp"
 
+#include "pflash/pflash_compress.h"
 #include "pflash/pflash_fold.h"
 #include "pflash/pflash_selection.h"
 #include "scoped_env.h"
+#include "server/tokenizer.h"
 
+#include "gguf.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -472,4 +479,51 @@ TEST_CASE(PFlashFoldFixture, fold_strategy_config_is_explicit_and_fails_closed) 
     REQUIRE(resolve_pflash_selection(32768, 32, config, error));
     REQUIRE(config.strategy == PFlashSelectStrategy::Segments);
     REQUIRE(std::string(pflash_select_strategy_name(PFlashSelectStrategy::Fold)) == "fold");
+}
+
+TEST_CASE(PFlashFoldFixture, select_chunks_folds_through_the_drafter_vocabulary) {
+    // A byte-level vocabulary: "Document 1: a\nx\n\nDocument 2: b\ny\n\n
+    // Document 3: c\nz\n\nQ", one piece per token.
+    const char * tokens[] = {"Document", "\xc4\xa0" "1", ":", "\xc4\xa0" "a", "\xc4\x8a", "x",
+                             "\xc4\x8a\xc4\x8a", "\xc4\xa0" "2", "\xc4\xa0" "b", "y",
+                             "\xc4\xa0" "3", "\xc4\xa0" "c", "z", "Q"};
+    gguf_context * g = gguf_init_empty();
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens, sizeof(tokens) / sizeof(tokens[0]));
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    const std::string path = (std::filesystem::temp_directory_path() /
+        ("luce_test_pflash_fold_" +
+         std::to_string(reinterpret_cast<uintptr_t>(&g)) + ".gguf")).string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    luce::common::Tokenizer vocab;
+    REQUIRE(vocab.load_from_gguf(path.c_str()));
+    std::remove(path.c_str());
+
+    const std::vector<int32_t> ids{0, 1, 2, 3, 4, 5, 6, 0, 7, 2, 8, 4, 9, 6,
+                                   0, 10, 2, 11, 4, 12, 6, 13};
+    REQUIRE(vocab.decode(ids) == "Document 1: a\nx\n\nDocument 2: b\ny\n\nDocument 3: c\nz\n\nQ");
+    const std::vector<PFlashTokenSpan> segments{
+        {0, 4}, {4, 7}, {7, 10}, {10, 14}, {14, 18}, {18, 21}, {21, 22}};
+    std::vector<float> mass(ids.size(), 0.01f);
+    mass[12] = 0.5f;   // "y", inside Document 2
+    PFlashSelectionConfig config;
+    config.mode = PFlashSelectionMode::BudgetOnly;
+    config.selection_active = true;
+    config.strategy = PFlashSelectStrategy::Fold;
+    config.fold_k = 1;
+    const auto run = [&](const luce::common::Tokenizer * v) {
+        return luce::common::select_pflash_chunks(
+            ids, mass, /*keep_ratio=*/0.5f, /*n_lookahead=*/1, /*score_query_end=*/22,
+            /*pool_kernel=*/1, config, {}, /*direct_mass=*/true, /*write_trace=*/false,
+            &segments, /*density=*/true, nullptr, 0.0, v);
+    };
+    const auto out = run(&vocab);
+    // The anchor [10, 14) completes to its record, Document 2 = [7, 14); the
+    // query token stays.
+    REQUIRE(out == std::vector<int32_t>({0, 7, 2, 8, 4, 9, 6, 13}));
+    const auto & kept = luce::common::pflash_last_kept_spans();
+    REQUIRE(same(kept, {{7, 14}, {21, 22}}));
+    // Without the vocabulary fold fails closed.
+    REQUIRE(run(nullptr).empty());
 }
