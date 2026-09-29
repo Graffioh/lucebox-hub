@@ -2076,14 +2076,6 @@ int moe_hybrid_expert_compute_batch_limit() {
     return value;
 }
 
-int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens) {
-    if (n_tokens <= 0) return 1;
-    const int requested = parse_moe_expert_compute_ipc_mode() == MoeExpertComputeIpcMode::Batched
-        ? env_int_or_default("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", 1024)
-        : moe_hybrid_expert_compute_batch_limit();
-    return std::min(std::max(1, std::min(requested, 4096)), n_tokens);
-}
-
 int moe_hybrid_prefill_hot_sub_batch_limit() {
     const char * raw = std::getenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH");
     int requested = 4;

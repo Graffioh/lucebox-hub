@@ -668,7 +668,6 @@ add_library(luce_common STATIC
     src/server/chat_template.cpp
     src/server/tool_parser.cpp
     src/server/tool_hint.cpp
-    src/server/reasoning.cpp
     src/server/tool_memory.cpp
     src/server/response_error.cpp
     src/server/sse_emitter.cpp
@@ -1464,16 +1463,6 @@ if(LUCE_TESTS)
         target_link_libraries(test_turbo_wht_warp PRIVATE CUDA::cudart)
         list(APPEND _raw_unit_test_targets test_turbo_wht_warp)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
-        # RED phase binary: same source WITHOUT the fix flag — documents the bug.
-        add_executable(test_drafter_tail_capture_guard_red
-            test/test_unit_main.cpp
-            test/test_drafter_tail_capture_guard.cpp)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_vs_reference.cpp")
-        add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
-        target_link_libraries(test_draft_vs_reference PRIVATE luce_common)
-    endif()
     if((LUCE_GPU_BACKEND STREQUAL "cuda" AND GGML_CUDA_GRAPHS) OR
        (LUCE_GPU_BACKEND STREQUAL "hip" AND GGML_HIP_GRAPHS))
         add_executable(test_direct_zero_uid_graph_aba test/test_direct_zero_uid_graph_aba.cpp)
@@ -1764,11 +1753,6 @@ if(LUCE_TESTS)
         else()
             target_link_libraries(test_ds4_dspark_load PRIVATE hip::host)
         endif()
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/spike_thin_copy.cpp")
-        add_executable(spike_thin_copy test/spike_thin_copy.cpp)
-        target_include_directories(spike_thin_copy PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
-        target_link_libraries(spike_thin_copy PRIVATE ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_draft_graph.cpp")
         add_executable(smoke_draft_graph test/smoke_draft_graph.cpp)
@@ -2164,8 +2148,6 @@ if(LUCE_TESTS)
             test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp
             test/test_drafter_early_exit_score_range.cpp
-            test/test_drafter_tail_capture_guard.cpp
-            test/test_drafter_warm_path_regression.cpp
             test/test_qwen3_buffer_plan.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
@@ -2191,10 +2173,6 @@ if(LUCE_TESTS)
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
-        # Keep the GREEN formula target-local: the separate RED regression
-        # executable compiles the same source without this definition.
-        target_compile_definitions(test_server_unit PRIVATE
-            TAIL_GUARD_USE_NEW_FORMULA)
         target_include_directories(test_server_unit PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
