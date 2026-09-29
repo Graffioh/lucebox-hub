@@ -1231,6 +1231,27 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
+#ifndef LUCE_GIT_SHA
+#define LUCE_GIT_SHA "unknown"
+#endif
+
+static observability::ConcurrencyCaptureConfig make_capture_config(
+        const ServerConfig & server) {
+    observability::ConcurrencyCaptureConfig config =
+        observability::ConcurrencyCaptureConfig::from_env();
+    if (!config.enabled) return config;
+    config.git_sha = LUCE_GIT_SHA;
+    config.model_name = server.model_name;
+    config.model_path = server.model_path;
+    config.draft_path = server.draft_path;
+    config.arch = server.arch;
+    config.runtime_backend = server.runtime_backend;
+    config.max_concurrency = server.max_concurrency;
+    config.ddtree_budget = server.ddtree_budget;
+    config.draft_block_size = server.draft_block_size;
+    return config;
+}
+
 // Memory the auto budget takes a quarter of: what is available once the
 // model has loaded (a container's cgroup v2 limit included; Windows too),
 // else total physical memory where the probe cannot read it.
@@ -1297,6 +1318,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend_)
+    , capture_(make_capture_config(config))
 {
     config_.image_input_enabled = backend_.supports_images() &&
         config_.pflash_upstream_base.empty() &&
@@ -4859,6 +4881,7 @@ void HttpServer::enqueue(ServerJob * job) {
     if (queue_tail_) queue_tail_->next = job;
     else queue_head_ = job;
     queue_tail_ = job;
+    job->profile_queued_ns = capture_.job_queued();
     queue_cv_.notify_one();
 }
 
@@ -4883,6 +4906,7 @@ ServerJob * HttpServer::dequeue() {
     queue_head_ = j->next;
     if (!queue_head_) queue_tail_ = nullptr;
     j->next = nullptr;
+    capture_.job_dequeued();
     return j;
 }
 
@@ -4893,6 +4917,7 @@ ServerJob * HttpServer::try_dequeue() {
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
+    capture_.job_dequeued();
     return job;
 }
 
@@ -4910,6 +4935,7 @@ ServerJob * HttpServer::dequeue_for(
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
     job->next = nullptr;
+    capture_.job_dequeued();
     return job;
 }
 
