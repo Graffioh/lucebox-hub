@@ -164,6 +164,10 @@ bool build_hybrid_full_layer_step(
 //     overrides logits_tail_rows. Multi-prompt steps need it because
 //     committing rows are scattered. 0 keeps the tail-view behavior.
 //   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
+//   `capture_chain_replay` — single-sequence chain verify that leaves the
+//     durable SSM/conv state untouched and exposes per-layer replay logs and
+//     conv windows in sg.delta_captures (replay_log / conv_input) for a
+//     later accepted-prefix commit. Exclusive with capture_delta_intermediate.
 // When `capture && paged_attention`, sg.target_feat_rows is an I32 graph
 // input mapping every token to its slot-local feature-ring destination. This
 // keeps accepted-path replay graph-stable and leaves legacy offset capture
@@ -192,7 +196,8 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments = nullptr,
     int n_prefill_segments = 0,
     int n_logits_rows = 0,
-    bool compact_slots = false);
+    bool compact_slots = false,
+    bool capture_chain_replay = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

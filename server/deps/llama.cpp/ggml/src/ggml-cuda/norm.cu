@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -814,4 +815,82 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// dflash: RMS_NORM + MUL(weight) + UNARY(SILU, z) + MUL, the gated output
+// norm of Qwen3.5 Gated DeltaNet layers, in one launch. Row reduction, block
+// size and every float operation are those of rms_norm_f32<block, true> and
+// unary_gated_op_kernel<op_silu>, so the result is bit-identical to the two
+// kernels it replaces. Enabled by LUCE_GDN_GATED_NORM_FUSE=1.
+template <int block_size>
+static __global__ void rms_norm_mul_silu_gate_f32(
+        const float * x, const float * gate, float * dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t gate_stride_row, const int64_t gate_stride_channel, const int64_t gate_stride_sample,
+        const float eps, const float * mul,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed,
+        const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x    += sample*stride_sample + channel*stride_channel + row*stride_row;
+    gate += sample*gate_stride_sample + channel*gate_stride_channel + row*gate_stride_row;
+    dst  += ((sample*nchannels + channel)*nrows + row)*ncols;
+    {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int mul_col = fastmodulo(col, mul_ncols_packed);
+        const float normed = scale * x[col] * mul[mul_col];
+        dst[col] = ggml_cuda_op_silu_single(gate[col]) * normed;
+    }
+}
+
+bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, ggml_tensor * rms_node,
+                                         ggml_tensor * mul_node, ggml_tensor * silu_node,
+                                         ggml_tensor * gate_mul_node) {
+    const ggml_tensor * src = rms_node->src[0];
+    const ggml_tensor * weight = mul_node->src[0] == rms_node ? mul_node->src[1] : mul_node->src[0];
+    const ggml_tensor * gate = silu_node->src[0];
+    if (src->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        gate_mul_node->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_mul_node) ||
+        src->nb[0] != sizeof(float) || weight->nb[0] != sizeof(float) || gate->nb[0] != sizeof(float) ||
+        !ggml_are_same_shape(src, gate) || !ggml_are_same_shape(src, gate_mul_node) ||
+        src->ne[0] >= 1024) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms_node->op_params, sizeof(float));
+    const int64_t ne00 = src->ne[0], ne01 = src->ne[1], ne02 = src->ne[2], ne03 = src->ne[3];
+    const dim3 blocks_num(ne01, ne02, ne03);
+    const dim3 block_dims(256, 1, 1);
+    rms_norm_mul_silu_gate_f32<256><<<blocks_num, block_dims, 32 * sizeof(float), ctx.stream()>>>(
+        (const float *) src->data, (const float *) gate->data, (float *) gate_mul_node->data, (int) ne00,
+        src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float),
+        gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float), gate->nb[3] / sizeof(float),
+        eps, (const float *) weight->data,
+        weight->nb[1] / sizeof(float), weight->nb[2] / sizeof(float), weight->nb[3] / sizeof(float),
+        init_fastdiv_values((uint32_t) weight->ne[0]), init_fastdiv_values((uint32_t) weight->ne[1]),
+        init_fastdiv_values((uint32_t) weight->ne[2]), init_fastdiv_values((uint32_t) weight->ne[3]));
+    return true;
 }

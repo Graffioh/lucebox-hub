@@ -48,6 +48,16 @@ int sample_logits(const float * logits_in,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng);
 
+// The same chain for a caller that already holds the penalized logits of the
+// top candidates: top_logits/top_ids descending (ties toward the lower id),
+// n >= cfg.top_k > 0, cfg.temp > 0. Draws the same single uniform as
+// sample_logits. Returns -1 when those conditions do not hold (no draw).
+int sample_logits_topk(const float * top_logits,
+                       const int32_t * top_ids,
+                       int n,
+                       const SamplerCfg & cfg,
+                       std::mt19937_64 & rng);
+
 // Strip ` samp=...` tail from `line` (in place); return true when one was
 // parsed. Out-of-band fields default to a permissive greedy-equivalent (top_p=1,
 // top_k=0, rep_pen=1, seed=0).

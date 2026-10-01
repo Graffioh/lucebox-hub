@@ -48,6 +48,22 @@ struct DFlashTarget {
         return false;
     }
 
+    // Sampled verify without the full logits: apply the given penalty
+    // entries to the most recent verify's logits in place and return each of
+    // the first n_tokens rows' k largest (penalized) logits, descending.
+    // `penalties` holds {row, id, repeat, count} int32 quadruples. Returns
+    // false when unsupported; the logits are then untouched only if no
+    // penalty was applied, so callers fall back before any other read.
+    virtual bool read_verify_topk(int n_tokens, int k,
+                                  const std::vector<int32_t> & penalties,
+                                  float rep_pen, float freq_pen, float pres_pen,
+                                  std::vector<float> & top_logits,
+                                  std::vector<int32_t> & top_ids) {
+        (void)n_tokens; (void)k; (void)penalties; (void)rep_pen;
+        (void)freq_pen; (void)pres_pen; (void)top_logits; (void)top_ids;
+        return false;
+    }
+
     // ── KV state management ─────────────────────────────────────────
 
     // Snapshot KV cache state before speculative verify, so it can be
@@ -65,6 +81,12 @@ struct DFlashTarget {
     // Whether fast rollback is an exact, low-overhead device-side commit for
     // which the replay breakeven threshold does not apply.
     virtual bool exact_fast_rollback() const { return false; }
+
+    // Whether a capturing chain verify of more than one token leaves the
+    // recurrent state untouched and defers it to rollback_to(). Callers then
+    // need no pre-verify snapshot and must call rollback_to() even when every
+    // verified token is accepted.
+    virtual bool chain_verify_defers_state() const { return false; }
 
     // Whether restore+replay remains safe after rollback_to() returns false.
     // In-place commit implementations override this while active.

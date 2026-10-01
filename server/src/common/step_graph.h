@@ -89,6 +89,10 @@ struct StepGraph {
     ggml_tensor *   commit_slot_ids = nullptr;      // [n_tree_seqs] i32
     ggml_tensor *   commit_rows = nullptr;         // [tree_width,n_tree_seqs] i64
     ggml_tensor *   feature_commit_rows = nullptr; // [n_tokens] i32
+    // Chain replay verify: the fused read-only conv window reads slab 0 of
+    // the (possibly slot-viewed) conv state along chain parents t-1.
+    ggml_tensor *   chain_conv_slots = nullptr;    // [1] i32
+    ggml_tensor *   chain_conv_parents = nullptr;  // [n_tokens] i32
     // Multi-prompt steps: i32 row indices gathered from the final norm
     // before the LM head (committing rows + decode rows).
     ggml_tensor *   logits_row_indices = nullptr;
@@ -140,6 +144,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.commit_slot_ids = nullptr;
     sg.commit_rows = nullptr;
     sg.feature_commit_rows = nullptr;
+    sg.chain_conv_slots = nullptr;
+    sg.chain_conv_parents = nullptr;
     sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;

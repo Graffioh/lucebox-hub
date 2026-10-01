@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "ggml-cuda.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <vector>
@@ -679,4 +680,155 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
         GGML_ABORT("tree commit failed during final synchronization");
     }
     return true;
+}
+
+namespace {
+
+// Pointers for one launch of the chain commit, passed by value so the commit
+// needs no device-side table. 48 layers is 1.5 KiB, under the argument limit.
+constexpr int kChainCommitLayers = 64;
+struct ChainCommitPointers {
+    const float * replay_logs[kChainCommitLayers];
+    float *       states[kChainCommitLayers];
+    const float * conv_inputs[kChainCommitLayers];
+    float *       conv_states[kChainCommitLayers];
+};
+
+// gdn_replay_log_commit_128_scalar_tile_kernel for one sequence, with the
+// layer on blockIdx.z and the accepted count and slot as arguments. The
+// per-element fmaf chain is the same.
+__global__ void gdn_replay_log_commit_chain_128_kernel(
+        const ChainCommitPointers pointers,
+        int n_heads,
+        int n_tokens,
+        int accepted,
+        int slot) {
+    constexpr int state_size = 128;
+    constexpr int max_tokens = 16;
+    constexpr int values_per_token = 1 + 32 + 8;
+    const int layer = blockIdx.z;
+    const int head = blockIdx.y;
+    const float * replay_log = pointers.replay_logs[layer];
+    float * state = pointers.states[layer];
+    const int row_base = (blockIdx.x & 3)*32;
+    const int col_base = (blockIdx.x >> 2)*8;
+    const int row = row_base + (threadIdx.x & 31);
+    const int col = col_base + (threadIdx.x >> 5);
+    __shared__ float staged[max_tokens][values_per_token];
+    for (int item = threadIdx.x;
+         item < accepted*values_per_token;
+         item += blockDim.x) {
+        const int token = item/values_per_token;
+        const int field = item % values_per_token;
+        const float * transition = replay_log +
+            ((size_t) token*n_heads + head)*(2*state_size + 1);
+        if (field == 0) {
+            staged[token][0] = transition[0];
+        } else if (field <= 32) {
+            staged[token][field] = transition[row_base + field];
+        } else {
+            staged[token][field] =
+                transition[1 + state_size + col_base + field - 33];
+        }
+    }
+    __syncthreads();
+    (void) n_tokens;
+    const size_t state_offset =
+        (((size_t) slot*n_heads + head)*state_size + col)*state_size + row;
+    float current = state[state_offset];
+    for (int token = 0; token < accepted; ++token) {
+        current = fmaf(
+            staged[token][1 + (threadIdx.x & 31)],
+            staged[token][33 + (threadIdx.x >> 5)],
+            staged[token][0]*current);
+    }
+    state[state_offset] = current;
+}
+
+__global__ void gdn_conv_commit_chain_kernel(
+        const ChainCommitPointers pointers,
+        int window,
+        int channels,
+        int n_tokens,
+        int accepted,
+        int slot) {
+    const int layer = blockIdx.y;
+    const int element = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element >= window * channels) return;
+    const int k = element % window;
+    const int channel = element / window;
+    pointers.conv_states[layer][((size_t) slot * channels + channel) * window + k] =
+        pointers.conv_inputs[layer][(size_t) channel * (window + n_tokens) + accepted + k];
+}
+
+} // namespace
+
+extern "C" bool ggml_backend_cuda_gdn_replay_log_commit_chain(
+        ggml_backend_t backend,
+        const ggml_tensor * const * replay_logs,
+        ggml_tensor * const * states,
+        const ggml_tensor * const * conv_inputs,
+        ggml_tensor * const * conv_states,
+        int n_layers,
+        int accepted,
+        int slot) {
+    cudaStream_t stream = (cudaStream_t) ggml_backend_cuda_get_stream(backend);
+    const int device = ggml_backend_cuda_get_device_id(backend);
+    if (!stream || device < 0 || !replay_logs || !states || !conv_inputs ||
+        !conv_states || n_layers <= 0 || accepted < 0) return false;
+    int heads = -1, tokens = -1, window = -1, channels = -1, slots = -1;
+    for (int layer = 0; layer < n_layers; ++layer) {
+        const ggml_tensor * log = replay_logs[layer];
+        const ggml_tensor * state = states[layer];
+        const ggml_tensor * conv_input = conv_inputs[layer];
+        const ggml_tensor * conv_state = conv_states[layer];
+        if (!log || !state || !conv_input || !conv_state ||
+            !log->data || !state->data || !conv_input->data || !conv_state->data ||
+            log->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+            conv_input->type != GGML_TYPE_F32 || conv_state->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(log) || !ggml_is_contiguous(state) ||
+            !ggml_is_contiguous(conv_input) || !ggml_is_contiguous(conv_state) ||
+            state->ne[0] != 128 || state->ne[1] != 128 ||
+            log->ne[0] != 2*128 + 1 || log->ne[1] != state->ne[2] ||
+            log->ne[3] != 1 || conv_input->ne[2] != 1 || conv_input->ne[3] != 1 ||
+            conv_input->ne[0] != conv_state->ne[0] + log->ne[2] ||
+            conv_input->ne[1] != conv_state->ne[1] ||
+            conv_state->ne[2] != state->ne[3] || conv_state->ne[3] != 1) {
+            return false;
+        }
+        if (layer == 0) {
+            heads = (int) state->ne[2];
+            tokens = (int) log->ne[2];
+            window = (int) conv_state->ne[0];
+            channels = (int) conv_state->ne[1];
+            slots = (int) state->ne[3];
+        } else if (state->ne[2] != heads || log->ne[2] != tokens ||
+                   conv_state->ne[0] != window || conv_state->ne[1] != channels ||
+                   state->ne[3] != slots) {
+            return false;
+        }
+    }
+    if (tokens < 1 || tokens > 16 || accepted > tokens || slot < 0 || slot >= slots) {
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    (void) cudaGetLastError();
+    constexpr int threads = 256;
+    for (int first = 0; first < n_layers; first += kChainCommitLayers) {
+        const int count = std::min(kChainCommitLayers, n_layers - first);
+        ChainCommitPointers pointers{};
+        for (int i = 0; i < count; ++i) {
+            pointers.replay_logs[i] = (const float *) replay_logs[first + i]->data;
+            pointers.states[i] = (float *) states[first + i]->data;
+            pointers.conv_inputs[i] = (const float *) conv_inputs[first + i]->data;
+            pointers.conv_states[i] = (float *) conv_states[first + i]->data;
+        }
+        gdn_replay_log_commit_chain_128_kernel
+            <<<dim3(128*128/threads, (unsigned) heads, (unsigned) count), threads, 0, stream>>>(
+                pointers, heads, tokens, accepted, slot);
+        gdn_conv_commit_chain_kernel
+            <<<dim3((unsigned) ((window*channels + threads - 1)/threads), (unsigned) count), threads, 0, stream>>>(
+                pointers, window, channels, tokens, accepted, slot);
+    }
+    return cudaGetLastError() == cudaSuccess;
 }

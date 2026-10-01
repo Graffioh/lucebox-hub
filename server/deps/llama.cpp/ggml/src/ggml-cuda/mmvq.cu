@@ -2872,7 +2872,8 @@ void ggml_cuda_mul_mat_vec_q(
                              ctx.stream_context().concurrent_events.empty();
     if (use_q8_memo) {
         for (const auto & e : ctx.luce_q8_memo) {
-            if (e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
+            if (e.layout == 0 &&
+                e.src1_node == (const void *) src1 && e.src1_data == (const void *) src1_d &&
                 e.src0_type == (int) src0->type &&
                 e.ne[0] == ne10 && e.ne[1] == ne11 && e.ne[2] == ne12 && e.ne[3] == ne13) {
                 src1_q8_d = e.buf->ptr;
