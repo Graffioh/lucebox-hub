@@ -1,5 +1,5 @@
 #include "CppUnitTestFramework.hpp"
-#include "../deps/llama.cpp/ggml/src/ggml-cuda/mmq-tile-selection.h"
+#include "../../deps/llama.cpp/ggml/src/ggml-cuda/mmq-tile-selection.h"
 
 #include <cstdint>
 #include <limits>

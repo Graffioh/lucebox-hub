@@ -35,11 +35,11 @@
                             // qwen35 + DFlash + DDTree pipeline below.
 #include "qwen35_daemon.h"   // arch dispatch - single-GPU qwen35 daemon mode
 #include "qwen35moe_daemon.h"
-#include "../src/common/moe_hybrid_ffn_eval.h"
-#include "../src/common/moe_hybrid_storage.h"
-#include "../src/common/moe_hybrid_placement.h"
-#include "../src/common/moe_hybrid_routing_stats.h"
-#include "../src/common/moe_hybrid_types_impl.h"
+#include "../../src/common/moe_hybrid_ffn_eval.h"
+#include "../../src/common/moe_hybrid_storage.h"
+#include "../../src/common/moe_hybrid_placement.h"
+#include "../../src/common/moe_hybrid_routing_stats.h"
+#include "../../src/common/moe_hybrid_types_impl.h"
 #include "qwen35moe_pipelined_decode.h"
 #include "qwen35_layer_split.h" // multi-GPU layer-split daemon args
 #include "layer_split_daemon_loop.h" // extracted layer-split daemon loop

@@ -17,8 +17,8 @@
 //        <cuda_runtime.h> shim). Run: ./test_draft_topk_cuda (0 = pass).
 
 #include "CppUnitTestFramework.hpp"
-#include "../src/common/geometric_draft_topk_cuda.h"
-#include "../src/common/ddtree.h"
+#include "../../src/common/geometric_draft_topk_cuda.h"
+#include "../../src/common/ddtree.h"
 
 #include <cuda_runtime.h>
 

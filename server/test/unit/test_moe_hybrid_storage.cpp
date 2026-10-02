@@ -1,6 +1,6 @@
 #include "CppUnitTestFramework.hpp"
-#include "../src/common/moe_hybrid_ffn_eval.h"
-#include "../src/common/moe_hybrid_storage.h"
+#include "../../src/common/moe_hybrid_ffn_eval.h"
+#include "../../src/common/moe_hybrid_storage.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 

@@ -21,7 +21,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-#include "../src/flashprefill.h"
+#include "../../src/flashprefill.h"
 
 using namespace CppUnitTestFramework;
 

@@ -2,7 +2,7 @@
 
 #include "CppUnitTestFramework.hpp"
 #include "common/concurrency/paged_kv_pool.h"
-#include "../src/common/paged_attention_config.h"
+#include "../../src/common/paged_attention_config.h"
 
 #include <initializer_list>
 #include <limits>

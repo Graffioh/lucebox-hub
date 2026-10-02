@@ -6,7 +6,7 @@
 // The decision also reports whether the model is all-hot with the FULL max_ctx
 // KV (i.e. KVFlash is redundant) so the gate can disable the pool when unneeded.
 #include "CppUnitTestFramework.hpp"
-#include "../src/common/kvflash_placement.h"
+#include "../../src/common/kvflash_placement.h"
 
 #include <cstdio>
 #include <cstdlib>

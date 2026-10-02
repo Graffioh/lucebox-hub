@@ -3,7 +3,7 @@
 #include "ggml.h"
 #include "rocmfp4.h"
 #include "rocmfpx.h"
-#include "../src/common/platform_env.h"
+#include "../../src/common/platform_env.h"
 
 #include <hip/hip_runtime.h>
 

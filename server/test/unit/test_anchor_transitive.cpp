@@ -2,7 +2,7 @@
 // T1: single-pass match; T2: single-pass misses hops; T3: transitive rescues all hops.
 
 #include "CppUnitTestFramework.hpp"
-#include "../src/qwen3/anchor_scan.h"
+#include "../../src/qwen3/anchor_scan.h"
 
 #include <cstdio>
 #include <cstdlib>

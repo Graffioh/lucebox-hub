@@ -1,5 +1,5 @@
 #include "CppUnitTestFramework.hpp"
-#include "../src/qwen35/prefill_helpers.h"
+#include "../../src/qwen35/prefill_helpers.h"
 
 namespace {
 struct KvflashUbatchFixture {};

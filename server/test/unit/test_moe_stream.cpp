@@ -2,9 +2,9 @@
 // Uses synthetic data only (no model files), while still printing timing.
 
 #include "CppUnitTestFramework.hpp"
-#include "../src/common/moe_hybrid_stream.h"
-#include "../src/common/moe_hybrid_storage.h"
-#include "../src/common/gpu_runtime_compat.h"
+#include "../../src/common/moe_hybrid_stream.h"
+#include "../../src/common/moe_hybrid_storage.h"
+#include "../../src/common/gpu_runtime_compat.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"

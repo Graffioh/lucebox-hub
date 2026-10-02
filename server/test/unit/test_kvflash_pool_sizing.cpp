@@ -8,7 +8,7 @@
 // reintroduce the divergence.
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
-#include "../src/common/kvflash_pager.h"
+#include "../../src/common/kvflash_pager.h"
 
 #include <cstdio>
 #include <cstdlib>

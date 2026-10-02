@@ -2,7 +2,7 @@
 #include "ggml-cuda.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "../src/pflash_ggml_adapter.h"
+#include "../../src/pflash_ggml_adapter.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

@@ -150,6 +150,17 @@ cd server
 
 ## Tests
 
+### C++ unit tests (no GPU needed)
+
+The tests that build and pass on a GPU-less machine carry the ctest label
+`cpu` (listed in `_luce_cpu_ctest_names` / `_luce_cpu_cppunit_targets` in
+`CMakeLists.txt`). One target builds just those binaries and runs them; the
+hosted CI job runs the same target:
+
+```bash
+cmake --build server/build --target check-cpu
+```
+
 ### C++ tests (require GPU + model files)
 
 After building:
@@ -169,7 +180,7 @@ cd server/build
 
 ### Integration tests (require running server)
 
-The Python tests live in `server/tests/` and are driven by pytest. Unit tests
+The Python tests live in `server/test/python/` and are driven by pytest. Unit tests
 run anywhere; tests that need a live `luce_server` are marked `server`, tests
 that need local model files/binaries are marked `model`.
 
@@ -178,23 +189,37 @@ that need local model files/binaries are marked `model`.
 pytest -m "not server and not model and not slow"
 
 # Server tests against a running server:
-pytest server/tests/test_server_smoke.py -v --base-url http://localhost:8080
+pytest server/test/python/test_server_smoke.py -v --base-url http://localhost:8080
 
 # Or let pytest spawn luce_server itself:
-pytest server/tests/test_server_smoke.py -v --launch models/Qwen3-0.6B-BF16.gguf
+pytest server/test/python/test_server_smoke.py -v --launch models/Qwen3-0.6B-BF16.gguf
+
+# Parallel-serving tests need the slot count; with --launch it also adds
+# --paged-attention --max-concurrency N to the spawned server:
+pytest server/test/python/test_server_parallel.py -v --launch <model.gguf> --max-concurrency 3
 ```
 
-The cache/integration tests spawn their own server with the required flags
-and skip automatically when the model files or `luce_server` binary are
-missing:
+The cache tests always spawn their own server with the flags they need (they
+never reuse `--base-url`), stop it when the module finishes, and skip when the
+model files or the `luce_server` binary are missing:
 
 ```bash
-pytest server/tests/test_server_prefix_cache.py -v
-pytest server/tests/test_multi_turn_prefix_cache.py -v
-pytest server/tests/test_full_compress_cache.py -v
-pytest server/tests/test_prefill_cache.py -v
-pytest server/tests/test_server_integration.py -v --base-url http://localhost:8000
+pytest server/test/python/test_server_prefix_cache.py -v
+pytest server/test/python/test_multi_turn_prefix_cache.py -v
+pytest server/test/python/test_full_compress_cache.py -v
+pytest server/test/python/test_prefill_cache.py -v
 ```
+
+| Variable / option | Used by |
+|---|---|
+| `--base-url` / `LUCE_TEST_SERVER_URL` | external server for `server` tests |
+| `--launch` / `LUCE_TEST_MODEL` | model for the session-spawned server |
+| `--server-bin` / `LUCE_SERVER_BIN` | every spawned server and the CLI tests |
+| `--server-extra-args` / `LUCE_SERVER_EXTRA_ARGS` | extra flags for the `--launch`ed server |
+| `--max-concurrency` / `LUCE_MAX_CONCURRENCY` | parallel tests (1–64; they skip without it) |
+| `LUCE_TARGET`, `LUCE_DRAFT` | target GGUF and draft for the cache tests |
+| `LUCE_PREFILL_DRAFTER` | pFlash drafter GGUF (`test_full_compress_cache.py`) |
+| `LUCE_TOKENIZER_MODEL`, `LUCE_TOKENIZER_HARNESS` | `test_tokenizer.py` |
 
 ---
 
@@ -205,7 +230,7 @@ server/
 ├── CMakeLists.txt              # C++ build (cmake)
 ├── include/                    # C++ headers
 ├── src/                        # C++ sources (target/draft graph, KV cache, FlashPrefill)
-├── test/                       # C++ test sources (test_dflash.cpp, smoke_*, test_*)
+├── test/                       # unit/, smoke/, bench/ (C++), python/ (pytest), fixtures/ + shared helpers
 ├── deps/
 │   ├── llama.cpp/              # Vendored ggml snapshot + extracted helpers
 │   └── Block-Sparse-Attention/ # BSA kernels (submodule)
@@ -215,7 +240,6 @@ server/
 ├── scripts/
 │   ├── run.py                  # CLI text generation
 │   └── setup_system.sh         # System dependency installer
-├── tests/                      # pytest suite (unit + luce_server integration)
 ├── README.md
 └── DEVELOPER.md                # This file
 ```

@@ -1,10 +1,10 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "../deps/llama.cpp/ggml/src/ggml-backend-impl.h"
+#include "../../deps/llama.cpp/ggml/src/ggml-backend-impl.h"
 #include "deepseek4/deepseek4_image_admission.h"
 #include "ggml-cpu.h"
-#include "../deps/llama.cpp/ggml/src/ggml-cuda/ds4-causal.h"
+#include "../../deps/llama.cpp/ggml/src/ggml-cuda/ds4-causal.h"
 #if defined(GGML_USE_HIP)
 #include <hip/hip_runtime_api.h>
 #endif

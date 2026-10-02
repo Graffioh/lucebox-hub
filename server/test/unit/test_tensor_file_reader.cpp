@@ -4,7 +4,7 @@
 // buffer; a span outside the file or its tensor is refused.
 
 #include "CppUnitTestFramework.hpp"
-#include "../src/common/tensor_file_reader.h"
+#include "../../src/common/tensor_file_reader.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"

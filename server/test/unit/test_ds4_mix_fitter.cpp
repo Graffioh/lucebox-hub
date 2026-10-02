@@ -1,5 +1,5 @@
 #define main ds4_mix_converter_main
-#include "../tools/ds4_mix_converter/ds4_mix_converter.cpp"
+#include "../../tools/ds4_mix_converter/ds4_mix_converter.cpp"
 #undef main
 
 int main(int argc, char ** argv) {
@@ -54,10 +54,12 @@ int main(int argc, char ** argv) {
             std::optional<Imatrix> imatrix = load_imatrix(argv[2]);
             const int layer = parse_nonnegative(argv[3], "layer");
             const int expert = parse_nonnegative(argv[4], "expert");
+            const uint32_t experts = config_u32(source.config(), "n_routed_experts");
             HistogramFitter gate_up, down;
             for (const auto & recipe : kExpertRecipes) {
                 const auto shape = validate_expert_source(source, layer, expert, recipe);
-                const auto * importance = require_imatrix(imatrix, target_expert_name(layer, recipe), shape.in);
+                const auto * importance = require_imatrix(imatrix, target_expert_name(layer, recipe), shape.in,
+                    expert, experts);
                 add_expert_to_fitter(source, layer, expert, recipe, importance,
                     recipe.books == BookSource::GateUpJoint ? gate_up : down);
             }

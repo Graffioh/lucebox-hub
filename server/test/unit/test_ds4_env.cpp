@@ -1,6 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
-#include "../deps/llama.cpp/ggml/src/ggml-cuda/ds4-env.cuh"
+#include "../../deps/llama.cpp/ggml/src/ggml-cuda/ds4-env.cuh"
 
 namespace {
 struct Ds4EnvFixture {};

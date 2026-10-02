@@ -1,7 +1,7 @@
 #include "CppUnitTestFramework.hpp"
-#include "../src/common/moe_hybrid_swap_manager.h"
-#include "../src/common/moe_hybrid_placement.h"
-#include "../src/common/moe_hybrid_routing_stats.h"
+#include "../../src/common/moe_hybrid_swap_manager.h"
+#include "../../src/common/moe_hybrid_placement.h"
+#include "../../src/common/moe_hybrid_routing_stats.h"
 
 #include <cstdio>
 #include <cstdlib>
