@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """End-to-end integration tests for concurrent serving (--max-concurrency N).
 
 Exercises the qwen35 paged-attention slot engine: true decode overlap across
@@ -11,9 +10,15 @@ Usage:
     ./server/build/luce_server <qwen36-model.gguf> --port 9099 \
         --paged-attention --max-concurrency 3
 
-    # Then run tests:
-    python3 server/tests/test_server_parallel.py \
+    # Then run tests (--max-concurrency must match the server; the module
+    # skips without it):
+    pytest server/test/python/test_server_parallel.py -v \
         --base-url http://127.0.0.1:9099 --max-concurrency 3
+
+    # Or let pytest launch the server (adds --paged-attention
+    # --max-concurrency N to the launched server):
+    pytest server/test/python/test_server_parallel.py -v \
+        --launch <qwen36-model.gguf> --max-concurrency 3
 
 The non-power-of-two default is intentional: three physical slots produce a
 four-row compact decode bucket, with the final row mapped to padding. This
@@ -24,14 +29,15 @@ token level (GEMM reduction order can flip near-tie tokens), so all answer
 checks are content-level (the expected number appears), never exact-match.
 """
 
-import argparse
 import json
 import re
-import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+
+import pytest
+
+pytestmark = [pytest.mark.server, pytest.mark.slow]
 
 
 def make_math_prompts(count: int):
@@ -74,36 +80,11 @@ def contains_number(text: str, number: str) -> bool:
     return re.search(rf"(?<![0-9]){re.escape(number)}(?![0-9])", text) is not None
 
 
-class ParallelTestSuite:
-    def __init__(self, base_url: str, parallel: int):
-        self.base = base_url.rstrip("/")
-        self.parallel = parallel
-        self.passed = 0
-        self.failed = 0
-        self.skipped = 0
-
-    def _req(self, method: str, path: str, body: dict | None = None,
-             stream: bool = False, timeout: float = 300.0):
-        url = self.base + path
-        data = json.dumps(body).encode() if body else None
-        headers = {"Content-Type": "application/json"} if body else {}
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        if stream:
-            return resp  # caller reads lines
-        return json.loads(resp.read().decode())
-
-    def _check(self, name: str, ok: bool, detail: str = ""):
-        if ok:
-            self.passed += 1
-            print(f"  ✅ {name}")
-        else:
-            self.failed += 1
-            print(f"  ❌ {name}: {detail}")
-
-    def _skip(self, name: str, reason: str):
-        self.skipped += 1
-        print(f"  ⏭️  {name}: {reason}")
+class TestParallel:
+    @pytest.fixture(autouse=True)
+    def _setup(self, server_handle, max_concurrency):
+        self.client = server_handle.client
+        self.parallel = max_concurrency
 
     # ── Request workers ──────────────────────────────────────────────────
 
@@ -128,9 +109,10 @@ class ParallelTestSuite:
         try:
             if barrier is not None:
                 barrier.wait(timeout=60)
-            resp = self._req("POST", "/v1/chat/completions",
-                             self._chat_body(prompt, max_tokens, stream=True),
-                             stream=True, timeout=timeout)
+            resp = self.client.post_stream(
+                "/v1/chat/completions",
+                self._chat_body(prompt, max_tokens, stream=True),
+                timeout=timeout)
             for line in resp:
                 line = line.decode().strip()
                 if not line:
@@ -180,9 +162,10 @@ class ParallelTestSuite:
             if start_delay > 0:
                 time.sleep(start_delay)
             r["started_t"] = time.monotonic()
-            resp = self._req("POST", "/v1/chat/completions",
-                             self._chat_body(prompt, max_tokens, stream=False),
-                             timeout=timeout)
+            resp = self.client.post(
+                "/v1/chat/completions",
+                self._chat_body(prompt, max_tokens, stream=False),
+                timeout=timeout)
             msg = resp["choices"][0]["message"]
             r["content"] = msg.get("content") or ""
             r["reasoning"] = msg.get("reasoning_content") or ""
@@ -231,21 +214,14 @@ class ParallelTestSuite:
         return self._run_workers(self._nonstream_worker, len(prompts), kwargs,
                                  join_timeout=join_timeout)
 
-    def _all_completed(self, results, label: str) -> bool:
-        """Check every worker result; report per-request failures."""
-        all_ok = True
-        for i, r in enumerate(results):
-            if r is None:
-                self._check(f"{label} request {i+1} completes", False,
-                            "worker did not finish (timeout)")
-                all_ok = False
-            elif not r["ok"]:
-                self._check(f"{label} request {i+1} completes", False, r["error"])
-                all_ok = False
-        if all_ok:
-            self._check(f"all {len(results)} {label} requests complete "
-                        "with 200", True)
-        return all_ok
+    @staticmethod
+    def _assert_all_completed(results, label: str) -> None:
+        """Every worker finished with a 200; report all failures at once."""
+        failures = [
+            f"{label} request {i+1}: "
+            + ("worker did not finish (timeout)" if r is None else r["error"])
+            for i, r in enumerate(results) if r is None or not r["ok"]]
+        assert not failures, "; ".join(failures)
 
     @staticmethod
     def _combined(r) -> str:
@@ -256,82 +232,68 @@ class ParallelTestSuite:
     def test_parallel_streaming(self):
         """N simultaneous streams must overlap and their chunks interleave."""
         n = self.parallel
-        print(f"\n[PAR-1] Streaming overlap + interleave — "
-              f"{n} simultaneous requests")
         if n == 1:
-            self._skip("streaming overlap + interleave",
-                       "--max-concurrency 1: concurrency is not expected; "
-                       "run with --max-concurrency > 1")
-            return
+            pytest.skip("--max-concurrency 1: concurrency is not expected; "
+                        "run with --max-concurrency > 1")
         prompts = make_long_prompts(n)
         timeline: list = []
         t0 = time.monotonic()
         results = self._launch_streams(prompts, max_tokens=192,
                                        timeline=timeline)
         elapsed = time.monotonic() - t0
-        if not self._all_completed(results, "streaming"):
-            return
+        self._assert_all_completed(results, "streaming")
 
         missing = [i + 1 for i, r in enumerate(results)
                    if r["first_chunk_t"] is None]
-        self._check("every stream produced at least one chunk",
-                    not missing, f"streams with no chunks: {missing}")
-        if missing:
-            return
+        assert not missing, f"streams with no chunks: {missing}"
 
         latest_first = max(r["first_chunk_t"] for r in results)
         earliest_finish = min(r["finish_t"] for r in results)
         rel = [(f"s{i+1}: first={r['first_chunk_t']-t0:.2f}s "
                 f"finish={r['finish_t']-t0:.2f}s")
                for i, r in enumerate(results)]
-        self._check("all first chunks arrive before earliest finish "
-                    "(true overlap, not serialization)",
-                    latest_first < earliest_finish,
-                    f"latest first chunk at {latest_first-t0:.2f}s, earliest "
-                    f"finish at {earliest_finish-t0:.2f}s; {'; '.join(rel)}")
-        print(f"    → {n} streams completed in {elapsed:.1f}s; "
+        # True overlap, not serialization.
+        assert latest_first < earliest_finish, (
+            f"latest first chunk at {latest_first-t0:.2f}s, earliest "
+            f"finish at {earliest_finish-t0:.2f}s; {'; '.join(rel)}")
+        print(f"{n} streams completed in {elapsed:.1f}s; "
               f"latest first chunk {latest_first-t0:.2f}s, "
               f"earliest finish {earliest_finish-t0:.2f}s")
 
         seq = [idx for _, idx in sorted(timeline)]
         distinct = len(set(seq))
-        runs = 1 + sum(1 for a, b in zip(seq, seq[1:]) if a != b) if seq else 0
-        self._check("chunks arrived from at least two streams", distinct >= 2,
-                    f"streams seen: {sorted(set(seq))}")
+        runs = (1 + sum(1 for a, b in zip(seq, seq[1:], strict=False) if a != b)
+                if seq else 0)
+        assert distinct >= 2, \
+            f"chunks arrived from < 2 streams: {sorted(set(seq))}"
         # If every stream's chunks formed one contiguous block, runs would
         # equal distinct; interleaving means some stream owns >= 2 runs.
-        self._check("chunks from different streams interleave",
-                    runs > distinct,
-                    f"{len(seq)} chunks arrived in {runs} contiguous runs "
-                    f"across {distinct} streams (fully serialized order)")
-        print(f"    → {len(seq)} chunks, {distinct} streams, {runs} runs")
+        assert runs > distinct, (
+            f"chunks from different streams do not interleave: {len(seq)} "
+            f"chunks arrived in {runs} contiguous runs across {distinct} "
+            "streams (fully serialized order)")
 
     def test_parallel_isolation(self):
         """Concurrent streams with distinct prompts: each answer belongs to
         its own prompt, none leaks into another stream (state isolation)."""
         n = self.parallel
-        print(f"\n[PAR-2] Isolation — {n} concurrent distinct prompts")
         prompts = make_math_prompts(n)
         results = self._launch_streams(prompts, max_tokens=512)
-        if not self._all_completed(results, "streaming"):
-            return
+        self._assert_all_completed(results, "streaming")
 
         answers = [ans for _, ans in prompts]
         for i, r in enumerate(results):
             combined = self._combined(r)
+            detail = (f"content={r['content']!r} "
+                      f"reasoning={r['reasoning'][:200]!r}")
             # Positive: own answer somewhere in reasoning+content.
-            self._check(f"stream {i+1} contains its own answer {answers[i]}",
-                        contains_number(combined, answers[i]),
-                        f"content={r['content']!r} "
-                        f"reasoning={r['reasoning'][:200]!r}")
+            assert contains_number(combined, answers[i]), \
+                f"stream {i+1} lacks its own answer {answers[i]}: {detail}"
             for j, answer in enumerate(answers):
                 if i == j:
                     continue
-                self._check(
-                    f"stream {i+1} excludes stream {j+1}'s answer {answer}",
-                    not contains_number(combined, answer),
-                    f"content={r['content']!r} "
-                    f"reasoning={r['reasoning'][:200]!r}")
+                assert not contains_number(combined, answer), \
+                    f"stream {i+1} contains stream {j+1}'s answer {answer}: {detail}"
 
     def test_parallel_nonstream(self):
         """A prompt answered correctly alone must still be answered correctly
@@ -340,80 +302,60 @@ class ParallelTestSuite:
         Content-level match only — batched GEMM reduction order may legally
         flip near-tie tokens, so exact token equality is NOT required."""
         n = self.parallel
-        print(f"\n[PAR-3] Sequential + concurrent non-streaming consistency")
         prompts = make_math_prompts(n)
         probe_prompt, probe_answer = prompts[0]
 
         # Solo run.
         solo = [None]
         self._nonstream_worker(0, probe_prompt, 512, solo)
-        if not solo[0]["ok"]:
-            self._check("solo request completes", False, solo[0]["error"])
-            return
-        self._check("solo request completes", True)
-        solo_ok = contains_number(self._combined(solo[0]), probe_answer)
-        self._check(f"solo answer contains {probe_answer}", solo_ok,
-                    f"content={solo[0]['content']!r} "
-                    f"reasoning={solo[0]['reasoning'][:200]!r}")
-        print(f"    → solo content: {solo[0]['content']!r}")
+        assert solo[0]["ok"], f"solo request failed: {solo[0]['error']}"
+        assert contains_number(self._combined(solo[0]), probe_answer), (
+            f"solo answer lacks {probe_answer}: "
+            f"content={solo[0]['content']!r} "
+            f"reasoning={solo[0]['reasoning'][:200]!r}")
 
         # Same prompt inside an N-way concurrent batch.
         results = self._launch_nonstream(prompts, max_tokens=512)
-        if not self._all_completed(results, "non-streaming"):
-            return
-        conc = results[0]
-        print(f"    → concurrent content: {conc['content']!r}")
-        if solo[0]["content"] != conc["content"]:
-            print("    → note: solo/concurrent contents differ at token level "
+        self._assert_all_completed(results, "non-streaming")
+        if solo[0]["content"] != results[0]["content"]:
+            print("note: solo/concurrent contents differ at token level "
                   "(allowed — batched reduction order)")
         for i, r in enumerate(results):
             ans = prompts[i][1]
-            self._check(f"request {i+1} contains its answer {ans}",
-                        contains_number(self._combined(r), ans),
-                        f"content={r['content']!r} "
-                        f"reasoning={r['reasoning'][:200]!r}")
-            completion_tokens = r["usage"].get("completion_tokens", 0)
-            self._check(f"request {i+1} usage.completion_tokens > 0",
-                        completion_tokens > 0,
-                        f"usage={r['usage']}")
+            assert contains_number(self._combined(r), ans), (
+                f"request {i+1} lacks its answer {ans}: "
+                f"content={r['content']!r} "
+                f"reasoning={r['reasoning'][:200]!r}")
+            assert r["usage"].get("completion_tokens", 0) > 0, \
+                f"request {i+1} usage.completion_tokens == 0: {r['usage']}"
             prompt_tokens = r["usage"].get("prompt_tokens", 0)
             timings = r["usage"].get("timings", {})
-            self._check(
-                f"request {i+1} timings account for the full prompt",
-                prompt_tokens > 0
-                and timings.get("prefilled_tokens") == prompt_tokens
-                and timings.get("effective_prompt_tokens") == prompt_tokens,
-                f"usage={r['usage']}")
+            assert (prompt_tokens > 0
+                    and timings.get("prefilled_tokens") == prompt_tokens
+                    and timings.get("effective_prompt_tokens") == prompt_tokens), \
+                f"request {i+1} timings miss part of the prompt: {r['usage']}"
 
     def test_parallel_more_than_slots(self):
         """2*N requests at once: extras must queue behind the N slots and
         all must finish with correct answers."""
         n = self.parallel
         count = 2 * n
-        print(f"\n[PAR-4] Over-subscription — {count} requests on {n} slots")
         prompts = make_math_prompts(count)
-        t0 = time.monotonic()
         results = self._launch_nonstream(prompts, max_tokens=512,
                                          join_timeout=1800.0)
-        elapsed = time.monotonic() - t0
-        if not self._all_completed(results, "non-streaming"):
-            return
+        self._assert_all_completed(results, "non-streaming")
         for i, r in enumerate(results):
             ans = prompts[i][1]
-            self._check(f"request {i+1} contains its answer {ans}",
-                        contains_number(self._combined(r), ans),
-                        f"content={r['content']!r} "
-                        f"reasoning={r['reasoning'][:200]!r}")
-        print(f"    → {count} requests completed in {elapsed:.1f}s")
+            assert contains_number(self._combined(r), ans), (
+                f"request {i+1} lacks its answer {ans}: "
+                f"content={r['content']!r} "
+                f"reasoning={r['reasoning'][:200]!r}")
 
     def test_unequal_packed_prefills(self):
         """A multi-chunk prefill must keep its slot-local state after an
         earlier short prefill commits and leaves the FIFO head."""
-        print("\n[PAR-5] Unequal prefills retain isolated paged state")
         if self.parallel < 2:
-            self._skip("unequal packed prefill",
-                       "--max-concurrency 1: packed prefill is unavailable")
-            return
+            pytest.skip("--max-concurrency 1: packed prefill is unavailable")
 
         short_prompt = "What is 55+56? Answer with just the number."
         filler = "\n".join(
@@ -434,38 +376,25 @@ class ParallelTestSuite:
         ]
         results = self._run_workers(
             self._nonstream_worker, 2, kwargs, join_timeout=1800.0)
-        if not self._all_completed(results, "unequal-prefill"):
-            return
-        self._check(
-            "short prefill commits before the long prefill",
-            results[0]["finish_t"] < results[1]["finish_t"],
+        self._assert_all_completed(results, "unequal-prefill")
+        assert results[0]["finish_t"] < results[1]["finish_t"], (
+            "short prefill did not commit before the long prefill: "
             f"short_finish={results[0]['finish_t']} "
             f"long_finish={results[1]['finish_t']}")
-
-        self._check(
-            "short prefill answers 111",
-            contains_number(self._combined(results[0]), "111"),
-            f"content={results[0]['content']!r}")
-        self._check(
-            "long prefill answers 9001 after the short prefill commits",
-            contains_number(self._combined(results[1]), "9001"),
-            f"content={results[1]['content']!r} "
+        assert contains_number(self._combined(results[0]), "111"), \
+            f"short prefill does not answer 111: {results[0]['content']!r}"
+        assert contains_number(self._combined(results[1]), "9001"), (
+            "long prefill does not answer 9001 after the short prefill "
+            f"commits: content={results[1]['content']!r} "
             f"reasoning={results[1]['reasoning'][:200]!r}")
-        long_prompt_tokens = results[1]["usage"].get("prompt_tokens", 0)
-        self._check(
-            "long prompt crosses the 2048-token initial prefill chunk",
-            long_prompt_tokens > 2048,
-            f"usage={results[1]['usage']}")
+        assert results[1]["usage"].get("prompt_tokens", 0) > 2048, (
+            "long prompt does not cross the 2048-token initial prefill "
+            f"chunk: usage={results[1]['usage']}")
 
     def test_parallel_prefill_no_pause(self):
         """A long admission must not pause a stream that is already decoding."""
-        n = self.parallel
-        print("\n[PAR-7] Prefill/decode fusion — decode continues during "
-              "a long prefill")
-        if n == 1:
-            self._skip("prefill no-pause",
-                       "--max-concurrency 1: fusion not applicable, skipping")
-            return
+        if self.parallel == 1:
+            pytest.skip("--max-concurrency 1: fusion not applicable")
 
         # Stream A starts alone and reaches steady decode before B arrives.
         a_prompt, _ = make_long_prompts(1)[0]
@@ -484,12 +413,10 @@ class ParallelTestSuite:
                 break
             time.sleep(0.05)
         ra = a_res[0]
-        if ra is None or ra["error"] or ra["n_chunks"] < 3:
-            self._check("stream A reaches steady decode", False,
-                        "no chunks" if ra is None else
-                        (ra["error"] or f"only {ra['n_chunks']} chunks"))
-            return
-        self._check("stream A reaches steady decode", True)
+        assert ra is not None and not ra["error"] and ra["n_chunks"] >= 3, (
+            "stream A did not reach steady decode: "
+            + ("no chunks" if ra is None else
+               (ra["error"] or f"only {ra['n_chunks']} chunks")))
 
         # Stream B has several 512-token prefill chunks. Answer 167 cannot
         # collide with the filler item indices (0..139).
@@ -508,27 +435,17 @@ class ParallelTestSuite:
         b_thread.join(timeout=900)
         a_thread.join(timeout=900)
 
-        if b_thread.is_alive():
-            self._check("stream B completes", False, "worker timed out")
-            return
+        assert not b_thread.is_alive(), "stream B worker timed out"
         ra = a_res[0]
-        if a_thread.is_alive() or ra is None or not ra["ok"]:
-            self._check(
-                "stream A completes", False,
-                "worker timed out" if a_thread.is_alive() else
-                ("no result" if ra is None else str(ra["error"])))
-            return
-        self._check("stream A completes", True)
+        assert not a_thread.is_alive(), "stream A worker timed out"
+        assert ra is not None and ra["ok"], \
+            f"stream A failed: {'no result' if ra is None else ra['error']}"
 
         rb = b_res[0]
-        if rb is None or not rb["ok"] or rb["first_chunk_t"] is None:
-            self._check("stream B completes", False,
-                        "no result" if rb is None else str(rb["error"]))
-            return
-        self._check("stream B completes", True)
-        self._check("stream B answers 167",
-                    contains_number(self._combined(rb), "167"),
-                    f"content={rb['content']!r}")
+        assert rb is not None and rb["ok"] and rb["first_chunk_t"] is not None, \
+            f"stream B failed: {'no result' if rb is None else rb['error']}"
+        assert contains_number(self._combined(rb), "167"), \
+            f"stream B does not answer 167: {rb['content']!r}"
 
         # Blocking admission leaves the prefill-dominated first 70% of B's
         # TTFT window empty. Fused steps keep producing A outputs there.
@@ -538,73 +455,8 @@ class ParallelTestSuite:
             a_early = [t for t, idx in timeline
                        if idx == 0 and b_started <= t <= early_end]
         if ra["finish_t"] is not None and ra["finish_t"] < early_end:
-            self._skip("A kept emitting during B's prefill",
-                       "stream A finished before B's window closed")
-            return
-        self._check("stream A kept emitting during B's prefill window",
-                    len(a_early) >= 2,
-                    f"A emitted {len(a_early)} chunks in the first "
-                    f"{0.7 * window:.2f}s of B's {window:.2f}s "
-                    "prefill window")
-
-    # ── Run all ──────────────────────────────────────────────────────────
-
-    def run_all(self):
-        print("=" * 60)
-        print("Parallel Serving Tests")
-        print(f"Target: {self.base} (parallel={self.parallel})")
-        print("=" * 60)
-
-        self.test_parallel_streaming()
-        self.test_parallel_isolation()
-        self.test_parallel_nonstream()
-        self.test_parallel_more_than_slots()
-        self.test_unequal_packed_prefills()
-        self.test_parallel_prefill_no_pause()
-
-        print("\n" + "=" * 60)
-        total = self.passed + self.failed + self.skipped
-        print(f"Results: {self.passed}/{total} passed, {self.failed} failed"
-              + (f", {self.skipped} skipped" if self.skipped else ""))
-        return 0 if self.failed == 0 else 1
-
-
-# ─── Main ────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Concurrent serving tests for luce_server "
-                    "(run against a server started with "
-                    "--paged-attention --max-concurrency N)")
-    parser.add_argument("--base-url", default="http://127.0.0.1:9099",
-                        help="Server base URL")
-    parser.add_argument("--max-concurrency", type=int, default=3,
-                        help="N: --max-concurrency value used to start the server")
-    args = parser.parse_args()
-
-    if not (1 <= args.max_concurrency <= 64):
-        print("ERROR: --max-concurrency must be in [1, 64], "
-              f"got {args.max_concurrency}")
-        sys.exit(2)
-
-    # Preflight: server must already be running.
-    base = args.base_url.rstrip("/")
-    try:
-        r = urllib.request.urlopen(base + "/health", timeout=10)
-        health = json.loads(r.read().decode())
-        if health.get("status") != "ok":
-            print(f"ERROR: server unhealthy: {health}")
-            sys.exit(2)
-    except Exception as e:
-        print(f"ERROR: server not reachable at {base}: {e}")
-        print("Start it first, e.g.:")
-        print(f"  ./server/build/luce_server <model.gguf> --port 9099 "
-              f"--paged-attention --max-concurrency {args.max_concurrency}")
-        sys.exit(2)
-
-    suite = ParallelTestSuite(base, args.max_concurrency)
-    sys.exit(suite.run_all())
-
-
-if __name__ == "__main__":
-    main()
+            pytest.skip("stream A finished before B's prefill window closed")
+        assert len(a_early) >= 2, (
+            f"stream A paused during B's prefill: emitted {len(a_early)} "
+            f"chunks in the first {0.7 * window:.2f}s of B's "
+            f"{window:.2f}s prefill window")

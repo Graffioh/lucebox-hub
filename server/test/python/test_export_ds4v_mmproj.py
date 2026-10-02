@@ -8,8 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 EXPORTER_PATH = REPO_ROOT / "server" / "tools" / "export_ds4v_mmproj.py"
 SPEC = importlib.util.spec_from_file_location("export_ds4v_mmproj", EXPORTER_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -46,7 +45,7 @@ def default_entries():
         nbytes = 2
         for dim in shape:
             nbytes *= dim
-        raw = bytes(((number * 17 + offset) % 256 for offset in range(nbytes)))
+        raw = bytes((number * 17 + offset) % 256 for offset in range(nbytes))
         start = len(payload)
         payload += raw
         entries[name] = {"dtype": "BF16", "shape": list(shape), "data_offsets": [start, len(payload)]}
@@ -94,14 +93,14 @@ def read_gguf(path):
                 subtype, count = struct.unpack("<IQ", handle.read(12))
                 if subtype != exporter.GGUF_TYPE_FLOAT32:
                     raise AssertionError("unexpected array subtype")
-                value = struct.unpack("<%df" % count, handle.read(4 * count))
+                value = struct.unpack(f"<{count}f", handle.read(4 * count))
             else:
-                raise AssertionError("unexpected metadata type %d" % value_type)
+                raise AssertionError(f"unexpected metadata type {value_type}")
             metadata[key] = value
         for _ in range(tensor_count):
             name = read_string(handle)
             dimensions = struct.unpack("<I", handle.read(4))[0]
-            ggml_shape = struct.unpack("<%dQ" % dimensions, handle.read(8 * dimensions))
+            ggml_shape = struct.unpack(f"<{dimensions}Q", handle.read(8 * dimensions))
             tensor_type, offset = struct.unpack("<IQ", handle.read(12))
             infos.append((name, tuple(reversed(ggml_shape)), tensor_type, offset))
         data_start = exporter._align(handle.tell())
@@ -159,7 +158,7 @@ class ExportDs4vMmprojTest(unittest.TestCase):
         try:
             import gguf
         except ImportError as exc:
-            self.skipTest("vendored GGUF reader dependency unavailable: %s" % exc)
+            self.skipTest(f"vendored GGUF reader dependency unavailable: {exc}")
         finally:
             sys.path.pop(0)
 

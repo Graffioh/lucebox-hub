@@ -10,8 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
-SERVER_DIR = Path(__file__).resolve().parents[1]
+SERVER_DIR = Path(__file__).resolve().parents[2]
 SCRIPT = SERVER_DIR / "scripts" / "quantize_draft_q8.py"
 SPEC = importlib.util.spec_from_file_location("quantize_draft_q8", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)

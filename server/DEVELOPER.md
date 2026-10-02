@@ -169,20 +169,31 @@ cd server/build
 
 ### Integration tests (require running server)
 
-These scripts start their own server subprocess and need the server binary + models:
+The Python tests live in `server/tests/` and are driven by pytest. Unit tests
+run anywhere; tests that need a live `luce_server` are marked `server`, tests
+that need local model files/binaries are marked `model`.
 
 ```bash
-cd server/scripts
-python test_server_prefix_cache.py
-python test_multi_turn_prefix_cache.py
-python test_full_compress_cache.py
+# From the repo root — everything that doesn't need hardware:
+pytest -m "not server and not model and not slow"
+
+# Server tests against a running server:
+pytest server/tests/test_server_smoke.py -v --base-url http://localhost:8080
+
+# Or let pytest spawn luce_server itself:
+pytest server/tests/test_server_smoke.py -v --launch models/Qwen3-0.6B-BF16.gguf
 ```
 
-Or run against an already-running server:
+The cache/integration tests spawn their own server with the required flags
+and skip automatically when the model files or `luce_server` binary are
+missing:
 
 ```bash
-python test_server_prefix_cache.py --url http://localhost:8000
-python test_multi_turn_prefix_cache.py --url http://localhost:8000
+pytest server/tests/test_server_prefix_cache.py -v
+pytest server/tests/test_multi_turn_prefix_cache.py -v
+pytest server/tests/test_full_compress_cache.py -v
+pytest server/tests/test_prefill_cache.py -v
+pytest server/tests/test_server_integration.py -v --base-url http://localhost:8000
 ```
 
 ---
@@ -203,10 +214,8 @@ server/
 │   └── draft/dflash-draft-3.6-q4_k_m.gguf
 ├── scripts/
 │   ├── run.py                  # CLI text generation
-│   ├── test_server_prefix_cache.py    # Integration test (--url or auto-spawn)
-│   ├── test_multi_turn_prefix_cache.py # Integration test (--url or auto-spawn)
-│   ├── test_full_compress_cache.py    # Integration test
 │   └── setup_system.sh         # System dependency installer
+├── tests/                      # pytest suite (unit + luce_server integration)
 ├── README.md
 └── DEVELOPER.md                # This file
 ```

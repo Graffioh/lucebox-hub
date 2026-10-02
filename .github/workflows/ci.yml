@@ -34,16 +34,14 @@ jobs:
       - name: Lint Python surfaces touched by lucebox tooling
         run: uv run --frozen --extra dev ruff check .
 
-      - name: Test DS4 benchmark tools
-        run: uv run --frozen --extra dev pytest -q harness/tests/test_ds4_benchmark_tools.py
+      - name: Python unit tests (no GPU/server/model required)
+        # Includes .github/ci. server/model/slow-marked tests need a running
+        # luce_server or local model files; no CI job runs them yet, so run
+        # them by hand with --base-url/--launch.
+        run: uv run --frozen --extra dev pytest -q -m "not server and not model and not slow"
 
-      - name: Test concurrency benchmark tools and runners
-        run: uv run --frozen --extra dev pytest -q harness/benchmarks/concurrency
-
-      - name: Lint and test CI helper scripts
-        run: |
-          find .github/ci -name '*.py' -print0 | xargs -0 uv run --frozen --extra dev ruff check
-          uv run --frozen --extra dev pytest -q .github/ci
+      - name: Lint CI helper scripts
+        run: find .github/ci -name '*.py' -print0 | xargs -0 uv run --frozen --extra dev ruff check
 
   build:
     name: Build (cmake + uv sync --extra megakernel)
