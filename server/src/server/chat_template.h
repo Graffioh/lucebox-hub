@@ -5,13 +5,25 @@
 //   - Qwen3/3.5: <|im_start|>role\ncontent<|im_end|>\n
 //   - BailingMoE3: <role>SYSTEM/HUMAN/ASSISTANT</role>...<|role_end|>
 //   - Laguna: XML-style role blocks
+//   - Gemma4: <|turn>role\ncontent<turn|>\n
+//   - DeepSeek V4/V4.1: role tokens with DSML tool-call blocks
 
 #pragma once
+
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <vector>
 
 namespace luce::common {
+
+// Model-independent assistant call. Arguments are decoded once on a memory
+// miss; renderers choose the model's native syntax.
+struct ChatToolCall {
+    std::string id;
+    std::string name;
+    nlohmann::json arguments;
+};
 
 // A single message in a chat conversation.
 struct ChatMessage {
@@ -25,6 +37,11 @@ struct ChatMessage {
     // `message.reasoning_content` so official templates (e.g. qwen4exp) can
     // decide whether to replay it inside <think>...</think>.
     std::string reasoning_content;
+    std::vector<ChatToolCall> tool_calls;
+    // On a memory hit, content is the original raw turn. Calls retain only
+    // their IDs/names for result association; do not render them a second time.
+    bool tool_calls_replayed = false;
+    std::string tool_name;  // Result's function name, resolved from tool_call_id.
 };
 
 // Chat template format.
@@ -48,8 +65,7 @@ enum class ChatFormat {
 //   false → assistant starts with <think>\n\n</think>\n\n (skip thinking)
 //
 // `tools_json` is an optional JSON string containing the tool definitions
-// array. When non-empty, the Qwen3/3.5 template injects a tool preamble
-// into the system message instructing the model how to emit <tool_call> tags.
+// array. Each renderer injects the corresponding native tool preamble.
 //
 // `reasoning_effort` is the normalized model-facing effort. DeepSeek V4 uses
 // low, high, and max; high and max prepend the official encoding prefixes.
@@ -75,8 +91,8 @@ ChatFormat chat_format_for_arch(const std::string & arch);
 // `bos_token`,
 // `eos_token`    passed through to the template (Qwen3.6 templates may use
 //                {{bos_token}} / {{eos_token}}). Use empty strings if unknown.
-// `tools_json`   optional JSON array of tool definitions; when non-empty it
-//                is parsed and injected as `tools` into the template context.
+// `tools_json`   optional JSON array of tool definitions, normalized from
+//                Chat Completions, Responses, or Anthropic to tools[].function.
 // `reasoning_effort` optional; injected as `reasoning_effort` when non-empty.
 // `preserve_thinking` tri-state: -1 leaves the template variable undefined
 //                (so the template's own default — typically true — applies);
@@ -84,6 +100,10 @@ ChatFormat chat_format_for_arch(const std::string & arch);
 //                templates (e.g. qwen4exp) use this to decide whether earlier
 //                assistant turns replay their recorded <think> block
 //                (message.reasoning_content) or render with it stripped.
+//
+// Messages must contain structured tool calls, not raw tool-memory replay.
+// function.arguments is exposed as an object, and result messages retain
+// tool_call_id and name. Raw-replayed messages throw std::logic_error.
 //
 // Internally caches the most recently parsed program per thread (avoids
 // re-parsing the template on every request). Throws std::runtime_error on

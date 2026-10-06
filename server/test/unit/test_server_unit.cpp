@@ -108,7 +108,8 @@ namespace luce::common {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
-    ToolMemory & tool_memory);
+    ToolMemory & tool_memory,
+    bool replay_tool_memory = true);
 
 struct SchedulerTestHarness {
     static PrefixCache & prefix_cache(HttpServer & server) {
@@ -3814,16 +3815,14 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_includes_trailing_too
     TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true, true) == 520);
 }
 
-// The last-marker cut is only safe if every native template renders the
-// prompt through its final role marker identically once the next agent turn
-// is appended after the tool results.
+// Families with a trailing role marker can snapshot through the tool results.
+// Gemma instead continues the open model turn; its continuation is tested below.
 TEST_CASE(ServerUnitFixture, test_tool_result_prompt_prefix_survives_next_agent_turn) {
     struct Family { ChatFormat format; const char * marker; };
     const Family families[] = {
         {ChatFormat::QWEN3, "<|im_start|>"},
         {ChatFormat::DEEPSEEK4, "<｜Assistant｜>"},
         {ChatFormat::DEEPSEEK41, "<｜Assistant｜>"},
-        {ChatFormat::GEMMA4, "<|turn>"},
         {ChatFormat::LAGUNA, "<assistant>"},
     };
     std::vector<ChatMessage> turn = {
@@ -5652,16 +5651,33 @@ TEST_CASE(ServerUnitFixture, test_jinja_render_no_gen_prompt) {
     TEST_ASSERT(out.find("<|assistant|>") == std::string::npos);
 }
 
-TEST_CASE(ServerUnitFixture, test_jinja_render_tools_injected) {
-    // Template references `tools` to confirm it was passed in.
-    static const char TPL[] =
-        "{%- if tools -%}TOOLS_PRESENT:{{ tools[0].name }}{%- endif -%}"
-        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}";
-    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
-    std::string tools = R"([{"name":"my_tool","description":"test"}])";
-    std::string out = render_chat_template_jinja(
-        TPL, msgs, "", "", false, false, tools);
-    TEST_ASSERT(out.find("TOOLS_PRESENT:my_tool") != std::string::npos);
+TEST_CASE(ServerUnitFixture, test_gemma_tool_schema_formats_preserve_nested_types) {
+    const json schema = {
+        {"type", "object"},
+        {"properties", {
+            {"config", {{"type", "object"}, {"properties", {
+                {"enabled", {{"type", "boolean"}}}}}}},
+            {"type", {{"type", "string"}, {"enum", json::array({"lowercase"})}}},
+        }},
+        {"required", json::array({"config"})},
+    };
+    const json function = {{"name", "inspect"}, {"description", "Inspect."}, {"parameters", schema}};
+    const std::vector<json> tools = {
+        json::array({{{"type", "function"}, {"function", function}}}),
+        json::array({function}),
+        json::array({{{"name", "inspect"}, {"description", "Inspect."}, {"input_schema", schema}}}),
+    };
+    const std::string declaration =
+        "<|tool>declaration:inspect{description:<|\"|>Inspect.<|\"|>,parameters:{"
+        "properties:{config:{properties:{enabled:{type:<|\"|>BOOLEAN<|\"|>}},"
+        "type:<|\"|>OBJECT<|\"|>},type:{enum:[<|\"|>lowercase<|\"|>],type:<|\"|>STRING<|\"|>}},"
+        "required:[<|\"|>config<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|>";
+    for (const auto & definition : tools) {
+        const auto prompt = render_chat_template({{"user", "inspect it"}}, ChatFormat::GEMMA4,
+                                                  true, false, definition.dump());
+        TEST_ASSERT(prompt.find(declaration) != std::string::npos);
+        TEST_ASSERT(prompt.find("input_schema") == std::string::npos);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_jinja_render_empty_tools_skipped) {
@@ -5849,12 +5865,16 @@ TEST_CASE(ServerUnitFixture, test_normalize_responses_tool_followup_messages) {
         TEST_ASSERT(chat_msgs[1].content == "fetch latest code");
         TEST_ASSERT(chat_msgs[2].role == "assistant");
         TEST_ASSERT(chat_msgs[2].content == raw_tool_call);
+        TEST_ASSERT(chat_msgs[2].tool_calls_replayed);
+        TEST_ASSERT(chat_msgs[2].tool_calls.size() == 2);
         TEST_ASSERT(chat_msgs[3].role == "tool");
         TEST_ASSERT(chat_msgs[3].tool_call_id == call_id);
         TEST_ASSERT(chat_msgs[3].content == "Process exited with code 0");
+        TEST_ASSERT(chat_msgs[3].tool_name == "exec_command");
         TEST_ASSERT(chat_msgs[4].role == "tool");
         TEST_ASSERT(chat_msgs[4].tool_call_id == second_call_id);
         TEST_ASSERT(chat_msgs[4].content == "int main() {}");
+        TEST_ASSERT(chat_msgs[4].tool_name == "read_file");
     }
 }
 
@@ -5893,10 +5913,14 @@ TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_followup_messages) {
     if (chat.size() == 6) {
         TEST_ASSERT(chat[0].role == "user" && chat[0].content == "read both");
         TEST_ASSERT(chat[1].role == "assistant" && chat[1].content == raw);
+        TEST_ASSERT(chat[1].tool_calls_replayed);
+        TEST_ASSERT(chat[1].tool_calls.size() == 2);
         TEST_ASSERT(chat[2].role == "tool" && chat[2].tool_call_id == "call_b" &&
                     chat[2].content == "B");
         TEST_ASSERT(chat[3].role == "tool" && chat[3].tool_call_id == "call_a" &&
                     chat[3].content == "A");
+        TEST_ASSERT(chat[2].tool_name == "Read");
+        TEST_ASSERT(chat[3].tool_name == "Read");
         TEST_ASSERT(chat[4].role == "user" &&
                     chat[4].content == "<system-reminder>x</system-reminder>");
         TEST_ASSERT(chat[5].role == "system");
@@ -5909,8 +5933,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_followup_messages) {
     TEST_ASSERT(http_detail::ends_with_tool_result(with_note));
 }
 
-// Calls the server no longer remembers (restart, eviction) still reach the
-// model, in the Qwen template's own tool-call rendering.
+// Calls the server no longer remembers retain structure for any renderer.
 TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_use_without_memory) {
     ToolMemory tool_memory;
     const json messages = json::array({
@@ -5926,12 +5949,525 @@ TEST_CASE(ServerUnitFixture, test_normalize_anthropic_tool_use_without_memory) {
         messages, ApiFormat::ANTHROPIC, tool_memory);
     TEST_ASSERT(chat.size() == 2);
     if (chat.size() == 2) {
-        TEST_ASSERT(chat[1].content ==
-            "Reading.\n\n"
-            "<tool_call>\n<function=Read>\n<parameter=file_path>\n/a.py\n"
-            "</parameter>\n</function>\n</tool_call>\n"
-            "<tool_call>\n<function=Grep>\n<parameter=n>\n3\n</parameter>\n"
-            "<parameter=pattern>\nx\n</parameter>\n</function>\n</tool_call>");
+        TEST_ASSERT(chat[1].content == "Reading.");
+        TEST_ASSERT(!chat[1].tool_calls_replayed);
+        TEST_ASSERT(chat[1].tool_calls.size() == 2);
+        if (chat[1].tool_calls.size() != 2) return;
+        TEST_ASSERT(chat[1].tool_calls[0].id == "toolu_1");
+        TEST_ASSERT(chat[1].tool_calls[0].name == "Read");
+        TEST_ASSERT(chat[1].tool_calls[0].arguments == json({{"file_path", "/a.py"}}));
+        TEST_ASSERT(chat[1].tool_calls[1].id == "toolu_2");
+        TEST_ASSERT(chat[1].tool_calls[1].name == "Grep");
+        TEST_ASSERT(chat[1].tool_calls[1].arguments == json({{"pattern", "x"}, {"n", 3}}));
+    }
+}
+
+// OpenAI clients (Hermes Agent, Pi, any chat-completions agent) replay their
+// history with tool_calls this server did not generate or no longer
+// remembers: the call itself must reach the prompt, not only the prose.
+TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_calls_without_memory) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "fix the bug"}},
+        {{"role", "assistant"}, {"content", "Let me look."},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"open src/io_utils.py 10\"}"}}}},
+             {{"id", "call_2"}, {"type", "function"},
+              {"function", {{"name", "raw"}, {"arguments", "not json"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "def read():"}},
+        {{"role", "assistant"}, {"content", nullptr},
+         {"tool_calls", json::array({
+             {{"id", "call_3"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+    });
+    const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    TEST_ASSERT(chat.size() == 4);
+    if (chat.size() != 4) return;
+    TEST_ASSERT(chat[1].role == "assistant");
+    TEST_ASSERT(chat[1].content == "Let me look.");
+    TEST_ASSERT(chat[1].tool_calls.size() == 2);
+    if (chat[1].tool_calls.size() != 2) return;
+    TEST_ASSERT(chat[1].tool_calls[0].name == "bash");
+    TEST_ASSERT(chat[1].tool_calls[0].arguments ==
+                json({{"command", "open src/io_utils.py 10"}}));
+    TEST_ASSERT(chat[1].tool_calls[1].name == "raw");
+    TEST_ASSERT(chat[1].tool_calls[1].arguments == json({{"arguments", "not json"}}));
+    TEST_ASSERT(chat[2].role == "tool" && chat[2].content == "def read():");
+    TEST_ASSERT(chat[2].tool_name == "bash");
+    TEST_ASSERT(chat[3].content.empty());
+    TEST_ASSERT(chat[3].tool_calls.size() == 1);
+    if (chat[3].tool_calls.size() == 1) {
+        TEST_ASSERT(chat[3].tool_calls[0].arguments == json({{"command", "ls"}}));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_argument_shapes) {
+    ToolMemory tool_memory;
+    const json nested = {
+        {"options", {{"enabled", true}, {"paths", json::array({"a", "b"})}}},
+        {"text", "line one\n\"line two\""},
+    };
+    const std::vector<std::pair<json, json>> cases = {
+        {nested, nested},
+        {nested.dump(), nested},
+        {"{}", json::object()},
+        {"", json::object()},
+        {"[1, \"two\"]", json({{"arguments", "[1, \"two\"]"}})},
+        {"42", json({{"arguments", "42"}})},
+        {"true", json({{"arguments", "true"}})},
+        {"null", json({{"arguments", "null"}})},
+        {"\"text\"", json({{"arguments", "\"text\""}})},
+        {"{broken", json({{"arguments", "{broken"}})},
+    };
+    for (const auto & [arguments, expected] : cases) {
+        const json messages = json::array({
+            {{"role", "assistant"}, {"content", nullptr},
+             {"tool_calls", json::array({
+                 {{"function", {{"name", "inspect"}, {"arguments", arguments}}}}})}},
+        });
+        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+        TEST_ASSERT(chat.size() == 1);
+        if (chat.size() != 1) return;
+        TEST_ASSERT(chat[0].content.empty());
+        TEST_ASSERT(!chat[0].tool_calls_replayed);
+        TEST_ASSERT(chat[0].tool_calls.size() == 1);
+        if (chat[0].tool_calls.size() != 1) return;
+        TEST_ASSERT(chat[0].tool_calls[0].id.empty());
+        TEST_ASSERT(chat[0].tool_calls[0].name == "inspect");
+        TEST_ASSERT(chat[0].tool_calls[0].arguments == expected);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_memory_replay_and_misses) {
+    ToolMemory tool_memory(2);
+    const std::string raw =
+        "<think>Keep this reasoning.</think>\n\nReading.\n\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\n/a\n</parameter>\n"
+        "</function>\n</tool_call>\n\n"
+        "<tool_call>\n<function=list>\n</function>\n</tool_call>\n";
+    tool_memory.remember({"call_a", "call_b"}, raw);
+    json messages = json::array({
+        {{"role", "assistant"}, {"content", "Reading."},
+         {"tool_calls", json::array({
+             {{"id", "call_a"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", R"({"path":"/a"})"}}}},
+             {{"id", "call_b"}, {"type", "function"},
+              {"function", {{"name", "list"}}}}})}},
+    });
+    auto check = [&](bool replayed) {
+        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+        TEST_ASSERT(chat.size() == 1);
+        if (chat.size() != 1) return;
+        TEST_ASSERT(chat[0].content == (replayed ? raw : "Reading."));
+        TEST_ASSERT(chat[0].tool_calls_replayed == replayed);
+        TEST_ASSERT(chat[0].tool_calls.size() == 2);
+        if (chat[0].tool_calls.size() != 2) return;
+        TEST_ASSERT(chat[0].tool_calls[0].name == "read");
+        TEST_ASSERT(chat[0].tool_calls[1].name == "list");
+        if (replayed) {
+            TEST_ASSERT(chat[0].tool_calls[0].arguments.is_null());
+            TEST_ASSERT(chat[0].tool_calls[1].arguments.is_null());
+            const auto rendered = render_chat_template(chat, ChatFormat::QWEN3, false, false, "");
+            const auto pos = rendered.find(raw);
+            TEST_ASSERT(pos != std::string::npos);
+            TEST_ASSERT(rendered.find("<function=read>", rendered.find("<function=read>") + 1) ==
+                        std::string::npos);
+        } else {
+            TEST_ASSERT(chat[0].tool_calls[0].arguments == json({{"path", "/a"}}));
+            TEST_ASSERT(chat[0].tool_calls[1].arguments == json::object());
+        }
+    };
+    check(true);
+    messages[0]["tool_calls"][1]["id"] = "unknown";
+    check(false);
+    messages[0]["tool_calls"][1].erase("id");
+    check(false);
+    messages[0]["tool_calls"][1]["id"] = "";
+    check(false);
+    messages[0]["tool_calls"][1]["id"] = "call_b";
+    tool_memory.remember({"unrelated"}, "Another turn.");
+    check(false);  // One of the original IDs has been evicted.
+    tool_memory.remember({"call_a"}, raw);
+    tool_memory.remember({"call_b"}, "A different turn.");
+    check(false);  // Both IDs exist, but belong to different turns.
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_openai_streamed_tool_calls) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
+    const std::string raw =
+        "<tool_call>\n<function=read>\n<parameter=path>\n/a\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\n/b\n</parameter>\n"
+        "</function>\n</tool_call>";
+    std::string wire = concat(em.emit_start());
+    for (size_t offset = 0; offset < raw.size(); offset += 7) {
+        wire += concat(em.emit_token(raw.substr(offset, 7)));
+    }
+    wire += concat(em.emit_finish(40));
+
+    // Accumulate deltas by index as an OpenAI streaming client does.
+    json calls = json::array();
+    for (size_t pos = 0; (pos = wire.find("data: ", pos)) != std::string::npos;) {
+        pos += 6;
+        const size_t end = wire.find('\n', pos);
+        const std::string data = wire.substr(pos, end - pos);
+        if (data == "[DONE]") break;
+        const auto event = json::parse(data);
+        for (const auto & choice : event["choices"]) {
+            const auto & delta = choice["delta"];
+            if (!delta.contains("tool_calls")) continue;
+            for (const auto & part : delta["tool_calls"]) {
+                const size_t index = part["index"].get<size_t>();
+                while (calls.size() <= index) {
+                    calls.push_back({{"type", "function"},
+                        {"function", {{"name", ""}, {"arguments", ""}}}});
+                }
+                auto & call = calls[index];
+                if (part.contains("id")) call["id"] = part["id"];
+                if (part.contains("function")) {
+                    for (const char * key : {"name", "arguments"}) {
+                        call["function"][key].get_ref<std::string &>() +=
+                            part["function"].value(key, "");
+                    }
+                }
+            }
+        }
+    }
+    TEST_ASSERT(calls.size() == 2);
+    if (calls.size() != 2) return;
+    TEST_ASSERT(json::parse(calls[0]["function"]["arguments"].get<std::string>()) ==
+                json({{"path", "/a"}}));
+    TEST_ASSERT(json::parse(calls[1]["function"]["arguments"].get<std::string>()) ==
+                json({{"path", "/b"}}));
+    ToolMemory cold_memory;
+    const auto chat = normalize_chat_messages(
+        json::array({{{"role", "assistant"}, {"content", nullptr}, {"tool_calls", calls}}}),
+        ApiFormat::OPENAI_CHAT, cold_memory);
+    TEST_ASSERT(chat.size() == 1);
+    if (chat.size() != 1) return;
+    TEST_ASSERT(chat[0].content.empty());
+    TEST_ASSERT(chat[0].tool_calls.size() == 2);
+    const auto rendered = render_chat_template(chat, ChatFormat::QWEN3, false, false, "");
+    TEST_ASSERT(rendered.find(raw) != std::string::npos);
+}
+
+// Equivalent histories exercise each API's distinct normalization branch.
+// Results deliberately arrive in the reverse order from the calls.
+static std::vector<std::pair<ApiFormat, json>> tool_history_inputs(
+        const json & arguments, const std::string & second_id = "call_b") {
+    return {
+        {ApiFormat::OPENAI_CHAT, json::array({
+            {{"role", "user"}, {"content", "go"}},
+            {{"role", "assistant"}, {"content", "Checking."},
+             {"tool_calls", json::array({
+                 {{"id", "call_a"}, {"type", "function"}, {"function", {
+                     {"name", "inspect"}, {"arguments", arguments.dump()}}}},
+                 {{"id", second_id}, {"type", "function"}, {"function", {
+                     {"name", "finish"}, {"arguments", "{}"}}}}})}},
+            {{"role", "tool"}, {"tool_call_id", second_id}, {"content", "DONE"}},
+            {{"role", "tool"}, {"tool_call_id", "call_a"}, {"content", "VALUE"}},
+        })},
+        {ApiFormat::RESPONSES, json::array({
+            {{"role", "user"}, {"content", "go"}},
+            {{"type", "message"}, {"role", "assistant"}, {"content", json::array({
+                {{"type", "output_text"}, {"text", "Checking."}}})}},
+            {{"type", "function_call"}, {"call_id", "call_a"},
+             {"name", "inspect"}, {"arguments", arguments.dump()}},
+            {{"type", "function_call"}, {"call_id", second_id},
+             {"name", "finish"}, {"arguments", "{}"}},
+            {{"type", "function_call_output"}, {"call_id", second_id}, {"output", "DONE"}},
+            {{"type", "function_call_output"}, {"call_id", "call_a"}, {"output", "VALUE"}},
+        })},
+        {ApiFormat::ANTHROPIC, json::array({
+            {{"role", "user"}, {"content", "go"}},
+            {{"role", "assistant"}, {"content", json::array({
+                {{"type", "text"}, {"text", "Checking."}},
+                {{"type", "tool_use"}, {"id", "call_a"}, {"name", "inspect"},
+                 {"input", arguments}},
+                {{"type", "tool_use"}, {"id", second_id}, {"name", "finish"},
+                 {"input", json::object()}}})}},
+            {{"role", "user"}, {"content", json::array({
+                {{"type", "tool_result"}, {"tool_use_id", second_id}, {"content", "DONE"}},
+                {{"type", "tool_result"}, {"tool_use_id", "call_a"}, {"content", "VALUE"}}})}},
+        })},
+    };
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_tool_history_cache_boundaries_all_apis) {
+    const json arguments = {{"path", "/a"}};
+    const std::string raw = "Checking.\n<tool_call>RAW ORIGINAL TURN</tool_call>\n";
+    for (const auto & [format, input] : tool_history_inputs(arguments)) {
+        ToolMemory memory(2);
+        const auto check = [&](bool replayed) {
+            const auto chat = normalize_chat_messages(input, format, memory);
+            // Responses message + adjacent calls must stay one assistant turn,
+            // including when the cache already contains that message's prose.
+            TEST_ASSERT(chat.size() == 4);
+            if (chat.size() != 4) return;
+            TEST_ASSERT(chat[1].role == "assistant");
+            TEST_ASSERT(chat[1].content == (replayed ? raw : "Checking."));
+            TEST_ASSERT(chat[1].tool_calls_replayed == replayed);
+            TEST_ASSERT(chat[1].tool_calls.size() == 2);
+            if (chat[1].tool_calls.size() != 2) return;
+            TEST_ASSERT(chat[1].tool_calls[0].id == "call_a");
+            TEST_ASSERT(chat[1].tool_calls[0].name == "inspect");
+            TEST_ASSERT(chat[1].tool_calls[1].id == "call_b");
+            TEST_ASSERT(chat[1].tool_calls[1].name == "finish");
+            TEST_ASSERT(chat[1].tool_calls[0].arguments ==
+                        (replayed ? json(nullptr) : arguments));
+            TEST_ASSERT(chat[1].tool_calls[1].arguments ==
+                        (replayed ? json(nullptr) : json::object()));
+            TEST_ASSERT(chat[2].tool_name == "finish" && chat[2].content == "DONE");
+            TEST_ASSERT(chat[3].tool_name == "inspect" && chat[3].content == "VALUE");
+        };
+        check(false);
+        memory.remember({"call_a"}, raw);
+        check(false);  // A partial hit must not erase the uncached call.
+        memory.remember({"call_a", "call_b"}, raw);
+        check(true);
+        memory.remember({"unrelated"}, "Other turn");
+        check(false);  // Eviction of either ID invalidates replay of the turn.
+    }
+    for (auto [format, input] : tool_history_inputs(arguments, "")) {
+        ToolMemory memory;
+        memory.remember({"call_a"}, raw);
+        for (bool absent : {false, true}) {
+            if (absent) {
+                if (format == ApiFormat::OPENAI_CHAT) {
+                    input[1]["tool_calls"][1].erase("id");
+                } else if (format == ApiFormat::RESPONSES) {
+                    input[3].erase("call_id");
+                } else {
+                    input[1]["content"][2].erase("id");
+                }
+            }
+            const auto chat = normalize_chat_messages(input, format, memory);
+            TEST_ASSERT(chat.size() == 4);
+            if (chat.size() != 4) continue;
+            TEST_ASSERT(!chat[1].tool_calls_replayed);
+            TEST_ASSERT(chat[1].content == "Checking.");
+            TEST_ASSERT(chat[1].tool_calls.size() == 2);
+            if (chat[1].tool_calls.size() != 2) continue;
+            TEST_ASSERT(chat[1].tool_calls[1].id.empty());
+            TEST_ASSERT(chat[1].tool_calls[1].name == "finish");
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_jinja_normalized_tool_history_structure_and_replay) {
+    static const char tpl[] =
+        "{%- for m in messages -%}[{{ m.role }}]{{ m.content }}"
+        "{%- for tc in m.tool_calls -%}"
+        "[CALL:{{ tc.id }}/{{ tc.type }}/{{ tc.function.name }}]"
+        "{%- if tc.function.name == 'inspect' -%}"
+        "{{ tc.function.arguments.text }}"
+        "{%- if tc.function.arguments.options.enabled and "
+        "tc.function.arguments.options.paths[1] == 2 and "
+        "tc.function.arguments.options.paths[2] == none -%}TYPED{%- endif -%}"
+        "{%- endif -%}{%- endfor -%}"
+        "{%- if m.role == 'tool' -%}[RESULT:{{ m.tool_call_id }}/{{ m.name }}]"
+        "{%- endif -%}{%- endfor -%}";
+    const json arguments = {
+        {"options", {{"enabled", true}, {"paths", json::array({"a", 2, nullptr})}}},
+        {"text", "line one\n\"line two\"\\end"},
+    };
+    for (const auto & [format, input] : tool_history_inputs(arguments)) {
+        ToolMemory memory;
+        const auto cold = normalize_chat_messages(input, format, memory);
+        const auto rendered = render_chat_template_jinja(tpl, cold, "", "", false, false, "");
+        TEST_ASSERT(rendered ==
+            "[user]go[assistant]Checking."
+            "[CALL:call_a/function/inspect]line one\n\"line two\"\\endTYPED"
+            "[CALL:call_b/function/finish]"
+            "[tool]DONE[RESULT:call_b/finish][tool]VALUE[RESULT:call_a/inspect]");
+        const std::string raw = "Checking.\n[original native calls]\n";
+        memory.remember({"call_a", "call_b"}, raw);
+        const auto warm = normalize_chat_messages(input, format, memory, false);
+        TEST_ASSERT(warm.size() == 4);
+        if (warm.size() != 4) continue;
+        TEST_ASSERT(!warm[1].tool_calls_replayed);
+        TEST_ASSERT(warm[1].content == "Checking.");
+        TEST_ASSERT(warm[1].tool_calls.size() == 2);
+        TEST_ASSERT(render_chat_template_jinja(tpl, warm, "", "", false, false, "") == rendered);
+
+        // Raw native replay cannot be interpreted by an arbitrary template:
+        // templates may depend on tool_calls to render both calls and results.
+        const auto raw_replay = normalize_chat_messages(input, format, memory);
+        bool threw = false;
+        try {
+            (void)render_chat_template_jinja(tpl, raw_replay, "", "", false, false, "");
+        } catch (const std::logic_error &) {
+            threw = true;
+        }
+        TEST_ASSERT(threw);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_normalize_openai_tool_result_explicit_name) {
+    auto input = tool_history_inputs(json::object()).front().second;
+    input[2]["name"] = "explicit_finish";
+    ToolMemory memory;
+    memory.remember({"call_a", "call_b"}, "Original cached turn");
+    const auto chat = normalize_chat_messages(input, ApiFormat::OPENAI_CHAT, memory);
+    TEST_ASSERT(chat.size() == 4);
+    if (chat.size() != 4) return;
+    TEST_ASSERT(chat[2].tool_name == "explicit_finish");
+    TEST_ASSERT(chat[2].tool_call_id == "call_b");
+    TEST_ASSERT(chat[3].tool_name == "inspect");
+}
+
+TEST_CASE(ServerUnitFixture, test_normalized_tool_history_native_rendering_all_apis) {
+    const json arguments = {
+        {"options", {{"enabled", true}, {"paths", json::array({"a, \"b\":\\c\n", 2, nullptr})}}},
+        {"text", "line one\n\"line two\"\\end"},
+    };
+    struct NativeHistory {
+        ChatFormat format;
+        std::string calls;
+        std::string first_result;
+        std::string second_result;
+    };
+    // Literal goldens from the official model templates, not our renderer:
+    // Qwen/Qwen3.6-27B, inclusionAI/Ling-3.0-flash, poolside/Laguna-XS.2,
+    // google/gemma-4-26B-A4B-it (chat_template.jinja on huggingface.co);
+    // deepseek-ai/DeepSeek-V4-Flash/encoding/encoding_dsv4.py and
+    // deepseek-ai/DeepSeek-V4.1-Flash/encoding/encoding.py.
+    const std::vector<NativeHistory> native = {
+        {ChatFormat::QWEN3,
+         "<tool_call>\n<function=inspect>\n"
+         "<parameter=options>\n"
+         R"({"enabled": true, "paths": ["a, \"b\":\\c\n", 2, null]})"
+         "\n</parameter>\n"
+         "<parameter=text>\nline one\n\"line two\"\\end\n</parameter>\n"
+         "</function>\n</tool_call>\n"
+         "<tool_call>\n<function=finish>\n</function>\n</tool_call>",
+         "<tool_response>\nDONE\n</tool_response>",
+         "<tool_response>\nVALUE\n</tool_response>"},
+        {ChatFormat::BAILINGMOE3,
+         "<tool_call>inspect<arg_key>options</arg_key>\n"
+         "<arg_value>"
+         R"({"enabled": true, "paths": ["a, \"b\":\\c\n", 2, null]})"
+         "</arg_value>"
+         "<arg_key>text</arg_key>\n<arg_value>line one\n\"line two\"\\end</arg_value>\n"
+         "</tool_call>\n<tool_call>finish\n</tool_call>",
+         "<tool_response>\nDONE\n</tool_response>",
+         "<tool_response>\nVALUE\n</tool_response>"},
+        {ChatFormat::LAGUNA,
+         "<tool_call>inspect<arg_key>options</arg_key>\n"
+         "<arg_value>"
+         R"({"enabled": true, "paths": ["a, \"b\":\\c\n", 2, null]})"
+         "</arg_value>\n"
+         "<arg_key>text</arg_key>\n<arg_value>line one\n\"line two\"\\end</arg_value>\n"
+         "</tool_call>\n<tool_call>finish</tool_call>",
+         "<tool_response>\nDONE\n</tool_response>",
+         "<tool_response>\nVALUE\n</tool_response>"},
+        {ChatFormat::GEMMA4,
+         "<|tool_call>call:inspect{options:{enabled:true,paths:[<|\"|>a, \"b\":\\c\n<|\"|>,2,null]},"
+         "text:<|\"|>line one\n\"line two\"\\end<|\"|>}<tool_call|>"
+         "<|tool_call>call:finish{}<tool_call|>",
+         "<|tool_response>response:finish{value:<|\"|>DONE<|\"|>}<tool_response|>",
+         "<|tool_response>response:inspect{value:<|\"|>VALUE<|\"|>}<tool_response|>"},
+        {ChatFormat::DEEPSEEK4,
+         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"inspect\">\n"
+         "<｜DSML｜parameter name=\"options\" string=\"false\">"
+         R"({"enabled": true, "paths": ["a, \"b\":\\c\n", 2, null]})"
+         "</｜DSML｜parameter>\n"
+         "<｜DSML｜parameter name=\"text\" string=\"true\">"
+         "line one\n\"line two\"\\end</｜DSML｜parameter>\n"
+         "</｜DSML｜invoke>\n<｜DSML｜invoke name=\"finish\">\n\n"
+         "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+         "<tool_result>DONE</tool_result>", "<tool_result>VALUE</tool_result>"},
+        {ChatFormat::DEEPSEEK41,
+         "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"inspect\">\n"
+         "<｜DSML｜ parameter name=\"options\" string=\"false\">"
+         R"({"enabled": true, "paths": ["a, \"b\":\\c\n", 2, null]})"
+         "</｜DSML｜ parameter>\n"
+         "<｜DSML｜ parameter name=\"text\" string=\"true\">"
+         "line one\n\"line two\"\\end</｜DSML｜ parameter>\n"
+         "</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"finish\">\n\n"
+         "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+         "<tool_result>DONE</tool_result>", "<tool_result>VALUE</tool_result>"},
+    };
+    const auto occurs_once = [](const std::string & text, const std::string & needle) {
+        const auto pos = text.find(needle);
+        return pos != std::string::npos && text.find(needle, pos + needle.size()) == std::string::npos;
+    };
+    for (const auto & expected : native) {
+        for (const auto & [api, input] : tool_history_inputs(arguments)) {
+            ToolMemory memory;
+            const auto cold = normalize_chat_messages(input, api, memory);
+            TEST_ASSERT(cold.size() == 4);
+            if (cold.size() != 4) continue;
+            TEST_ASSERT(cold[1].content == "Checking.");
+            TEST_ASSERT(cold[1].tool_calls.size() == 2);
+            if (cold[1].tool_calls.size() != 2) continue;
+            TEST_ASSERT(cold[1].tool_calls[0].arguments == arguments);
+            const auto rendered = render_chat_template(cold, expected.format, true, false, "");
+            TEST_ASSERT(occurs_once(rendered, expected.calls));
+            TEST_ASSERT(occurs_once(rendered, "Checking."));
+            TEST_ASSERT(occurs_once(rendered, expected.first_result));
+            TEST_ASSERT(occurs_once(rendered, expected.second_result));
+            TEST_ASSERT(rendered.find(expected.calls) < rendered.find(expected.first_result));
+            TEST_ASSERT(rendered.find(expected.first_result) < rendered.find(expected.second_result));
+            if (expected.format != ChatFormat::QWEN3) {
+                TEST_ASSERT(rendered.find("<function=") == std::string::npos);
+                TEST_ASSERT(rendered.find("<parameter=") == std::string::npos);
+            }
+            if (expected.format == ChatFormat::GEMMA4) {
+                TEST_ASSERT(occurs_once(rendered, "<|turn>model\n"));
+                TEST_ASSERT(rendered.find("<|turn>tool\n") == std::string::npos);
+            }
+
+            // Raw cached bytes may have different whitespace from cold
+            // serialization. Preserve them, without replaying metadata again.
+            const std::string raw = "Checking.\n\n" + expected.calls + "\n";
+            memory.remember({"call_a", "call_b"}, raw);
+            const auto warm = normalize_chat_messages(input, api, memory);
+            TEST_ASSERT(warm.size() == 4);
+            if (warm.size() != 4) continue;
+            TEST_ASSERT(warm[1].content == raw);
+            TEST_ASSERT(warm[1].tool_calls_replayed);
+            const auto replayed = render_chat_template(warm, expected.format, true, false, "");
+            TEST_ASSERT(occurs_once(replayed, raw));
+            TEST_ASSERT(occurs_once(replayed, expected.calls));
+            TEST_ASSERT(occurs_once(replayed, "Checking."));
+            TEST_ASSERT(occurs_once(replayed, expected.first_result));
+            TEST_ASSERT(occurs_once(replayed, expected.second_result));
+            TEST_ASSERT(replayed.find(expected.calls) < replayed.find(expected.first_result));
+            TEST_ASSERT(replayed.find(expected.first_result) < replayed.find(expected.second_result));
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_gemma_tool_turn_continuation_preserves_results) {
+    for (const auto & [api, input] : tool_history_inputs(json::object())) {
+        for (const bool replay : {false, true}) {
+            ToolMemory memory;
+            if (replay) {
+                memory.remember({"call_a", "call_b"},
+                    "Checking.<|tool_call>call:inspect{}<tool_call|>"
+                    "<|tool_call>call:finish{}<tool_call|><|tool_response>");
+            }
+            const auto messages = normalize_chat_messages(input, api, memory);
+            for (const bool thinking : {false, true}) {
+                const auto prefix = render_chat_template(
+                    messages, ChatFormat::GEMMA4, false, thinking, "");
+                const std::string responses =
+                    "<|tool_response>response:finish{value:<|\"|>DONE<|\"|>}<tool_response|>"
+                    "<|tool_response>response:inspect{value:<|\"|>VALUE<|\"|>}<tool_response|>";
+                TEST_ASSERT(prefix.size() >= responses.size());
+                TEST_ASSERT(prefix.compare(prefix.size() - responses.size(), responses.size(), responses) == 0);
+                auto continued = messages;
+                continued.push_back({"assistant", "Finished."});
+                continued.push_back({"user", "Next."});
+                const auto next = render_chat_template(
+                    continued, ChatFormat::GEMMA4, true, thinking, "");
+                TEST_ASSERT(next.compare(0, prefix.size(), prefix) == 0);
+                TEST_ASSERT(next.find("<tool_response|>Finished.<turn|>\n<|turn>user\nNext.") != std::string::npos);
+                TEST_ASSERT(next.find("<|tool_response><|tool_response>") == std::string::npos);
+            }
+        }
     }
 }
 
