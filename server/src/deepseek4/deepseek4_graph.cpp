@@ -2285,8 +2285,10 @@ static ggml_tensor * build_mla_output_projection(
     // The grouped source layout is read by MMQ's activation quantizer and by
     // nothing else, so a projection stored unquantized (BF16 attention from a
     // converter that leaves dense tensors alone) takes the plain path.
+    // MXFP8 (native FP8 dense) has no MMQ, so it also takes the plain path.
     const bool grouped_output_projection =
         allow_grouped && n_tokens > 1 && ggml_is_quantized(L.attn_output_b->type) &&
+        L.attn_output_b->type != GGML_TYPE_MXFP8 &&
         !ds4_env_flag("LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
     if (grouped_output_projection) {
         return ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
@@ -3597,8 +3599,15 @@ struct Ds4IndexSelectionStore {
         params.no_alloc = true;
         ctx = ggml_init(params);
         if (!ctx) return false;
-        const bool candidates = w.candidate_source_layer >= 0 &&
-            columns > w.candidate_topk_blocks * w.candidate_block_size;
+        // The candidate source publishes [top_k + candidate_topk_blocks, n] once a query
+        // sees more than candidate_topk_blocks * candidate_block_size rows, a condition on
+        // the CONTEXT at that layer's ratio (V4.1-Flash: ratio 1 at layer 20, so from
+        // position 16,384 inside an 18,432 context). The store's width is the step's, not
+        // the context's, so it cannot stand in for that condition: a store sized for a
+        // 10,240-token step held no candidate rows, and the first hybrid-path graph past
+        // position 16,384 aborted in ds4_publish_index_selection (B300, 2026-10-05).
+        // Reserve the rows whenever the model has a candidate source (8 KiB per column).
+        const bool candidates = w.candidate_source_layer >= 0;
         rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,
                                   w.n_indexer_top_k + (candidates ? w.candidate_topk_blocks : 0), columns);
         buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
