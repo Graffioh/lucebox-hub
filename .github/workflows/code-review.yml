@@ -1,0 +1,50 @@
+name: Code review
+
+# Asks the code review bot to review a pull request for bugs. It posts a review
+# with an inline comment for each issue it is confident about and a summary. It
+# only comments: it never approves, requests changes, pushes or merges.
+#
+# - A pull request marked ready for review (or opened as ready) is reviewed once,
+#   the first time.
+# - Adding the `code-review` label asks for a review at any time, on a draft or a
+#   ready pull request; the bot removes the label when it is done.
+#
+# This workflow only forwards the request; it checks out and runs nothing. The bot
+# re-checks every request, including the labeler's write access.
+
+on:
+  pull_request_target:
+    types: [labeled, ready_for_review, opened]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: >-
+      (github.event.action == 'labeled' && github.event.label.name == 'code-review') ||
+      github.event.action == 'ready_for_review' ||
+      (github.event.action == 'opened' && !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hand the pull request to the code review bot
+        env:
+          GH_TOKEN: ${{ secrets.LUCEBOX_BOTS_DISPATCH_TOKEN }}
+          BOT_REPO: ${{ secrets.LUCEBOX_BOTS_DISPATCH_REPO }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SENDER: ${{ github.event.sender.login }}
+          TRIGGER: ${{ github.event.action == 'labeled' && 'label' || 'ready' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ] || [ -z "$BOT_REPO" ]; then
+            echo "::error::LUCEBOX_BOTS_DISPATCH_TOKEN or LUCEBOX_BOTS_DISPATCH_REPO is not set"
+            exit 1
+          fi
+          gh api "repos/$BOT_REPO/dispatches" \
+            -f event_type=code-review \
+            -f "client_payload[repository]=$REPO" \
+            -F "client_payload[pr]=$PR" \
+            -f "client_payload[sender]=$SENDER" \
+            -f "client_payload[trigger]=$TRIGGER" >/dev/null
+          echo "Sent PR #$PR ($TRIGGER) to the code review bot." >> "$GITHUB_STEP_SUMMARY"
