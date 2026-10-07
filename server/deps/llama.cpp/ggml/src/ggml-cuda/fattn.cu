@@ -8,6 +8,7 @@
 #include "fattn.cuh"
 #include "ds4-env.cuh"
 #include "ds4-causal.h"
+#include "qsa.cuh"
 
 #include <type_traits>
 
@@ -4634,6 +4635,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_qsa(ctx, dst);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     if (ggml_flash_attn_ext_is_ds4(dst)) {
 #if defined(GGML_USE_HIP)
         if (!ggml_cuda_ds4_flash_attn_d512_f32(ctx, dst)) {
@@ -4644,6 +4655,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         GGML_ABORT("DeepSeek4 D=512 flash attention is only available on HIP");
 #endif // defined(GGML_USE_HIP)
     }
+    // Only the QSA kernel honours selected-cell indices. The generic kernels
+    // below attend to every key; a maskless sparse op must not reach them.
+    // DeepSeek4 has its own maskless kernel and returns above.
+    GGML_ASSERT((dst->src[3] || !dst->src[5]) &&
+        "sparse flash attention without a mask needs the qsa kernel");
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -157,7 +157,7 @@ static void print_usage(const char * prog) {
         "                                 qwen35 layer splits (extra VRAM; env:\n"
         "                                 LUCE_SPLIT_FAST_ROLLBACK=1)\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
-        "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
+        "  --chunk <N>          Chunked-prefill chunk size (default: 512; qwen4exp memory-sized)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
         "  --ds4-fused-verify-f16-kv\n"
         "                       Reuse F16 MLA cache in batched DeepSeek4 verification\n"
@@ -549,6 +549,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
+            bargs.chunk_set = true;
         } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
             bargs.ds4_fused_decode = true;
         } else if (std::strcmp(argv[i], "--ds4-fused-verify-f16-kv") == 0) {
@@ -1491,6 +1492,16 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         general_arch,
         /*repo_root_hint=*/"");
 
+    // Qwen3.8-Flash-Next renders with the GGUF's own chat template (reasoning-effort instruction, thinking default,
+    // tool format), as llama.cpp does, unless --chat-template-file overrides it.
+    if (general_arch == "qwen4exp" && sconfig.chat_template_src.empty() &&
+        !backend_model.metadata.chat_template.empty()) {
+        sconfig.chat_template_src = backend_model.metadata.chat_template;
+        sconfig.chat_template_path = "gguf:tokenizer.chat_template";
+        std::fprintf(stderr, "[server] using the GGUF chat template (%zu bytes)\n",
+                     sconfig.chat_template_src.size());
+    }
+
     // Apply each tunable to sconfig only if the operator did NOT set it
     // via CLI. CLI always wins (spec §3.1 source #1).
     //
@@ -1535,6 +1546,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 
     // Sampler defaults — currently no CLI surface; always take from card.
     sconfig.sampler_defaults = card.sampling;
+    // Instruct-mode (non-thinking) sampler defaults, if the card supplies
+    // `sampling_no_thinking`; all has_* false otherwise, which is a no-op
+    // at request time. See docs/specs/thinking-budget.md §3.3.
+    sconfig.sampler_defaults_no_thinking = card.sampling_no_thinking;
 
     sconfig.model_card_source_label = card.source_label;
     // Stash the raw sidecar JSON (or null on family/hard fallback) so
@@ -1697,7 +1712,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  backend_placement.target.peer_access ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  chunk           = %d\n", backend_execution.chunk);
+    std::fprintf(stderr, "[server] │  chunk           = %d\n", backend->prefill_chunk_size() > 0 ? backend->prefill_chunk_size() : backend_execution.chunk);
     std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
                  sconfig.admission_coalesce_ms);
     if (arch_is_deepseek4_family(arch)) {
@@ -1818,7 +1833,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 #else
         "cuda";
 #endif
-    sconfig.chunk         = backend_execution.chunk;
+    sconfig.chunk         = backend->prefill_chunk_size() > 0
+        ? backend->prefill_chunk_size() : backend_execution.chunk;
     sconfig.target_device = placement_device_name(backend_placement.target);
     sconfig.draft_device  = backend_speculation.draft_path
                                 ? placement_device_name(backend_placement.draft)

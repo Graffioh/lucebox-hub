@@ -529,6 +529,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35moe
     ${CMAKE_CURRENT_SOURCE_DIR}/src/bailingmoe3
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen4exp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
@@ -544,6 +545,10 @@ add_library(luce_common STATIC
     src/bailingmoe3/bailingmoe3_loader.cpp
     src/bailingmoe3/bailingmoe3_graph.cpp
     src/bailingmoe3/bailingmoe3_backend.cpp
+    src/qwen4exp/qwen4exp_loader.cpp
+    src/qwen4exp/qwen4exp_cache.cpp
+    src/qwen4exp/qwen4exp_graph.cpp
+    src/qwen4exp/qwen4exp_backend.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
@@ -1218,6 +1223,22 @@ if(LUCE_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_gfx1151_width4_dispatch)
 
+        # Guards the mul_mat_id routing helper: negative (masked owner) ids must
+        # not reserve holes in the compact routing arrays. Drives the helper for
+        # the fast (<=256 experts) and classic paths with ten experts per token.
+        add_executable(test_mmid_regression test/unit/test_mmid_regression.cpp)
+        set_source_files_properties(test/unit/test_mmid_regression.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_mmid_regression PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_mmid_regression PRIVATE GGML_USE_HIP)
+        target_include_directories(test_mmid_regression PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_mmid_regression PRIVATE
+            ggml
+            ggml-base
+            ${LUCE_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_mmid_regression)
+
         add_executable(test_qwen35_gdn_verify_fusion test/unit/test_qwen35_gdn_verify_fusion.cpp)
         set_source_files_properties(test/unit/test_qwen35_gdn_verify_fusion.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_qwen35_gdn_verify_fusion PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
@@ -1237,10 +1258,45 @@ if(LUCE_TESTS)
         target_link_libraries(test_softmax_sink_col PRIVATE ggml ggml-base ggml-cpu ${LUCE_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_softmax_sink_col)
 
+        luce_add_ggml_gpu_executable(test_mul_mat_host_input test/unit/test_mul_mat_host_input.cpp)
+        list(APPEND _raw_unit_test_targets test_mul_mat_host_input)
+        luce_add_ggml_gpu_executable(test_rms_norm_scale test/unit/test_rms_norm_scale.cpp)
+        list(APPEND _raw_unit_test_targets test_rms_norm_scale)
+        luce_add_ggml_gpu_executable(test_qwen4exp_indexer_score test/unit/test_qwen4exp_indexer_score.cpp)
+        target_link_libraries(test_qwen4exp_indexer_score PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_qwen4exp_indexer_score)
+        luce_add_ggml_gpu_executable(test_qwen4exp_qsa_ids test/unit/test_qwen4exp_qsa_ids.cpp)
+        target_link_libraries(test_qwen4exp_qsa_ids PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_qwen4exp_qsa_ids)
+
         luce_add_ggml_gpu_executable(test_fattn_mma256 test/unit/test_fattn_mma256.cpp)
         target_compile_definitions(test_fattn_mma256 PRIVATE GGML_USE_HIP)
         target_link_libraries(test_fattn_mma256 PRIVATE ggml-cpu)
         list(APPEND _raw_unit_test_targets test_fattn_mma256)
+
+        # Standalone mmb-vs-library-GEMM differential on one quantized MUL_MAT,
+        # against a CPU dequant reference. See the file header.
+        luce_add_ggml_gpu_executable(test_mmb_cublas_diff test/unit/test_mmb_cublas_diff.cpp)
+        target_compile_definitions(test_mmb_cublas_diff PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_mmb_cublas_diff PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_mmb_cublas_diff)
+
+        # Vectorized bf16<->f32 cast vs the scalar fallback, bit-exact.
+        add_executable(test_convert_vec test/unit/test_convert_vec.cpp)
+        set_source_files_properties(test/unit/test_convert_vec.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_convert_vec PROPERTIES HIP_ARCHITECTURES "${_luce_archs}")
+        target_compile_definitions(test_convert_vec PRIVATE GGML_USE_HIP)
+        target_include_directories(test_convert_vec PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_convert_vec PRIVATE
+            ggml ggml-base ${LUCE_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_convert_vec)
+
+        # ne00==1 scalar get_rows gather vs a reference gather.
+        luce_add_ggml_gpu_executable(test_getrows_scalar test/unit/test_getrows_scalar.cpp)
+        target_compile_definitions(test_getrows_scalar PRIVATE GGML_USE_HIP)
+        target_link_libraries(test_getrows_scalar PRIVATE ggml-cpu)
+        list(APPEND _raw_unit_test_targets test_getrows_scalar)
 
         # The rocWMMA fragment-layout probe requires the rocWMMA headers; it
         # only builds when the rocWMMA fattn kernel is enabled so the
@@ -1858,6 +1914,17 @@ if(LUCE_TESTS)
         target_include_directories(smoke_qwen3_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
         target_link_libraries(smoke_qwen3_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     endif()
+    add_executable(test_qwen4exp_chunk test/unit/test_qwen4exp_chunk.cpp)
+    target_include_directories(test_qwen4exp_chunk PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_qwen4exp_chunk PRIVATE ggml)
+    target_compile_options(test_qwen4exp_chunk PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
+    add_test(NAME test_qwen4exp_chunk COMMAND test_qwen4exp_chunk)
+    set_tests_properties(test_qwen4exp_chunk PROPERTIES LABELS cpu)
+    list(APPEND _luce_cpu_test_targets test_qwen4exp_chunk)
+
+    add_executable(smoke_qwen4exp_forward test/smoke/smoke_qwen4exp_forward.cpp)
+    target_include_directories(smoke_qwen4exp_forward PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    target_link_libraries(smoke_qwen4exp_forward PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/unit/test_vs_oracle.cpp")
         add_executable(test_vs_oracle test/unit/test_vs_oracle.cpp)
         target_include_directories(test_vs_oracle PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
