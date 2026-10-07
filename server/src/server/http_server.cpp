@@ -3063,31 +3063,10 @@ json build_responses_api_response(
         const ParsedRequest & req, const GenerateResult & result,
         const GenTimings & timings, const CompletionTokenCounts & counts,
         const SseEmitter & emitter) {
-    json output = json::array();
-    if (!emitter.tool_calls().empty()) {
-        for (const auto & tool_call : emitter.tool_calls()) {
-            output.push_back({
-                {"type", "function_call"},
-                {"id", tool_call.id},
-                {"status", "completed"},
-                {"call_id", tool_call.id},
-                {"name", tool_call.name},
-                {"arguments", tool_call.arguments},
-            });
-        }
-    } else {
-        output.push_back({
-            {"type", "message"},
-            {"id", req.response_id + "_msg"},
-            {"status", "completed"},
-            {"role", "assistant"},
-            {"content", json::array({{
-                {"type", "output_text"},
-                {"text", emitter.accumulated_text()},
-                {"annotations", json::array()},
-            }})},
-        });
-    }
+    // The same items as the stream's response.completed: the assistant
+    // message first, then one function_call item per call.
+    const json output = responses_output_items(
+        req.response_id + "_msg", emitter.accumulated_text(), emitter.tool_calls());
 
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const json usage = {
