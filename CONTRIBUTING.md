@@ -80,6 +80,15 @@ The scope is required and lowercase, and the subject stays within 300 characters
 trailing period. CI checks every commit in a pull request
 ([`commit-style.yml`](.github/workflows/commit-style.yml)).
 
+## Automated code review
+
+When a pull request is marked ready for review (or opened as ready), a bot reviews it
+for bugs once and posts a review: an inline comment for each issue it is confident
+about, and a summary. It only comments; it never approves or blocks a merge. To ask
+for another review later, or one on a draft, a maintainer adds the `code-review`
+label; the bot removes it when done. See
+[`code-review.yml`](.github/workflows/code-review.yml).
+
 ## Compacting commits before merge
 
 When a pull request is ready, a maintainer can add the `compact-commits` label. A bot then
