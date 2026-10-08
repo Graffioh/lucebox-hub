@@ -87,7 +87,7 @@ bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
 
     // Packed attention reads groups of four keys even for an unaligned
     // logical context limit. Padding is masked by the causal cell IDs.
-    const int64_t align = profile.optimized ? 4 : 1;
+    const int64_t align = w.qsa ? 4 : 1;
     const int64_t kv_capacity = (static_cast<int64_t>(max_ctx) + align - 1) / align * align;
     for (size_t i = 0; i < n_full; ++i) {
         out.attn_k[i] = ggml_new_tensor_3d(out.ctx, kv_type,
@@ -194,6 +194,7 @@ void clear_qwen4exp_decode_workspace(Qwen4ExpDecodeWorkspace & workspace) {
         ggml_backend_cuda_graph_invalidate_range(workspace.backend,
             ggml_get_mem_buffer(workspace.ctx), ggml_get_mem_size(workspace.ctx));
     }
+    if (workspace.sched) ggml_backend_sched_free(workspace.sched);
     if (workspace.alloc) ggml_gallocr_free(workspace.alloc);
     if (workspace.ctx) ggml_free(workspace.ctx);
     workspace = {};
@@ -205,10 +206,27 @@ void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & wo
     workspace = {};
 }
 
-void free_qwen4exp_cache(Qwen4ExpCache & c) {
+// Every retained graph of the cache: the stable T=1 decode graph, the verify graph per width and the MTP graphs.
+static void clear_retained_graphs(Qwen4ExpCache & c) {
     clear_qwen4exp_decode_workspace(c.decode_workspace);
-    clear_qwen4exp_decode_workspace(c.verify_workspace);
+    for (auto & ws : c.verify_workspace) clear_qwen4exp_decode_workspace(ws);
     clear_qwen4exp_decode_workspace(c.mtp_workspace);
+    for (auto & ws : c.mtp_catchup_workspace) clear_qwen4exp_decode_workspace(ws);
+    for (auto & ws : c.mtp_rank_workspace) clear_qwen4exp_decode_workspace(ws);
+}
+
+// A jump in the cache's position (reset, snapshot restore). The stable T=1 graph replays only from the position it
+// stopped at and its captures hold the old sequence's recurrent and K/V state, so it goes. The verify and MTP graphs
+// stay: they are keyed by their spans and upload every position-dependent input on each replay.
+static void clear_position_bound_graphs(Qwen4ExpCache & c) {
+    clear_qwen4exp_decode_workspace(c.decode_workspace);
+}
+
+void free_qwen4exp_cache(Qwen4ExpCache & c) {
+    clear_retained_graphs(c);
+    if (c.split_sched) { ggml_backend_sched_free(c.split_sched); c.split_sched = nullptr; }
+    if (c.split_sched_short) { ggml_backend_sched_free(c.split_sched_short); c.split_sched_short = nullptr; }
+    if (c.split_cpu) { ggml_backend_free(c.split_cpu); c.split_cpu = nullptr; }
     if (c.input_ring.buf) {
         ggml_backend_buffer_free(c.input_ring.buf);
         c.input_ring.buf = nullptr;
@@ -247,9 +265,7 @@ void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c) {
     // A rejected final MTP verify leaves rollback copies queued on the backend
     // stream; the memsets below run on another stream and must not race them.
     ggml_backend_synchronize(backend);
-    // A reset makes any stable T=1 graph's captured recurrent/KV state stale.
-    // Batched graphs are rebuilt each call and use a separate shared arena.
-    clear_qwen4exp_decode_workspace(c.decode_workspace);
+    clear_position_bound_graphs(c);
     for (ggml_tensor * t : c.ssm_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
@@ -341,7 +357,7 @@ bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwe
 
 void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c) {
     ggml_backend_synchronize(backend); // finish rollback before clearing its source/destination buffer
-    clear_qwen4exp_decode_workspace(c.decode_workspace);
+    clear_position_bound_graphs(c);
     // Clear masked suffixes too: stable QSA scores the entire bucket.
     ggml_backend_buffer_clear(c.buf, 0);
     for (auto [live, copy] : s.strips) ggml_backend_tensor_copy_async(backend, backend, copy, live);

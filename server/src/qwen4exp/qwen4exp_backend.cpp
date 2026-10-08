@@ -2,21 +2,101 @@
 #include "qwen4exp_chunk.h"
 #include "qwen4exp_graph.h"
 
+#include "common/peer_access.h"
 #include "common/sampler.h"
 
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace luce::common {
+
+// Split mode: copy the most-routed experts of the routing-stats CSV, up to
+// `budget` bytes of them, to the target, plus the per-layer lookup tables that
+// send each pick to one device.
+static bool load_qwen4exp_hot_experts(ggml_backend_t backend, Qwen4ExpWeights & w, const std::string & csv,
+                                      uint64_t budget) {
+    if (csv.empty() || !w.expert_backend) return true;
+    const char * path = csv.c_str();
+    std::string err;
+    MoeHybridRoutingStats stats;
+    if (!MoeHybridRoutingStats::load_csv(path, stats, &err) ||
+        !stats.matches(w.n_layer, w.n_expert, w.n_expert_used)) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: %s: %s\n", path, err.empty() ? "shape mismatch" : err.c_str());
+        return false;
+    }
+    std::vector<MoeLayerDesc> descs((size_t) w.n_layer);
+    std::vector<uint64_t> expert_bytes((size_t) w.n_layer);
+    for (int il = 0; il < w.n_layer; ++il) {
+        const Qwen4ExpLayer & L = w.layers[(size_t) il];
+        descs[(size_t) il].ffn_gate_exps = L.ffn_gate_exps;
+        descs[(size_t) il].ffn_up_exps   = L.ffn_up_exps;
+        descs[(size_t) il].ffn_down_exps = L.ffn_down_exps;
+        expert_bytes[(size_t) il] = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
+    }
+    MoeHybridPlacement placement;
+    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(stats, expert_bytes, budget, 0, placement, &err)) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: placement failed: %s\n", err.c_str());
+        return false;
+    }
+    MoeHybridConfig cfg;
+    cfg.n_embd = w.n_embd;
+    cfg.n_expert = w.n_expert;
+    cfg.n_expert_used = w.n_expert_used;
+    cfg.n_ff_exp = (int) w.layers[0].ffn_gate_exps->ne[1];
+    cfg.n_layer = w.n_layer;
+    cfg.cold_expert_backend = MoeHybridColdBackend::None;   // the full stacks stay on the expert device
+    cfg.materialize_cold_experts = false;
+    w.hot = std::make_unique<MoeHybridStorage>();
+    if (!build_moe_hybrid_storage(cfg, backend, placement, descs, *w.hot, &err)) {
+        std::fprintf(stderr, "[qwen4exp] hot experts: %s\n", err.c_str());
+        return false;
+    }
+    ggml_context * lut_ctx = w.derived.open(2 * (size_t) w.n_layer);
+    w.hot_lut.assign((size_t) w.n_layer, nullptr);
+    w.cold_lut.assign((size_t) w.n_layer, nullptr);
+    for (int il = 0; lut_ctx && il < w.n_layer; ++il) {
+        if (w.hot->layers[(size_t) il].hot_expert_ids.empty()) continue;
+        w.hot_lut[(size_t) il]  = ggml_new_tensor_2d(lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
+        w.cold_lut[(size_t) il] = ggml_new_tensor_2d(lut_ctx, GGML_TYPE_I32, 1, w.n_expert);
+    }
+    if (!w.derived.commit(backend)) {
+        w.hot_lut.clear();
+        w.cold_lut.clear();
+        std::fprintf(stderr, "[qwen4exp] hot experts: lookup table allocation failed\n");
+        return false;
+    }
+    uint64_t hot_routes = 0, routes = 0;
+    double hot_bytes = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        const std::vector<int32_t> & hot = w.hot->layers[(size_t) il].hot_local_by_global;
+        hot_bytes += (double) placement.hot_counts[(size_t) il] * (double) expert_bytes[(size_t) il];
+        for (int e = 0; e < w.n_expert; ++e) {
+            routes += stats.count(il, e);
+            if (w.hot_lut[(size_t) il] && hot[(size_t) e] >= 0) hot_routes += stats.count(il, e);
+        }
+        if (!w.hot_lut[(size_t) il]) continue;
+        std::vector<int32_t> cold((size_t) w.n_expert);
+        for (int e = 0; e < w.n_expert; ++e) cold[(size_t) e] = hot[(size_t) e] >= 0 ? -1 : e;
+        ggml_backend_tensor_set(w.hot_lut[(size_t) il], hot.data(), 0, hot.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(w.cold_lut[(size_t) il], cold.data(), 0, cold.size() * sizeof(int32_t));
+    }
+    std::fprintf(stderr, "[qwen4exp] hot experts: %d of %d (%.2f GiB) on the target, %.1f%% of the profiled picks\n",
+                 placement.total_hot, w.n_layer * w.n_expert, hot_bytes / (1ull << 30),
+                 routes ? 100.0 * (double) hot_routes / (double) routes : 0.0);
+    return true;
+}
 
 int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         Qwen4ExpCache & cache, int slots, int resident_slots, size_t * snapshot_budget) {
@@ -46,6 +126,10 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     const int ratio = w.compress_ratios.empty() ? 1 : std::max(1, *std::max_element(w.compress_ratios.begin(), w.compress_ratios.end()));
     const int dense_end = std::min(cache.max_ctx, w.indexer_top_k + ratio - 1);
     size_t decode = 0, verify = 0, draft = 0, runtime_scratch = 0, runtime_host = 0;
+    // Each verify width retains its own graph allocation; their metadata arenas stay mostly untouched.
+    // So does each MTP draft graph: rank 0 per catch-up width, and every later rank (sized as width 1).
+    std::array<size_t, QWEN4EXP_MTP_MAX_VERIFY + 1> verify_width{}, draft_width{};
+    size_t verify_arena = 0;
     auto retain = [&](const Qwen4ExpGraphMemory & m, size_t & resident) {
         if (m.graph == SIZE_MAX) return false;
         resident = std::max(resident, m.graph + m.metadata);
@@ -59,15 +143,32 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
     for (const int end : {dense_end, std::min(cache.max_ctx, dense_end + cache.mtp_draft + 1), cache.max_ctx}) {
         if (!retain(qwen4exp_graph_memory(backend, w, cache, 1, end - 1), decode)) return 0;
         if (mtp) for (int n = 1; n <= cache.mtp_draft + 1 && n <= end; ++n) {
-            if (!retain(qwen4exp_mtp_graph_memory(backend, w, cache, n, end - n), draft)) return 0;
-            if (n > 1 && !retain(qwen4exp_graph_memory(backend, w, cache, n, end - n, true), verify)) return 0;
+            const Qwen4ExpGraphMemory d = qwen4exp_mtp_graph_memory(backend, w, cache, n, end - n);
+            size_t resident = 0;
+            if (!retain(d, resident)) return 0;
+            draft_width[n] = std::max(draft_width[n], d.graph + d.metadata);
+            if (n > 1) {
+                const Qwen4ExpGraphMemory m = qwen4exp_graph_memory(backend, w, cache, n, end - n, true);
+                if (!retain(m, resident)) return 0;
+                verify_width[n] = std::max(verify_width[n], m.graph);
+                verify_arena = std::max(verify_arena, m.metadata);
+            }
         }
     }
+    verify = verify_arena;
+    for (const size_t bytes : verify_width) verify += bytes;
+    for (const size_t bytes : draft_width) draft += bytes;
+    draft += (size_t) cache.mtp_draft * draft_width[1];
     // The decode workspaces stay resident while the next prompt prefills.
     const size_t fixed = (slots - resident_slots) * state + shadow + shadow_tmp +
                          slots * (decode + verify + draft);
     std::fprintf(stderr, "[qwen4exp] chunk-runtime mtp=%d decode=%zu verify=%zu draft=%zu scratch=%zu host=%zu\n",
         (int) mtp, decode, verify, draft, runtime_scratch, runtime_host);
+    // Split mode: the expert device's MoE id helper bounds a chunk. With hot experts the target keeps no slack for
+    // its matmul scratch pool, which grows over a long prompt and which the measurements below do not see, so the
+    // chunk stays at the floor (still two 4096-row pipeline streams).
+    const int max_rows = !w.expert_backend ? kQwen4ExpMaxChunk
+                       : w.hot ? kQwen4ExpSplitChunkFloor : kQwen4ExpSplitMaxChunk;
     struct Plan { size_t graph = 0, ring = 0, host = 0, scratch = 0; };
     std::vector<std::pair<int, Plan>> plans;   // one per probed chunk size
     const int chunk = qwen4exp_fit_chunk(cache.max_ctx, available, fixed, [&](int n) {
@@ -99,7 +200,7 @@ int qwen4exp_select_chunk(ggml_backend_t backend, const Qwen4ExpWeights & w,
         std::fprintf(stderr, "[qwen4exp] chunk-plan rows=%d graph=%zu ring=%zu host=%zu scratch=%zu required=%zu available=%zu\n",
             n, graph, slots * (inputs + mask), host, scratch, fixed + workspace, available);
         return workspace;
-    }, snapshot_budget);
+    }, snapshot_budget, w.expert_backend ? kQwen4ExpSplitChunkFloor : 4096, max_rows);
     std::fprintf(stderr, "[qwen4exp] chunk-auto ctx=%d slots=%d resident=%d chunk=%d state=%zu fixed=%zu available=%zu headroom=%zu\n",
         cache.max_ctx, slots, resident_slots, chunk, state,
         fixed + (snapshot_budget ? *snapshot_budget : 0), available, available / 10);
@@ -128,6 +229,11 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] --max-concurrency %d: MTP off\n", cfg_.max_concurrency);
         cfg_.verify_width = 1;
     }
+    // The multi-slot decode graph has no split-mode placement yet.
+    if (cfg_.max_concurrency > 1 && cfg_.expert_device) {
+        std::fprintf(stderr, "[qwen4exp] --max-concurrency > 1 is not supported with --expert-device yet\n");
+        return false;
+    }
     if (cfg_.device.is_layer_split()) {
         std::fprintf(stderr, "[qwen4exp] layer split is not supported yet\n");
         return false;
@@ -138,6 +244,29 @@ bool Qwen4ExpBackend::init() {
                      cfg_.device.gpu);
         return false;
     }
+    if (!cfg_.expert_placement_path.empty() && !cfg_.expert_device) {
+        std::fprintf(stderr, "[qwen4exp] --expert-placement needs --expert-device\n");
+        return false;
+    }
+    // Split mode: routed experts on a second GPU, everything else on the target.
+    if (cfg_.expert_device) {
+        const int expert_gpu = cfg_.expert_device->gpu;   // the plan checked it differs from the target
+        weights_.expert_backend = ggml_backend_cuda_init(expert_gpu);
+        if (!weights_.expert_backend) {
+            std::fprintf(stderr, "[qwen4exp] expert backend init failed for GPU %d\n", expert_gpu);
+            return false;
+        }
+        weights_.expert_gfx1151 = ggml_backend_cuda_qwen4exp_supported(weights_.expert_backend);
+        // Direct device-to-device copies for the activations crossing between the two GPUs.
+        if (!enable_peer_access_pair(cfg_.device.gpu, expert_gpu)) {
+            std::fprintf(stderr, "[qwen4exp] peer access between GPU %d and %d unavailable; copies stage through the host\n",
+                         cfg_.device.gpu, expert_gpu);
+        }
+    }
+    return load_target();
+}
+
+bool Qwen4ExpBackend::load_target() {
     if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
                            cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
         std::fprintf(stderr, "[qwen4exp] model load failed: %s\n",
@@ -149,8 +278,11 @@ bool Qwen4ExpBackend::init() {
         std::fprintf(stderr, "[qwen4exp] cache creation failed\n");
         return false;
     }
+    if (!load_qwen4exp_hot_experts(backend_, weights_, cfg_.expert_placement_path,
+                                   expert_budget_bytes_from_env(kQwen4ExpHotExpertBudget))) return false;
+    snapshot_budget_ = SIZE_MAX;
     if (cfg_.chunk > 0) {
-        chunk_ = cfg_.chunk;
+        chunk_ = weights_.expert_backend ? std::min(cfg_.chunk, kQwen4ExpSplitMaxChunk) : cfg_.chunk;
     } else if (cfg_.max_concurrency > 1) {
         // Cap at the single-slot speed target: a larger chunk only holds the
         // other slots' decode for longer (and filled 93 GB at 4x32K: 12800 rows).
@@ -169,6 +301,17 @@ bool Qwen4ExpBackend::init() {
         return false;
     }
     return true;
+}
+
+void Qwen4ExpBackend::release_target() {
+    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
+    tokens_.clear(); logits_.clear();
+    seq_engine_.reset();
+    for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
+    seq_caches_.clear();
+    free_qwen4exp_cache(cache_);
+    free_qwen4exp_weights(weights_);
+    ggml_backend_cuda_trim_pool(backend_); // also frees the bf16 weight shadows keyed by the freed weights' addresses
 }
 
 bool Qwen4ExpBackend::start_seq_engine() {
@@ -205,14 +348,7 @@ bool Qwen4ExpBackend::park(ParkTarget target) {
         return false;
     }
     if (parked_) return true;
-    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
-    tokens_.clear(); logits_.clear();
-    seq_engine_.reset();
-    for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
-    seq_caches_.clear();
-    free_qwen4exp_cache(cache_);
-    free_qwen4exp_weights(weights_);
-    ggml_backend_cuda_trim_pool(backend_); // also frees the bf16 weight shadows keyed by the freed weights' addresses
+    release_target();
     parked_ = true;
     std::printf("[qwen4exp] target parked\n");
     std::fflush(stdout);
@@ -224,21 +360,10 @@ bool Qwen4ExpBackend::unpark(ParkTarget target) {
         return false;
     }
     if (!parked_) return true;
-    if (!load_qwen4exp_gguf(cfg_.model_path, backend_, weights_,
-                           cfg_.verify_width == 1 ? "0" : cfg_.draft_path.value_or(""))) {
-        std::fprintf(stderr, "[qwen4exp] unpark reload failed: %s\n",
-                     luce_last_error());
-        return false;
-    }
-    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
-                               cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1))) {
-        std::fprintf(stderr, "[qwen4exp] unpark cache creation failed\n");
-        free_qwen4exp_weights(weights_);
-        return false;
-    }
-    // Keep the resolved serving policy across park/unpark (and /props stable).
-    if (!start_seq_engine()) {
-        std::fprintf(stderr, "[qwen4exp] unpark slot allocation failed\n");
+    // The same bring-up as init (the resolved serving policy is kept), sized for the memory free now.
+    if (!load_target()) {
+        std::fprintf(stderr, "[qwen4exp] unpark failed; nothing stays resident\n");
+        release_target();
         return false;
     }
     parked_ = false;
@@ -401,19 +526,42 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     // exactly once per emitted token. No RNG draws for unvisited verify rows.
     long long drafts = 0, accepted = 0, steps = 0;
     std::array<long long, QWEN4EXP_MTP_MAX_VERIFY> width_steps{};
-    auto width_policy = qwen4exp_mtp_width_policy(cache_.mtp_draft,
-        spec && cfg_.verify_width == 0, (int) req.prompt.size());
+    const int decode_ctx = pos;
+    const bool adaptive = spec && cfg_.verify_width == 0;
+    if (adaptive) {
+        mtp_costs_.load(mtp_width_, decode_ctx);
+        mtp_width_.carry_acceptance(QWEN4EXP_MTP_CARRIED_TRIALS);
+    }
     double draft_s = 0.0;
+    auto verify_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
+        uint64_t n = 0;
+        for (const auto & ws : cache_.verify_workspace) n += ws.*count;
+        return n;
+    };
+    auto draft_graphs = [&](uint64_t Qwen4ExpDecodeWorkspace::*count) {
+        uint64_t n = 0;
+        for (const auto & ws : cache_.mtp_catchup_workspace) n += ws.*count;
+        for (const auto & ws : cache_.mtp_rank_workspace) n += ws.*count;
+        return n;
+    };
+    auto built = [&] { return verify_graphs(&Qwen4ExpDecodeWorkspace::builds) + draft_graphs(&Qwen4ExpDecodeWorkspace::builds); };
+    const uint64_t builds0 = verify_graphs(&Qwen4ExpDecodeWorkspace::builds);
+    const uint64_t replays0 = verify_graphs(&Qwen4ExpDecodeWorkspace::replays);
+    const uint64_t draft_builds0 = draft_graphs(&Qwen4ExpDecodeWorkspace::builds);
+    const uint64_t draft_replays0 = draft_graphs(&Qwen4ExpDecodeWorkspace::replays);
     const auto t_dec0 = std::chrono::steady_clock::now();
     int32_t next = sample(logits.data());
     bool more = req.n_gen > 0 && commit(next);
     if (mtp) mtp_tok.assign(1, next);
     std::vector<int32_t> draft_tokens;
     while (more) {
-        const int k = spec ? std::max(0, std::min({qwen4exp_mtp_next_width(width_policy) - 1,
+        const int width = adaptive ? mtp_width_.next_width_cost_aware({}, cache_.mtp_draft + 1)
+                                   : cache_.mtp_draft + 1;
+        const int k = spec ? std::max(0, std::min({width - 1,
             req.n_gen - (int) result.tokens.size() - 1, cache_.max_ctx - pos - 1})) : 0;
         const bool verify = k > 0;
         const auto step_start = verify ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const uint64_t step_builds = verify ? built() : 0;
         if (verify) {
             const auto td0 = std::chrono::steady_clock::now();
             if (!qwen4exp_mtp_draft(backend_, weights_, cache_, mtp_tok.data(), mtp_h.data(), (int) mtp_tok.size(),
@@ -466,9 +614,13 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
                        logits.begin() + (size_t) retained * weights_.n_vocab);
         pos += retained;
         if (decode_check_) decode_check_(false, mtp_tok, logits_);
-        if (verify) width_policy.observe(decision.n_accepted + 1, k + 1,
+        // Only a step that replayed its verify and draft graphs times the width; one
+        // that built a graph is slower and counts for acceptance alone.
+        if (verify && adaptive) mtp_width_.observe(decision.n_accepted + 1, k + 1,
+            built() != step_builds ? -1.0f :
             (float) std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - step_start).count());
     }
+    if (adaptive) mtp_costs_.store(mtp_width_, decode_ctx);
     if (cancelled) {
         result.fail(GenerateErrorCode::Cancelled, "cancelled during decode");
         return result;
@@ -492,13 +644,27 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     result.accept_rate = drafts > 0 ? (float) accepted / (float) drafts : 0.0f;
     if (drafts > 0) {
         const double decoded = (double) result.tokens.size() - 1.0;   // the first token came from the prefill
+        std::string width_costs;   // the measured step cost of each timed width, ms
+        for (int w = 2; w <= QWEN4EXP_MTP_MAX_VERIFY; ++w) {
+            const float ms = mtp_width_.measured_costs()[(size_t) w];
+            if (!std::isfinite(ms)) continue;
+            char item[24];
+            std::snprintf(item, sizeof(item), "%s%d:%.1f", width_costs.empty() ? "" : ",", w, ms);
+            width_costs += item;
+        }
         std::fprintf(stderr,
             "[qwen4exp-mtp] k=%d drafts=%lld accepted=%lld rate=%.3f tokens_per_step=%.3f draft_ms=%.2f decode=%.2f tok/s "
-            "adaptive=%d steps_k1=%lld steps_k2=%lld steps_k3=%lld steps_k4=%lld steps_k5=%lld steps_k6=%lld steps_k7=%lld\n",
+            "adaptive=%d steps_k1=%lld steps_k2=%lld steps_k3=%lld steps_k4=%lld steps_k5=%lld steps_k6=%lld steps_k7=%lld "
+            "verify_builds=%llu verify_replays=%llu draft_builds=%llu draft_replays=%llu width_ms=%s\n",
             cache_.mtp_draft, drafts, accepted, (double) accepted / (double) drafts, steps > 0 ? decoded / (double) steps : 0.0,
             1e3 * draft_s / (double) drafts, result.decode_s > 0.0 ? decoded / result.decode_s : 0.0,
-            (int) width_policy.enabled(), width_steps[1], width_steps[2], width_steps[3], width_steps[4],
-            width_steps[5], width_steps[6], width_steps[7]);
+            (int) adaptive, width_steps[1], width_steps[2], width_steps[3], width_steps[4],
+            width_steps[5], width_steps[6], width_steps[7],
+            (unsigned long long) (verify_graphs(&Qwen4ExpDecodeWorkspace::builds) - builds0),
+            (unsigned long long) (verify_graphs(&Qwen4ExpDecodeWorkspace::replays) - replays0),
+            (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::builds) - draft_builds0),
+            (unsigned long long) (draft_graphs(&Qwen4ExpDecodeWorkspace::replays) - draft_replays0),
+            width_costs.c_str());
     }
 
     guard.complete = true;
@@ -629,13 +795,11 @@ bool Qwen4ExpBackend::handle_compress(const std::string & line,
 void Qwen4ExpBackend::free_drafter() {}
 
 void Qwen4ExpBackend::shutdown() {
-    for (int i = 0; i < kMaxSlots; ++i) snapshot_free(i);
-    tokens_.clear(); logits_.clear();
-    seq_engine_.reset();
-    for (Qwen4ExpCache & cache : seq_caches_) free_qwen4exp_cache(cache);
-    seq_caches_.clear();
-    free_qwen4exp_cache(cache_);
-    free_qwen4exp_weights(weights_);
+    if (backend_) release_target();
+    if (weights_.expert_backend) {
+        ggml_backend_free(weights_.expert_backend);
+        weights_.expert_backend = nullptr;
+    }
     if (backend_) {
         ggml_backend_free(backend_);
         backend_ = nullptr;
