@@ -10,8 +10,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
+#include <utility>
 
 namespace luce::common {
 
@@ -217,6 +220,64 @@ static void append_dsml_tool_calls(std::string & out, const ChatMessage & msg,
         out += v41 ? "\n</｜DSML｜ invoke>" : "\n</｜DSML｜invoke>";
     }
     out += v41 ? "\n</｜DSML｜ calls>" : "\n</｜DSML｜tool_calls>";
+}
+
+// DeepSeek results carry no IDs in the prompt. Match the reference encoder:
+// sort only tool-result slots within each user/tool run, leaving user text
+// in place. Return an empty permutation for already ordered histories.
+static std::vector<size_t> dsml_message_order(const std::vector<ChatMessage> & messages) {
+    std::vector<size_t> order;
+    const std::vector<ChatToolCall> * calls = nullptr;
+    const auto is_result = [](const ChatMessage & msg) {
+        return msg.role == "tool" || msg.role == "function";
+    };
+    for (size_t begin = 0; begin < messages.size();) {
+        const auto & msg = messages[begin];
+        if (msg.role == "assistant" && !msg.tool_calls.empty()) calls = &msg.tool_calls;
+        if (!calls || (msg.role != "user" && !is_result(msg))) {
+            ++begin;
+            continue;
+        }
+        const auto rank = [&](size_t index) {
+            const auto & id = messages[index].tool_call_id;
+            if (!id.empty()) {
+                for (size_t i = 0; i < calls->size(); ++i) {
+                    if ((*calls)[i].id == id) return i;
+                }
+            }
+            return size_t{0};  // Reference fallback for absent/unknown IDs.
+        };
+        size_t end = begin;
+        size_t previous = 0;
+        bool sorted = true;
+        for (; end < messages.size(); ++end) {
+            if (messages[end].role != "user" && !is_result(messages[end])) break;
+            if (!is_result(messages[end])) continue;
+            const size_t current = rank(end);
+            if (current < previous) sorted = false;
+            previous = current;
+        }
+        if (!sorted) {
+            if (order.empty()) {
+                order.resize(messages.size());
+                std::iota(order.begin(), order.end(), size_t{0});
+            }
+            // Sorting (rank, original index) keeps equal-rank results stable
+            // without copying message bodies or allocating a sort buffer.
+            std::vector<std::pair<size_t, size_t>> results;
+            results.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                if (is_result(messages[i])) results.emplace_back(rank(i), i);
+            }
+            std::sort(results.begin(), results.end());
+            size_t next = 0;
+            for (size_t i = begin; i < end; ++i) {
+                if (is_result(messages[i])) order[i] = results[next++].second;
+            }
+        }
+        begin = end;
+    }
+    return order;
 }
 
 // Google's canonical template (google/gemma-4-26B-A4B-it/chat_template.jinja)
@@ -838,7 +899,9 @@ std::string render_chat_template(
 
         bool pending_assistant = false;
         bool pending_tool_result = false;
-        for (const auto & msg : messages) {
+        const auto order = dsml_message_order(messages);
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto & msg = messages[order.empty() ? i : order[i]];
             if (msg.role == "system") {
                 continue;
             } else if (msg.role == "user") {
@@ -847,7 +910,7 @@ std::string render_chat_template(
                 pending_assistant = true;
                 pending_tool_result = false;
             } else if (msg.role == "tool" || msg.role == "function") {
-                if (!pending_tool_result) result += "<｜User｜>";
+                result += pending_tool_result ? "\n\n" : "<｜User｜>";
                 result += "<tool_result>";
                 result += msg.content;
                 result += "</tool_result>";
@@ -857,6 +920,10 @@ std::string render_chat_template(
                 if (pending_assistant) {
                     result += "<｜Assistant｜>";
                     result += enable_thinking ? "<think>" : "</think>";
+                }
+                // Cold API history contains visible prose, not raw reasoning.
+                if (enable_thinking && !msg.tool_calls_replayed && !msg.tool_calls.empty()) {
+                    result += "</think>";
                 }
                 result += msg.content;
                 append_dsml_tool_calls(result, msg, false);
@@ -897,8 +964,9 @@ std::string render_chat_template(
 
         bool in_user_turn = false;
         bool pending_assistant = false;
+        const auto order = dsml_message_order(messages);
         for (size_t i = first; i < messages.size(); ++i) {
-            const auto & msg = messages[i];
+            const auto & msg = messages[order.empty() ? i : order[i]];
             if (msg.role == "system") {
                 result += "<｜System｜>";
                 result += msg.content;
@@ -919,6 +987,9 @@ std::string render_chat_template(
                 if (pending_assistant) {
                     result += "<｜Assistant｜>";
                     result += enable_thinking ? "<think>" : "</think>";
+                }
+                if (enable_thinking && !msg.tool_calls_replayed && !msg.tool_calls.empty()) {
+                    result += "</think>";
                 }
                 result += msg.content;
                 append_dsml_tool_calls(result, msg, true);

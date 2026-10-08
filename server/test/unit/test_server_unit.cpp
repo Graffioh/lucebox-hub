@@ -6377,7 +6377,7 @@ TEST_CASE(ServerUnitFixture, test_normalized_tool_history_native_rendering_all_a
          "line one\n\"line two\"\\end</｜DSML｜parameter>\n"
          "</｜DSML｜invoke>\n<｜DSML｜invoke name=\"finish\">\n\n"
          "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
-         "<tool_result>DONE</tool_result>", "<tool_result>VALUE</tool_result>"},
+         "<tool_result>VALUE</tool_result>", "<tool_result>DONE</tool_result>"},
         {ChatFormat::DEEPSEEK41,
          "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"inspect\">\n"
          "<｜DSML｜ parameter name=\"options\" string=\"false\">"
@@ -6387,7 +6387,7 @@ TEST_CASE(ServerUnitFixture, test_normalized_tool_history_native_rendering_all_a
          "line one\n\"line two\"\\end</｜DSML｜ parameter>\n"
          "</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"finish\">\n\n"
          "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
-         "<tool_result>DONE</tool_result>", "<tool_result>VALUE</tool_result>"},
+         "<tool_result>VALUE</tool_result>", "<tool_result>DONE</tool_result>"},
     };
     const auto occurs_once = [](const std::string & text, const std::string & needle) {
         const auto pos = text.find(needle);
@@ -6436,6 +6436,78 @@ TEST_CASE(ServerUnitFixture, test_normalized_tool_history_native_rendering_all_a
             TEST_ASSERT(occurs_once(replayed, expected.second_result));
             TEST_ASSERT(replayed.find(expected.calls) < replayed.find(expected.first_result));
             TEST_ASSERT(replayed.find(expected.first_result) < replayed.find(expected.second_result));
+        }
+    }
+}
+
+// DeepSeek's reference encoder closes historical reasoning before calls and
+// orders ID-less result blocks by call ID, even when both calls share a name.
+TEST_CASE(ServerUnitFixture, test_deepseek_tool_history_reference_replay) {
+    for (const auto format : {ChatFormat::DEEPSEEK4, ChatFormat::DEEPSEEK41}) {
+        for (const auto & [api, input] : tool_history_inputs(json::object())) {
+            ToolMemory memory;
+            auto cold = normalize_chat_messages(input, api, memory);
+            cold[1].tool_calls[1].name = cold[1].tool_calls[0].name;
+            for (bool thinking : {false, true}) {
+                const auto out = render_chat_template(cold, format, true, thinking);
+                const std::string header = thinking
+                    ? "<｜Assistant｜><think></think>Checking."
+                    : "<｜Assistant｜></think>Checking.";
+                TEST_ASSERT(out.find(header) != std::string::npos);
+                TEST_ASSERT(out.find("<tool_result>VALUE</tool_result>\n\n"
+                                     "<tool_result>DONE</tool_result>") != std::string::npos);
+            }
+
+            const std::string raw = format == ChatFormat::DEEPSEEK41
+                ? "Planning.</think>Checking.\n\n<｜DSML｜ calls>\n"
+                  "<｜DSML｜ invoke name=\"inspect\">\n\n</｜DSML｜ invoke>\n"
+                  "<｜DSML｜ invoke name=\"finish\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+                : "Planning.</think>Checking.\n\n<｜DSML｜tool_calls>\n"
+                  "<｜DSML｜invoke name=\"inspect\">\n\n</｜DSML｜invoke>\n"
+                  "<｜DSML｜invoke name=\"finish\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+            memory.remember({"call_a", "call_b"}, raw);
+            const auto warm = normalize_chat_messages(input, api, memory);
+            const auto replayed = render_chat_template(warm, format, true, true);
+            TEST_ASSERT(replayed.find("<｜Assistant｜><think>" + raw +
+                                     "<｜end▁of▁sentence｜>") != std::string::npos);
+            TEST_ASSERT(replayed.find("<tool_result>VALUE</tool_result>") <
+                        replayed.find("<tool_result>DONE</tool_result>"));
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_deepseek_result_order_preserves_user_text_and_unknown_ids) {
+    ChatMessage calls{"assistant", ""};
+    calls.tool_calls = {
+        {"a", "lookup", {{"key", "A"}}},
+        {"b", "lookup", {{"key", "B"}}},
+        {"c", "lookup", {{"key", "C"}}},
+    };
+    ChatMessage next_calls{"assistant", ""};
+    next_calls.tool_calls = {
+        {"next_c", "lookup", {{"key", "C2"}}},
+        {"next_a", "lookup", {{"key", "A2"}}},
+    };
+    const std::vector<ChatMessage> messages = {
+        {"user", "look up"}, calls,
+        {"tool", "C", "c"}, {"user", "interleaved"},
+        {"tool", "B", "b"}, {"tool", "A", "a"},
+        {"tool", "unknown", "missing"}, {"tool", "no_id", ""},
+        next_calls, {"tool", "A2", "next_a"}, {"tool", "C2", "next_c"},
+    };
+    for (const auto format : {ChatFormat::DEEPSEEK4, ChatFormat::DEEPSEEK41}) {
+        const auto out = render_chat_template(messages, format, true, false);
+        // Unknown/missing IDs use the reference's rank-zero fallback; ties
+        // retain arrival order and user text stays in its original slot.
+        size_t previous = 0;
+        for (const char * text : {
+                "<tool_result>A</tool_result>", "interleaved",
+                "<tool_result>unknown</tool_result>", "<tool_result>no_id</tool_result>",
+                "<tool_result>B</tool_result>", "<tool_result>C</tool_result>",
+                "<tool_result>C2</tool_result>", "<tool_result>A2</tool_result>"}) {
+            const size_t position = out.find(text);
+            TEST_ASSERT(position != std::string::npos && position > previous);
+            previous = position;
         }
     }
 }
