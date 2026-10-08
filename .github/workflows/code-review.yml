@@ -8,6 +8,8 @@ name: Code review
 #   the first time.
 # - Adding the `code-review` label asks for a review at any time, on a draft or a
 #   ready pull request; the bot removes the label when it is done.
+# - When a diff is over the bot's size limit, it posts a comment listing the files
+#   it left out, with a checkbox. Ticking it asks for one review of those files.
 #
 # This workflow only forwards the request; it checks out and runs nothing. The bot
 # re-checks every request, including the labeler's write access.
@@ -15,15 +17,23 @@ name: Code review
 on:
   pull_request_target:
     types: [labeled, ready_for_review, opened]
+  # The left-out files checkbox: ticking it edits the bot's comment.
+  issue_comment:
+    types: [edited]
 
 permissions: {}
 
 jobs:
   dispatch:
     if: >-
-      (github.event.action == 'labeled' && github.event.label.name == 'code-review') ||
-      github.event.action == 'ready_for_review' ||
-      (github.event.action == 'opened' && !github.event.pull_request.draft)
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '<!-- code-review-bot-left-out ') &&
+        contains(github.event.comment.body, '- [x] Review the left-out files') &&
+        !contains(github.event.changes.body.from, '- [x] Review the left-out files')) ||
+      (github.event_name == 'pull_request_target' && (
+        (github.event.action == 'labeled' && github.event.label.name == 'code-review') ||
+        github.event.action == 'ready_for_review' ||
+        (github.event.action == 'opened' && !github.event.pull_request.draft)))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -32,9 +42,12 @@ jobs:
           GH_TOKEN: ${{ secrets.LUCEBOX_BOTS_DISPATCH_TOKEN }}
           BOT_REPO: ${{ secrets.LUCEBOX_BOTS_DISPATCH_REPO }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
           SENDER: ${{ github.event.sender.login }}
-          TRIGGER: ${{ github.event.action == 'labeled' && 'label' || 'ready' }}
+          TRIGGER: >-
+            ${{ github.event_name == 'issue_comment' && 'rest' ||
+                github.event.action == 'labeled' && 'label' || 'ready' }}
         run: |
           set -euo pipefail
           if [ -z "$GH_TOKEN" ] || [ -z "$BOT_REPO" ]; then
@@ -46,5 +59,6 @@ jobs:
             -f "client_payload[repository]=$REPO" \
             -F "client_payload[pr]=$PR" \
             -f "client_payload[sender]=$SENDER" \
-            -f "client_payload[trigger]=$TRIGGER" >/dev/null
+            -f "client_payload[trigger]=$TRIGGER" \
+            -f "client_payload[comment_id]=$COMMENT_ID" >/dev/null
           echo "Sent PR #$PR ($TRIGGER) to the code review bot." >> "$GITHUB_STEP_SUMMARY"
