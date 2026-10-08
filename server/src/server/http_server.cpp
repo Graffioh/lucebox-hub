@@ -1400,7 +1400,7 @@ PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
     PrefixCacheBudget out;
     // No prefix cache, nothing to bound (e.g. single-sequence paged serving).
     if (config.prefix_cache_cap <= 0) return out;
-    if (config.concurrent_paged_prefix_cache) {
+    if (config.concurrent_prefix_cache) {
         out.automatic = config.concurrent_prefix_cache_max_bytes ==
             ServerConfig::kPrefixCacheBudgetAuto;
         // Auto starts at the old 4 GiB default; the scheduler resizes it once
@@ -1472,7 +1472,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
     // Single-sequence commits prune superseded snapshots (see
     // trim_snapshots_after_commit); the paged scheduler does not.
-    prefix_cache_.set_prunes_superseded(!config.concurrent_paged_prefix_cache);
+    prefix_cache_.set_prunes_superseded(!config.concurrent_prefix_cache);
     // Fold model+config identity into the layout fingerprint BEFORE init()
     // so compute_layout_id sees it on every learn/verify call. Prevents stale
     // KV hits when the server restarts over the same --kv-cache-dir with a
@@ -2781,28 +2781,6 @@ namespace {
 // Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
-// Every position a later request may restore `prompt`'s prefix from: its chat
-// boundaries plus the extra cuts a cache may take (a PPP pin, a fixed disk
-// scope). See GenerateRequest::restore_points. `drop_last_boundary` leaves
-// out the generation prompt's own boundary: a request that does not snapshot
-// there saves no state past it, so that split would only cost a short extra
-// prefill step (a snapshot there comes back through `cuts`).
-std::vector<int> prefix_restore_points(const std::vector<int32_t> & prompt,
-                                       const ChatMarkers & markers,
-                                       std::initializer_list<int> cuts,
-                                       bool drop_last_boundary = false,
-                                       int spacing = 0) {
-    std::vector<int> points = find_all_boundaries(prompt, markers);
-    if (drop_last_boundary && !points.empty()) points.pop_back();
-    // A backend that cuts prefill at every restore point gets them spaced.
-    points = spaced_restore_points(points, spacing);
-    for (int cut : cuts) {
-        if (cut > 0 && cut < (int) prompt.size()) points.push_back(cut);
-    }
-    std::sort(points.begin(), points.end());
-    points.erase(std::unique(points.begin(), points.end()), points.end());
-    return points;
-}
 
 struct CompletionTokenCounts {
     int total = 0;
@@ -3709,6 +3687,14 @@ bool HttpServer::forward_upstream(
 #endif
 }
 
+std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> & prompt,
+                                                    bool ends_with_tool_result,
+                                                    std::initializer_list<int> cuts) const {
+    return prefix_restore_points(prompt, prefix_cache_.chat_markers(), cuts,
+        /*drop_last_boundary=*/!(backend_.prefill_cuts_at_restore_points() && ends_with_tool_result),
+        backend_.restore_point_spacing());
+}
+
 // Cache lookup and snapshot preparation form one lifecycle; confirmation is
 // deferred until generation proves that the snapshot contains useful output.
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
@@ -4148,14 +4134,10 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.full_snap_slot, cache.full_snap_pos);
 
     if (!prefix_cache_.disabled() || !disk_cache_.disabled()) {
-        generate_request.restore_points = prefix_restore_points(
-            effective_prompt, prefix_cache_.chat_markers(),
+        generate_request.restore_points = request_restore_points(
+            effective_prompt, req.ends_with_tool_result,
             {forced_cut, selected_boundary,
-             cache.snap_prepared ? cache.snap_cut : 0},
-            // qwen4exp requires the same cuts on hits and misses, even when
-            // a tool-result hit skips capture and a miss captures the tools head.
-            /*drop_last_boundary=*/!(config_.arch == "qwen4exp" && req.ends_with_tool_result),
-            backend_.restore_point_spacing());
+             cache.snap_prepared ? cache.snap_cut : 0});
     }
 
     status_.set_flags(

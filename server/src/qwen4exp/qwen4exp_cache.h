@@ -76,15 +76,41 @@ struct Qwen4ExpDecodeWorkspace {
     uint64_t split_gen = 0;
 };
 
-// Shared arena for exact-width independent-sequence decode. Unlike the stable
-// single-slot graph, the graph is rebuilt for each call because its state
-// tensor edges depend on the active slot ordering. The metadata arena and
-// allocator backing storage are still shared across calls.
-struct Qwen4ExpBatchedDecodeWorkspace {
-    ggml_context * ctx = nullptr;
-    ggml_gallocr_t alloc = nullptr;
-    bool planned = false;
+struct Qwen4ExpCache;
+
+// The concurrency slots' multi-slot decode graph: a retained decode graph (its context, allocator or own split
+// scheduler, logits, hidden rows and shared QSA inputs) plus every slot's inputs. It is replayed while the slots (in
+// order) and their attention spans are unchanged; positions, masks, K/V rows and slot ids are runtime inputs.
+struct Qwen4ExpBatchedDecodeWorkspace : Qwen4ExpDecodeWorkspace {
+    struct GroupInput {
+        ggml_tensor * positions = nullptr;   // I32 [4 * n], the group's M-RoPE sections
+        int s0 = 0, n = 0;
+    };
+    std::vector<GroupInput> groups;
+    ggml_tensor * slot_ids = nullptr;            // I32 [n]: each slot's slab of Qwen4ExpSlotStates
+    std::vector<ggml_tensor *> masks, kv_rows;   // per slot: attention mask (dense slots), I32 [1] K/V row
+    // QSA slots: each one's runtime inputs and [4] M-RoPE positions as its stable T=1 graph has them, views of
+    // qsa_params (I32 [10 * n]), qsa_visibility (each QSA slot's blocks in turn) and qsa_positions (I32 [4 * n]).
+    std::vector<Qwen4ExpDecodeWorkspace> slot_qsa;
+    ggml_tensor * qsa_positions = nullptr;
+    std::vector<const Qwen4ExpCache *> caches;   // the slots the graph was built for, in order
+    std::vector<int64_t> spans;                  // and their attention spans (< 0: a QSA K/V bucket)
 };
+
+// Recurrent state of every concurrency slot, stacked per linear layer, so one
+// multi-slot decode graph runs each layer's conv and recurrence once for all
+// slots (by slot id). A slot cache's ssm_state/conv_state are views of its slab.
+struct Qwen4ExpSlotStates {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<ggml_tensor *> ssm;    // [S_v, S_v, H_v, n_slots]
+    std::vector<ggml_tensor *> conv;   // [kernel-1, conv_channels, n_slots]
+    int n_slots = 0;
+};
+
+bool create_qwen4exp_slot_states(ggml_backend_t backend, const Qwen4ExpWeights & w,
+                                 int n_slots, Qwen4ExpSlotStates & out);
+void free_qwen4exp_slot_states(Qwen4ExpSlotStates & s);
 
 struct Qwen4ExpCache {
     ggml_context *        ctx     = nullptr;
@@ -119,6 +145,9 @@ struct Qwen4ExpCache {
     //                  conv_state [kernel-1, conv_channels] f32.
     std::vector<ggml_tensor *> ssm_state;   // size = n_linear
     std::vector<ggml_tensor *> conv_state;
+    // Set when the recurrent state above is slab `state_slot` of shared slot states.
+    const Qwen4ExpSlotStates * slot_states = nullptr;
+    int state_slot = -1;
 
     // Per-layer embedding (PLE) conv history, one per PLE layer:
     // [ple_hist, hc_dim] f32 where ple_hist = (ple_conv_kernel-1)*ple_ngram_size.
@@ -165,9 +194,11 @@ struct Qwen4ExpCache {
 };
 
 // `mtp` adds the MTP draft layer's K/V and the verify rollback state (needs a loaded sidecar).
+// `slot_states`: the recurrent state is slab `state_slot` of those (allocated by the caller).
 bool create_qwen4exp_cache(ggml_backend_t backend, const Qwen4ExpWeights & w,
                            int max_ctx, Qwen4ExpCache & out, bool mtp = false,
-                           int mtp_draft = 1); // allocate the explicit draft cap once
+                           int mtp_draft = 1, // allocate the explicit draft cap once
+                           const Qwen4ExpSlotStates * slot_states = nullptr, int state_slot = -1);
 
 void free_qwen4exp_cache(Qwen4ExpCache & c);
 
@@ -184,6 +215,7 @@ struct Qwen4ExpSnapshot {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> strips;
+    bool mtp = false;   // the source cache has the MTP draft layer: its strips close `strips`
     int cur_pos = 0, indexer_blocks = 0, mtp_prev_pos = -1;
     int64_t kv_bucket_base = 0;
     std::vector<int32_t> ple_prev, tokens;
@@ -193,7 +225,12 @@ struct Qwen4ExpSnapshot {
 size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens,
                              size_t * host_bytes = nullptr);
 bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
-void restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
+// Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a
+// concurrency slot resuming another slot's checkpoint). The MTP draft layer's state comes along
+// when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps
+// no draft state (mtp_prev_pos -1), so its request decodes without drafts. False, with `c`
+// untouched, when the layouts differ otherwise.
+bool restore_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpSnapshot & s, Qwen4ExpCache & c);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 
 }  // namespace luce::common
