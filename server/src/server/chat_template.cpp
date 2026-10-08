@@ -10,8 +10,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
+#include <utility>
 
 namespace luce::common {
 
@@ -93,7 +96,8 @@ static const char DS41_TOOLS_HEADER[] =
 
 // Python json.dumps(value, ensure_ascii=False) spelling: ", " and ": "
 // separators, keys in their original order.
-static void append_python_json(std::string & out, const nlohmann::ordered_json & value) {
+template <typename Json>
+static void append_python_json(std::string & out, const Json & value) {
     if (value.is_object()) {
         out += '{';
         bool first = true;
@@ -145,6 +149,268 @@ static int ds41_reasoning_budget(const std::string & effort) {
         if (budget >= 1 && budget <= 100) return budget;
     }
     return 75;
+}
+
+// The XML-like formats deliberately leave string arguments unescaped. JSON
+// values retain their types, including nested objects, arrays, booleans and null.
+static void append_tool_argument(std::string & out, const nlohmann::json & value) {
+    if (value.is_string()) out += value.get_ref<const std::string &>();
+    else append_python_json(out, value);
+}
+
+static void append_xml_tool_calls(std::string & out, const ChatMessage & msg,
+                                  ChatFormat format) {
+    if (msg.tool_calls_replayed) return;
+    for (size_t i = 0; i < msg.tool_calls.size(); ++i) {
+        const auto & call = msg.tool_calls[i];
+        if (i != 0 || !msg.content.empty()) {
+            out += format == ChatFormat::QWEN3 && i == 0 ? "\n\n" : "\n";
+        }
+        if (format == ChatFormat::QWEN3) {
+            out += "<tool_call>\n<function=";
+            out += call.name;
+            out += ">\n";
+            for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
+                out += "<parameter=";
+                out += it.key();
+                out += ">\n";
+                append_tool_argument(out, it.value());
+                out += "\n</parameter>\n";
+            }
+            out += "</function>\n</tool_call>";
+        } else {
+            // Ling and Laguna's shipped templates put the first key directly
+            // after the name, unlike the illustrative preamble.
+            out += "<tool_call>";
+            out += call.name;
+            for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
+                out += "<arg_key>";
+                out += it.key();
+                out += "</arg_key>\n<arg_value>";
+                append_tool_argument(out, it.value());
+                out += "</arg_value>";
+                if (format == ChatFormat::LAGUNA) out += '\n';
+            }
+            if (format == ChatFormat::BAILINGMOE3) out += '\n';
+            out += "</tool_call>";
+        }
+    }
+}
+
+static void append_dsml_tool_calls(std::string & out, const ChatMessage & msg,
+                                   bool v41) {
+    if (msg.tool_calls_replayed || msg.tool_calls.empty()) return;
+    out += v41 ? "\n\n<｜DSML｜ calls>\n" : "\n\n<｜DSML｜tool_calls>\n";
+    for (size_t i = 0; i < msg.tool_calls.size(); ++i) {
+        if (i != 0) out += '\n';
+        const auto & call = msg.tool_calls[i];
+        out += v41 ? "<｜DSML｜ invoke name=\"" : "<｜DSML｜invoke name=\"";
+        out += call.name;
+        out += "\">\n";
+        bool first = true;
+        for (auto it = call.arguments.begin(); it != call.arguments.end(); ++it) {
+            if (!first) out += '\n';
+            first = false;
+            out += v41 ? "<｜DSML｜ parameter name=\"" : "<｜DSML｜parameter name=\"";
+            out += it.key();
+            out += it.value().is_string() ? "\" string=\"true\">" : "\" string=\"false\">";
+            append_tool_argument(out, it.value());
+            out += v41 ? "</｜DSML｜ parameter>" : "</｜DSML｜parameter>";
+        }
+        out += v41 ? "\n</｜DSML｜ invoke>" : "\n</｜DSML｜invoke>";
+    }
+    out += v41 ? "\n</｜DSML｜ calls>" : "\n</｜DSML｜tool_calls>";
+}
+
+// DeepSeek results carry no IDs in the prompt. Match the reference encoder:
+// sort only tool-result slots within each user/tool run, leaving user text
+// in place. Return an empty permutation for already ordered histories.
+static std::vector<size_t> dsml_message_order(const std::vector<ChatMessage> & messages) {
+    std::vector<size_t> order;
+    const std::vector<ChatToolCall> * calls = nullptr;
+    const auto is_result = [](const ChatMessage & msg) {
+        return msg.role == "tool" || msg.role == "function";
+    };
+    for (size_t begin = 0; begin < messages.size();) {
+        const auto & msg = messages[begin];
+        if (msg.role == "assistant" && !msg.tool_calls.empty()) calls = &msg.tool_calls;
+        if (!calls || (msg.role != "user" && !is_result(msg))) {
+            ++begin;
+            continue;
+        }
+        const auto rank = [&](size_t index) {
+            const auto & id = messages[index].tool_call_id;
+            if (!id.empty()) {
+                for (size_t i = 0; i < calls->size(); ++i) {
+                    if ((*calls)[i].id == id) return i;
+                }
+            }
+            return size_t{0};  // Reference fallback for absent/unknown IDs.
+        };
+        size_t end = begin;
+        size_t previous = 0;
+        bool sorted = true;
+        for (; end < messages.size(); ++end) {
+            if (messages[end].role != "user" && !is_result(messages[end])) break;
+            if (!is_result(messages[end])) continue;
+            const size_t current = rank(end);
+            if (current < previous) sorted = false;
+            previous = current;
+        }
+        if (!sorted) {
+            if (order.empty()) {
+                order.resize(messages.size());
+                std::iota(order.begin(), order.end(), size_t{0});
+            }
+            // Sorting (rank, original index) keeps equal-rank results stable
+            // without copying message bodies or allocating a sort buffer.
+            std::vector<std::pair<size_t, size_t>> results;
+            results.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                if (is_result(messages[i])) results.emplace_back(rank(i), i);
+            }
+            std::sort(results.begin(), results.end());
+            size_t next = 0;
+            for (size_t i = begin; i < end; ++i) {
+                if (is_result(messages[i])) order[i] = results[next++].second;
+            }
+        }
+        begin = end;
+    }
+    return order;
+}
+
+// Google's canonical template (google/gemma-4-26B-A4B-it/chat_template.jinja)
+// uses special string delimiters and bare keys recursively for calls and
+// responses, not JSON or Python repr().
+static void append_gemma_string(std::string & out, const std::string & value,
+                                bool uppercase = false) {
+    out += "<|\"|>";
+    if (uppercase) {
+        for (char c : value) out += c >= 'a' && c <= 'z' ? char(c - 'a' + 'A') : c;
+    } else {
+        out += value;
+    }
+    out += "<|\"|>";
+}
+
+static void append_gemma_value(std::string & out, const nlohmann::json & value) {
+    if (value.is_string()) {
+        append_gemma_string(out, value.get_ref<const std::string &>());
+    } else if (value.is_object()) {
+        out += '{';
+        bool first = true;
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (!first) out += ',';
+            first = false;
+            out += it.key();
+            out += ':';
+            append_gemma_value(out, it.value());
+        }
+        out += '}';
+    } else if (value.is_array()) {
+        out += '[';
+        bool first = true;
+        for (const auto & item : value) {
+            if (!first) out += ',';
+            first = false;
+            append_gemma_value(out, item);
+        }
+        out += ']';
+    } else {
+        out += value.dump();
+    }
+}
+
+// Schema type names are uppercase; literal enum/default strings are not.
+// Property maps are separate from schemas so a property named "type" remains
+// a normal property. Recurse into object and array schemas without flattening.
+static void append_gemma_schema(std::string & out, const nlohmann::json & schema,
+                                 bool property_map = false) {
+    if (!schema.is_object()) {
+        append_gemma_value(out, schema);
+        return;
+    }
+    out += '{';
+    bool first = true;
+    for (auto it = schema.begin(); it != schema.end(); ++it) {
+        if (!first) out += ',';
+        first = false;
+        out += it.key();
+        out += ':';
+        const auto & value = it.value();
+        if (property_map) {
+            append_gemma_schema(out, value);
+        } else if (it.key() == "type" && value.is_string()) {
+            append_gemma_string(out, value.get_ref<const std::string &>(), true);
+        } else if (it.key() == "type" && value.is_array()) {
+            out += '[';
+            for (size_t i = 0; i < value.size(); ++i) {
+                if (i != 0) out += ',';
+                if (value[i].is_string()) {
+                    append_gemma_string(out, value[i].get_ref<const std::string &>(), true);
+                } else {
+                    append_gemma_value(out, value[i]);
+                }
+            }
+            out += ']';
+        } else if (it.key() == "properties" || it.key() == "$defs") {
+            append_gemma_schema(out, value, true);
+        } else if (it.key() == "items" || it.key() == "additionalProperties") {
+            append_gemma_schema(out, value);
+        } else if ((it.key() == "anyOf" || it.key() == "oneOf" || it.key() == "allOf") &&
+                   value.is_array()) {
+            out += '[';
+            for (size_t i = 0; i < value.size(); ++i) {
+                if (i != 0) out += ',';
+                append_gemma_schema(out, value[i]);
+            }
+            out += ']';
+        } else {
+            append_gemma_value(out, value);
+        }
+    }
+    out += '}';
+}
+
+static void append_gemma_tools(std::string & out, const std::string & tools_json) {
+    const auto tools = nlohmann::json::parse(tools_json);
+    for (const auto & tool : tools) {
+        const auto & function = tool.contains("function") ? tool["function"] : tool;
+        out += "<|tool>declaration:";
+        out += function.at("name").get_ref<const std::string &>();
+        out += "{description:";
+        const auto description = function.find("description");
+        if (description != function.end() && description->is_string()) {
+            append_gemma_string(out, description->get_ref<const std::string &>());
+        } else {
+            out += "<|\"|><|\"|>";
+        }
+        const auto parameters = function.find("parameters");
+        const auto input_schema = function.find("input_schema");
+        if (parameters != function.end() && parameters->is_object()) {
+            out += ",parameters:";
+            append_gemma_schema(out, *parameters);
+        } else if (input_schema != function.end() && input_schema->is_object()) {
+            out += ",parameters:";
+            append_gemma_schema(out, *input_schema);
+        }
+        if (function.contains("response")) {
+            out += ",response:";
+            append_gemma_schema(out, function["response"]);
+        }
+        out += "}<tool|>";
+    }
+}
+
+static void append_gemma_tool_calls(std::string & out, const ChatMessage & msg) {
+    if (msg.tool_calls_replayed) return;
+    for (const auto & call : msg.tool_calls) {
+        out += "<|tool_call>call:";
+        out += call.name;
+        append_gemma_value(out, call.arguments);
+        out += "<tool_call|>";
+    }
 }
 
 ChatFormat chat_format_for_arch(const std::string & arch) {
@@ -247,6 +513,7 @@ std::string render_chat_template(
                     result += "<think></think>";
                 }
                 result += msg.content;
+                append_xml_tool_calls(result, msg, format);
                 result += "<|role_end|>";
             } else if (msg.role == "tool") {
                 if (!in_tool_response) {
@@ -331,6 +598,7 @@ std::string render_chat_template(
                 result += msg.role;
                 result += '\n';
                 result += msg.content;
+                if (msg.role == "assistant") append_xml_tool_calls(result, msg, format);
                 result += "<|im_end|>\n";
             }
         }
@@ -447,6 +715,7 @@ std::string render_chat_template(
                 // (including any embedded <think>...</think> blocks).
                 result += "<assistant>\n";
                 result += msg.content;
+                append_xml_tool_calls(result, msg, format);
                 result += "\n</assistant>\n";
             } else if (msg.role == "tool") {
                 result += "<tool_response>\n";
@@ -519,35 +788,68 @@ std::string render_chat_template(
             if (!system_content.empty()) {
                 result += system_content;
             }
-            // TODO: tool definitions block (`<|tool>…<tool|>`) goes here
-            // when tools_json is non-empty. Out of scope for the
-            // budget-signaling fix.
-            (void)tools_json;
+            if (has_tools) append_gemma_tools(result, tools_json);
             result += "<turn|>\n";
         }
 
-        // User/assistant turns. Unlike the previous implementation we
-        // don't prepend system content to the first user message — the
-        // system turn above already carries it (or there isn't one).
-        for (size_t i = start_idx; i < messages.size(); i++) {
+        // Calls and responses are part of the SAME model turn. A following
+        // assistant continues after the responses, without a second header.
+        bool model_turn_open = false;
+        bool response_prefix_open = false;
+        for (size_t i = start_idx; i < messages.size(); ++i) {
             const auto & msg = messages[i];
-            std::string role = msg.role;
-            if (role == "assistant") role = "model";
+            if (msg.role == "tool") {
+                if (!model_turn_open) {
+                    result += "<|turn>model\n";
+                    model_turn_open = true;
+                }
+                if (!response_prefix_open) result += "<|tool_response>";
+                result += "response:";
+                if (msg.tool_name.empty()) result += "unknown";
+                else result += msg.tool_name;
+                result += "{value:";
+                append_gemma_string(result, msg.content);
+                result += "}<tool_response|>";
+                response_prefix_open = false;
+                const bool continues = i + 1 == messages.size() ||
+                    messages[i + 1].role == "tool" || messages[i + 1].role == "assistant";
+                if (!continues) {
+                    result += "<turn|>\n";
+                    model_turn_open = false;
+                }
+                continue;
+            }
 
-            result += "<|turn>";
-            result += role;
-            result += '\n';
+            if (msg.role != "assistant" || !model_turn_open) {
+                result += "<|turn>";
+                if (msg.role == "assistant") result += "model";
+                else result += msg.role;
+                result += '\n';
+            }
             result += msg.content;
-            result += "<turn|>\n";
+            if (msg.role == "assistant" && !msg.tool_calls.empty()) {
+                append_gemma_tool_calls(result, msg);
+                model_turn_open = true;
+                // A raw cache hit can already contain the handoff token.
+                static constexpr char response_prefix[] = "<|tool_response>";
+                constexpr size_t response_prefix_size = sizeof(response_prefix) - 1;
+                response_prefix_open = result.size() >= response_prefix_size &&
+                    result.compare(result.size() - response_prefix_size,
+                                   response_prefix_size, response_prefix) == 0;
+                if (!response_prefix_open) result += response_prefix;
+                response_prefix_open = true;
+            } else {
+                result += "<turn|>\n";
+                model_turn_open = false;
+                response_prefix_open = false;
+            }
         }
         if (add_generation_prompt) {
-            result += "<|turn>model\n";
-            if (!enable_thinking) {
-                // Empty thought-channel guard: model will skip its own
-                // `<|channel>thought…<channel|>` block since this one
-                // already sits in the prompt. Matches the GGUF
-                // template's "if not enable_thinking" branch.
-                result += "<|channel>thought\n<channel|>";
+            if (!model_turn_open) {
+                result += "<|turn>model\n";
+                if (!enable_thinking) result += "<|channel>thought\n<channel|>";
+            } else if (!response_prefix_open && enable_thinking) {
+                result += "<|channel>thought\n";
             }
         }
         break;
@@ -597,7 +899,9 @@ std::string render_chat_template(
 
         bool pending_assistant = false;
         bool pending_tool_result = false;
-        for (const auto & msg : messages) {
+        const auto order = dsml_message_order(messages);
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto & msg = messages[order.empty() ? i : order[i]];
             if (msg.role == "system") {
                 continue;
             } else if (msg.role == "user") {
@@ -606,7 +910,7 @@ std::string render_chat_template(
                 pending_assistant = true;
                 pending_tool_result = false;
             } else if (msg.role == "tool" || msg.role == "function") {
-                if (!pending_tool_result) result += "<｜User｜>";
+                result += pending_tool_result ? "\n\n" : "<｜User｜>";
                 result += "<tool_result>";
                 result += msg.content;
                 result += "</tool_result>";
@@ -617,7 +921,13 @@ std::string render_chat_template(
                     result += "<｜Assistant｜>";
                     result += enable_thinking ? "<think>" : "</think>";
                 }
+                // Cold API history contains visible prose, not raw reasoning.
+                if (enable_thinking && !msg.tool_calls_replayed && !msg.tool_calls.empty()) {
+                    result += "</think>";
+                }
                 result += msg.content;
+                append_dsml_tool_calls(result, msg, false);
+                // The official V4 encoder ends tool-call turns with EOS too.
                 result += "<｜end▁of▁sentence｜>";
                 pending_assistant = false;
                 pending_tool_result = false;
@@ -654,8 +964,9 @@ std::string render_chat_template(
 
         bool in_user_turn = false;
         bool pending_assistant = false;
+        const auto order = dsml_message_order(messages);
         for (size_t i = first; i < messages.size(); ++i) {
-            const auto & msg = messages[i];
+            const auto & msg = messages[order.empty() ? i : order[i]];
             if (msg.role == "system") {
                 result += "<｜System｜>";
                 result += msg.content;
@@ -677,7 +988,12 @@ std::string render_chat_template(
                     result += "<｜Assistant｜>";
                     result += enable_thinking ? "<think>" : "</think>";
                 }
+                if (enable_thinking && !msg.tool_calls_replayed && !msg.tool_calls.empty()) {
+                    result += "</think>";
+                }
                 result += msg.content;
+                append_dsml_tool_calls(result, msg, true);
+                // V4.1 retains EOS after its distinct, leading-space DSML tags.
                 result += "<｜end▁of▁sentence｜>";
                 in_user_turn = false;
                 pending_assistant = false;
@@ -753,6 +1069,13 @@ std::string render_chat_template_jinja(
     // eos_token, add_generation_prompt, enable_thinking).
     nlohmann::ordered_json messages_j = nlohmann::ordered_json::array();
     for (const auto & m : messages) {
+        // Arbitrary templates may require tool_calls to consume following
+        // results (Gemma does). Raw replay cannot safely replace that structure.
+        if (m.tool_calls_replayed) {
+            throw std::logic_error(
+                "render_chat_template_jinja: raw tool replay is unsupported; "
+                "normalize with tool-memory replay disabled");
+        }
         nlohmann::ordered_json mj;
         mj["role"]    = m.role;
         mj["content"] = m.content;
@@ -761,6 +1084,19 @@ std::string render_chat_template_jinja(
         }
         if (!m.reasoning_content.empty()) {
             mj["reasoning_content"] = m.reasoning_content;
+        }
+        if (!m.tool_name.empty()) {
+            mj["name"] = m.tool_name;
+        }
+        if (!m.tool_calls.empty()) {
+            auto & calls = mj["tool_calls"] = nlohmann::ordered_json::array();
+            for (const auto & call : m.tool_calls) {
+                calls.push_back({
+                    {"id", call.id},
+                    {"type", "function"},
+                    {"function", {{"name", call.name}, {"arguments", call.arguments}}},
+                });
+            }
         }
         messages_j.push_back(std::move(mj));
     }
@@ -780,6 +1116,31 @@ std::string render_chat_template_jinja(
     if (has_tools) {
         try {
             inputs["tools"] = nlohmann::ordered_json::parse(tools_json);
+            // Chat Completions wraps functions, Responses flattens them, and
+            // Anthropic names the parameter schema input_schema. Templates
+            // receive the same OpenAI-shaped function definition for all three.
+            for (auto & tool : inputs["tools"]) {
+                if (!tool.is_object()) continue;
+                if (!tool.contains("function") && tool.contains("name")) {
+                    auto function = std::move(tool);
+                    function.erase("type");
+                    tool = nlohmann::ordered_json::object();
+                    tool["type"] = "function";
+                    tool["function"] = std::move(function);
+                }
+                if (!tool.contains("function") || !tool["function"].is_object()) continue;
+                auto & function = tool["function"];
+                const auto input_schema = function.find("input_schema");
+                if (input_schema != function.end()) {
+                    if (!function.contains("parameters")) {
+                        auto schema = std::move(*input_schema);
+                        function.erase("input_schema");
+                        function["parameters"] = std::move(schema);
+                    } else {
+                        function.erase("input_schema");
+                    }
+                }
+            }
         } catch (const std::exception & e) {
             throw std::runtime_error(
                 std::string("render_chat_template_jinja: failed to parse tools JSON: ") + e.what());

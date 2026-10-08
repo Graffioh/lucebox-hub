@@ -882,3 +882,38 @@ codex --provider luce "Explain this codebase"
 | Codex models endpoint | ✅ |
 | Reasoning / thinking | ✅ (effort: low / medium) |
 | WebSockets | ❌ (not needed) |
+
+Tool-call history from OpenAI Chat Completions, Responses, and Anthropic Messages
+is normalized into model-independent calls (IDs, names, and typed arguments).
+The selected renderer then emits the model's native protocol: Qwen function
+blocks, Bailing/Laguna argument blocks, DeepSeek V4/V4.1 DSML, or Gemma tool
+calls and responses. Tool results retain their call IDs and resolve function
+names from the corresponding calls, including out-of-order parallel results.
+DeepSeek V4/V4.1 follow the reference encoder: results are reordered by call ID
+into call order before rendering their ID-less result blocks, while intervening
+user text stays in place. Missing or unknown result IDs use the reference's
+rank-zero fallback, preserving arrival order among ties. Cold tool-call history
+closes the thinking channel before assistant prose and calls; remembered raw
+turns retain their existing reasoning. Other built-in renderers retain result
+arrival order, so clients should send parallel results in call order when the
+model protocol cannot uniquely identify the calls.
+
+For built-in renderers, if every call has a non-empty ID and tool memory resolves
+all IDs to the same remembered turn, the server replays that turn byte for byte
+without duplicating assistant text or calls. Otherwise every call is reconstructed
+in order. Missing IDs, partial cache misses, eviction, and server restarts do not
+discard calls. Object arguments become named parameters; non-empty argument
+strings that are invalid JSON or encode a non-object value are preserved as one
+`arguments` parameter. Empty or omitted arguments render a parameterless call.
+
+With `--chat-template-file`, the template always receives structured
+`messages[].tool_calls`, object-valued `function.arguments`, and tool-result
+`tool_call_id` / `name` fields. Tool definitions from all three APIs are exposed
+as OpenAI-shaped `tools[].function` objects. Raw tool-memory replay and its
+canonical-turn cache optimization are bypassed for custom templates: templates
+such as Gemma's need the structured calls to locate and render the results.
+Custom templates that previously read flat `tools[].name` or `input_schema`
+must use `tools[].function.name` and `tools[].function.parameters` instead.
+Custom templates remain limited to features supported by the bundled Jinja
+interpreter; filter-mapped `map('upper')` (used by Gemma's template for union-type
+schemas) is currently unsupported.

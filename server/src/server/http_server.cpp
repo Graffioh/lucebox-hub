@@ -49,6 +49,8 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
 using luce::common::SocketHandle;
@@ -1027,31 +1029,17 @@ static void normalize_anthropic_system(const json & body, json & messages) {
     }
 }
 
-json parse_responses_arguments(const json & item) {
-    if (!item.contains("arguments")) return json::object();
-    const auto & arguments = item["arguments"];
-    if (arguments.is_object()) return arguments;
-    if (arguments.is_string()) {
-        try {
-            return json::parse(arguments.get<std::string>());
-        } catch (const std::exception &) {
-            return json::object();
-        }
+static json normalize_tool_arguments(const json * arguments) {
+    if (!arguments) return json::object();
+    if (arguments->is_object()) return *arguments;
+    if (arguments->is_string()) {
+        const auto & text = arguments->get_ref<const std::string &>();
+        if (text.empty()) return json::object();
+        auto parsed = json::parse(text, nullptr, false);
+        if (parsed.is_object()) return parsed;
     }
-    return json::object();
-}
-
-std::string render_tool_call_xml(const std::string & name, const json & arguments) {
-    std::string out = "<function=" + name + ">\n";
-    if (arguments.is_object()) {
-        for (const auto & [key, value] : arguments.items()) {
-            out += "<parameter=" + key + ">\n";
-            out += value.is_string() ? value.get<std::string>() : value.dump();
-            out += "\n</parameter>\n";
-        }
-    }
-    out += "</function>\n";
-    return out;
+    // Retain malformed/non-object arguments rather than silently losing them.
+    return json{{"arguments", *arguments}};
 }
 
 // Text of an Anthropic tool_result block: a string, or the text blocks of an
@@ -1074,34 +1062,59 @@ static std::string anthropic_tool_result_text(const json & block) {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
-    ToolMemory & tool_memory) {
+    ToolMemory & tool_memory,
+    bool replay_tool_memory) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
-    std::vector<std::string> response_call_ids;
-    std::string response_call_fallback;
+    ChatMessage response_turn;
+    std::vector<const json *> response_arguments;
 
-    auto flush_response_calls = [&]() {
-        if (response_call_fallback.empty()) return;
-        std::string raw = response_call_ids.empty()
-            ? std::string() : tool_memory.lookup(response_call_ids);
-        chat_msgs.push_back({"assistant",
-                             raw.empty() ? response_call_fallback : raw});
-        response_call_ids.clear();
-        response_call_fallback.clear();
+    auto append_call = [](ChatMessage & message, std::vector<const json *> & arguments,
+                          const json & function, std::string id, const char * argument_key) {
+        message.tool_calls.push_back({std::move(id), function.value("name", ""), {}});
+        const auto supplied = function.find(argument_key);
+        arguments.push_back(supplied == function.end() ? nullptr : &*supplied);
+    };
+    auto finish_calls = [&](ChatMessage & message, const std::vector<const json *> & arguments) {
+        if (message.tool_calls.empty()) return;
+        std::string raw;
+        if (replay_tool_memory && !tool_memory.disabled()) {
+            std::vector<std::string> ids;
+            ids.reserve(message.tool_calls.size());
+            for (const auto & call : message.tool_calls) ids.push_back(call.id);
+            // Empty IDs remain in the lookup: partial/id-less turns cannot replay.
+            raw = tool_memory.lookup(ids);
+        }
+        if (!raw.empty()) {
+            message.content = std::move(raw);
+            message.tool_calls_replayed = true;
+        } else {
+            for (size_t i = 0; i < message.tool_calls.size(); ++i) {
+                message.tool_calls[i].arguments = normalize_tool_arguments(arguments[i]);
+            }
+        }
+    };
+    auto flush_response_turn = [&]() {
+        if (response_turn.role.empty()) return;
+        finish_calls(response_turn, response_arguments);
+        chat_msgs.push_back(std::move(response_turn));
+        response_turn = {};
+        response_arguments.clear();
     };
 
     if (messages.is_array()) {
         for (const auto & m : messages) {
             if (format == ApiFormat::RESPONSES && m.is_object()) {
-                std::string item_type = m.value("type", "message");
+                const std::string item_type = m.value("type", "message");
                 if (item_type == "function_call") {
-                    std::string call_id = m.value("call_id", m.value("id", ""));
-                    if (!call_id.empty()) response_call_ids.push_back(call_id);
-                    response_call_fallback += render_tool_call_xml(
-                        m.value("name", ""), parse_responses_arguments(m));
+                    response_turn.role = "assistant";
+                    append_call(response_turn, response_arguments, m,
+                                m.value("call_id", m.value("id", "")), "arguments");
                     continue;
                 }
-                flush_response_calls();
+                if (item_type != "message" || m.value("role", "user") != "assistant") {
+                    flush_response_turn();
+                }
                 if (item_type == "function_call_output") {
                     std::string output;
                     if (m.contains("output") && m["output"].is_string()) {
@@ -1109,15 +1122,21 @@ std::vector<ChatMessage> normalize_chat_messages(
                     } else if (m.contains("output")) {
                         output = m["output"].dump();
                     }
-                    chat_msgs.push_back({"tool", output,
+                    chat_msgs.push_back({"tool", std::move(output),
                                          m.value("call_id", m.value("id", ""))});
                     continue;
                 }
             }
-            if (format == ApiFormat::RESPONSES) flush_response_calls();
 
-            ChatMessage cm;
-            cm.role = m.value("role", "user");
+            // Responses splits one assistant turn into message/function_call
+            // items. Keep adjacent items together for both raw and cold replay.
+            const std::string role = m.value("role", "user");
+            const bool response_assistant = format == ApiFormat::RESPONSES && role == "assistant";
+            ChatMessage local_message;
+            std::vector<const json *> local_arguments;
+            ChatMessage & cm = response_assistant ? response_turn : local_message;
+            auto & arguments = response_assistant ? response_arguments : local_arguments;
+            cm.role = role;
 
             // Carry a replayed assistant turn's prior <think> text through to
             // the Jinja renderer as message.reasoning_content (OpenAI/DeepSeek
@@ -1136,9 +1155,7 @@ std::vector<ChatMessage> normalize_chat_messages(
             const bool anthropic_blocks = format == ApiFormat::ANTHROPIC &&
                 m.contains("content") && m["content"].is_array();
 
-            // Anthropic sends tool results as tool_result blocks at the
-            // start of a user turn. Each becomes a tool message; the user's
-            // own text, if any, follows them.
+            // Anthropic tool results precede any user text in the same turn.
             if (anthropic_blocks && cm.role == "user") {
                 bool has_results = false;
                 std::string text;
@@ -1159,69 +1176,60 @@ std::vector<ChatMessage> normalize_chat_messages(
                 }
             }
 
-            // Tool calls come back as OpenAI tool_calls or Anthropic
-            // tool_use blocks. Tool memory replays the call as the model
-            // wrote it.
-            std::vector<std::string> call_ids;
-            std::string rendered_calls;
             if (cm.role == "assistant" && m.contains("tool_calls") &&
                 m["tool_calls"].is_array()) {
+                cm.tool_calls.reserve(cm.tool_calls.size() + m["tool_calls"].size());
+                arguments.reserve(arguments.size() + m["tool_calls"].size());
                 for (const auto & tc : m["tool_calls"]) {
-                    std::string id = tc.value("id", "");
-                    if (!id.empty()) call_ids.push_back(id);
+                    if (!tc.is_object()) continue;
+                    const auto function = tc.find("function");
+                    if (function == tc.end() || !function->is_object()) continue;
+                    append_call(cm, arguments, *function, tc.value("id", ""), "arguments");
                 }
             }
             if (anthropic_blocks && cm.role == "assistant") {
                 for (const auto & part : m["content"]) {
-                    if (!part.is_object() || part.value("type", "") != "tool_use")
-                        continue;
-                    std::string id = part.value("id", "");
-                    if (!id.empty()) call_ids.push_back(id);
-                    if (!rendered_calls.empty()) rendered_calls += "\n";
-                    rendered_calls += "<tool_call>\n" +
-                        render_tool_call_xml(part.value("name", ""),
-                                             part.value("input", json::object())) +
-                        "</tool_call>";
+                    if (!part.is_object() || part.value("type", "") != "tool_use") continue;
+                    append_call(cm, arguments, part, part.value("id", ""), "input");
                 }
             }
 
-            bool replayed = false;
-            if (!call_ids.empty()) {
-                std::string raw = tool_memory.lookup(call_ids);
-                if (!raw.empty()) {
-                    cm.content = raw;
-                    replayed = true;
-                }
-            }
-
-            if (!replayed) {
+            if (!response_assistant) finish_calls(cm, arguments);
+            if (!cm.tool_calls_replayed) {
+                std::string text;
                 if (m.contains("content") && m["content"].is_string()) {
-                    cm.content = m["content"].get<std::string>();
+                    text = m["content"].get<std::string>();
                 } else if (m.contains("content") && m["content"].is_array()) {
                     for (const auto & part : m["content"]) {
-                        std::string ptype = part.value("type", "");
-                        if (ptype == "text" || ptype == "input_text" ||
-                            ptype == "output_text") {
-                            cm.content += part.value("text", "");
+                        if (!part.is_object()) continue;
+                        const std::string ptype = part.value("type", "");
+                        if (ptype == "text" || ptype == "input_text" || ptype == "output_text") {
+                            text += part.value("text", "");
                         }
                     }
                 }
-                // Calls the server no longer remembers: the Qwen template's
-                // own rendering of message.tool_calls.
-                if (!rendered_calls.empty()) {
-                    if (!cm.content.empty()) cm.content += "\n\n";
-                    cm.content += rendered_calls;
+                if (!text.empty()) {
+                    if (cm.content.empty()) {
+                        cm.content = std::move(text);
+                    } else {
+                        cm.content += "\n\n";
+                        cm.content += text;
+                    }
                 }
             }
+            if (cm.role == "tool" || cm.role == "function") {
+                cm.tool_call_id = m.value("tool_call_id", "");
+                cm.tool_name = m.value("name", "");
+            }
+            if (response_assistant) continue;
 
-            if (format == ApiFormat::RESPONSES &&
-                (cm.role == "system" || cm.role == "developer")) {
-                system_parts.push_back(cm.content);
+            if (format == ApiFormat::RESPONSES && (cm.role == "system" || cm.role == "developer")) {
+                system_parts.push_back(std::move(cm.content));
             } else {
                 chat_msgs.push_back(std::move(cm));
             }
         }
-        flush_response_calls();
+        flush_response_turn();
     } else if (messages.is_string()) {
         chat_msgs.push_back({"user", messages.get<std::string>()});
     }
@@ -1232,9 +1240,21 @@ std::vector<ChatMessage> normalize_chat_messages(
             if (i) merged_system += "\n\n";
             merged_system += system_parts[i];
         }
-        chat_msgs.insert(chat_msgs.begin(), {"system", merged_system});
+        chat_msgs.insert(chat_msgs.begin(), {"system", std::move(merged_system)});
     }
 
+    // Resolve names only after the message vector is stable; views avoid
+    // copying IDs/names while associating out-of-order tool results.
+    std::unordered_map<std::string_view, std::string_view> tool_names;
+    for (auto & message : chat_msgs) {
+        for (const auto & call : message.tool_calls) {
+            if (!call.id.empty()) tool_names[call.id] = call.name;
+        }
+        if (message.tool_name.empty() && !message.tool_call_id.empty()) {
+            const auto name = tool_names.find(message.tool_call_id);
+            if (name != tool_names.end()) message.tool_name = name->second;
+        }
+    }
     return chat_msgs;
 }
 
@@ -2497,9 +2517,8 @@ bool HttpServer::render_messages_to_text(
     }
 
     if (!config_.chat_template_src.empty()) {
-        // Jinja path: --chat-template-file overrides the hardcoded
-        // QWEN3/LAGUNA renderer. Used for tool-using agents that need the
-        // Anthropic tool_use envelope (e.g. froggeric Qwen3.6 template).
+        // Custom templates receive structured calls and normalized schemas;
+        // unlike the built-in renderers, they cannot safely replay raw turns.
         //
         // Special tokens like <|im_start|> / <|im_end|> are stored verbatim
         // in the GGUF vocab — use raw_token() to skip the GPT-2 byte decode
@@ -2666,7 +2685,8 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         }
 
         const std::vector<ChatMessage> chat_messages =
-            normalize_chat_messages(req.messages, req.format, tool_memory_);
+            normalize_chat_messages(req.messages, req.format, tool_memory_,
+                                    config_.chat_template_src.empty());
         req.ends_with_tool_result =
             http_detail::ends_with_tool_result(chat_messages);
         // Reasoning must be applied BEFORE rendering: the template injects
@@ -3367,7 +3387,7 @@ void HttpServer::apply_flowkv_compression(
     }
 
     const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
-        modified_messages, req.format, tool_memory_);
+        modified_messages, req.format, tool_memory_, config_.chat_template_src.empty());
 
     std::string rendered;
     std::string render_error;
@@ -3412,7 +3432,7 @@ std::string HttpServer::apply_pflash_compression(
     auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
 
     const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
-        req.messages, req.format, tool_memory_);
+        req.messages, req.format, tool_memory_, config_.chat_template_src.empty());
     std::string rendered_messages;
     std::string render_error;
     if (!render_messages_to_text(
@@ -4431,10 +4451,12 @@ void HttpServer::remember_agent_turn(
     const bool valid_tool_turn = result.ok() && completion_tokens > 0 &&
         visible_output_seen && !client_disconnected && !req.tools.empty() &&
         !emitter.tool_calls().empty() && !emitter.accumulated_raw().empty();
-    if (!supported_format || !valid_tool_turn) return;
+    // Arbitrary Jinja templates need structured calls to render their results;
+    // raw-turn caching cannot preserve that contract.
+    if (!supported_format || !valid_tool_turn || !config_.chat_template_src.empty()) return;
 
     std::vector<ChatMessage> messages =
-        normalize_chat_messages(req.messages, req.format, tool_memory_);
+        normalize_chat_messages(req.messages, req.format, tool_memory_, true);
     static constexpr const char * kSentinel =
         "__LUCE_AGENT_TURN_CONTENT_7A21D9__";
     messages.push_back({"assistant", kSentinel});
@@ -4471,6 +4493,13 @@ void HttpServer::remember_agent_turn(
     // Cache only stateless-equivalent prompts. Compression and token rewrites
     // need a separate replay contract.
     if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
+
+    auto & replayed_turn = messages.back();
+    replayed_turn.tool_calls_replayed = true;
+    replayed_turn.tool_calls.reserve(emitter.tool_calls().size());
+    for (const auto & call : emitter.tool_calls()) {
+        replayed_turn.tool_calls.push_back({call.id, call.name, {}});
+    }
 
     std::string canonical_rendered;
     if (!render_messages_to_text(
