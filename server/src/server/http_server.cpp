@@ -4616,6 +4616,8 @@ void HttpServer::prepare_generation_inputs(
         config_.hard_limit_reply_budget > 0) {
         inputs.request.budget_hook.close_token_ids =
             config_.think_close_token_ids;
+        inputs.request.budget_hook.marker_token_ids =
+            config_.think_marker_token_ids;
         inputs.request.budget_hook.hard_limit_remaining = reply_budget;
     }
 

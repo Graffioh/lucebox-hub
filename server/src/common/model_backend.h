@@ -169,6 +169,12 @@ struct ModelBackend {
     // ── Generation ───────────────────────────────────────────────────
     // Run a full prefill + decode cycle. Backend owns the strategy
     // (autoregressive, speculative, DDTree, …).
+    // Decode contract for every backend, including restore paths: create one
+    // ThinkingBudget from req.budget_hook and the effective output cap. Share
+    // it with the seed and all decode strategies. Apply accepted candidates
+    // before history/KV/emission; never process prompts or replay tokens.
+    // A speculative cut must repair KV even if emission cancels the request.
+    // Prefer the shared AR/speculative loops when adding a model adapter.
     GenerateResult generate(const GenerateRequest & req, const DaemonIO & io) {
         GenerateResult result = generate_impl(req, io);
         if (!should_retry_empty_spec_decode(req, result)) return result;

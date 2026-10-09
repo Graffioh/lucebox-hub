@@ -54,11 +54,9 @@ struct SchedSlot {
     // reader can never head-of-line-block the shared decode loop.
     luce::common::ClientSendBuffer send_buffer;
     // Thinking-budget force-close, applied scheduler-side before the token
-    // is fed back (mirrors do_ar_decode's maybe_force_close).
+    // is fed back (the same rule as do_ar_decode, common/thinking_budget.h).
     luce::common::BudgetHook hook;
-    bool hook_started = false;
-    int  hook_pos = 0;
-    bool budget_forced_close = false;
+    luce::common::ThinkingBudget budget;
     bool degenerate_close = false;
 };
 
@@ -200,37 +198,16 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
     };
 
-    auto maybe_force_close = [](SchedSlot & s, int32_t & tok) {
-        if (s.hook.close_token_ids.empty()) return;
-        if (s.hook_started) {
-            if (s.hook_pos < (int)s.hook.close_token_ids.size()) {
-                tok = s.hook.close_token_ids[(size_t)s.hook_pos++];
-            }
-            return;
-        }
-        const int generated = (int)s.gen_tokens.size();
-        const int remaining = s.n_gen_cap - generated;
-        if (remaining <= s.hook.hard_limit_remaining) {
-            const int32_t first_close = s.hook.close_token_ids.front();
-            s.hook_started = true;
-            s.hook_pos = 1;
-            if (tok != first_close) {
-                tok = first_close;
-                s.budget_forced_close = true;
-            }
-        }
-    };
-
     // Advances one slot by a single sampled token — the post-sample path
     // shared by the first (prefill-logits) token and every decode-step token.
-    // Note `tok` is by value but not passthrough: maybe_force_close may
-    // *substitute* a close token for it, and that substitute is what gets
+    // Note `tok` is by value but not passthrough: the shared budget may
+    // substitute a close token, and that substitute is what gets
     // recorded, emitted, and fed back. Appends to gen_tokens, streams the
     // delta into send_buffer, and parks the token in pending_tok as the next
     // step's input for this slot. Sets s.finished — but never retires the
     // slot — on EOS, gen cap, stop-sequence hit, or degenerate repetition.
     auto advance_slot = [&](SchedSlot & s, int32_t tok) {
-        maybe_force_close(s, tok);
+        tok = s.budget.apply(tok).token;
         s.gen_tokens.push_back(tok);
         const bool cont = deliver_generation_token(
             s.job, s.job->req, *s.emitter, tok, s.completion_tokens,
@@ -259,8 +236,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         // Post-close repetition watchdog (periods 12..80), mirrors
         // do_ar_decode's sweep once the close sequence has fully injected.
-        if (s.hook_started &&
-            s.hook_pos >= (int)s.hook.close_token_ids.size()) {
+        if (s.budget.forced_close() && !s.budget.injecting()) {
             const auto end = s.gen_tokens.end();
             const int avail = (int)s.gen_tokens.size();
             for (int P = 12; P <= 80; P++) {
@@ -336,7 +312,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         } else if (!req.stream && !s.client_disconnected) {
             send_nonstream_response(req, s.fd, *s.emitter, s.gen_tokens,
-                                    s.n_gen_cap, s.budget_forced_close,
+                                    s.n_gen_cap, s.budget.forced_close(),
                                     s.degenerate_close, gen_timings,
                                     &s.send_buffer);
         }
@@ -696,8 +672,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (budget_active && !config_.think_close_token_ids.empty() &&
             config_.hard_limit_reply_budget > 0) {
             s.hook.close_token_ids = config_.think_close_token_ids;
+            s.hook.marker_token_ids = config_.think_marker_token_ids;
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
         }
+        s.budget = luce::common::ThinkingBudget(s.hook, s.n_gen_cap);
         live_slots++;
         publish_live_count();
         return AdmissionDisposition::Admitted;
@@ -893,7 +871,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (!s.job || parked(i)) continue;
                 if (!s.prefilling) {
                     step_plan.decode.push_back(
-                        {i, s.pending_tok, s.hook.close_token_ids.empty()});
+                        {i, s.pending_tok, s.budget.settled()});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }

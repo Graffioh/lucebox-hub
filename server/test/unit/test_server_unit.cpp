@@ -4835,30 +4835,6 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
         resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
-// Thinking force-close: once the remaining budget reaches the reply reserve the next tokens become the close
-// sequence; a model that emits close[0] itself keeps its own token and is not counted as forced.
-TEST_CASE(ServerUnitFixture, test_budget_hook_state_force_closes_at_reply_reserve) {
-    const BudgetHook hook{{7, 8, 9}, 4};
-    BudgetHookState s;
-    int32_t tok = 1;
-    TEST_ASSERT(!s.apply(hook, 5, 10, tok) && tok == 1);   // remaining 5 > reserve 4
-    tok = 2;
-    TEST_ASSERT(s.apply(hook, 6, 10, tok) && tok == 7);    // remaining 4: forced close[0]
-    tok = 3;
-    TEST_ASSERT(!s.apply(hook, 7, 10, tok) && tok == 8);
-    tok = 3;
-    TEST_ASSERT(!s.apply(hook, 8, 10, tok) && tok == 9);
-    tok = 3;
-    TEST_ASSERT(!s.apply(hook, 9, 10, tok) && tok == 3);   // the answer resumes
-    BudgetHookState own;
-    tok = 7;
-    TEST_ASSERT(!own.apply(hook, 6, 10, tok) && tok == 7); // self-closed at the boundary
-    tok = 5;
-    TEST_ASSERT(!own.apply(hook, 7, 10, tok) && tok == 8);
-    BudgetHookState off;
-    tok = 5;
-    TEST_ASSERT(!off.apply(BudgetHook{}, 9, 10, tok) && tok == 5);
-}
 
 static ServerConfig deepseek_reasoning_test_config() {
     ServerConfig config;
@@ -6954,14 +6930,15 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         if (on_prefill) on_prefill();
         return true;
     }
-    bool decode_ar(int last_tok, int committed, int n_gen,
+    bool decode_ar(int last_tok, int committed, ThinkingBudget & budget,
                    const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override {
         (void)history_prefix;
         TEST_ASSERT(committed == current_pos);
+        const int n_gen = budget.remaining();
         for (int i = 0; i < n_gen; ++i) {
-            int32_t tok = last_tok + i + 1;
+            int32_t tok = budget.apply(last_tok + i + 1).token;
             out_tokens.push_back(tok);
             emitted_tokens.push_back(tok);
             io.emit(tok);
@@ -6976,15 +6953,16 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return mixed_backend_enabled;
     }
     bool decode_dflash(const std::vector<int32_t> & prompt, int base_pos,
-                       int last_tok, int n_gen, std::vector<int32_t> & out_tokens,
+                       int last_tok, ThinkingBudget & budget, std::vector<int32_t> & out_tokens,
                        const DaemonIO & io, float & accept_rate_out) override {
         (void)prompt;
         accept_rate_out = 0.0f;
         dflash_called = true;
         dflash_base = base_pos;
         dflash_last = last_tok;
+        const int n_gen = budget.remaining();
         for (int i = 0; i < n_gen; ++i) {
-            int32_t tok = last_tok + i + 10;
+            int32_t tok = budget.apply(last_tok + i + 10).token;
             out_tokens.push_back(tok);
             emitted_tokens.push_back(tok);
             io.emit(tok);

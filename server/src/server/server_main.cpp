@@ -1896,6 +1896,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         auto close_ids = tokenizer.encode(close_text);
         if (!close_ids.empty()) {
             sconfig.think_close_token_ids = close_ids;
+            // The marker alone is how the hook recognizes that the model
+            // closed thinking itself, after which it no longer intervenes.
+            sconfig.think_marker_token_ids = tokenizer.encode(marker);
             const char * src = card.thinking_terminator_hint.empty()
                                    ? "marker-only" : "sidecar-hint";
             std::fprintf(stderr,
