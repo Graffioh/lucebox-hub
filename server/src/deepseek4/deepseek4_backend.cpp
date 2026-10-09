@@ -2,7 +2,7 @@
 #include "deepseek4_roctx.h"
 
 #include "deepseek4_backend.h"
-#include "deepseek4_budget_hook.h"
+#include "thinking_budget.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_image_spans.h"
 #include "deepseek4_image_budget.h"
@@ -4482,10 +4482,8 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                   const std::vector<int32_t> & history_prefix,
                                   std::vector<int32_t> & out_tokens,
                                   const DaemonIO & io,
-                                  const BudgetHook & budget_hook,
-                                  bool * forced_close_out) {
+                                  ThinkingBudget & budget) {
     const DeepSeek4RoctxPhaseScope roctx_phase(InferencePhase::Decode);
-    if (forced_close_out) *forced_close_out = false;
     const bool timing = env_flag_enabled("LUCE_DS4_TIMING");
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
@@ -4498,17 +4496,6 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             history.reserve(history.size() + (size_t)n_gen);
         }
     }
-
-    // Budget-hook state. The close sequence is injected one token per step, then decoding
-    // CONTINUES so the model can spend the reserved reply budget on a visible answer. The
-    // previous implementation pushed the whole close sequence and broke out of the loop, which
-    // (a) never ran a forward over the injected tokens, so KV state did not reflect them, and
-    // (b) ended generation, so the reply budget was reserved and never usable. Measured on
-    // DeepSeek-V4-Flash: total tokens came to exactly thinking_ceiling + len(close_sequence)
-    // for close sequences of 1, 3 and 23 tokens -- zero tokens of answer in every case, while
-    // finish_reason still reported "stop". This mirrors qwen35_backend's override-and-continue.
-    bool budget_close_started = false;
-    size_t close_inject_pos = 0;
 
     for (int generated = 0; generated < n_gen; generated++) {
         if (io.is_cancelled()) break;
@@ -4582,18 +4569,10 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         }
         if (timing) tel_acc.sample_us += elapsed_us(sample_t0, Clock::now());
 
-        // Budget hook: steer the tail of the window into the close sequence, then let the model
-        // keep going. Runs before history.push_back so penalty history records what was
-        // actually emitted. The rule lives in a header-only helper so it is testable without a
-        // model; see deepseek4_budget_hook.h for why this overrides rather than appends.
-        {
-            bool hook_forced = false;
-            next_token = luce::deepseek4::budget_hook_apply(
-                budget_hook.close_token_ids, n_gen - generated,
-                budget_hook.hard_limit_remaining, next_token,
-                budget_close_started, close_inject_pos, hook_forced);
-            if (hook_forced && forced_close_out) *forced_close_out = true;
-        }
+        // Account only output tokens, before recording their emitted values
+        // in penalty history. The controller also covers the first seed.
+        if (io.is_cancelled()) break;
+        next_token = budget.apply(next_token).token;
 
         if (process_logits) {
             history.push_back(next_token);
@@ -4783,14 +4762,11 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 
     // Decode
     auto t1 = Clock::now();
-    // A thinking budget runs inside DSpark (DSparkBudgetHook), which emits
-    // what the AR loop's hook would. The seed is emitted before DSpark starts,
-    // so a hook that would already fire on it decodes AR.
-    // LUCE_DS4_SPEC_HOOK=0 routes every budgeted request through AR.
-    const bool budget_hook_active = !req.budget_hook.close_token_ids.empty();
-    const bool budget_requires_ar = budget_hook_active &&
-        (env_flag_disabled("LUCE_DS4_SPEC_HOOK") ||
-         req.n_gen <= req.budget_hook.hard_limit_remaining);
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
+    // DSpark shares the seed's controller, including a close forced on the
+    // seed itself. LUCE_DS4_SPEC_HOOK=0 remains an explicit AR override.
+    const bool budget_requires_ar = !req.budget_hook.close_token_ids.empty() &&
+        env_flag_disabled("LUCE_DS4_SPEC_HOOK");
     // Sampling and penalties run through DSpark as speculative sampling
     // (deepseek4_spec_sampling.h): drafts stay greedy and each is kept with
     // the target sampler's probability, so tokens follow the request's sampler.
@@ -4837,11 +4813,17 @@ GenerateResult DeepSeek4Backend::generate_from_state(
             spec_sampler->rng = &sampler_rng_;
             seed = sample_logits(last_logits_.data(), w_.n_vocab, sampler_,
                                  spec_sampler->history, sampler_rng_);
-            spec_sampler->history.push_back(seed);
         } else {
             float mv = last_logits_[0];
             for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; }
         }
+        if (out_io.is_cancelled()) {
+            result.succeed();
+            maybe_save_routing_stats();
+            return result;
+        }
+        seed = budget.apply(seed).token;
+        if (spec_sampler) spec_sampler->history.push_back(seed);
         if (env_flag_enabled("LUCE_DS4_TIMING")) {
             size_t nonfinite_logits = 0;
             for (float value : last_logits_) {
@@ -4858,7 +4840,6 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         out_io.emit(seed);
         float accept_rate = 0.0f;
         bool spec_ran = false;
-        bool spec_forced_close = false;
         if (!out_io.is_cancelled() && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
@@ -4868,19 +4849,12 @@ GenerateResult DeepSeek4Backend::generate_from_state(
             // advances the target cache, reject post-decode snapshots rather
             // than pairing that state with stale prefill logits.
             last_logits_pos_ = -1;
-            std::optional<DSparkBudgetHook> spec_hook;
-            if (budget_hook_active) {
-                spec_hook.emplace();
-                spec_hook->close_ids = req.budget_hook.close_token_ids;
-                spec_hook->hard_limit = req.budget_hook.hard_limit_remaining;
-            }
             if (!run_deepseek4_dspark_spec_decode(
                     backend_, cfg_.device.gpu, w_, cache_, *spec_drafter_, committed, seed,
-                    req.n_gen - 1,
+                    req.n_gen - 1, budget,
                     win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
                     spec_toks, &accept_rate,
                     [&out_io](int32_t tok) {
-                        if (out_io.is_cancelled()) return false;
                         out_io.emit(tok);
                         return !out_io.is_cancelled();
                     },
@@ -4889,20 +4863,19 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                     expert_runtime_.compute ? &expert_runtime_ : nullptr,
                     routing_stats_.get(),
                     spec_sampler ? &*spec_sampler : nullptr,
-                    spec_hook ? &*spec_hook : nullptr)) {
+                    [&out_io]() { return out_io.is_cancelled(); })) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");
                 return result;
             }
             gen.insert(gen.end(), spec_toks.begin(), spec_toks.end());
-            spec_forced_close = spec_hook && spec_hook->fired;
         }
         result.succeed();
         result.tokens = std::move(gen);
         result.decode_s = elapsed_s(t1);
         result.accept_rate = accept_rate;
         result.spec_decode_ran = spec_ran;
-        result.budget_forced_close = spec_forced_close;
+        result.budget_forced_close = budget.forced_close();
         std::fprintf(stderr, "[deepseek4] DSpark decode: %zu tok in %.3fs (%.1f tok/s) accept_rate=%.2f\n",
                      result.tokens.size(), result.decode_s,
                      result.decode_s > 0 ? result.tokens.size() / result.decode_s : 0.0, accept_rate);
@@ -4913,9 +4886,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     std::vector<int32_t> gen_tokens;
     gen_tokens.reserve(req.n_gen);
 
-    bool forced_close = false;
     if (!do_decode(committed, req.n_gen, req.prompt, gen_tokens, out_io,
-                   req.budget_hook, &forced_close)) {
+                   budget)) {
         result.fail(GenerateErrorCode::DecodeFailed);
         return result;
     }
@@ -4923,7 +4895,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     result.succeed();
     result.tokens = std::move(gen_tokens);
     result.decode_s = elapsed_s(t1);
-    result.budget_forced_close = forced_close;
+    result.budget_forced_close = budget.forced_close();
     maybe_save_routing_stats();
     return result;
 }

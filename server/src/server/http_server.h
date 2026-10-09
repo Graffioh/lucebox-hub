@@ -163,6 +163,9 @@ struct ServerConfig {
     // populates this from the tokenizer after loading; HttpServer just
     // forwards into GenerateRequest.budget_hook when thinking is opted in.
     std::vector<int32_t> think_close_token_ids;
+    // The bare end-of-thinking marker, used as BudgetHook.marker_token_ids
+    // so the hook stops once the model closes thinking on its own.
+    std::vector<int32_t> think_marker_token_ids;
 
     // Phase-1 budgets per `reasoning.effort` tier (spec §4.2). Selected
     // by the request parser when `reasoning.effort` is present. Each

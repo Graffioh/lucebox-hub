@@ -546,11 +546,14 @@ GenerateResult Qwen4ExpBackend::run(const GenerateRequest & req, const DaemonIO 
     auto sample = [&](const float * row) {
         return (int32_t) sample_logits(row, weights_.n_vocab, req.sampler, history, rng);
     };
-    BudgetHookState budget;   // thinking force-close: keeps the reply reserve of the budget for the answer
+    ThinkingBudget budget(req.budget_hook, req.n_gen);
     bool cancelled = false;
-    // Commits a sampled token, after the budget hook's substitution; false once generation ends.
+    // MTP compares this substituted token with its draft before retaining the
+    // next row, so matching forced drafts are safe and mismatches cut the block.
+    // False ends generation. The same controller also owns the prefill seed.
     auto commit = [&](int32_t & tok) {
-        if (budget.apply(req.budget_hook, (int) result.tokens.size(), req.n_gen, tok)) result.budget_forced_close = true;
+        tok = budget.apply(tok).token;
+        result.budget_forced_close = budget.forced_close();
         result.tokens.push_back(tok);
         io.emit(tok);
         if (io.is_cancelled()) {
