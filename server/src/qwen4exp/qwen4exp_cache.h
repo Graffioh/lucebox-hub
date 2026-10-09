@@ -186,7 +186,10 @@ struct Qwen4ExpCache {
     std::array<Qwen4ExpDecodeWorkspace, QWEN4EXP_MTP_MAX_DRAFT + 1> mtp_rank_workspace;
 
     // Split mode (Qwen4ExpWeights::expert_backend): schedulers over the target,
-    // the expert device and the CPU, reused across forwards.
+    // the expert device and the CPU, reused across forwards. Concurrency slots
+    // use the first slot's (split_owner): one forward runs at a time, so one
+    // prompt chunk's buffers serve every slot, as the chunk planner counts them.
+    Qwen4ExpCache *      split_owner       = nullptr;   // not owned; null: this cache's own
     ggml_backend_sched_t split_sched       = nullptr;   // prompt chunks
     ggml_backend_sched_t split_sched_short = nullptr;   // decode and short batches
     uint64_t             split_short_gen   = 0;         // bumped on every short-scheduler allocation
@@ -209,8 +212,10 @@ void clear_qwen4exp_batched_decode_workspace(Qwen4ExpBatchedDecodeWorkspace & wo
 // cur_pos. KV is left intact: the next sequence overwrites it from position 0.
 void reset_qwen4exp_state(ggml_backend_t backend, Qwen4ExpCache & c);
 
-// Prefix-sized device copies. Live strip views remain valid until the cache is
-// freed; callers must release snapshots first. No verify scratch is retained.
+// Prefix-sized copies, in the memory of the `store` backend they were saved to:
+// the device's own, or system memory (create_snapshot_backend). Live strip views
+// remain valid until the cache is freed; callers must release snapshots first.
+// No verify scratch is retained.
 struct Qwen4ExpSnapshot {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
@@ -222,9 +227,11 @@ struct Qwen4ExpSnapshot {
     std::vector<float> logits;
 };
 
-size_t qwen4exp_snapshot_bytes(ggml_backend_t backend, const Qwen4ExpCache & c, int tokens,
+size_t qwen4exp_snapshot_bytes(ggml_backend_t store, const Qwen4ExpCache & c, int tokens,
                              size_t * host_bytes = nullptr);
-bool save_qwen4exp_snapshot(ggml_backend_t backend, const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
+// Copy `c`, which lives on `backend`, into a snapshot allocated on `store`.
+bool save_qwen4exp_snapshot(ggml_backend_t backend, ggml_backend_t store, const Qwen4ExpCache & c,
+                            Qwen4ExpSnapshot & s);
 // Restore into `c`, the cache `s` was saved from or another one with the same trunk layout (a
 // concurrency slot resuming another slot's checkpoint). The MTP draft layer's state comes along
 // when both caches have the layer; a cache that has it, restored from a snapshot without it, keeps
