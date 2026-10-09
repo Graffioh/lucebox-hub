@@ -62,6 +62,7 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <type_traits>
@@ -2937,6 +2938,227 @@ TEST_CASE(ServerUnitFixture, test_emitter_responses_bare_function_tool_call) {
     }
     TEST_ASSERT(finish_str.find("\"type\":\"function_call\"") != std::string::npos);
     TEST_ASSERT(finish_str.find("response.function_call_arguments.done") != std::string::npos);
+}
+
+// The OpenAI Responses stream contract for a tool call, as clients parse it
+// (Pi's openai-responses provider builds a call only from an item that
+// response.output_item.added opened): the message item is closed at
+// output_index 0, then the function_call item is added, its arguments
+// streamed and done, the item done, and response.completed lists both items.
+namespace {
+// One streamed Responses turn: the events' data payloads, in order.
+struct ResponsesTurn {
+    std::vector<json> events;
+    json completed_output;
+    std::vector<ToolCall> calls;
+};
+
+json responses_turn_tools() {
+    return json::array({
+        {{"type", "function"}, {"name", "ls"},
+         {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}},
+        {{"type", "function"}, {"name", "read"},
+         {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}}});
+}
+
+ResponsesTurn stream_responses_turn(const std::string & generated, ToolMemory * memory) {
+    const json tools = responses_turn_tools();
+    SseEmitter em(ApiFormat::RESPONSES, "resp_rt", "test-model", 10, tools, memory);
+    std::vector<std::string> raw = em.emit_start();
+    for (const auto & e : em.emit_token(generated)) raw.push_back(e);
+    for (const auto & e : em.emit_finish(12)) raw.push_back(e);
+    ResponsesTurn turn;
+    for (const auto & e : raw) {
+        const size_t at = e.find("data: ");
+        if (at == std::string::npos) continue;
+        const size_t end = e.find('\n', at);
+        turn.events.push_back(json::parse(e.substr(at + 6, end - at - 6)));
+    }
+    turn.completed_output = turn.events.back()["response"]["output"];
+    turn.calls = em.tool_calls();
+    return turn;
+}
+
+// A client replaying the turn (Pi, OMP): the completed output items as
+// input, then one function_call_output per call.
+json responses_replay(const json & output) {
+    json input = json::array({{{"role", "user"}, {"content", "go"}}});
+    for (const auto & item : output) input.push_back(item);
+    for (const auto & item : output) {
+        if (item["type"] == "function_call") {
+            input.push_back({{"type", "function_call_output"}, {"call_id", item["call_id"]}, {"output", "ok"}});
+        }
+    }
+    return input;
+}
+
+size_t count_of(const std::string & hay, const std::string & needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + needle.size())) ++n;
+    return n;
+}
+
+}  // namespace
+
+// Round trips: the completed turn, replayed, normalises to ONE assistant
+// turn -- the remembered raw generation once on a tool-memory hit, the prose
+// plus the calls' native rendering on a miss -- with no duplicated prose and
+// no extra assistant boundary.
+TEST_CASE(ServerUnitFixture, test_responses_turn_round_trip_one_assistant_turn) {
+    const std::string call_ls = "<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+    const std::string call_read = "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>";
+    struct Case { std::string generated; std::string prose; size_t calls; };
+    const std::vector<Case> cases = {
+        {call_ls, "", 1},                                   // empty message
+        {"Listing.\n" + call_ls, "Listing.", 1},             // text + tool
+        {"Two.\n" + call_ls + "\n" + call_read, "Two.", 2}, // text + two calls
+    };
+    for (const auto & c : cases) {
+        for (const bool hit : {true, false}) {
+            ToolMemory memory;
+            const auto turn = stream_responses_turn(c.generated, hit ? &memory : nullptr);
+            TEST_ASSERT(turn.calls.size() == c.calls);
+            ToolMemory replay_memory;
+            ToolMemory & used = hit ? memory : replay_memory;
+            const auto chat = normalize_chat_messages(
+                responses_replay(turn.completed_output), ApiFormat::RESPONSES, used);
+            TEST_ASSERT(chat.size() == 2 + c.calls);     // user, ONE assistant, the tool results
+            if (chat.size() != 2 + c.calls) continue;
+            TEST_ASSERT(chat[0].role == "user");
+            TEST_ASSERT(chat[1].role == "assistant");
+            for (size_t k = 0; k < c.calls; ++k) TEST_ASSERT(chat[2 + k].role == "tool");
+            TEST_ASSERT(chat[1].tool_calls.size() == c.calls);
+            TEST_ASSERT(chat[1].tool_calls_replayed == hit);
+            const std::string & content = chat[1].content;
+            if (hit) {
+                TEST_ASSERT(content == c.generated);    // the remembered raw turn, exactly once
+            } else {
+                TEST_ASSERT(chat[1].tool_calls.at(0).name == "ls");
+                TEST_ASSERT(chat[1].tool_calls.at(0).arguments == json({{"path", "."}}));
+                const std::string rendered = render_chat_template(
+                    {chat[1]}, ChatFormat::QWEN3, false);
+                TEST_ASSERT(count_of(rendered, "<tool_call>") == c.calls);
+                if (!c.prose.empty()) {
+                    TEST_ASSERT(content.rfind(c.prose, 0) == 0);
+                    TEST_ASSERT(count_of(content, c.prose) == 1);
+                } else {
+                    TEST_ASSERT(content.empty());
+                }
+            }
+        }
+    }
+}
+
+// Several calls: unique, ordered output indices; the arguments of each call
+// equal across delta, arguments done, item done and the completed output.
+TEST_CASE(ServerUnitFixture, test_responses_multiple_calls_indices_and_arguments) {
+    const auto turn = stream_responses_turn(
+        "Two.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+        nullptr);
+    TEST_ASSERT(turn.calls.size() == 2);
+    std::vector<int> added, done;
+    std::map<int, std::string> delta, args_done, item_done;
+    for (const auto & e : turn.events) {
+        const std::string type = e.value("type", "");
+        const int index = e.value("output_index", -1);
+        if (type == "response.output_item.added") added.push_back(index);
+        if (type == "response.output_item.done") {
+            done.push_back(index);
+            if (e["item"]["type"] == "function_call") item_done[index] = e["item"]["arguments"];
+        }
+        if (type == "response.function_call_arguments.delta") delta[index] += e["delta"].get<std::string>();
+        if (type == "response.function_call_arguments.done") args_done[index] = e["arguments"];
+    }
+    TEST_ASSERT(added == std::vector<int>({0, 1, 2}));
+    TEST_ASSERT(done == std::vector<int>({0, 1, 2}));
+    const json & out = turn.completed_output;
+    TEST_ASSERT(out.size() == 3);
+    for (int index : {1, 2}) {
+        TEST_ASSERT(delta[index] == args_done[index]);
+        TEST_ASSERT(args_done[index] == item_done[index]);
+        TEST_ASSERT(item_done[index] == out[(size_t) index]["arguments"].get<std::string>());
+    }
+    TEST_ASSERT(out[1]["id"] != out[2]["id"]);
+}
+
+TEST_CASE(ServerUnitFixture, test_responses_replay_preserves_turn_boundaries) {
+    ToolMemory memory;
+    const json call = {{"type", "function_call"}, {"call_id", "call_boundary"},
+                       {"name", "ls"}, {"arguments", R"({"path":"."})"}};
+    const json result = {{"type", "function_call_output"},
+                         {"call_id", "call_boundary"}, {"output", "ok"}};
+    const json input = json::array({
+        {{"role", "assistant"}, {"content", "Earlier answer."}},
+        {{"role", "user"}, {"content", "List files."}},
+        {{"type", "message"}, {"role", "assistant"},
+         {"content", json::array({{{"type", "output_text"}, {"text", "Listing."}}})}},
+        call, result,
+        {{"role", "assistant"}, {"content", "Finished."}},
+    });
+    const auto chat = normalize_chat_messages(input, ApiFormat::RESPONSES, memory);
+    TEST_ASSERT(chat.size() == 5);
+    TEST_ASSERT(chat.at(0).role == "assistant" && chat.at(0).content == "Earlier answer.");
+    TEST_ASSERT(chat.at(1).role == "user" && chat.at(1).content == "List files.");
+    TEST_ASSERT(chat.at(2).role == "assistant");
+    TEST_ASSERT(chat.at(2).content == "Listing.");
+    TEST_ASSERT(chat.at(2).tool_calls.size() == 1);
+    TEST_ASSERT(chat.at(2).tool_calls.at(0).name == "ls");
+    TEST_ASSERT(chat.at(2).tool_calls.at(0).arguments == json({{"path", "."}}));
+    TEST_ASSERT(chat.at(3).role == "tool" && chat.at(3).content == "ok");
+    TEST_ASSERT(chat.at(3).tool_call_id == "call_boundary");
+    TEST_ASSERT(chat.at(4).role == "assistant" && chat.at(4).content == "Finished.");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_responses_function_call_item_lifecycle) {
+    json tools = json::array({{
+        {"type", "function"}, {"name", "ls"},
+        {"parameters", {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}}}
+    }});
+    SseEmitter em(ApiFormat::RESPONSES, "resp_test_002", "test-model", 10, tools, nullptr);
+    std::vector<std::string> events = em.emit_start();
+    for (const auto & e : em.emit_token("Listing.\n<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n"))
+        events.push_back(e);
+    for (const auto & e : em.emit_token("</function>\n</tool_call>")) events.push_back(e);
+    for (const auto & e : em.emit_finish(12)) events.push_back(e);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    // Parse the SSE "data:" payloads in order.
+    std::vector<json> data;
+    for (const auto & e : events) {
+        const size_t at = e.find("data: ");
+        if (at == std::string::npos) continue;
+        const size_t end = e.find('\n', at);
+        data.push_back(json::parse(e.substr(at + 6, end - at - 6)));
+    }
+    std::vector<std::string> types;
+    for (const auto & d : data) types.push_back(d.value("type", ""));
+    const auto pos = [&](const std::string & type, int output_index) {
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (types[i] == type && data[i].value("output_index", -1) == output_index) return (int) i;
+        }
+        return -1;
+    };
+    const int msg_added = pos("response.output_item.added", 0);
+    const int msg_done = pos("response.output_item.done", 0);
+    const int fc_added = pos("response.output_item.added", 1);
+    const int fc_delta = pos("response.function_call_arguments.delta", 1);
+    const int fc_args_done = pos("response.function_call_arguments.done", 1);
+    const int fc_done = pos("response.output_item.done", 1);
+    TEST_ASSERT(msg_added >= 0 && msg_done > msg_added);
+    TEST_ASSERT(fc_added > msg_done && fc_delta > fc_added && fc_args_done > fc_delta && fc_done > fc_args_done);
+    if (fc_added >= 0 && fc_done >= 0) {
+        const json & added = data[(size_t) fc_added]["item"];
+        TEST_ASSERT(added["type"] == "function_call" && added["name"] == "ls" && added["status"] == "in_progress");
+        const json & done = data[(size_t) fc_done]["item"];
+        TEST_ASSERT(done["status"] == "completed" && done["call_id"] == added["call_id"]);
+        TEST_ASSERT(json::parse(done["arguments"].get<std::string>())["path"] == ".");
+        TEST_ASSERT(data[(size_t) fc_delta]["item_id"] == added["id"]);
+    }
+    const json & completed = data.back();
+    TEST_ASSERT(completed["type"] == "response.completed");
+    const json & output = completed["response"]["output"];
+    TEST_ASSERT(output.size() == 2 && output[0]["type"] == "message" && output[1]["type"] == "function_call");
+    TEST_ASSERT(output[0]["content"][0]["text"] == "Listing.\n");
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_streaming_openai_has_done) {
