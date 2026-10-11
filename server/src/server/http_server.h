@@ -545,6 +545,23 @@ PflashChatTurnSpan pflash_chat_query_turn(
 // whitespace included. A message with empty content maps to the empty span
 // {0, 0}. False (``out`` cleared) when any message
 // does not map that way -- the caller then maps by sentinel renders.
+// cand_v4 / stage 2 (STAGE2-CONTRACT.md section 1): the character span of every message's exact content in
+// ``prompt_text``, from ``placeholder_render`` -- a render of the same messages with content i replaced by
+// ``placeholders[i]`` ("" = left as is). Each non-empty placeholder must occur exactly once, in message order, and
+// putting the contents back must give ``prompt_text`` byte for byte (a template that rewrites content fails).
+// ``spans[i]`` = {begin, end} characters ({0, 0} for a message left as is). False + ``error`` otherwise.
+bool pflash_content_char_spans(
+    const std::string & placeholder_render,
+    const std::vector<std::string> & placeholders,
+    const std::vector<std::string> & contents,
+    const std::string & prompt_text,
+    std::vector<std::pair<size_t, size_t>> & spans,
+    std::string & error);
+// The tokens whose character extent [token_begin[t], token_begin[t+1]) overlaps [begin, end) (the last token ends
+// at ``text_size``); {0, 0} when the range is empty.
+PFlashTokenSpan pflash_char_span_tokens(
+    const std::vector<size_t> & token_begin, size_t text_size, size_t begin, size_t end);
+
 bool pflash_human_message_spans(
     const Tokenizer & tokenizer,
     const std::vector<int32_t> & prompt,

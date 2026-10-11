@@ -130,7 +130,8 @@ void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestPro
     // Candidate rule (human + every non-system message): only for a GGUF with that rule.
     if (t.set.turns_read) {
         std::fprintf(file, ",\"candidate_rule\":\"%s\",\"turn_tokens\":%d,\"turns\":[",
-                     luce::pflash::kRequestCandidateRule, t.set.turn_tokens);
+                     t.set.rule.empty() ? luce::pflash::kRequestCandidateRule : t.set.rule.c_str(),
+                     t.set.turn_tokens);
         for (size_t index = 0; index < t.set.turns.size(); ++index) {
             const auto & m = t.set.turns[index];
             const int message = index < t.set.turn_messages.size() ? t.set.turn_messages[index] : -1;
@@ -141,6 +142,49 @@ void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestPro
             std::fputc('}', file);
         }
         std::fputc(']', file);
+    }
+    // Stage 2 (STAGE2-CONTRACT.md section 5): only under the cand_v5 rule.
+    const auto & s2 = t.stage2;
+    if (s2.evaluated) {
+        std::fprintf(file, ",\"stage2\":{\"active\":%s,\"reason\":", s2.active ? "true" : "false");
+        if (s2.reason.empty()) {
+            std::fputs("null", file);
+        } else {
+            std::fputc('"', file);
+            for (const char c : s2.reason) {
+                if (c == '"' || c == '\\') std::fputc('\\', file);
+                if ((unsigned char) c >= 0x20) std::fputc(c, file);
+            }
+            std::fputc('"', file);
+        }
+        std::fprintf(file, ",\"post_reserve\":%d,\"seed_tokens\":%d,\"seed_capped\":%s,\"latest_tokens\":%d,"
+                     "\"lookback_logit\":", s2.post_reserve, s2.seed_tokens, s2.seed_capped ? "true" : "false",
+                     s2.latest_tokens);
+        if (s2.active) write_float_or_null(file, s2.lookback_logit); else std::fputs("null", file);
+        std::fputs(",\"vague_logit\":", file);
+        if (s2.active) write_float_or_null(file, s2.vague_logit); else std::fputs("null", file);
+        std::fprintf(file,
+            ",\"lookback\":%s,\"earlier_tokens\":%d,\"promoted_tokens\":%d,\"promoted_capped\":%s,"
+            "\"promoted_runs\":%d,\"post_tokens\":%d,\"widened\":%s,\"budget\":%d,\"budget_widened\":%d,"
+            "\"raw_fits\":%s,\"s2_computed\":%s,\"latest_message\":%d,\"latest_span\":[%d,%d],"
+            "\"resume\":%d,\"session_resume\":\"disabled_by_stage2\",\"history_dropped\":%d,"
+            "\"attention_tiles\":%d,\"pass1_us\":%lld,\"pass2_us\":%lld,\"fallback\":",
+            s2.lookback ? "true" : "false", s2.earlier_tokens, s2.promoted_tokens,
+            s2.promoted_capped ? "true" : "false", s2.promoted_runs, s2.post_tokens,
+            s2.widened ? "true" : "false", s2.budget, s2.budget_widened, s2.raw_fits ? "true" : "false",
+            s2.s2_computed ? "true" : "false", s2.latest_message, s2.latest_span.begin, s2.latest_span.end,
+            s2.resume, s2.history_dropped, s2.attention_tiles, (long long) s2.pass1_us, (long long) s2.pass2_us);
+        if (s2.fallback.empty()) {
+            std::fputs("null", file);
+        } else {
+            std::fputc('"', file);
+            for (const char c : s2.fallback) {
+                if (c == '"' || c == '\\') std::fputc('\\', file);
+                if ((unsigned char) c >= 0x20) std::fputc(c, file);
+            }
+            std::fputc('"', file);
+        }
+        std::fprintf(file, ",\"fallback_count\":%ld}", s2.fallback_count);
     }
     std::fputc('}', file);
 }
@@ -351,7 +395,16 @@ namespace {
 thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
 thread_local PFlashScoringStats g_last_scoring_stats;
 thread_local std::vector<PFlashCandidateLift> g_last_candidate_lifts;
+thread_local PFlashStage2Outcome g_last_stage2_outcome;
 } // namespace
+
+const PFlashStage2Outcome & pflash_last_stage2_outcome() {
+    return g_last_stage2_outcome;
+}
+
+void pflash_set_stage2_outcome(const PFlashStage2Outcome & outcome) {
+    g_last_stage2_outcome = outcome;
+}
 
 const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts() {
     return g_last_candidate_lifts;
@@ -373,6 +426,7 @@ void pflash_clear_kept_spans() {
     g_last_kept_spans.clear();
     g_last_scoring_stats = {};
     g_last_candidate_lifts.clear();
+    g_last_stage2_outcome = {};
 }
 
 std::vector<int32_t> select_pflash_chunks(

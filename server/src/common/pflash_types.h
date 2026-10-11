@@ -44,6 +44,12 @@ struct PFlashRequestMessages {
     std::vector<PFlashTokenSpan> recent;
     std::vector<int> recent_index;
     std::string recent_error;     // why the recent messages could not be mapped
+    // cand_v4 / stage 2 (STAGE2-CONTRACT.md section 1): every normalised message in order, its role
+    // ("system", "user", "assistant", "tool") and its content span (the tokens overlapping its exact content
+    // characters; {0, 0} = no tokens); ``all_error`` = why the server could not map them.
+    std::vector<std::string> all_roles;
+    std::vector<PFlashTokenSpan> all_spans;
+    std::string all_error;
     std::vector<int> ident_tokens;
     int ident_turns = 0;
     std::string ident_error;

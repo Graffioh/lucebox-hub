@@ -182,6 +182,228 @@ PFlashRequestQuerySet pflash_request_query_set_v2(
     return set;
 }
 
+bool pflash_request_role_from_name(const std::string & name, PFlashRequestRole & role) {
+    if (name == "system") role = PFlashRequestRole::System;
+    else if (name == "user") role = PFlashRequestRole::User;
+    else if (name == "assistant") role = PFlashRequestRole::Assistant;
+    else if (name == "tool") role = PFlashRequestRole::Tool;
+    else return false;
+    return true;
+}
+
+const char * pflash_request_role_name(PFlashRequestRole role) noexcept {
+    switch (role) {
+        case PFlashRequestRole::System: return "system";
+        case PFlashRequestRole::User: return "user";
+        case PFlashRequestRole::Assistant: return "assistant";
+        case PFlashRequestRole::Tool: return "tool";
+    }
+    return "system";
+}
+
+std::vector<int> pflash_request_by_score(const std::vector<int> & tokens, const std::vector<float> & scores) {
+    std::vector<int> out = tokens;
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    // Run tokens are never NaN (a NaN breaks a run); a NaN still sorts last so the order stays strict.
+    const auto key = [&scores](int t) {
+        const float v = t >= 0 && t < (int) scores.size() ? scores[(size_t) t] : std::nanf("");
+        return std::isnan(v) ? -std::numeric_limits<float>::infinity() : v;
+    };
+    std::sort(out.begin(), out.end(), [&](int a, int b) {
+        const float va = key(a);
+        const float vb = key(b);
+        if (va != vb) return va > vb;
+        return a > b;
+    });
+    return out;
+}
+
+std::vector<int> pflash_request_span_run_tokens(const std::vector<float> & scores, PFlashTokenSpan span, float tau) {
+    return pflash_request_run_tokens(pflash_request_runs(scores, span, tau));
+}
+
+int pflash_request_latest_user(const std::vector<PFlashRequestMessage> & messages) {
+    for (size_t i = messages.size(); i-- > 0;) {
+        if (messages[i].role == PFlashRequestRole::User) return (int) i;
+    }
+    return -1;
+}
+
+std::vector<int> pflash_request_seed(const std::vector<float> & s1, float tau,
+                                     const std::vector<PFlashRequestMessage> & messages, int latest, int cap,
+                                     bool * capped) {
+    if (capped) *capped = false;
+    if (latest < 0 || latest >= (int) messages.size()) return {};
+    std::vector<int> ranked = pflash_request_by_score(
+        pflash_request_span_run_tokens(s1, messages[(size_t) latest].span, tau), s1);
+    const size_t keep = (size_t) std::max(0, cap);
+    if (ranked.size() > keep) {
+        if (capped) *capped = true;
+        ranked.resize(keep);
+    }
+    std::sort(ranked.begin(), ranked.end());
+    return ranked;
+}
+
+std::vector<int> pflash_request_capped_seed(const std::vector<float> & s1, float tau,
+                                            const std::vector<PFlashRequestMessage> & messages, int cap, int reserve,
+                                            int & reserve_out, std::vector<int> & post_out, bool * capped) {
+    const int latest = pflash_request_latest_user(messages);
+    post_out.clear();
+    if (latest >= 0) {
+        for (size_t i = (size_t) latest + 1; i < messages.size(); ++i) {
+            if (messages[i].role == PFlashRequestRole::System) continue;
+            for (const int t : pflash_request_span_run_tokens(s1, messages[i].span, tau)) post_out.push_back(t);
+        }
+    }
+    std::sort(post_out.begin(), post_out.end());
+    post_out.erase(std::unique(post_out.begin(), post_out.end()), post_out.end());
+    reserve_out = std::min(std::max(0, reserve), (int) post_out.size());
+    return pflash_request_seed(s1, tau, messages, latest, cap - reserve_out, capped);
+}
+
+PFlashRequestQuerySet pflash_request_query_set_v5(
+        const std::vector<float> & logits,
+        const std::vector<PFlashRequestMessage> & messages,
+        float tau,
+        int cap,
+        int reserve) {
+    PFlashRequestQuerySet set;
+    set.turns_read = true;
+    set.rule = kRequestCandidateRuleV5;
+    for (const auto & m : messages) {
+        if (m.span.end > m.span.begin && (m.span.begin < 0 || m.span.end > (int) logits.size())) {
+            set.fallback = "logits_missing";
+            return set;
+        }
+    }
+    const int latest = pflash_request_latest_user(messages);
+    set.latest_message = latest;
+    std::vector<int> post;
+    set.seed = pflash_request_capped_seed(logits, tau, messages, cap, reserve, set.reserve, post, &set.seed_capped);
+    if (latest >= 0) set.messages.push_back(request_message_runs(logits, messages[(size_t) latest].span, tau));
+    std::vector<int> taken = set.seed;
+    const auto is_taken = [&taken](int t) { return std::binary_search(taken.begin(), taken.end(), t); };
+    // The R best post-latest run tokens.
+    std::vector<int> reserved;
+    for (const int t : pflash_request_by_score(post, logits)) {
+        if ((int) reserved.size() >= set.reserve) break;
+        if (!is_taken(t)) reserved.push_back(t);
+    }
+    taken.insert(taken.end(), reserved.begin(), reserved.end());
+    std::sort(taken.begin(), taken.end());
+    std::vector<int> others;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto & m = messages[i];
+        if (m.role == PFlashRequestRole::System || (int) i == latest) continue;
+        if (m.span.end <= m.span.begin) continue;
+        set.turns.push_back(request_message_runs(logits, m.span, tau));
+        set.turn_messages.push_back((int) i);
+        for (const int t : pflash_request_run_tokens(set.turns.back().runs)) others.push_back(t);
+    }
+    std::vector<int> rest;
+    for (const int t : pflash_request_by_score(others, logits)) {
+        if (!is_taken(t)) rest.push_back(t);
+    }
+    const size_t room = (size_t) std::max(0, cap - (int) taken.size());
+    if (rest.size() > room) rest.resize(room);
+    set.latest_tokens = (int) set.seed.size();
+    set.turn_tokens = (int) (reserved.size() + rest.size());
+    set.tokens = taken;
+    set.tokens.insert(set.tokens.end(), rest.begin(), rest.end());
+    std::sort(set.tokens.begin(), set.tokens.end());
+    std::vector<int> all = others;
+    if (latest >= 0) {
+        for (const int t : pflash_request_run_tokens(set.messages[0].runs)) all.push_back(t);
+    }
+    std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
+    set.uncapped_tokens = (int) all.size();
+    set.capped = (int) set.tokens.size() < set.uncapped_tokens;
+    if (set.tokens.empty()) set.fallback = "no_request_runs";
+    return set;
+}
+
+int pflash_stage2_widened_budget(int budget, int n_prompt, bool & raw_fits) {
+    const long wide = std::min<long>((long) n_prompt, (long) budget + (long) budget / 2);
+    raw_fits = wide >= (long) n_prompt;
+    return (int) wide;
+}
+
+PFlashStage2Assembly pflash_stage2_assemble(
+        const std::vector<PFlashRequestMessage> & messages,
+        const std::vector<float> & s1,
+        const std::vector<float> & s2,
+        float lookback_logit,
+        float vague_logit,
+        float tau1, float tau2, float tau_lb, float tau_fb,
+        int budget, int n_prompt,
+        int cap,
+        int promoted_cap,
+        int reserve) {
+    PFlashStage2Assembly out;
+    out.budget = budget;
+    const int latest = pflash_request_latest_user(messages);
+    out.latest = latest;
+    if (latest < 0) {
+        // Stage 2 inactive: the cand_v5 rule alone, no widening.
+        out.reason = "no_user_message";
+        out.query = pflash_request_query_set_v5(s1, messages, tau1, cap, reserve).tokens;
+        return out;
+    }
+    out.active = true;
+    std::vector<int> post_cands;
+    out.seed = pflash_request_capped_seed(s1, tau1, messages, cap, reserve, out.reserve, post_cands,
+                                          &out.seed_capped);
+    std::vector<int> taken = out.seed;   // ascending
+    const auto is_taken = [&taken](int t) { return std::binary_search(taken.begin(), taken.end(), t); };
+    bool any_earlier = false;
+    for (int i = 0; i < latest; ++i) {
+        const auto & m = messages[(size_t) i];
+        if (m.role != PFlashRequestRole::System && m.span.end > m.span.begin) any_earlier = true;
+    }
+    if (lookback_logit >= tau_lb && any_earlier) {     // F32 compare; NaN -> false
+        out.lookback = true;
+        std::vector<int> cands;
+        for (int i = 0; i < latest; ++i) {
+            const auto & m = messages[(size_t) i];
+            if (m.role == PFlashRequestRole::System || m.span.end <= m.span.begin) continue;
+            const auto runs = pflash_request_runs(s2, m.span, tau2);
+            out.promoted_runs += (int) runs.size();
+            for (const int t : pflash_request_run_tokens(runs)) cands.push_back(t);
+        }
+        std::vector<int> ranked;
+        for (const int t : pflash_request_by_score(cands, s2)) {
+            if (!is_taken(t)) ranked.push_back(t);
+        }
+        const size_t room = (size_t) std::max(0, std::min(promoted_cap,
+                                                          cap - out.reserve - (int) out.seed.size()));
+        out.promoted.assign(ranked.begin(), ranked.begin() + (long) std::min(room, ranked.size()));
+        out.promoted_capped = out.promoted.size() < ranked.size();
+        std::sort(out.promoted.begin(), out.promoted.end());
+        taken.insert(taken.end(), out.promoted.begin(), out.promoted.end());
+        std::sort(taken.begin(), taken.end());
+    }
+    std::vector<int> post;
+    for (const int t : pflash_request_by_score(post_cands, s1)) {
+        if (!is_taken(t)) post.push_back(t);
+    }
+    const size_t room = (size_t) std::max(0, cap - (int) taken.size());
+    if (post.size() > room) post.resize(room);
+    std::sort(post.begin(), post.end());
+    out.post = post;
+    taken.insert(taken.end(), post.begin(), post.end());
+    std::sort(taken.begin(), taken.end());
+    if (vague_logit >= tau_fb) {
+        out.widened = true;
+        out.budget = pflash_stage2_widened_budget(budget, n_prompt, out.raw_fits);
+    }
+    out.query = taken;
+    if (out.query.empty()) out.reason = "no_request_runs";
+    return out;
+}
+
 PFlashRequestQuerySet pflash_request_query_set(
         const std::vector<float> & logits,
         const std::vector<PFlashTokenSpan> & human_messages,

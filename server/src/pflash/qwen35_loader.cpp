@@ -14,6 +14,7 @@
 #include "gguf.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -331,7 +332,17 @@ static void free_qwen35_request_probe(Qwen35DrafterState & st) {
     st.request_width = 0;
     st.request_loaded = false;
     st.request_stub = false;
+    st.request_turns = false;
+    st.request_v5 = false;
+    st.request_checkpoint_sha256.clear();
     st.request_policy = luce::pflash::PFlashRequestPolicy{};
+}
+
+static void free_qwen35_stage2(Qwen35DrafterState & st) {
+    luce::pflash::pflash_stage2_device_free(st.stage2_dev);
+    st.stage2 = luce::pflash::PFlashStage2Weights{};
+    st.stage2_w_in.clear();
+    st.stage2_loaded = false;
 }
 
 static constexpr const char * kQwen35RequestProbeSchema = "qwen3_5_0_8b_request_probe_v1";
@@ -387,16 +398,31 @@ static bool load_qwen35_request_probe(const char * path, bool stub,
                         "is missing or is not ") + luce::pflash::kRequestExtractionVersion +
                         " (the runtime's request-run extraction rule)");
         }
-        // V2-A3 candidate rule: opted in by the GGUF; absent = human messages only.
+        // V2-A3 candidate rule: opted in by the GGUF; absent = human messages only. cand_v5 (STAGE2-CONTRACT.md
+        // section 2) is applied only on an exact match too.
         st.request_turns = false;
+        st.request_v5 = false;
         if (gguf_find_key(g, luce::pflash::kRequestCandidateRuleKey) >= 0) {
-            if (!qwen35_metadata_equals(g, luce::pflash::kRequestCandidateRuleKey,
-                                        luce::pflash::kRequestCandidateRule)) {
+            if (qwen35_metadata_equals(g, luce::pflash::kRequestCandidateRuleKey,
+                                       luce::pflash::kRequestCandidateRule)) {
+                st.request_turns = true;
+            } else if (qwen35_metadata_equals(g, luce::pflash::kRequestCandidateRuleKey,
+                                              luce::pflash::kRequestCandidateRuleV5)) {
+                st.request_v5 = true;
+            } else {
                 return fail(std::string("request probe metadata ") +
                             luce::pflash::kRequestCandidateRuleKey + " is not " +
-                            luce::pflash::kRequestCandidateRule + " (the runtime's candidate rule)");
+                            luce::pflash::kRequestCandidateRule + " or " + luce::pflash::kRequestCandidateRuleV5 +
+                            " (the runtime's candidate rules)");
             }
-            st.request_turns = true;
+        }
+        // Provenance; the pairing key of a stage-2 GGUF (read, never checked here).
+        st.request_checkpoint_sha256.clear();
+        {
+            const int64_t id = gguf_find_key(g, luce::pflash::kRequestCheckpointShaKey);
+            if (id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING) {
+                st.request_checkpoint_sha256 = gguf_get_val_str(g, id);
+            }
         }
         ggml_tensor * fc1 = ggml_get_tensor(data_ctx, "requestprobe.fc1.weight");
         if (!fc1 || fc1->type != GGML_TYPE_F32 || ggml_n_dims(fc1) != 2 ||
@@ -500,6 +526,9 @@ static bool load_qwen35_request_probe(const char * path, bool stub,
     if (data_ctx) ggml_free(data_ctx);
     st.request_stub = stub;
     st.request_loaded = true;
+    std::fprintf(stderr, "[qwen35-drafter] request probe candidate rule: %s\n",
+                 st.request_v5 ? luce::pflash::kRequestCandidateRuleV5
+                 : st.request_turns ? luce::pflash::kRequestCandidateRule : "human messages only");
     std::fprintf(stderr,
         "[qwen35-drafter] loaded request probe: %s (width %d, tau %g; policy: prompt [%d,%d], "
         "min mean/max margin %g/%g, latest share [%g,%g], max runs %d, recency pin %d)\n",
@@ -507,6 +536,86 @@ static bool load_qwen35_request_probe(const char * path, bool stub,
         st.request_width, (double) st.request_tau, policy.min_prompt_tokens, policy.max_prompt_tokens,
         (double) policy.min_mean_margin, (double) policy.min_max_margin, (double) policy.min_latest_share,
         (double) policy.max_latest_share, policy.max_runs, policy.recency_pin_tokens);
+    std::fflush(stderr);
+    return true;
+}
+
+// Stage 2 (PFLASH_REQUEST_STAGE2_GGUF, STAGE2-CONTRACT.md section 3): only with a cand_v5 request probe and the
+// scoring head (a_h reads its Q/K). Every pin is checked by pflash_stage2_load; the drafter's block-15 norms the
+// look-back multiplies by must be F32 at the head's shapes. Fails closed.
+static bool load_qwen35_stage2(const char * path, const std::string & drafter_path,
+                               const std::string & head_path, Qwen35DrafterState & st) {
+    free_qwen35_stage2(st);
+    const TargetWeights & w = st.weights;
+    const auto fail = [&](const std::string & message) {
+        free_qwen35_stage2(st);
+        set_last_error(message);
+        return false;
+    };
+    if (!path || !*path) return fail(std::string(luce::pflash::kStage2GgufEnv) + " is empty");
+    if (!st.request_loaded || st.request_stub || !st.request_v5) {
+        return fail(std::string(luce::pflash::kStage2GgufEnv) +
+                    " needs PFLASH_SELECT_QUERY_PROBE=1 with a cand_v5 request probe (requestprobe.candidate_rule " +
+                    luce::pflash::kRequestCandidateRuleV5 + ")");
+    }
+    if (!st.head_loaded || head_path.empty()) {
+        return fail(std::string(luce::pflash::kStage2GgufEnv) + " needs PFLASH_SCORING_HEAD_GGUF (a_h uses its Q/K)");
+    }
+    if (w.n_embd != luce::pflash::kStage2Hidden || w.n_head != luce::pflash::kStage2Heads ||
+        w.n_head_kv != luce::pflash::kStage2KvHeads || w.n_embd_head_k != luce::pflash::kStage2HeadDim) {
+        return fail("stage 2: the drafter's block-15 geometry is not the u314 head's (1024 / 8 / 2 / 256)");
+    }
+    const TargetLayer & L = w.layers[(size_t) kQwen35HeadBlock];
+    const struct { ggml_tensor * t; int64_t ne0; const char * name; } norms[] = {
+        {L.attn_norm, w.n_embd, "blk.15.attn_norm.weight"},
+        {L.q_norm, w.n_embd_head_k, "blk.15.attn_q_norm.weight"},
+        {L.k_norm, w.n_embd_head_k, "blk.15.attn_k_norm.weight"},
+    };
+    for (const auto & n : norms) {
+        if (!n.t || n.t->type != GGML_TYPE_F32 || ggml_nelements(n.t) != n.ne0) {
+            return fail(std::string("stage 2: drafter tensor ") + n.name + " is not F32 at the expected shape");
+        }
+    }
+    // The drafter's own epsilon key (the loader's 1e-6 default is not a pin).
+    float drafter_eps = 0.0f;
+    {
+        gguf_init_params params{ /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        gguf_context * g = gguf_init_from_file(drafter_path.c_str(), params);
+        if (!g) return fail("stage 2: the drafter GGUF could not be reopened for its metadata");
+        const int64_t id = gguf_find_key(g, "qwen35.attention.layer_norm_rms_epsilon");
+        const bool ok = id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_FLOAT32;
+        if (ok) drafter_eps = gguf_get_val_f32(g, id);
+        gguf_free(g);
+        if (!ok) return fail("stage 2: the drafter GGUF has no f32 qwen35.attention.layer_norm_rms_epsilon");
+        if (std::memcmp(&drafter_eps, &w.rms_eps, sizeof(float)) != 0) {
+            return fail("stage 2: the drafter's loaded rms_eps differs from its GGUF key");
+        }
+    }
+    const auto head_identity = read_gguf_metadata(head_path, /*compute_sha256=*/ true);
+    if (!head_identity.ok || head_identity.sha256.empty()) {
+        return fail("stage 2: the scoring-head GGUF could not be hashed");
+    }
+    luce::pflash::PFlashStage2Pins pins;
+    pins.drafter_sha256 = st.gguf_sha256;
+    pins.head_sha256 = head_identity.sha256;
+    pins.stage1_checkpoint_sha256 = st.request_checkpoint_sha256;
+    pins.stage1_candidate_rule = luce::pflash::kRequestCandidateRuleV5;
+    pins.drafter_rms_eps = drafter_eps;
+    std::string error;
+    if (!luce::pflash::pflash_stage2_load(path, pins, st.stage2, error)) return fail(error);
+    if (!luce::pflash::pflash_stage2_device_upload(w.backend, st.stage2, st.stage2_dev, error)) return fail(error);
+    st.stage2_w_in.resize((size_t) w.n_embd);
+    ggml_backend_tensor_get(L.attn_norm, st.stage2_w_in.data(), 0, st.stage2_w_in.size() * sizeof(float));
+    st.stage2_loaded = true;
+    std::fprintf(stderr,
+        "[qwen35-drafter] loaded request stage 2: %s (tau2 %g, tau_lb %g, tau_fb %g, tau_source %s%s)\n",
+        path, (double) st.stage2.tau2, (double) st.stage2.tau_lb, (double) st.stage2.tau_fb,
+        st.stage2.tau_source.c_str(),
+        st.stage2.tau_source == luce::pflash::kStage2TauSourceDev ? ": PROVISIONAL thresholds, not gate-eligible" : "");
+    std::fprintf(stderr,
+        "[qwen35-drafter] request stage 2: drafter scoring sessions DISABLED (every scoring call runs on fresh F32 "
+        "rows, as PFLASH_DRAFTER_SESSIONS=0; the variable is ignored); PFLASH_CHAT_HISTORY_QUERIES windows are "
+        "dropped (stage 2 alone decides look-back)\n");
     std::fflush(stderr);
     return true;
 }
@@ -572,6 +681,20 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             return false;
         }
     }
+    if (const char * stage2_path = std::getenv(luce::pflash::kStage2GgufEnv)) {
+        if (!load_qwen35_stage2(stage2_path, gguf_path, head_path ? head_path : "", *st)) {
+            std::fprintf(stderr,
+                "[qwen35-drafter] ERROR: %s is set and request stage 2 did not load (%s), "
+                "refusing to serve without it\n", luce::pflash::kStage2GgufEnv, luce_last_error());
+            std::fflush(stderr);
+            free_qwen35_head(*st);
+            free_qwen35_segment_probe(*st);
+            free_qwen35_request_probe(*st);
+            free_target_weights(st->weights);
+            delete st;
+            return false;
+        }
+    }
     if (st->probe_loaded && st->probe_line_aligned) {
         st->probe_vocab = std::make_unique<Tokenizer>();
         if (!st->probe_vocab->load_from_gguf(gguf_path.c_str())) {
@@ -580,6 +703,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
                 "[qwen35-drafter] ERROR: the line-aligned probe split needs the "
                 "drafter vocabulary, refusing to serve without it\n");
             std::fflush(stderr);
+            free_qwen35_stage2(*st);
             free_qwen35_head(*st);
             free_qwen35_segment_probe(*st);
             free_qwen35_request_probe(*st);
@@ -596,6 +720,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
                 "[qwen35-drafter] ERROR: fold selection needs the drafter "
                 "vocabulary, refusing to serve without it\n");
             std::fflush(stderr);
+            free_qwen35_stage2(*st);
             free_qwen35_head(*st);
             free_qwen35_segment_probe(*st);
             free_qwen35_request_probe(*st);
@@ -622,6 +747,7 @@ void free_qwen35_drafter_state(DrafterContext & ctx) {
         if (session) free_qwen35_scoring_session(*session);
     }
     st->sessions.clear();
+    free_qwen35_stage2(*st);
     free_qwen35_head(*st);
     free_qwen35_segment_probe(*st);
     free_qwen35_request_probe(*st);
