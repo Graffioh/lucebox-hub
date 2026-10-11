@@ -260,6 +260,10 @@ struct ServerConfig {
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
     double      disk_cache_ttl_hours = 72.0;  // delete files unused this long (0 = never)
+    // Write-behind for session snapshots: a session's deepest raw state is
+    // written once it has had no follow-up for this long (also on RAM
+    // eviction and at shutdown), not after every turn.
+    int         disk_cache_persist_idle_s = 30;
     DiskPrefixCachePolicy disk_cache_policy;
 
     // Optional Jinja chat template (overrides the hardcoded ChatFormat::QWEN3
@@ -1021,6 +1025,27 @@ private:
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache);
     void forget_inline_slot_metadata(int slot);
+    // Free a RAM snapshot slot for reuse. A session state still waiting for
+    // its write-behind is persisted first, so eviction never loses it.
+    void evict_inline_slot(int slot);
+    // Disk persistence of agent/chat sessions (write-behind, see
+    // docs/PREFIX_CACHE.md). Slots committed during the current request are
+    // candidates; the deepest one becomes the session's pending write.
+    void note_session_slot(int slot);
+    void schedule_session_persist(const ParsedRequest & req,
+                                  const GenerationCacheState & cache,
+                                  const PreparedPrompt & prepared,
+                                  const SseEmitter & emitter,
+                                  bool generation_ok);
+    // The tool-call replay text a session's prompt was rendered with
+    // (ToolMemory), stored with its disk snapshot so a restart renders the
+    // same tokens; restored into ToolMemory at startup.
+    std::string session_replay_blob(const ParsedRequest & req,
+                                    const SseEmitter & emitter);
+    void restore_replay_blobs();
+    void persist_session_slot(int slot, const char * reason);
+    // Persist pending sessions whose idle deadline passed (all when `all`).
+    void persist_due_sessions(bool all);
     // After a commit in `slot`: free the snapshots it supersedes, then evict
     // until committed snapshots fit the resident budget again.
     void trim_snapshots_after_commit(int slot);
@@ -1164,6 +1189,14 @@ private:
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+    // Session snapshots not yet on disk: slot -> write-behind deadline and
+    // the replay blob stored with it.
+    struct PendingPersist {
+        std::chrono::steady_clock::time_point due;
+        std::string replay;
+    };
+    std::unordered_map<int, PendingPersist> persist_due_;
+    std::vector<int> request_session_slots_;
 
     // Memory held by the live cache and saved snapshots, rebuilt on the
     // generation thread after each request and read by /props (see
