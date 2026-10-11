@@ -1485,8 +1485,14 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         // with strict head selection. Without it every compression call fails
         // and FlowKV / PFlash silently serve the prompt verbatim: refuse to
         // start instead.
+        if (const char * ident = std::getenv("PFLASH_EVAL_REF_IDENT_QUERY")) {
+            if (std::strcmp(ident, "off") != 0) {
+                std::fprintf(stderr, "[server] PFLASH_EVAL_REF_IDENT_QUERY=%s: EVALUATION REFERENCE ARM "
+                             "(identifier heuristic), not a product path\n", ident);
+            }
+        }
         if (luce::pflash::pflash_query_probe_requested() ||
-            std::getenv("PFLASH_SELECT_QUERY_IDENT") != nullptr) {
+            std::getenv("PFLASH_EVAL_REF_IDENT_QUERY") != nullptr) {
             luce::pflash::PFlashSelectionConfig check;
             std::string check_error;
             if (!luce::pflash::resolve_pflash_selection(1 << 16, 32, check, check_error)) {

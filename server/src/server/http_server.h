@@ -384,6 +384,7 @@ struct PflashViewPiece {
     int begin = 0;
     int end = 0;
     bool recall = false;
+    int block = -1;       // recall pieces: the view turn whose recall block holds them
 };
 
 struct PflashChatView {

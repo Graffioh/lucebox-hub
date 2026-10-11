@@ -53,6 +53,20 @@ inline constexpr int kRequestMinRun = 2;        // shorter runs are dropped ("wh
 // any other value.
 inline constexpr const char * kRequestExtractionVersion =
     "request_runs_v2_minrun2_ge_raw_logit";
+// PLAN-V2 amendments V2-A3 / V2-A5: one candidate rule for chat AND agents,
+// the trainer's contract.CANDIDATE_RULE: candidates = the latest human
+// message (+ the previous one when the latest has fewer than
+// kRequestPreviousBelow request tokens) PLUS ALL non-system messages
+// (assistant prose and tool calls, tool results, user; V2-A5 dropped the
+// fixed 3-message window);
+// runs inside each candidate message; the query takes the candidate messages
+// latest first, each message's tail first, capped at kRequestQueryCap
+// (pflash_request_query_set_v2 = rule.probe_query_v2). A GGUF opts in with
+// the metadata key kRequestCandidateRuleKey == kRequestCandidateRule; without
+// the key the human-only rule (pflash_request_query_set) applies.
+inline constexpr const char * kRequestCandidateRuleKey = "requestprobe.candidate_rule";
+inline constexpr const char * kRequestCandidateRule =
+    "cand_v3_latest_human_prev8_plus_all_nonsystem_turns";
 inline constexpr int kRequestPreviousBelow = 8; // latest < 8 tokens -> add previous
 inline constexpr int kRequestQueryCap = 1024;   // query tokens, latest first
 inline constexpr int kRequestRowCap = 2048;     // retained rows per session
@@ -102,6 +116,24 @@ struct PFlashRequestQuerySet {
     // today's windows: "no_human_message", "logits_missing",
     // "no_request_runs".
     std::string fallback;
+    // Candidate rule: the other candidate messages read (the non-system
+    // messages that are not the human messages above), latest first, with
+    // their message indices, and the query tokens taken from them.
+    bool turns_read = false;
+    std::vector<PFlashRequestMessageRuns> turns;
+    std::vector<int> turn_messages;
+    int turn_tokens = 0;
+};
+
+// A request-probe candidate message for the V2-A3 rule: its index in the
+// normalised message list, whether it is human (role "user"), whether it is
+// a non-system message (every one is a candidate under the rule), and its
+// content span.
+struct PFlashRequestCandidate {
+    int message_index = -1;
+    bool human = false;
+    bool recent = false;
+    PFlashTokenSpan span{-1, -1};
 };
 
 // The role rule over ``human_messages``. The < kRequestPreviousBelow test
@@ -114,6 +146,17 @@ PFlashRequestQuerySet pflash_request_query_set(
     const std::vector<float> & logits,
     const std::vector<PFlashTokenSpan> & human_messages,
     float tau);
+
+// The candidate rule (trainer rule.probe_query_v2). ``messages`` lists the
+// latest two human messages and every non-system message (one entry per
+// message index; any order; ``recent`` marks the non-system candidates). Fallbacks: "logits_missing"
+// (a span outside the logits), "no_request_runs" (no token anywhere),
+// "no_human_message" (no human message and no recent message).
+PFlashRequestQuerySet pflash_request_query_set_v2(
+    const std::vector<float> & logits,
+    const std::vector<PFlashRequestCandidate> & messages,
+    float tau,
+    int cap = kRequestQueryCap);   // the runtime always uses kRequestQueryCap; replay parity varies it
 
 // v2 policy (PLAN-V2 W4), all optional; the defaults never abstain and pin nothing, so a probe without policy
 // metadata behaves exactly like v1.

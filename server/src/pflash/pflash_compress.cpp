@@ -126,10 +126,26 @@ void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestPro
         }
         std::fputc('}', file);
     }
-    std::fputs("]}", file);
+    std::fputc(']', file);
+    // Candidate rule (human + every non-system message): only for a GGUF with that rule.
+    if (t.set.turns_read) {
+        std::fprintf(file, ",\"candidate_rule\":\"%s\",\"turn_tokens\":%d,\"turns\":[",
+                     luce::pflash::kRequestCandidateRule, t.set.turn_tokens);
+        for (size_t index = 0; index < t.set.turns.size(); ++index) {
+            const auto & m = t.set.turns[index];
+            const int message = index < t.set.turn_messages.size() ? t.set.turn_messages[index] : -1;
+            std::fprintf(file, "%s{\"message\":%d,\"span\":[%d,%d],\"tokens\":%d,\"request_tokens\":%d,\"runs\":",
+                         index ? "," : "", message, m.message.begin, m.message.end, m.message_tokens,
+                         m.request_tokens);
+            write_spans(file, m.runs);
+            std::fputc('}', file);
+        }
+        std::fputc(']', file);
+    }
+    std::fputc('}', file);
 }
 
-// ``"ident_query":{...}``: the identifier query (PFLASH_SELECT_QUERY_IDENT).
+// ``"ident_query":{...}``: the identifier query (PFLASH_EVAL_REF_IDENT_QUERY).
 void write_ident_query_trace(FILE * file, const luce::pflash::PFlashIdentQueryTrace & t) {
     std::fprintf(file, ",\"ident_query\":{\"mode\":\"%s\",\"fallback\":",
                  luce::pflash::pflash_ident_query_name(t.mode));

@@ -862,6 +862,66 @@ TEST_CASE(ServerUnitFixture, test_pflash_qwen_late_developer_span_covers_role_en
         std::string::npos);
 }
 
+namespace {
+struct AgentClientRequest { const char * name; const char * path; const char * body; };
+const AgentClientRequest kAgentClientRequests[] = {
+#include "agent_client_requests.inc"
+};
+}  // namespace
+
+TEST_CASE(ServerUnitFixture, test_real_agent_client_requests_render_every_tool_call) {
+    // Hermes Agent (chat completions) and Pi (chat completions and Responses)
+    // replay their tool history in their own formats; every call must reach
+    // the rendered prompt (tool memory empty: these calls were not generated here),
+    // every tool result must become a tool message, the system prompt first.
+    for (const auto & r : kAgentClientRequests) {
+        const json body = json::parse(r.body);
+        const bool responses = std::string(r.path) == "/v1/responses";
+        const json & messages = responses ? body["input"] : body["messages"];
+        ToolMemory tool_memory;
+        const auto chat = normalize_chat_messages(
+            messages, responses ? ApiFormat::RESPONSES : ApiFormat::OPENAI_CHAT, tool_memory);
+        TEST_ASSERT(!chat.empty());
+        TEST_ASSERT(chat[0].role == "system");
+        std::vector<std::pair<std::string, json>> calls;
+        size_t results = 0;
+        for (const auto & m : messages) {
+            if (responses) {
+                const std::string type = m.value("type", "message");
+                if (type == "function_call") {
+                    calls.push_back({m.value("name", ""), json::parse(m.value("arguments", "{}"))});
+                } else if (type == "function_call_output") {
+                    ++results;
+                }
+            } else {
+                if (m.value("role", "") == "tool") ++results;
+                if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                    for (const auto & tc : m["tool_calls"]) {
+                        calls.push_back({tc["function"].value("name", ""),
+                                         json::parse(tc["function"].value("arguments", "{}"))});
+                    }
+                }
+            }
+        }
+        TEST_ASSERT(!calls.empty());
+        size_t tool_messages = 0;
+        for (const auto & m : chat) {
+            if (m.role == "tool") ++tool_messages;
+        }
+        TEST_ASSERT(tool_messages == results);
+        const std::string rendered = render_chat_template(
+            chat, ChatFormat::QWEN3, true, false);
+        for (const auto & [name, args] : calls) {
+            TEST_ASSERT(rendered.find("<function=" + name + ">") != std::string::npos);
+            for (const auto & [key, value] : args.items()) {
+                const std::string v = value.is_string() ? value.get<std::string>() : value.dump();
+                TEST_ASSERT(rendered.find("<parameter=" + key + ">\n" + v + "\n</parameter>") !=
+                            std::string::npos);
+            }
+        }
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_responses_string_tails_only_raw_content) {
     ToolMemory tool_memory;
     const auto normalized = normalize_chat_messages(

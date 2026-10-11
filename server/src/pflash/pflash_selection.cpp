@@ -34,7 +34,7 @@ constexpr const char * kQueryHeadEnv = "PFLASH_SELECT_QUERY_HEAD";
 constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
 constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
 constexpr const char * kQueryProbeEnv = "PFLASH_SELECT_QUERY_PROBE";
-constexpr const char * kQueryIdentEnv = "PFLASH_SELECT_QUERY_IDENT";
+constexpr const char * kQueryIdentEnv = "PFLASH_EVAL_REF_IDENT_QUERY";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -504,10 +504,10 @@ bool resolve_pflash_selection(
             return false;
         }
     }
-    if (config.query_head && (config.query_parser != PFlashQueryParser::SemanticUser ||
-                              config.mode == PFlashSelectionMode::Legacy)) {
-        error = std::string(kQueryHeadEnv) + "=1 needs strict selection with " +
-            std::string(kQueryParserEnv) + "=latest_user";
+    // Query head: latest_user (the benchmark parser) or, since V2-A3, the
+    // chat parser, where it reads the latest human message wherever it sits.
+    if (config.query_head && config.mode == PFlashSelectionMode::Legacy) {
+        error = std::string(kQueryHeadEnv) + "=1 needs strict selection";
         return false;
     }
     // Request probe: off unless exactly "1". It is not a selection knob of
