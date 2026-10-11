@@ -120,6 +120,35 @@ void write_compression_trace(
         const std::vector<int32_t> & compressed_ids,
         const PFlashTraceFields * trace_fields = nullptr);
 
+// The spans the last strict selection on this thread kept, in input
+// coordinates, ascending and merged. Cleared at the start of every
+// drafter_score_and_compress call; empty when the call did not reach a
+// strict selection (legacy selection, errors).
+const std::vector<PFlashTokenSpan> & pflash_last_kept_spans();
+void pflash_clear_kept_spans();
+
+// What the last strict scoring on this thread reused: the token its drafter
+// session resumed from, how many tokens it ran, how many query windows it
+// scored. Cleared with the kept spans.
+struct PFlashScoringStats {
+    int resume = -1;
+    int new_tokens = -1;
+    int query_windows = 0;
+    double forward_s = 0.0;
+};
+const PFlashScoringStats & pflash_last_scoring_stats();
+void pflash_set_scoring_stats(const PFlashScoringStats & stats);
+
+// Every candidate of the last strict selection on this thread with its
+// attention lift: mean per-token mass relative to uniform attention over
+// the input (1 = average, 20 = twenty times average). Cleared with the
+// kept spans.
+struct PFlashCandidateLift {
+    PFlashTokenSpan span;
+    double lift = 0.0;
+};
+const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts();
+
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,

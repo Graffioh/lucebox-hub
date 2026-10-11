@@ -18,6 +18,7 @@
 #include "common/platform_env.h"
 #include "common/sampler.h"
 #include "common/dspark_head.h"
+#include "pflash/pflash_compress.h"
 #include "common/moe_hybrid_expert_cache.h"
 #include "common/moe_hybrid_routing_stats.h"
 
@@ -5295,8 +5296,20 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
         result.compressed_ids = drafter_score_and_compress(
             pflash_drafter_ctx_, request.input_ids, request.keep_ratio,
             /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            score_query_end, request.required_instruction_spans);
+            score_query_end, request.required_instruction_spans,
+            request.query_suffix_candidates, request.history_query_spans,
+            request.turn_query_span);
         result.ok = !result.compressed_ids.empty();
+        if (result.ok) result.kept_spans = pflash_last_kept_spans();
+        if (result.ok) {
+            const auto & scoring = pflash_last_scoring_stats();
+            result.scorer_resume = scoring.resume;
+            result.scorer_new_tokens = scoring.new_tokens;
+            result.scorer_forward_s = scoring.forward_s;
+            for (const auto & candidate : pflash_last_candidate_lifts()) {
+                result.candidate_lifts.push_back({candidate.span, candidate.lift});
+            }
+        }
     }
 
     if (load_request->residency_action ==
