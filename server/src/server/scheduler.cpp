@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <atomic>
+#include <memory>
 #include <optional>
 #include <thread>
 
@@ -74,6 +76,7 @@ struct SchedSlot {
 enum class AdmissionDisposition {
     Admitted,  // job owns an engine slot and its first token is on the wire
     Deferred,  // engine had no room; caller keeps the job and retries it first
+    Loading,   // its disk snapshot is being read; retried first, without backoff
     Retired,   // job finished or failed during admission; no slot was taken
 };
 
@@ -100,6 +103,43 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // of the line so FIFO order survives the deferral.
     ServerJob * deferred = nullptr;
     std::chrono::steady_clock::time_point deferred_retry_at{};
+
+    // Disk session cache. Checkpoints that leave RAM (a capture replacing
+    // its reservation's victim) are written by the disk writer thread; a
+    // prompt whose deepest state is on disk waits at the head of the line
+    // while a reader thread loads it, so live streams keep decoding. Only
+    // engines whose checkpoints live in the backend's snapshot slots
+    // (Qwen paged) take part.
+    const bool disk_enabled = !disk_cache_.disabled() &&
+        engine.supports_prefix_store() && !prefix_cache_.disabled() &&
+        engine.prefix_store_in_backend_snapshots();
+    if (!disk_cache_.disabled() && !disk_enabled) {
+        std::fprintf(stderr,
+            "[disk-cache] off for concurrent serving: this engine keeps no "
+            "checkpoints in backend snapshot slots\n");
+    }
+    prefix_cache_.set_record_evictions(disk_enabled);
+    struct DiskLoad {
+        ServerJob * job = nullptr;
+        std::vector<int32_t> key;
+        struct Result {
+            std::atomic<bool> done{false};
+            OwnedSnapshot snap;
+        };
+        std::shared_ptr<Result> result;
+        std::thread reader;
+    };
+    std::optional<DiskLoad> disk_load;
+    std::vector<std::thread> finished_readers;
+    // Staging checkpoint for a disk restore: PrefixCache never uses it.
+    constexpr int kDiskStagingIndex = PrefixCache::MAX_CACHE_SLOTS;
+    auto drop_disk_load = [&]() {
+        if (!disk_load) return;
+        if (disk_load->reader.joinable()) {
+            finished_readers.push_back(std::move(disk_load->reader));
+        }
+        disk_load.reset();
+    };
 
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
     // else 32 when the min-tokens floor is active, else off.
@@ -450,6 +490,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         PrefixCaptureTxn prepared_capture;
         PrefixCache::InlineReservation capture_reservation;
         int restore_policy_slot = -1;
+        bool disk_restore = false;
         // Tokens alone do not identify an image: image requests never touch
         // the prefix cache.
         const bool prefix_supported = !req.images &&
@@ -463,6 +504,65 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 restore_policy_slot = hit.first;
                 prefix_plan.restore = {
                     (uint64_t)hit.first + 1, hit.second};
+            }
+            // A deeper state on disk (the index answers without a read):
+            // load it off this thread, then restore from the staging slot.
+            const auto probe = disk_enabled
+                ? disk_cache_.longest_prefix(req.prompt_tokens)
+                : DiskPrefixCache::PrefixProbe{};
+            if (disk_load && disk_load->job != job) drop_disk_load();
+            if (probe.cur_pos > prefix_plan.restore.tokens &&
+                probe.cur_pos == probe.len &&
+                probe.cur_pos < (int)req.prompt_tokens.size()) {
+                if (!disk_load) {
+                    disk_load.emplace();
+                    disk_load->job = job;
+                    disk_load->key.assign(req.prompt_tokens.begin(),
+                                          req.prompt_tokens.begin() + probe.len);
+                    disk_load->result = std::make_shared<DiskLoad::Result>();
+                    disk_load->reader = std::thread(
+                        [this, key = disk_load->key, out = disk_load->result]() {
+                            out->snap = disk_cache_.load(key);
+                            out->done.store(true, std::memory_order_release);
+                        });
+                    std::fprintf(stderr,
+                        "[disk-cache] %s: reading %d-token state from disk "
+                        "(RAM has %d)\n", req.response_id.c_str(), probe.len,
+                        prefix_plan.restore.tokens);
+                }
+                if (!disk_load->result->done.load(std::memory_order_acquire)) {
+                    return AdmissionDisposition::Loading;
+                }
+                disk_load->reader.join();
+                OwnedSnapshot snap = std::move(disk_load->result->snap);
+                disk_load.reset();
+                const int pos = snap.cur_pos();
+                if (!snap.empty() &&
+                    disk_cache_.adopt(std::move(snap), kDiskStagingIndex)) {
+                    disk_restore = true;
+                    restore_policy_slot = -1;
+                    prefix_plan.restore = {(uint64_t)kDiskStagingIndex + 1, pos};
+                } else {
+                    std::fprintf(stderr,
+                        "[disk-cache] %s: disk state unusable, %s\n",
+                        req.response_id.c_str(),
+                        prefix_plan.restore.valid() ? "restoring from RAM"
+                                                    : "prefilling");
+                }
+            }
+
+            if (prefix_plan.restore.valid() && disk_cache_digest_enabled()) {
+                int n_tensors = 0;
+                uint64_t n_bytes = 0;
+                const uint64_t digest = snapshot_state_digest(
+                    backend_.snapshot_ref((int)prefix_plan.restore.id - 1),
+                    &n_tensors, &n_bytes);
+                std::fprintf(stderr,
+                    "[disk-cache] digest %s source=%s pos=%d tensors=%d "
+                    "bytes=%llu xxh64=%016llx\n",
+                    req.response_id.c_str(), disk_restore ? "ssd" : "ram",
+                    prefix_plan.restore.tokens, n_tensors,
+                    (unsigned long long)n_bytes, (unsigned long long)digest);
             }
 
             // The restore source is never the capture destination: the new
@@ -539,7 +639,25 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 prefix_cache_.invalidate_inline_snap(restore_policy_slot);
             }
         }
-        if (prefix.invalidated.valid()) {
+        if (disk_restore) {
+            // The engine copied the staging checkpoint into the sequence's
+            // pages during admission (or rejected it); it is not kept.
+            backend_.snapshot_free(kDiskStagingIndex);
+            if (prefix.restored.valid() &&
+                prefix.restored == requested_plan.restore) {
+                std::fprintf(stderr,
+                    "[disk-cache] hit %s: restored %d tokens from disk\n",
+                    req.response_id.c_str(), prefix.restored.tokens);
+            }
+        }
+        if (disk_restore && prefix.invalidated.valid() &&
+            prefix.invalidated == requested_plan.restore) {
+            // A disk state that does not fit this cache layout: the engine
+            // already admitted the prompt cold.
+            std::fprintf(stderr,
+                "[disk-cache] %s: disk state rejected by the engine, prefilling\n",
+                req.response_id.c_str());
+        } else if (prefix.invalidated.valid()) {
             if (prefix.invalidated != requested_plan.restore ||
                 restore_policy_slot < 0) {
                 prefix_protocol_error =
@@ -761,6 +879,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 continue;
             }
             const AdmissionDisposition outcome = admit_job(job);
+            if (outcome == AdmissionDisposition::Loading) {
+                deferred = job;
+                deferred_retry_at = std::chrono::steady_clock::now() +
+                                    std::chrono::milliseconds(2);
+                break;  // keep decoding while the disk read runs
+            }
             if (outcome == AdmissionDisposition::Deferred) {
                 deferred = job;
                 deferred_retry_at = std::chrono::steady_clock::now() +
@@ -1050,14 +1174,51 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 using Resolution = PrefixCaptureTxn::Resolution;
                 const Resolution resolution = s.cache_capture.resolve(
                     out.prefix_store, s.job->req.prompt_tokens);
+                const int captured =
+                    (int)out.prefix_store.ticket.checkpoint.id - 1;
+                // The checkpoint this capture replaced in its slot (the
+                // reservation's victim) left RAM: write it to disk unless it
+                // was only an edit backup. Claimed on every outcome.
+                OwnedSnapshot displaced = disk_enabled
+                    ? backend_.snapshot_take_displaced(captured) : OwnedSnapshot{};
+                for (auto & evicted : prefix_cache_.take_evicted()) {
+                    if (evicted.slot != captured || displaced.empty()) continue;
+                    if (evicted.persist) {
+                        const auto aux = slot_aux_.find(captured);
+                        const int pos = displaced.cur_pos();
+                        const bool queued = disk_cache_.save_async(
+                            std::move(displaced), evicted.ids,
+                            aux == slot_aux_.end() ? std::string() : aux->second);
+                        if (queued) {
+                            disk_cache_.prune_ancestors(
+                                evicted.ids, config_.disk_cache_cold_max_tokens);
+                        }
+                        std::fprintf(stderr,
+                            "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
+                            "pos=%d -> %s\n", captured + 1, evicted.ids.size(),
+                            pos, queued ? "write queued" : "not written");
+                    }
+                    displaced.reset();
+                }
                 if (resolution == Resolution::saved) {
+                    // The slot holds the new checkpoint now.
+                    forget_inline_slot_metadata(captured);
+                    if (disk_enabled) {
+                        const int tokens = out.prefix_store.ticket.checkpoint.tokens;
+                        const auto & prompt = s.job->req.prompt_tokens;
+                        slot_tokens_[captured] = std::vector<int32_t>(
+                            prompt.begin(), prompt.begin() + tokens);
+                        slot_aux_[captured] =
+                            session_replay_blob(s.job->req, nullptr);
+                    }
                     // A conversation's checkpoints are prefixes of each other;
                     // restores use only the deepest, so the ones it supersedes
                     // would hold memory the other conversations need.
                     std::vector<int> tokens;
                     const auto pruned = prefix_cache_.prune_superseded_ancestors(
-                        (int)out.prefix_store.ticket.checkpoint.id - 1, &tokens);
+                        captured, &tokens);
                     for (size_t i = 0; i < pruned.size(); ++i) {
+                        forget_inline_slot_metadata(pruned[i]);
                         engine.discard_prefix_store({(uint64_t)pruned[i] + 1, tokens[i]});
                     }
                 } else if (resolution == Resolution::failed) {
@@ -1138,6 +1299,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         }
     }
+
+    drop_disk_load();
+    for (auto & reader : finished_readers) reader.join();
+    finished_readers.clear();
 
     // Shutdown: unblock every parked client thread.
     for (int i = 0; i < n_slots; i++) {
