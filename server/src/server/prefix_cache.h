@@ -266,7 +266,37 @@ public:
     // Evicts committed entries, never `keep_slot` or protected pins, until the
     // resident bytes fit the budget again. Returns the evicted slots; the
     // caller frees their snapshot payloads.
-    std::vector<int> enforce_resident_budget(int keep_slot);
+    // `persist` (optional) gets persist_on_evict() of each evicted slot,
+    // decided before it was erased.
+    std::vector<int> enforce_resident_budget(
+        int keep_slot, std::vector<bool> * persist = nullptr);
+
+    // ── Disk persistence of evicted entries ─────────────────────────
+    // Whether the entry in `slot`, about to leave RAM, should be written to
+    // disk: every conversation's newest snapshot and the shared heads are;
+    // a previous turn kept only as an edit backup (see
+    // prune_superseded_ancestors) is not while a deeper snapshot of its
+    // conversation is resident. False when `slot` holds no entry.
+    bool persist_on_evict(int slot) const;
+    // Token ids an entry in `slot` covers (empty when none).
+    std::vector<int32_t> entry_tokens(int slot) const;
+    struct Evicted {
+        int slot = -1;
+        std::vector<int32_t> ids;
+        bool persist = false;
+    };
+    // Opt-in log of entries a commit replaced (its reservation's victim) or
+    // the resident budget evicted, for callers whose payload outlives the
+    // metadata (the concurrent scheduler writes them to disk).
+    void set_record_evictions(bool on) { record_evictions_ = on; }
+    std::vector<Evicted> take_evicted() {
+        std::vector<Evicted> out;
+        out.swap(evicted_log_);
+        return out;
+    }
+    // Every committed entry, most recently used first, with its
+    // persist_on_evict() flag: graceful shutdown evicts them all.
+    std::vector<Evicted> entries_for_shutdown() const;
 
     // Declares that the caller prunes after every commit, so the budget check
     // counts the entries a capture supersedes as freed when it lands.
@@ -346,6 +376,9 @@ private:
         std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
         bool                 protect = false;  // sticky tools-boundary pin
         size_t               resident_bytes = 0;
+        // Kept behind a deeper snapshot of its conversation only so an
+        // edit of the last message can resume (prune_superseded_ancestors).
+        bool                 edit_backup = false;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
@@ -364,6 +397,10 @@ private:
     uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
     bool prunes_superseded_ = false;
+    bool record_evictions_ = false;
+    std::vector<Evicted> evicted_log_;
+    // Log entries_[idx] into evicted_log_ (when recording) before an erase.
+    void record_eviction(int idx);
     size_t resident_bytes_ = 0;
 
     // Full-cache state

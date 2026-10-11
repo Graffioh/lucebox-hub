@@ -254,10 +254,14 @@ struct ServerConfig {
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
-    size_t      disk_cache_budget_mb = 4096; // max disk usage in MB
+    size_t      disk_cache_budget_mb = 131072; // max disk usage in MB (128 GB)
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
+    double      disk_cache_ttl_hours = 72.0;  // delete files unused this long (0 = never)
+    // Graceful shutdown writes the RAM snapshots to disk (one last
+    // eviction) for at most this long; < 0 = no limit.
+    double      disk_cache_shutdown_flush_s = 120.0;
     DiskPrefixCachePolicy disk_cache_policy;
 
     // Optional Jinja chat template (overrides the hardcoded ChatFormat::QWEN3
@@ -569,6 +573,28 @@ private:
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache);
     void forget_inline_slot_metadata(int slot);
+    // Free a RAM snapshot slot for reuse, writing it to disk first when
+    // PrefixCache::persist_on_evict() says so (see persist_evicted_slot).
+    void evict_inline_slot(int slot);
+    // Disk persistence (docs/PREFIX_CACHE.md): a snapshot is written only
+    // when it leaves RAM, never after every turn. Hands the payload of
+    // `slot` to the disk writer when `persist` is set and the slot has a disk
+    // key (slot_tokens_); the slot is left empty. Returns true when queued.
+    bool persist_evicted_slot(int slot, bool persist, const char * reason);
+    // Slots committed during the current request get this request's
+    // tool-call replay text (slot_aux_) once its response is known.
+    void note_session_slot(int slot);
+    void record_session_aux(const ParsedRequest & req, const SseEmitter & emitter);
+    // The tool-call replay text a session's prompt was rendered with
+    // (ToolMemory), stored with its disk snapshot so a restart renders the
+    // same tokens; restored into ToolMemory at startup.
+    std::string session_replay_blob(const ParsedRequest & req,
+                                    const SseEmitter * emitter);
+    void restore_replay_blobs();
+    // Graceful shutdown: evict every RAM snapshot to disk (newest of each
+    // conversation and the heads; not edit backups), bounded by
+    // disk_cache_shutdown_flush_s.
+    void flush_sessions_to_disk(const char * reason);
     // After a commit in `slot`: free the snapshots it supersedes, then evict
     // until committed snapshots fit the resident budget again.
     void trim_snapshots_after_commit(int slot);
@@ -706,9 +732,12 @@ private:
     std::string status_html_path_;
     std::string resolve_status_html();
 
-    // Track prompt tokens for each snapshot slot (for shutdown save).
+    // Disk key of each RAM snapshot slot (written on eviction/shutdown).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+    // Replay blob stored with each slot's disk snapshot.
+    std::unordered_map<int, std::string> slot_aux_;
+    std::vector<int> request_session_slots_;
 
     // Memory held by the live cache and saved snapshots, rebuilt on the
     // generation thread after each request and read by /props (see

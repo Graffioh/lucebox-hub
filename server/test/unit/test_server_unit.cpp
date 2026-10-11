@@ -163,6 +163,26 @@ struct SchedulerTestHarness {
         return server.slot_tokens_.at(slot);
     }
 
+    static void set_slot_tokens(HttpServer & server, int slot,
+                                std::vector<int32_t> tokens) {
+        server.slot_tokens_[slot] = std::move(tokens);
+    }
+
+    static DiskPrefixCache & disk_cache(HttpServer & server) {
+        return server.disk_cache_;
+    }
+
+    static void flush_sessions(HttpServer & server) {
+        server.flush_sessions_to_disk("shutdown");
+    }
+
+    // What prepare_generation_cache does with a reservation's slot before
+    // the new snapshot overwrites it.
+    static void evict_inline_slot(HttpServer & server, int slot) {
+        server.evict_inline_slot(slot);
+        server.backend_.snapshot_free(slot);
+    }
+
     static void publish_memory_report(HttpServer & server) {
         server.publish_memory_report();
     }
@@ -8900,10 +8920,11 @@ static void rm_rf(const std::string & path) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_config_defaults) {
     DiskCacheConfig cfg;
     TEST_ASSERT(cfg.cache_dir.empty());
-    TEST_ASSERT(cfg.budget_bytes == (size_t)4 * 1024 * 1024 * 1024);
+    TEST_ASSERT(cfg.budget_bytes == (size_t)128 * 1024 * 1024 * 1024);
     TEST_ASSERT(cfg.min_tokens == 512);
     TEST_ASSERT(cfg.continued_interval == 10240);
     TEST_ASSERT(cfg.cold_max_tokens == 10240);
+    TEST_ASSERT(cfg.ttl_seconds == 72ull * 3600);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_policy_parse) {
@@ -9056,12 +9077,14 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
-    // The header should be exactly 80 bytes.
-    TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 80);
+    // The header should be exactly 96 bytes.
+    TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 96);
+    TEST_ASSERT(DISK_CACHE_LAST_USED_OFFSET == 68);
     // Bumped to 2 when the K-rotation default changed: a cache written by an
     // older binary stores K in the rotated basis, and the layout id does not
     // cover that, so the version is what rejects it.
-    TEST_ASSERT(DISK_CACHE_VERSION == 3);
+    // v4 added the identity salt and the stored key tokens.
+    TEST_ASSERT(DISK_CACHE_VERSION == 5);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
@@ -9082,6 +9105,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     hdr.created_at = 1700000000;
     hdr.last_used = 1700000100;
     hdr.last_tok = 151643;
+    std::memset(hdr.identity_salt, 0xEF, 16);
 
     // Use DiskPrefixCache's static write/read_header (they are private, so
     // we test indirectly through file I/O matching the on-disk format).
@@ -9100,6 +9124,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     u64 = hdr.created_at; std::fwrite(&u64, 8, 1, f);
     u64 = hdr.last_used; std::fwrite(&u64, 8, 1, f);
     int32_t i32 = hdr.last_tok; std::fwrite(&i32, 4, 1, f);
+    std::fwrite(hdr.identity_salt, 16, 1, f);
     std::fclose(f);
 
     // Verify file size is DISK_CACHE_HEADER_SIZE.
@@ -9123,6 +9148,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000000);  // created_at
     std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000100);  // last_used
     int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
+    uint8_t salt[16]; std::fread(salt, 16, 1, f);
+    TEST_ASSERT(salt[0] == 0xEF && salt[15] == 0xEF);
     std::fclose(f);
 
     remove_test_path(path);
@@ -9339,22 +9366,22 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
     std::string dir = test_tmp_path("luce_test_past_key").string();
     rm_rf(dir);
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
-    DiskPrefixCache cache(cfg, backend);
-    TEST_ASSERT(cache.init());
-    cache.learn_layout(0);
-
     std::vector<int32_t> short_key;
     for (int i = 0; i < MockBackendWithLayout::kMaxPos - 4; ++i) short_key.push_back(i + 1);
     std::vector<int32_t> full_key;
     for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) full_key.push_back(i + 1);
-
-    TEST_ASSERT(!cache.save(0, short_key));
-    TEST_ASSERT(cache.total_bytes() == 0);
-    TEST_ASSERT(cache.save(0, full_key));
-    TEST_ASSERT(cache.total_bytes() > 0);
-    TEST_ASSERT(!cache.lookup(short_key, 1));
-    TEST_ASSERT(cache.lookup(full_key, 1));
-    TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(!cache.save(0, short_key));
+        TEST_ASSERT(cache.total_bytes() == 0);
+        TEST_ASSERT(cache.save(0, full_key));
+        TEST_ASSERT(cache.total_bytes() > 0);
+        TEST_ASSERT(!cache.lookup(short_key, 1));
+        TEST_ASSERT(cache.lookup(full_key, 1));
+        TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
+    }  // the writer finishes and the directory lock is released
 
     // Forge the pre-fix shape on disk: key shorter than the snapshot. The
     // scan keys entries by the header's token hash, so only the header
@@ -9536,6 +9563,1082 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     rm_rf(dir1);
     rm_rf(dir2);
 }
+
+// ─── Session persistence: TTL, LRU budget, restart, validation ──────────
+
+namespace {
+
+std::vector<int32_t> disk_test_key(int n, int32_t base = 1) {
+    std::vector<int32_t> key;
+    for (int i = 0; i < n; ++i) key.push_back(base + i);
+    return key;
+}
+
+std::vector<std::string> dkv_files(const std::string & dir) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (auto & e : fs::recursive_directory_iterator(dir, ec)) {
+        if (e.is_regular_file() && e.path().extension() == ".dkv") {
+            out.push_back(e.path().string());
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Size of one snapshot file the mock produces for a key of `n` tokens.
+uint64_t one_file_size(MockBackendWithAdopt & backend, const std::string & dir, int n) {
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    uint64_t size = 0;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.init();
+        cache.learn_layout(0);
+        cache.save(0, disk_test_key(n));
+        size = cache.total_bytes();
+    }
+    rm_rf(dir);
+    return size;
+}
+
+}  // namespace
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_ttl_expiry) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_ttl").string();
+    rm_rf(dir);
+    uint64_t clock = 1000;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    cfg.ttl_seconds = 100;
+    const auto a = disk_test_key(40, 1);
+    const auto b = disk_test_key(40, 500);
+    const auto c = disk_test_key(40, 900);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, a));
+        clock = 1090;
+        TEST_ASSERT(cache.lookup(a, 1));          // used at 1090
+        clock = 1180;
+        TEST_ASSERT(cache.lookup(a, 1));          // 90 s idle: still alive
+        clock = 1281;
+        TEST_ASSERT(!cache.lookup(a, 1));         // 101 s idle: expired + deleted
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(dkv_files(dir).empty());
+
+        // Insertion sweep: saving b deletes an expired c.
+        TEST_ASSERT(cache.save(0, c));
+        clock = 1400;
+        TEST_ASSERT(cache.save(0, b));
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(!cache.lookup(c, 1));
+    }
+    {
+        // Startup sweep: b expires while the server is down.
+        clock = 1600;
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(dkv_files(dir).empty());
+    }
+    {
+        // ttl 0 = never expire.
+        DiskCacheConfig never = cfg; never.ttl_seconds = 0;
+        DiskPrefixCache cache(never, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, a));
+        clock += 10ull * 365 * 24 * 3600;
+        TEST_ASSERT(cache.lookup(a, 1));
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_lru").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    TEST_ASSERT(one > 0);
+    uint64_t clock = 1;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);  // room for two files
+    const auto a = disk_test_key(40, 1);
+    const auto b = disk_test_key(40, 500);
+    const auto c = disk_test_key(40, 900);
+    const auto d = disk_test_key(40, 1300);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        clock = 1; TEST_ASSERT(cache.save(0, a));
+        clock = 2; TEST_ASSERT(cache.save(0, b));
+        clock = 3; TEST_ASSERT(cache.lookup(a, 1));  // a is now newer than b
+    }
+    {
+        // last_used came from the file: b (2) is the LRU, not a (created 1).
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 2);
+        cache.learn_layout(0);
+        clock = 4; TEST_ASSERT(cache.save(0, c));
+        TEST_ASSERT(cache.total_bytes() <= cfg.budget_bytes);
+        TEST_ASSERT(cache.entry_count() == 2);
+        TEST_ASSERT(!cache.lookup(b, 1));
+        clock = 5; TEST_ASSERT(cache.lookup(a, 1));
+        clock = 6; TEST_ASSERT(cache.save(0, d));   // evicts c (4)
+        TEST_ASSERT(cache.total_bytes() <= cfg.budget_bytes);
+        TEST_ASSERT(!cache.lookup(c, 1));
+        TEST_ASSERT(cache.lookup(a, 1));
+        TEST_ASSERT(cache.lookup(d, 1));
+    }
+    {
+        // A smaller budget is enforced at startup, before any request.
+        DiskCacheConfig small = cfg; small.budget_bytes = (size_t)(one + one / 2);
+        DiskPrefixCache cache(small, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(cache.total_bytes() <= small.budget_bytes);
+    }
+    {
+        // A snapshot larger than the whole budget is never written.
+        DiskCacheConfig tiny = cfg; tiny.budget_bytes = (size_t)(one / 2);
+        DiskPrefixCache t(tiny, backend);
+        TEST_ASSERT(t.init());
+        t.learn_layout(0);
+        TEST_ASSERT(!t.disabled());
+        TEST_ASSERT(!t.save(0, disk_test_key(40, 7000)));
+        TEST_ASSERT(t.total_bytes() <= tiny.budget_bytes);
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_restart_restores_and_rejects_other_identity) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_restart").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    std::array<uint8_t, 16> q4{}; q4[0] = 4;
+    std::array<uint8_t, 16> q8{}; q8[0] = 8;
+    const auto key = disk_test_key(40);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_identity_salt(q4);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, key, "replay-text"));
+    }
+    {
+        // Same identity after a restart: the index is rebuilt from disk and
+        // the first lookup hits before any live snapshot exists.
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_identity_salt(q4);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        std::vector<std::string> aux;
+        cache.for_each_aux([&](const std::string & blob) { aux.push_back(blob); });
+        TEST_ASSERT(aux.size() == 1 && aux[0] == "replay-text");
+        TEST_ASSERT(cache.longest_prefix(key).len == 40);
+        backend.adopted_cur_pos_ = 0;
+        TEST_ASSERT(cache.lookup(key, 1));
+        TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
+    }
+    {
+        // Another KV type/model identity: never restored, still indexed so
+        // the budget and the TTL cover it.
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_identity_salt(q8);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        size_t other_aux = 0;
+        cache.for_each_aux([&](const std::string &) { ++other_aux; });
+        TEST_ASSERT(other_aux == 0);
+        TEST_ASSERT(cache.longest_prefix(key).len == 0);
+        TEST_ASSERT(!cache.lookup(key, 1));
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.longest_prefix(key).len == 0);
+        TEST_ASSERT(!cache.lookup(key, 1));
+        TEST_ASSERT(dkv_files(dir).size() == 1);
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_init_deletes_corrupt_files) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_corrupt").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    const auto good = disk_test_key(40, 1);
+    const auto cut = disk_test_key(40, 300);
+    const auto old = disk_test_key(40, 600);
+    std::string layout_dir;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, good));
+        TEST_ASSERT(cache.save(0, cut));
+        TEST_ASSERT(cache.save(0, old));
+    }
+    auto files = dkv_files(dir);
+    TEST_ASSERT(files.size() == 3);
+    layout_dir = fs::path(files[0]).parent_path().string();
+    auto path_of = [&](const std::vector<int32_t> & k) {
+        const PrefixHash h = hash_prefix(k.data(), (int)k.size());
+        static const char * hx = "0123456789abcdef";
+        std::string name;
+        for (uint8_t byte : h) { name += hx[byte >> 4]; name += hx[byte & 15]; }
+        return layout_dir + "/" + name + ".dkv";
+    };
+    // Truncated (crash or full disk mid-write).
+    fs::resize_file(path_of(cut), fs::file_size(path_of(cut)) - 7);
+    // Older format version.
+    if (FILE * f = std::fopen(path_of(old).c_str(), "r+b")) {
+        const uint32_t v3 = 3;
+        std::fseek(f, 4, SEEK_SET);
+        std::fwrite(&v3, 4, 1, f);
+        std::fclose(f);
+    }
+    // Garbage and a temp file left by an interrupted write.
+    { FILE * f = std::fopen((layout_dir + "/" + std::string(32, 'a') + ".dkv").c_str(), "wb");
+      std::fputs("not a snapshot", f); std::fclose(f); }
+    { FILE * f = std::fopen((layout_dir + "/" + std::string(32, 'b') + ".dkv.tmp").c_str(), "wb");
+      std::fputs("partial", f); std::fclose(f); }
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        files = dkv_files(dir);
+        TEST_ASSERT(files.size() == 1 && files[0] == path_of(good));
+        TEST_ASSERT(cache.lookup(good, 1));
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_verifies_stored_tokens) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tokens").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    const auto key = disk_test_key(40);
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    TEST_ASSERT(cache.save(0, key));
+    cache.drain();
+    const auto files = dkv_files(dir);
+    TEST_ASSERT(files.size() == 1);
+    // The stored key sits right before the (empty) aux blob, the payload
+    // and the 8-byte checksum.
+    uint64_t payload = 0;
+    FILE * f = std::fopen(files[0].c_str(), "r+b");
+    TEST_ASSERT(f != nullptr);
+    std::fseek(f, 52, SEEK_SET);
+    TEST_ASSERT(std::fread(&payload, 8, 1, f) == 1);
+    const long tokens_at = (long)(fs::file_size(files[0]) - payload - 8 - 4 - 4 * key.size());
+    const int32_t other = 999999;
+    std::fseek(f, tokens_at + 4 * 10, SEEK_SET);
+    std::fwrite(&other, 4, 1, f);
+    std::fclose(f);
+    // Same hash in the index, different stored tokens: rejected and deleted.
+    TEST_ASSERT(!cache.lookup(key, 1));
+    TEST_ASSERT(dkv_files(dir).empty());
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_longest_prefix_and_prune_ancestors) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_prefix_probe").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    const auto turn3 = disk_test_key(60);
+    const std::vector<int32_t> turn1(turn3.begin(), turn3.begin() + 40);
+    const std::vector<int32_t> turn2(turn3.begin(), turn3.begin() + 48);
+    TEST_ASSERT(cache.save(0, turn1));
+    TEST_ASSERT(cache.save(0, turn2));
+
+    // Deepest restorable prefix, without reading any file.
+    auto probe = cache.longest_prefix(turn3);
+    TEST_ASSERT(probe.len == 48 && probe.cur_pos == MockBackendWithLayout::kMaxPos);
+    auto diverged = turn3; diverged[45] = -7;
+    TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
+    TEST_ASSERT(cache.longest_prefix(disk_test_key(60, 5000)).len == 0);
+    TEST_ASSERT(cache.longest_prefix(turn1).len == 40);
+
+    // A deeper state of the session supersedes turn2, but the shared head
+    // (<= keep_max) stays for other sessions.
+    TEST_ASSERT(cache.save(0, turn3));
+    TEST_ASSERT(cache.prune_ancestors(turn3, 40) == 1);
+    TEST_ASSERT(cache.entry_count() == 2);
+    TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
+    // Without a head at or below keep_max, the shallowest ancestor stays
+    // in its place (a long system/tools head).
+    TEST_ASSERT(cache.prune_ancestors(turn3, 0) == 0);
+    TEST_ASSERT(cache.entry_count() == 2);
+    TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
+    TEST_ASSERT(cache.longest_prefix(turn3).len == 60);
+    const auto turn4 = disk_test_key(70);
+    TEST_ASSERT(cache.save(0, turn4));
+    TEST_ASSERT(cache.prune_ancestors(turn4, 0) == 1);  // turn3; turn1 stays
+    TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_write_failure_is_not_fatal) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_write_fail").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    TEST_ASSERT(cache.save(0, disk_test_key(40)));
+    cache.drain();
+    const std::string layout_dir = fs::path(dkv_files(dir)[0]).parent_path().string();
+    // Unwritable directory (stands in for a full disk): the write, in the
+    // background, fails cleanly, leaves no temp file and drops the entry.
+    fs::permissions(layout_dir, fs::perms::owner_read | fs::perms::owner_exec);
+    const bool queued = cache.save(0, disk_test_key(40, 800));
+    cache.drain();
+    fs::permissions(layout_dir, fs::perms::owner_all);
+    TEST_ASSERT(queued);
+    if (::geteuid() != 0) {
+        TEST_ASSERT(cache.stats().write_failures == 1);
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(dkv_files(dir).size() == 1);
+        TEST_ASSERT(!cache.lookup(disk_test_key(40, 800), 1));
+    }
+    rm_rf(dir);
+}
+
+// ─── SSD session cache: eviction writes, edit backups, shutdown, paged ──
+
+namespace {
+
+// Snapshot payloads in real host ggml buffers, one per slot, so the server
+// can detach them for the disk writer and adopt them back. A payload of
+// `pos` positions holds one F32 tensor [4, pos] filled with `pos`.
+struct DiskPayloadBackend : MockBackend {
+    struct Payload {
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        int pos = 0;
+    };
+    std::map<int, Payload> slots;
+    std::map<int, Payload> displaced;
+    std::vector<int> freed;
+    std::vector<int> adopted;
+    int live_position = 0;  // what snapshot_save() captures
+
+    static Payload make(int pos) {
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * 4 + 1024;
+        ip.no_alloc = true;
+        Payload p;
+        p.ctx = ggml_init(ip);
+        ggml_tensor * t = ggml_new_tensor_2d(p.ctx, GGML_TYPE_F32, 4, pos);
+        ggml_set_name(t, "snap_k_0");
+        p.buf = ggml_backend_alloc_ctx_tensors_from_buft(p.ctx, ggml_backend_cpu_buffer_type());
+        std::vector<float> fill((size_t)ggml_nelements(t), (float)pos);
+        ggml_backend_tensor_set(t, fill.data(), 0, ggml_nbytes(t));
+        p.pos = pos;
+        return p;
+    }
+    static void release(Payload & p) {
+        if (p.buf) ggml_backend_buffer_free(p.buf);
+        if (p.ctx) ggml_free(p.ctx);
+        p = Payload{};
+    }
+    void put(int slot, int pos) {
+        drop(slot);
+        slots[slot] = make(pos);
+    }
+    void drop(int slot) {
+        auto it = slots.find(slot);
+        if (it == slots.end()) return;
+        release(it->second);
+        slots.erase(it);
+    }
+    ~DiskPayloadBackend() override {
+        for (auto & [slot, p] : slots) release(p);
+        for (auto & [slot, p] : displaced) release(p);
+    }
+    void snapshot_free(int slot) override {
+        if (slots.count(slot)) freed.push_back(slot);
+        drop(slot);
+    }
+    bool snapshot_save(int slot) override {
+        if (live_position <= 0) return false;
+        put(slot, live_position);
+        return true;
+    }
+    bool snapshot_used(int slot) const override { return slots.count(slot) != 0; }
+    int snapshot_cur_pos(int slot) const override {
+        auto it = slots.find(slot);
+        return it == slots.end() ? 0 : it->second.pos;
+    }
+    SnapshotRef snapshot_ref(int slot) const override {
+        SnapshotRef ref;
+        auto it = slots.find(slot);
+        if (it == slots.end()) return ref;
+        ref.ctx = it->second.ctx;
+        ref.buf = it->second.buf;
+        ref.cur_pos = it->second.pos;
+        ref.last_tok = 7;
+        return ref;
+    }
+    bool snapshot_adopt(int slot, ggml_context * ctx, ggml_backend_buffer_t buf,
+                        int cur_pos, int32_t) override {
+        drop(slot);
+        slots[slot] = {ctx, buf, cur_pos};
+        adopted.push_back(slot);
+        return true;
+    }
+    OwnedSnapshot snapshot_take_displaced(int slot) override {
+        auto it = displaced.find(slot);
+        if (it == displaced.end()) return {};
+        OwnedSnapshot out(it->second.ctx, it->second.buf, it->second.pos, -1);
+        displaced.erase(it);
+        return out;
+    }
+    size_t snapshot_bytes_estimate(int tokens) const override {
+        return (size_t)tokens * 100 + 1000;
+    }
+};
+
+ServerConfig disk_session_config(const std::string & dir) {
+    ServerConfig config;
+    config.prefix_cache_cap = 8;
+    config.prefix_cache_max_bytes = 0;
+    config.disk_cache_dir = dir;
+    config.disk_cache_min_tokens = 1;
+    config.disk_cache_cold_max_tokens = 2;  // the 2-token head is "short"
+    return config;
+}
+
+// Commit `prompt` as an inline snapshot at its end, the way a request does.
+int commit_turn(HttpServer & server, DiskPayloadBackend & backend,
+                const std::vector<int32_t> & prompt, int restore_slot = -1) {
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    auto reservation = cache.reserve_inline_snap(
+        prompt, restore_slot >= 0 ? backend.snapshot_cur_pos(restore_slot) : 0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/(int)prompt.size(),
+        restore_slot, [&](int tokens) { return backend.snapshot_bytes_estimate(tokens); });
+    if (!reservation.active()) return -1;
+    const int slot = reservation.slot();
+    SchedulerTestHarness::evict_inline_slot(server, slot);
+    backend.put(slot, (int)prompt.size());
+    SchedulerTestHarness::finalize_inline_snapshot(
+        server, prompt, std::move(reservation), slot, (int)prompt.size(),
+        restore_slot);
+    return slot;
+}
+
+}  // namespace
+
+// Persist-on-evict policy: every conversation's newest snapshot and the
+// shared heads are written; a previous turn kept only as an edit backup is
+// not, while its conversation's deeper snapshot is resident.
+TEST_CASE(ServerUnitFixture, test_prefix_cache_persist_on_evict_skips_edit_backups) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(8, tokenizer, 0);
+    const std::vector<int32_t> head = {1, 100};
+    const std::vector<int32_t> turn1 = {1, 100, 3, 101};
+    const std::vector<int32_t> turn2 = {1, 100, 3, 101, 4, 102};
+    const std::vector<int32_t> turn3 = {1, 100, 3, 101, 4, 102, 3, 103};
+    cache.confirm_inline_snap(0, (int)head.size(), head);
+    cache.confirm_inline_snap(1, (int)turn1.size(), turn1);
+    cache.confirm_inline_snap(2, (int)turn2.size(), turn2);
+    TEST_ASSERT(cache.persist_on_evict(1));  // nothing marked yet
+    cache.confirm_inline_snap(3, (int)turn3.size(), turn3);
+    const auto pruned = cache.prune_superseded_ancestors(3);
+    TEST_ASSERT(pruned == std::vector<int>({1}));
+    TEST_ASSERT(cache.persist_on_evict(0));   // head
+    TEST_ASSERT(!cache.persist_on_evict(2));  // edit backup of turn3
+    TEST_ASSERT(cache.persist_on_evict(3));   // newest
+    TEST_ASSERT(!cache.persist_on_evict(5));  // no entry
+    const auto all = cache.entries_for_shutdown();
+    TEST_ASSERT(all.size() == 3 && all[0].slot == 3);  // most recent first
+    for (const auto & e : all) TEST_ASSERT(e.persist == (e.slot != 2));
+
+    // A protected pin (the system/tools head of a tool request) is always
+    // written, even with a deeper snapshot after it.
+    PrefixCache pinned(8, tokenizer, 0);
+    pinned.confirm_inline_snap(0, (int)turn1.size(), turn1, /*protect=*/true);
+    pinned.confirm_inline_snap(1, (int)turn2.size(), turn2);
+    pinned.confirm_inline_snap(2, (int)turn3.size(), turn3);
+    pinned.prune_superseded_ancestors(2);
+    TEST_ASSERT(pinned.persist_on_evict(0));
+    TEST_ASSERT(pinned.persist_on_evict(2));
+
+    // Once the deeper snapshot is gone, the kept turn is the newest again.
+    cache.invalidate_inline_snap(3);
+    TEST_ASSERT(cache.persist_on_evict(2));
+
+    // Commit victims are logged (with their flag) only when recording.
+    cache.confirm_inline_snap(3, (int)turn3.size(), turn3);
+    cache.prune_superseded_ancestors(3);
+    TEST_ASSERT(!cache.persist_on_evict(2));
+    PrefixCache small(2, tokenizer, 0);
+    small.set_record_evictions(true);
+    small.confirm_inline_snap(0, (int)turn1.size(), turn1);
+    small.confirm_inline_snap(1, (int)head.size(), {1, 200});
+    const std::vector<int32_t> other = {1, 300, 3, 301};
+    auto reservation = small.reserve_inline_snap(other, 0, false, (int)other.size());
+    TEST_ASSERT(reservation.active());
+    const int victim_slot = reservation.slot();
+    TEST_ASSERT(reservation.commit(other));
+    const auto evicted = small.take_evicted();
+    TEST_ASSERT(evicted.size() == 1 && evicted[0].persist &&
+                evicted[0].slot == victim_slot &&
+                (evicted[0].ids == turn1 || evicted[0].ids == std::vector<int32_t>({1, 200})));
+    TEST_ASSERT(small.take_evicted().empty());
+    unlink(path.c_str());
+}
+
+// Single-sequence path: a snapshot the resident budget evicts is written to
+// disk in the background and a later request restores it from there.
+TEST_CASE(ServerUnitFixture, test_disk_session_ram_eviction_writes_and_restores) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_evict").string();
+    rm_rf(dir);
+    const std::vector<int32_t> a = {1, 100, 3, 101};
+    const std::vector<int32_t> b = {1, 200, 3, 201};
+    const std::vector<int32_t> c = {1, 300, 3, 301};
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config = disk_session_config(dir);
+        config.prefix_cache_max_bytes = 3000;  // two 4-token snapshots (1400 B)
+        HttpServer server(engine, tokenizer, config);
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        TEST_ASSERT(!disk.disabled());
+        const int slot_a = commit_turn(server, backend, a);
+        TEST_ASSERT(slot_a >= 0 && commit_turn(server, backend, b) >= 0);
+        TEST_ASSERT(disk.entry_count() == 0);       // nothing written per turn
+        TEST_ASSERT(commit_turn(server, backend, c) >= 0);  // evicts a
+        // c reuses a's slot: a was handed to the disk writer first.
+        TEST_ASSERT(SchedulerTestHarness::prefix_cache(server).lookup(a).first != slot_a);
+        TEST_ASSERT(disk.entry_count() == 1);
+        TEST_ASSERT(disk.longest_prefix(a).len == (int)a.size());
+        // The next turn of conversation a restores from disk (served from
+        // memory if the write is still queued), into the staging slot.
+        std::vector<int32_t> next = a;
+        next.insert(next.end(), {4, 102, 3, 103});
+        auto prepared = SchedulerTestHarness::prepare_cache(server, next);
+        TEST_ASSERT(prepared.restore_slot == ModelBackend::kMaxSlots - 1);
+        TEST_ASSERT(prepared.prefix_len == (int)a.size());
+        disk.drain();
+        TEST_ASSERT(disk.stats().writes == 1 && disk.stats().pending_files == 0);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// Tool path: an agent turn saved with its generated text (the live state
+// after generation) is written when the resident budget evicts it, keyed
+// by the tokens the next request renders.
+TEST_CASE(ServerUnitFixture, test_disk_session_agent_turn_eviction_writes_live_state) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_agent").string();
+    rm_rf(dir);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101};
+    const std::vector<int32_t> generated = {200, 201, 202};
+    const std::vector<int32_t> canonical = {1, 100, 3, 101, 200, 201, 202, 7};
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config = disk_session_config(dir);
+        config.prefix_cache_max_bytes = 3500;
+        HttpServer server(engine, tokenizer, config);
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        backend.live_position = 6;  // the last sampled token is not decoded
+        TEST_ASSERT(SchedulerTestHarness::save_generated_turn(
+            server, prompt, generated, canonical));
+        TEST_ASSERT(commit_turn(server, backend, {1, 200, 3, 201}) >= 0);
+        TEST_ASSERT(disk.entry_count() == 0);
+        TEST_ASSERT(commit_turn(server, backend, {1, 300, 3, 301}) >= 0);
+        std::vector<int32_t> next = canonical;
+        next.insert(next.end(), {8, 9});
+        const auto probe = disk.longest_prefix(next);
+        TEST_ASSERT(probe.len == 6 && probe.cur_pos == 6);
+        disk.drain();
+        TEST_ASSERT(disk.stats().writes == 1);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// Graceful shutdown is one last eviction: the head and each conversation's
+// newest snapshot are written, the edit backup and pruned turns are not, and
+// a restarted server restores the session from disk.
+TEST_CASE(ServerUnitFixture, test_disk_session_shutdown_flush_then_restart_restores) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_flush").string();
+    rm_rf(dir);
+    const std::vector<int32_t> head = {1, 100};
+    const std::vector<int32_t> turn1 = {1, 100, 3, 101};
+    const std::vector<int32_t> turn2 = {1, 100, 3, 101, 4, 102};
+    const std::vector<int32_t> turn3 = {1, 100, 3, 101, 4, 102, 3, 103};
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        // The head, then three turns, each restoring the previous one.
+        int prev = -1;
+        for (const auto * turn : {&head, &turn1, &turn2, &turn3}) {
+            if (turn == &head) {
+                backend.put(0, (int)head.size());
+                cache.confirm_inline_snap(0, (int)head.size(), head);
+                SchedulerTestHarness::set_slot_tokens(server, 0, head);
+                prev = 0;
+                continue;
+            }
+            prev = commit_turn(server, backend, *turn, prev);
+            TEST_ASSERT(prev >= 0);
+        }
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        TEST_ASSERT(disk.entry_count() == 0);
+        SchedulerTestHarness::flush_sessions(server);
+        TEST_ASSERT(disk.stats().pending_files == 0);
+        TEST_ASSERT(disk.entry_count() == 2);  // head + turn3
+        TEST_ASSERT(disk.longest_prefix(turn3).len == (int)turn3.size());
+        TEST_ASSERT(disk.longest_prefix(turn2).len == (int)head.size());
+        TEST_ASSERT(dkv_files(dir).size() == 2);
+    }
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        std::vector<int32_t> next = turn3;
+        next.insert(next.end(), {4, 104});
+        const auto prepared = SchedulerTestHarness::prepare_cache(server, next);
+        TEST_ASSERT(prepared.restore_slot == ModelBackend::kMaxSlots - 1);
+        TEST_ASSERT(prepared.prefix_len == (int)turn3.size());
+        TEST_ASSERT(backend.adopted == std::vector<int>({ModelBackend::kMaxSlots - 1}));
+        // Another conversation on the same head restores the head.
+        const std::vector<int32_t> other = {1, 100, 3, 555, 4, 556};
+        TEST_ASSERT(SchedulerTestHarness::prepare_cache(server, other).prefix_len ==
+                    (int)head.size());
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// A session evicted to disk still matches the shared head in RAM; its
+// next request restores the deeper disk state, not the head. When that read
+// fails, the RAM head is still used.
+TEST_CASE(ServerUnitFixture, test_disk_session_deeper_than_ram_hit_restores_from_disk) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_deeper").string();
+    rm_rf(dir);
+    const std::vector<int32_t> head = {1, 100};
+    const std::vector<int32_t> turn1 = {1, 100, 3, 101};
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        HttpServer server(engine, tokenizer, disk_session_config(dir));
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        backend.put(0, (int)head.size());
+        cache.confirm_inline_snap(0, (int)head.size(), head);
+        SchedulerTestHarness::set_slot_tokens(server, 0, head);
+        const int slot = commit_turn(server, backend, turn1, 0);
+        TEST_ASSERT(slot > 0);
+        SchedulerTestHarness::evict_inline_slot(server, slot);
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        disk.drain();
+        TEST_ASSERT(disk.stats().writes == 1);
+        std::vector<int32_t> next = turn1;
+        next.insert(next.end(), {4, 104});
+        const auto prepared = SchedulerTestHarness::prepare_cache(server, next);
+        TEST_ASSERT(prepared.restore_slot == ModelBackend::kMaxSlots - 1);
+        TEST_ASSERT(prepared.prefix_len == (int)turn1.size());
+        backend.snapshot_free(ModelBackend::kMaxSlots - 1);
+        // The file is gone: the index still names it, the read fails and
+        // the request restores the resident head.
+        for (const auto & f : dkv_files(dir)) fs::remove(f);
+        const auto fallback = SchedulerTestHarness::prepare_cache(server, next);
+        TEST_ASSERT(fallback.restore_slot == 0);
+        TEST_ASSERT(fallback.prefix_len == (int)head.size());
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// Corruption fails closed: a flipped payload byte or a cut file is a logged
+// miss, the file is deleted, and nothing is adopted.
+TEST_CASE(ServerUnitFixture, test_disk_cache_checksum_rejects_corrupt_payload) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_checksum").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    const auto a = disk_test_key(40, 1);
+    const auto b = disk_test_key(40, 500);
+    TEST_ASSERT(cache.save(0, a));
+    TEST_ASSERT(cache.save(0, b));
+    cache.drain();
+    const auto path_of = [&](const std::vector<int32_t> & k) {
+        for (const auto & f : dkv_files(dir)) {
+            const PrefixHash h = hash_prefix(k.data(), (int)k.size());
+            static const char * hx = "0123456789abcdef";
+            std::string name;
+            for (uint8_t byte : h) { name += hx[byte >> 4]; name += hx[byte & 15]; }
+            if (fs::path(f).filename().string() == name + ".dkv") return f;
+        }
+        return std::string();
+    };
+    const std::string fa = path_of(a), fb = path_of(b);
+    TEST_ASSERT(!fa.empty() && !fb.empty());
+    // One bit in the middle of the tensor payload.
+    {
+        FILE * f = std::fopen(fa.c_str(), "r+b");
+        TEST_ASSERT(f != nullptr);
+        const long at = (long)fs::file_size(fa) - 8 - 100;
+        std::fseek(f, at, SEEK_SET);
+        const int byte = std::fgetc(f);
+        std::fseek(f, at, SEEK_SET);
+        std::fputc(byte ^ 0x10, f);
+        std::fclose(f);
+    }
+    const size_t adopted_before = backend.adopted_.size();
+    TEST_ASSERT(!cache.lookup(a, 1));
+    TEST_ASSERT(!fs::exists(fa));
+    TEST_ASSERT(cache.stats().load_failures == 1);
+    // Cut short after the index was built (no startup scan in between).
+    fs::resize_file(fb, fs::file_size(fb) - 3);
+    TEST_ASSERT(!cache.lookup(b, 1));
+    TEST_ASSERT(!fs::exists(fb));
+    TEST_ASSERT(backend.adopted_.size() == adopted_before);
+    TEST_ASSERT(cache.entry_count() == 0);
+    rm_rf(dir);
+}
+
+// Tensor metadata is untrusted too: reject it before GGML can assert,
+// divide by zero on a removed type, or allocate from overflowing dimensions.
+TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_corrupt_tensor_metadata) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tensor_metadata").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    const auto key = disk_test_key(40);
+    for (int corruption = 0; corruption < 4; ++corruption) {
+        for (bool restart : {false, true}) {
+            rm_rf(dir);
+            auto cache = std::make_unique<DiskPrefixCache>(cfg, backend);
+            TEST_ASSERT(cache->init());
+            TEST_ASSERT(cache->save(0, key));
+            cache->drain();
+            const auto files = dkv_files(dir);
+            TEST_ASSERT(files.size() == 1);
+            FILE * f = std::fopen(files[0].c_str(), "r+b");
+            TEST_ASSERT(f != nullptr);
+            std::fseek(f, DISK_CACHE_HEADER_SIZE, SEEK_SET);
+            uint16_t name_len = 0;
+            TEST_ASSERT(std::fread(&name_len, sizeof(name_len), 1, f) == 1);
+            const long type_at = DISK_CACHE_HEADER_SIZE + 2 + name_len;
+            std::fseek(f, type_at, SEEK_SET);
+            const uint32_t type = corruption == 0 ? 4 : GGML_TYPE_Q4_0;
+            TEST_ASSERT(std::fwrite(&type, sizeof(type), 1, f) == 1);
+            if (corruption != 0) {
+                const int64_t ne = corruption == 1 ? 1 :
+                    (corruption == 2 ? INT64_MAX - 31 : 32);
+                TEST_ASSERT(std::fwrite(&ne, sizeof(ne), 1, f) == 1);
+                if (corruption == 3) {
+                    const int64_t huge = INT64_MAX;
+                    TEST_ASSERT(std::fwrite(&huge, sizeof(huge), 1, f) == 1);
+                }
+            }
+            std::fclose(f);
+            if (restart) {
+                cache.reset();
+                cache = std::make_unique<DiskPrefixCache>(cfg, backend);
+                TEST_ASSERT(cache->init());
+            }
+            TEST_ASSERT(!cache->lookup(key, 1));
+            TEST_ASSERT(!fs::exists(files[0]));
+            TEST_ASSERT(cache->entry_count() == 0);
+            TEST_ASSERT(backend.adopted_.empty());
+        }
+    }
+    rm_rf(dir);
+}
+
+// Writes are asynchronous: a queued snapshot counts against the budget and
+// is served from memory at once; the payload handed over is owned by the
+// cache; the budget is clamped to the free space.
+TEST_CASE(ServerUnitFixture, test_disk_cache_save_async_queue_and_free_space) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_async").string();
+    rm_rf(dir);
+    const auto key = disk_test_key(40, 1);
+    const auto ref = backend.snapshot_ref(0);
+    {
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.save_async(
+            OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok), key, "aux"));
+        TEST_ASSERT(cache.total_bytes() > 0);
+        TEST_ASSERT(cache.lookup(key, 1));  // from memory or from the file
+        TEST_ASSERT(backend.adopted_cur_pos_ == ref.cur_pos);
+        const auto drained = cache.drain();
+        TEST_ASSERT(drained.cancelled == 0);
+        TEST_ASSERT(cache.stats().writes == 1 && cache.stats().pending_bytes == 0);
+        TEST_ASSERT(dkv_files(dir).size() == 1);
+        // An empty payload or one past its key is refused.
+        TEST_ASSERT(!cache.save_async(OwnedSnapshot{}, disk_test_key(40, 99)));
+        TEST_ASSERT(!cache.save_async(
+            OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok),
+            disk_test_key(ref.cur_pos - 1, 99)));
+    }
+    {
+        // 1 MB free and no reserve: the configured 128 GB budget shrinks to
+        // the bytes already used plus the free space.
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        cfg.free_space_reserve_bytes = 0;
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_free_space_probe([] { return (uint64_t)1 << 20; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.budget_bytes() == cache.total_bytes() + (1u << 20));
+        cache.set_free_space_probe([] { return (uint64_t)0; });
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, disk_test_key(40, 700)));  // evicts the old one
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(!cache.lookup(key, 1));
+    }
+    // A second server on the same directory leaves it alone.
+    {
+        DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+        DiskPrefixCache first(cfg, backend);
+        TEST_ASSERT(first.init() && !first.disabled());
+        DiskPrefixCache second(cfg, backend);
+        TEST_ASSERT(second.init());
+        TEST_ASSERT(second.disabled());
+    }
+    rm_rf(dir);
+}
+
+#if !defined(_WIN32)
+namespace {
+
+// A concurrent engine whose checkpoints live in the backend's snapshot
+// slots (as Qwen's paged checkpoints do): a capture replaces the slot's
+// payload and leaves the old one displaced; restoring checkpoint 64 reads
+// the disk staging slot.
+class DiskCheckpointEngine final : public SeqEngine {
+public:
+    explicit DiskCheckpointEngine(DiskPayloadBackend & backend)
+        : backend_(backend), slots_(2) {}
+    int slot_count() const override { return (int)slots_.size(); }
+    int max_context() const override { return 64; }
+    bool supports_prefix_store() const override { return true; }
+    bool prefix_store_in_backend_snapshots() const override { return true; }
+    size_t estimate_prefix_store_bytes(int) const override { return 256; }
+    bool token_is_eos(int32_t token) const override { return token == 2; }
+    StepPlanLimits step_plan_limits(int) const override {
+        return {2, 64, 128, 64};
+    }
+    AdmitResult admit(uint64_t id, const std::vector<int32_t> & prompt,
+                      const SamplerCfg & sampler) override {
+        return admit_with_prefix(id, prompt, sampler, PrefixStorePlan{});
+    }
+    AdmitResult admit_with_prefix(uint64_t, const std::vector<int32_t> & prompt,
+                                  const SamplerCfg &,
+                                  const PrefixStorePlan & plan) override {
+        AdmitResult result;
+        int chosen = -1;
+        for (int i = 0; i < (int)slots_.size(); ++i) {
+            if (!slots_[(size_t)i].active) { chosen = i; break; }
+        }
+        if (prompt.empty() || chosen < 0) {
+            result.status = AdmitResult::Status::busy;
+            return result;
+        }
+        Slot & slot = slots_[(size_t)chosen];
+        slot = Slot{true, true, {}};
+        result.status = AdmitResult::Status::admitted;
+        result.slot = chosen;
+        if (plan.restore.valid()) {
+            result.prefix_store.restore_attempted = true;
+            const int index = (int)plan.restore.id - 1;
+            if (backend_.snapshot_cur_pos(index) == plan.restore.tokens) {
+                result.prefix_store.restored = plan.restore;
+                restores.push_back(plan.restore);
+            } else {
+                result.prefix_store.invalidated = plan.restore;
+            }
+        }
+        if (!result.prefix_store.invalidated.valid() && plan.capture.valid()) {
+            slot.capture = plan.capture;
+            result.prefix_store.capture = plan.capture;
+        }
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const StepInput & input : plan.decode) {
+            result.decode.push_back({input.slot, 2, false, {}});
+        }
+        for (const PrefillSlice & slice : plan.prefills) {
+            Slot & slot = slots_[(size_t)slice.slot];
+            slot.prefilling = false;
+            PrefillOutput output;
+            output.slot = slice.slot;
+            output.status = PrefillOutput::Status::completed;
+            output.token = 2;
+            if (slot.capture.valid()) {
+                const int index = (int)slot.capture.checkpoint.id - 1;
+                auto old = backend_.slots.find(index);
+                if (old != backend_.slots.end()) {
+                    DiskPayloadBackend::release(backend_.displaced[index]);
+                    backend_.displaced[index] = old->second;
+                    backend_.slots.erase(old);
+                }
+                backend_.slots[index] =
+                    DiskPayloadBackend::make(slot.capture.checkpoint.tokens);
+                output.prefix_store.status = PrefixStoreEvent::Status::saved;
+                output.prefix_store.ticket = slot.capture;
+                output.prefix_store.bytes = 256;
+                slot.capture = {};
+            }
+            result.prefills.push_back(std::move(output));
+        }
+        return result;
+    }
+    void retire(int slot) override { slots_[(size_t)slot] = Slot{}; }
+    void discard_prefix_store(PrefixStoreRef checkpoint) override {
+        backend_.drop((int)checkpoint.id - 1);
+    }
+    std::vector<PrefixStoreRef> restores;
+
+private:
+    struct Slot {
+        bool active = false;
+        bool prefilling = false;
+        PrefixCaptureTicket capture;
+    };
+    DiskPayloadBackend & backend_;
+    std::vector<Slot> slots_;
+};
+
+struct DiskCheckpointBackend : DiskPayloadBackend {
+    DiskCheckpointEngine engine{*this};
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+}  // namespace
+
+// Concurrent (paged) serving: a checkpoint evicted by another capture is
+// written to disk, the conversation's next request is restored from it
+// through the staging checkpoint, and shutdown writes the rest.
+TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_eviction_and_restore) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_paged").string();
+    rm_rf(dir);
+
+    auto backend_owner = std::make_unique<DiskCheckpointBackend>();
+    DiskCheckpointBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config = disk_session_config(dir);
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;  // a third conversation evicts the first
+    config.concurrent_prefix_cache_max_bytes = 4096;
+    config.concurrent_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(engine, tokenizer, config);
+    DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+    TEST_ASSERT(!disk.disabled());
+
+    std::vector<std::unique_ptr<ServerJob>> jobs;
+    std::vector<int> fds;
+    const auto make_job = [&](std::vector<int32_t> prompt, const char * id) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        fds.push_back(sockets[0]);
+        fds.push_back(sockets[1]);
+        auto job = std::make_unique<ServerJob>();
+        job->fd = sockets[0];
+        job->req.format = ApiFormat::OPENAI_CHAT;
+        job->req.prompt_tokens = std::move(prompt);
+        job->req.max_output = 1;
+        job->req.stream = false;
+        job->req.model = "scheduler-test";
+        job->req.response_id = id;
+        jobs.push_back(std::move(job));
+        return jobs.back().get();
+    };
+    const auto run_one = [&](std::vector<int32_t> prompt, const char * id) {
+        ServerJob * job = make_job(std::move(prompt), id);
+        SchedulerTestHarness::enqueue(server, job);
+        std::unique_lock<std::mutex> lock(job->mu);
+        return job->cv.wait_for(lock, std::chrono::seconds(5), [&] { return job->done; });
+    };
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    const std::vector<int32_t> a = {1, 100, 3, 101, 4};
+    const std::vector<int32_t> b = {1, 200, 3, 201, 4};
+    const std::vector<int32_t> c = {1, 300, 3, 301, 4};
+    const bool abc = run_one(a, "a") && run_one(b, "b") && run_one(c, "c");
+    disk.drain();
+    const auto written = disk.stats().writes;
+    const auto probe_a = disk.longest_prefix({1, 100, 3, 101, 4, 9});
+    // Conversation a again: RAM lost it, disk has it.
+    const bool again = run_one({1, 100, 3, 101, 4, 9, 2, 3, 102, 4}, "a2");
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    for (const int fd : fds) close(fd);
+
+    TEST_ASSERT(abc && again);
+    TEST_ASSERT(written == 1);
+    TEST_ASSERT(probe_a.len == 3 && probe_a.cur_pos == 3);
+    bool restored_from_disk = false;
+    for (const auto & r : backend.engine.restores) {
+        restored_from_disk |= r == PrefixStoreRef{(uint64_t)ModelBackend::kMaxSlots, 3};
+    }
+    TEST_ASSERT(restored_from_disk);
+    TEST_ASSERT(!backend.snapshot_used(ModelBackend::kMaxSlots - 1));  // staging freed
+    TEST_ASSERT(backend.displaced.empty());  // every displaced payload claimed
+
+    // Shutdown writes what is still in RAM.
+    SchedulerTestHarness::flush_sessions(server);
+    TEST_ASSERT(disk.stats().pending_files == 0);
+    TEST_ASSERT(disk.longest_prefix({1, 300, 3, 301, 4, 9}).len == 3);
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+#endif
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     const std::string file_path = test_tmp_path(
