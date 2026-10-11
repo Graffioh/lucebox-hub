@@ -1534,6 +1534,12 @@ if(LUCE_TESTS)
             SKIP_RETURN_CODE 77
             ENVIRONMENT "GGML_CUDA_DISABLE_COPY_BATCH=1")
     endif()
+    # GPU F32 copy into a strided view (the PFlash scorer's chunked logits
+    # copy; a one-key-wide last chunk used to take the dense transpose
+    # kernel). CUDA and HIP; exits 77 without a device.
+    luce_add_ggml_gpu_executable(test_cpy_strided_dst test/unit/test_cpy_strided_dst.cpp)
+    target_link_libraries(test_cpy_strided_dst PRIVATE ggml-cpu)
+    list(APPEND _raw_unit_test_targets test_cpy_strided_dst)
     if(LUCE_GPU_BACKEND STREQUAL "hip")
         add_executable(test_ggml_host_mailbox_cuda test/unit/test_ggml_host_mailbox_cuda.cpp)
         set_source_files_properties(test/unit/test_ggml_host_mailbox_cuda.cpp PROPERTIES LANGUAGE HIP)
