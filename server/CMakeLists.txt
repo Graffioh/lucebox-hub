@@ -191,9 +191,9 @@ endif()
 
 # ─── ggml (vendored from llama.cpp) ──────────────────────────────────
 #
-# We use only ggml from the vendored llama.cpp snapshot. The drafter is
-# loaded via our own custom Qwen3-0.6B forward
-# (src/qwen3/qwen3_loader.cpp + src/qwen3/qwen3_graph.cpp)
+# We use only ggml from the vendored llama.cpp snapshot. The PFlash drafter
+# is loaded via our own custom Qwen3.5-0.8B forward
+# (src/pflash/qwen35_loader.cpp + src/qwen35/qwen35_target_graph.cpp)
 # rather than libllama, so libllama is not built.
 #
 # No BLAS, no Metal, no Vulkan, no examples/tests/tools.
@@ -532,6 +532,7 @@ set(LUCE_SRC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen4exp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/laguna
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/pflash
     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server
@@ -553,11 +554,14 @@ add_library(luce_common STATIC
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
-    src/qwen3/anchor_scan.cpp
-    src/qwen3/qwen3_drafter.cpp
-    src/qwen3/qwen3_kvflash_scorer.cpp
+    src/pflash/anchor_scan.cpp
+    src/pflash/pflash_selection.cpp
+    src/pflash/pflash_drafter.cpp
+    src/pflash/pflash_compress.cpp
+    src/pflash/qwen35_drafter.cpp
+    src/pflash/qwen35_loader.cpp
+    src/pflash/kvflash_drafter_scorer.cpp
     src/qwen3/qwen3_loader.cpp
-    src/qwen3/qwen3_graph.cpp
     src/qwen3/qwen3_backend.cpp
     src/qwen3/qwen3_daemon.cpp
     src/gemma4/gemma4_loader.cpp
@@ -762,7 +766,7 @@ endif()
 #   - CUDA sm_60–sm_69 (Pascal): scalar F16, no tensor cores — flashprefill_scalar.cu
 #   - HIP Phase 1 (default): ggml q8 fallback, no custom kernels.
 #   - HIP Phase 2 (LUCE_HIP_SM80_EQUIV=ON): rocWMMA-native kernels.
-# The dispatch in qwen3_graph.cpp checks buffer type at runtime:
+# The dispatch in flashprefill.h checks buffer type at runtime:
 #   BF16 buffers → bf16 WMMA kernel; F16 buffers → f16 WMMA kernel; else → ggml FA.
 if(LUCE_GPU_BACKEND STREQUAL "hip")
     # rms_norm_hip.cu is needed by the HIP chunk-B graph path regardless of SM80_EQUIV.
@@ -2352,8 +2356,8 @@ if(LUCE_TESTS)
             test/unit/test_chain_rollback_policy.cpp
             test/unit/test_ddtree_tau.cpp
             test/unit/test_anchor_transitive.cpp
-            test/unit/test_drafter_early_exit_score_range.cpp
-            test/unit/test_qwen3_buffer_plan.cpp
+            test/unit/test_pflash_drafter_ipc.cpp
+            test/unit/test_pflash_selection.cpp
             test/unit/test_model_test_paths.cpp
             test/unit/test_gguf_mmap.cpp
             test/unit/test_kv_quant.cpp
@@ -2378,7 +2382,7 @@ if(LUCE_TESTS)
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
-            src/qwen3/anchor_scan.cpp)
+            src/pflash/anchor_scan.cpp)
         target_include_directories(test_server_unit PRIVATE
             ${LUCE_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
