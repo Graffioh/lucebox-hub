@@ -402,8 +402,12 @@ struct PflashChatView {
 
 // One scored turn that compresses only `regions` of the raw prompt (drafter
 // tokens, canonical) and serves everything else as the view holds it or raw:
-// "arrive" = a large uncached chunk. The served prompt keeps the cached view
-// up to cut_view (raw position cut_raw) and serves the rest anew.
+// "arrive" = a large uncached chunk; "new_content" = the newest user turn's
+// content of an agent conversation (PFLASH_AGENT_HISTORY=keep). The served
+// prompt keeps the cached view up to cut_view (raw position cut_raw) and
+// serves the rest anew. ``raw_base`` (no view): the raw prompt's own target
+// tokens [0, cut_view) stand in for the view, so the earlier conversation is
+// served token for token as full prefill would serve it.
 struct PflashRegionPlan {
     bool active = false;
     std::string mode;
@@ -413,6 +417,7 @@ struct PflashRegionPlan {
     int tail_after = 0;
     bool has_view = false;
     int region_droppable = 0;
+    bool raw_base = false;
 };
 
 class PflashChatViewStore {
@@ -657,7 +662,8 @@ PflashFallbackDecision pflash_fallback_decision(
 // hold, and that cache holds less than ``threshold`` droppable tokens:
 // compressing never throws away a threshold's worth of reusable cache. A raw
 // prompt that does not fit the context is always compressed.
-enum class PflashAdmission { Compress, UnderThreshold, WarmCache, ColdHistory };
+enum class PflashAdmission {
+    Compress, UnderThreshold, WarmCache, ColdHistory, NewContent, KeepHistory };
 const char * pflash_admission_name(PflashAdmission admission) noexcept;
 bool pflash_cache_admission_enabled() noexcept;
 PflashAdmission pflash_cache_admission(
@@ -695,6 +701,40 @@ PFlashTokenSpan pflash_chat_history_region(
 PflashAdmission pflash_cold_history_admission(
     PflashAdmission admission, bool raw_fits, bool tool_activity,
     int history_uncached_droppable, int threshold) noexcept;
+// Agent history (PFLASH_AGENT_HISTORY=keep, cache admission only; unset or
+// any other value = off, today's decisions). In a conversation with tool
+// activity whose newest turn is a user turn after an assistant turn, the
+// earlier conversation (everything before that user turn) is never
+// compressed: only the new user turn's content may be, and only when its
+// droppable tokens reach the threshold (decision ``NewContent``: a region
+// plan over that content alone, served on a raw base or the conversation's
+// view). Smaller new content is served raw (``KeepHistory``), or as the
+// view continues it. A newest tool output, a first turn and a raw prompt
+// over the context keep today's rules.
+bool pflash_agent_history_enabled() noexcept;
+// The newest turn of ``turns`` when it is a user turn with an assistant turn
+// before it: returns nullptr and sets ``newest``; otherwise the reason it is
+// out of scope ("no_turns", "newest_not_user", "no_history") and newest = -1.
+const char * pflash_keep_history_scope(
+    const std::vector<PflashChatTurn> & turns, int & newest) noexcept;
+// The decision for an in-scope request: UnderThreshold stays; new content
+// of at least ``threshold`` droppable tokens turns Compress, WarmCache and
+// ColdHistory into NewContent; smaller new content turns Compress (and
+// WarmCache when ``arrive`` would compress the uncached tail) into
+// KeepHistory; ColdHistory and WarmCache without arrive stay (both raw).
+PflashAdmission pflash_keep_history_admission(
+    PflashAdmission admission, int new_droppable, int threshold,
+    bool arrive) noexcept;
+// Target tokens of ``prompt`` that hold exactly the drafter tokens
+// ``drafter_ids``[0, drafter_cut), where drafter_cut is the role_begin of
+// ``turns``[turn] (the drafter parse): the same turn in a parse of the
+// target tokens, verified by decoding both prefixes. -1 when the parses or
+// the decoded prefixes differ (fail closed: the caller serves raw).
+int pflash_raw_base_target(
+    const Tokenizer & target, const ChatMarkers & markers,
+    const std::vector<int32_t> & prompt, const Tokenizer & drafter,
+    const std::vector<int32_t> & drafter_ids,
+    const std::vector<PflashChatTurn> & turns, int turn);
 // Tokens of the canonical ``spans`` inside [begin, end).
 int pflash_span_tokens_within(
     const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept;
@@ -941,6 +981,11 @@ private:
     // no scoring: a repeated prompt, or a small follow-up with recall off;
     // it returns false for the caller to compress. With one it always
     // serves: a continued view, or the fresh prompt as a new view.
+    // ``keep_history`` (PFLASH_AGENT_HISTORY=keep, in scope): the view only
+    // continues -- new tokens are appended verbatim (no compress-new), the
+    // view is not rebuilt when it outgrows a fresh selection, and when it
+    // cannot continue it returns false for the caller to serve the raw
+    // prompt; only a view over the context limit is still rebuilt.
     bool serve_pflash_chat_view(
         const ParsedRequest & req,
         const std::vector<int32_t> & drafter_ids,
@@ -949,7 +994,8 @@ private:
         const std::vector<PFlashTokenSpan> * kept_spans,
         std::vector<int32_t> & served,
         int & snapshot_cut,
-        nlohmann::json & stats);
+        nlohmann::json & stats,
+        bool keep_history = false);
     // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
     // the served prompt's text, for evidence checks in evaluations.
     // Target tokens of ``prompt`` the reader can restore from its in-memory
@@ -1219,7 +1265,10 @@ private:
     uint64_t                        pflash_fallback_refused_ = 0;
     std::map<std::string, uint64_t> pflash_fallback_reasons_;   // served, by reason
     std::map<std::string, uint64_t> pflash_refused_reasons_;    // refused, by why
+    // PFLASH_AGENT_HISTORY=keep decisions, by name (/props pflash.keep_history).
+    std::map<std::string, uint64_t> pflash_keep_history_counts_;
     nlohmann::json pflash_failure_counters_json() const;
+    nlohmann::json pflash_keep_history_json() const;
 
     // Active client thread tracking.
     std::atomic<int>                active_clients_{0};
