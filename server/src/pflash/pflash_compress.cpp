@@ -179,6 +179,34 @@ void write_compression_trace(
     std::fclose(file);
 }
 
+namespace {
+thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
+thread_local PFlashScoringStats g_last_scoring_stats;
+thread_local std::vector<PFlashCandidateLift> g_last_candidate_lifts;
+} // namespace
+
+const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts() {
+    return g_last_candidate_lifts;
+}
+
+const PFlashScoringStats & pflash_last_scoring_stats() {
+    return g_last_scoring_stats;
+}
+
+void pflash_set_scoring_stats(const PFlashScoringStats & stats) {
+    g_last_scoring_stats = stats;
+}
+
+const std::vector<PFlashTokenSpan> & pflash_last_kept_spans() {
+    return g_last_kept_spans;
+}
+
+void pflash_clear_kept_spans() {
+    g_last_kept_spans.clear();
+    g_last_scoring_stats = {};
+    g_last_candidate_lifts.clear();
+}
+
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,
@@ -225,7 +253,8 @@ std::vector<int32_t> select_pflash_chunks(
         const bool mandatory =
             luce::pflash::pflash_chunk_is_structurally_required(
                 begin, end, query_begin, query_end, input_tokens,
-                required_instruction_spans);
+                required_instruction_spans,
+                /*query_suffix_structural=*/ !config.query_suffix_candidates);
         candidates.push_back({(size_t) chunk, begin, end, score, mandatory});
         chunk_means.push_back({(float) score, chunk});
         exact_chunk_scores.push_back(score);
@@ -280,11 +309,33 @@ std::vector<int32_t> select_pflash_chunks(
 
     std::vector<int32_t> output;
     output.reserve((size_t) selected.retained_tokens);
+    g_last_kept_spans.clear();
+    g_last_candidate_lifts.clear();
+    if (direct_mass) {
+        // Head mass sums to one over the keys, so uniform attention gives
+        // each token 1/input of it.
+        for (const auto & candidate : candidates) {
+            double mass = 0.0;
+            for (int token = candidate.begin; token < candidate.end; ++token) {
+                mass += token_scores[(size_t) token];
+            }
+            const int length = std::max(1, candidate.end - candidate.begin);
+            g_last_candidate_lifts.push_back(
+                {{candidate.begin, candidate.end},
+                 mass / (double) length * (double) input_tokens});
+        }
+    }
     for (const auto & candidate : candidates) {
         if (!selected_mask[candidate.ordinal]) continue;
         output.insert(output.end(),
                       ids.begin() + candidate.begin,
                       ids.begin() + candidate.end);
+        if (!g_last_kept_spans.empty() &&
+            g_last_kept_spans.back().end == candidate.begin) {
+            g_last_kept_spans.back().end = candidate.end;
+        } else {
+            g_last_kept_spans.push_back({candidate.begin, candidate.end});
+        }
     }
 
     std::fprintf(stderr,

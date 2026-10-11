@@ -445,149 +445,402 @@ std::string pflash_token_fingerprint(
     return encoded;
 }
 
-PflashChatTailSpan pflash_last_message_content_span(
+PflashChatTurnSpan pflash_chat_query_turn(
         const Tokenizer & marker_tokenizer,
         const ChatMarkers & markers,
         const Tokenizer & tokenizer,
         const std::vector<int32_t> & prompt) {
-    PflashChatTailSpan tail;
-    if (prompt.empty()) return tail;
+    PflashChatTurnSpan chosen;
+    if (prompt.empty()) return chosen;
 
+    // Marker strings, searched in the decoded prompt text so a drafter whose
+    // vocabulary spells the control tokens differently still maps.
+    struct Mark {
+        size_t at = 0;
+        size_t len = 0;
+        bool role = false;
+        std::string text;
+    };
     const auto seq_text = [&marker_tokenizer](
             const std::vector<int32_t> & seq) {
         std::string text;
         for (const int32_t id : seq) text += marker_tokenizer.token_text(id);
         return text;
     };
-    std::vector<std::string> role_marks;
+    std::vector<std::pair<std::string, bool>> needles;
     for (const auto & seq : markers.next_role_starts) {
         std::string text = seq_text(seq);
-        if (!text.empty()) role_marks.push_back(std::move(text));
+        if (!text.empty()) needles.emplace_back(std::move(text), true);
     }
-    std::vector<std::string> end_marks;
     for (const auto & seq : markers.end_msg_seqs) {
         std::string text = seq_text(seq);
-        if (!text.empty()) end_marks.push_back(std::move(text));
+        if (!text.empty()) needles.emplace_back(std::move(text), false);
     }
-    if (role_marks.empty() && end_marks.empty()) return tail;
+    if (needles.empty()) return chosen;
 
     const DecodedPrompt decoded =
         decode_prompt_with_offsets(tokenizer, prompt);
     const std::string & text = decoded.text;
-
-    // Last occurrence strictly before `before` (npos: anywhere), as
-    // (offset, length). Marker strings never overlap themselves, so the
-    // rightmost start across all needles is the answer.
-    const auto last_before = [&text](
-            const std::vector<std::string> & needles, size_t before)
-            -> std::pair<size_t, size_t> {
-        size_t best = std::string::npos, len = 0;
-        for (const auto & needle : needles) {
-            const size_t at = before == std::string::npos
-                ? text.rfind(needle)
-                : before == 0
-                    ? std::string::npos
-                    : text.rfind(needle, before - 1);
-            if (at != std::string::npos &&
-                (best == std::string::npos || at > best)) {
-                best = at;
-                len = needle.size();
-            }
+    std::vector<Mark> marks;
+    for (const auto & [needle, role] : needles) {
+        for (size_t at = text.find(needle); at != std::string::npos;
+             at = text.find(needle, at + needle.size())) {
+            marks.push_back({at, needle.size(), role, needle});
         }
-        return {best, len};
-    };
-
-    const auto last_role = last_before(role_marks, std::string::npos);
-    const auto last_end = last_before(end_marks, std::string::npos);
-    if (last_role.first == std::string::npos &&
-        last_end.first == std::string::npos) {
-        return tail;
     }
+    if (marks.empty()) return chosen;
+    std::sort(marks.begin(), marks.end(),
+              [] (const Mark & a, const Mark & b) { return a.at < b.at; });
 
-    // Families whose markers already name the role (DeepSeek "<｜User｜>",
-    // Laguna "<user>") delimit content at the marker itself. Generic markers
-    // (Qwen "<|im_start|>", Gemma "<|turn>") are followed by a "name\n"
-    // header line.
+    // Families whose markers name the role (DeepSeek "<｜User｜>", Laguna
+    // "<user>") start content at the marker; generic markers (Qwen
+    // "<|im_start|>", Gemma "<|turn>") are followed by a "name\n" line.
     const bool marker_carries_role =
         markers.role_starts_delimit || markers.family == "laguna";
+    const auto role_from_marker = [] (const std::string & marker) {
+        std::string role;
+        for (const char c : marker) {
+            if (std::isalpha((unsigned char) c)) {
+                role += (char) std::tolower((unsigned char) c);
+            }
+        }
+        return role;
+    };
+    const auto is_space = [] (char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    const auto starts_with = [&text] (size_t at, const char * prefix) {
+        return text.compare(at, std::strlen(prefix), prefix) == 0;
+    };
 
-    // The character offset where the final message's content stops. The
-    // prompt's last marker is either the message's own end marker, the
-    // assistant generation marker (a role marker followed only by a
-    // role-name header), or a role marker that opened an unterminated
-    // message — in which case content runs to the prompt end.
-    size_t content_end_text;
-    if (last_role.first != std::string::npos &&
-        (last_end.first == std::string::npos ||
-         last_role.first > last_end.first)) {
-        const size_t after = last_role.first + last_role.second;
-        bool generation;
+    struct Turn {
+        size_t role_at = 0;
+        size_t content_at = 0;
+        size_t content_end = 0;
+        size_t close_end = 0;   // past the closing marker, if any
+        std::string role;
+        bool closed = false;
+    };
+    std::vector<Turn> turns;
+    for (size_t index = 0; index < marks.size(); ++index) {
+        const Mark & mark = marks[index];
+        if (!mark.role) continue;
+        Turn turn;
+        turn.role_at = mark.at;
+        size_t content_at = mark.at + mark.len;
         if (marker_carries_role) {
-            generation = text.find_first_not_of(" \t\n\r", after) ==
-                std::string::npos;
+            turn.role = role_from_marker(mark.text);
         } else {
-            size_t i = after;
-            while (i < text.size() && i - after < 16 &&
-                   std::isalpha((unsigned char) text[i])) ++i;
-            generation = i > after && i < text.size() && text[i] == '\n' &&
-                text.find_first_not_of(" \t\n\r", i + 1) ==
-                    std::string::npos;
-        }
-        if (generation) {
-            if (marker_carries_role) {
-                content_end_text = last_role.first;
-            } else {
-                // Content ends at this message's end marker — the last one
-                // after the role marker that opened it, not an earlier
-                // turn's.
-                const auto prev_role = last_before(role_marks, last_role.first);
-                content_end_text =
-                    (last_end.first != std::string::npos &&
-                     (prev_role.first == std::string::npos ||
-                          last_end.first > prev_role.first))
-                        ? last_end.first : last_role.first;
+            size_t name_end = content_at;
+            while (name_end < text.size() && name_end - content_at < 16 &&
+                   std::isalpha((unsigned char) text[name_end])) {
+                ++name_end;
             }
-        } else {
-            content_end_text = text.size();
-        }
-    } else {
-        content_end_text = last_end.first;
-    }
-
-    // The marker that opened the message containing content_end.
-    const auto role = last_before(role_marks, content_end_text);
-    size_t content_begin_text = 0;
-    if (role.first != std::string::npos) {
-        tail.role_begin = token_at_offset(decoded, role.first);
-        size_t begin = role.first + role.second;
-        if (!marker_carries_role) {
-            size_t i = begin;
-            while (i < content_end_text && i - begin < 16 &&
-                   std::isalpha((unsigned char) text[i])) ++i;
-            if (i > begin && i < content_end_text && text[i] == '\n') {
-                begin = i + 1;
+            turn.role = text.substr(content_at, name_end - content_at);
+            if (name_end < text.size() && text[name_end] == '\n') {
+                content_at = name_end + 1;
             }
         }
-        content_begin_text = begin;
+        // A turn ends at its end marker, or -- when role markers delimit
+        // (DeepSeek user turns) -- at the next role marker. Nothing after
+        // it leaves the turn open to the prompt end.
+        size_t content_end = text.size();
+        turn.close_end = text.size();
+        if (index + 1 < marks.size()) {
+            const Mark & next = marks[index + 1];
+            content_end = next.at;
+            turn.closed = !next.role || markers.role_starts_delimit;
+            turn.close_end = next.role ? next.at : next.at + next.len;
+        }
+        // Content ignores the whitespace the template wraps it in.
+        while (content_at < content_end && is_space(text[content_at])) {
+            ++content_at;
+        }
+        while (content_end > content_at && is_space(text[content_end - 1])) {
+            --content_end;
+        }
+        turn.content_at = content_at;
+        turn.content_end = content_end;
+        // Tool output travels in user turns on some templates.
+        if (starts_with(content_at, "<tool_response>") ||
+            starts_with(content_at, "<tool_result>")) {
+            turn.role = "tool";
+        }
+        turns.push_back(std::move(turn));
     }
+    if (turns.empty()) return chosen;
 
-    tail.content_end = content_end_text >= text.size()
-        ? (int) prompt.size()
-        : token_at_offset(decoded, content_end_text);
-    // First token whose text starts at-or-after the content offset — a token
-    // merged across the header/content boundary stays with the header.
-    tail.content_begin = (int) (std::lower_bound(
-        decoded.token_begin.begin(), decoded.token_begin.end(),
-        content_begin_text) - decoded.token_begin.begin());
-    if (tail.role_begin > tail.content_begin) {
-        tail.role_begin = tail.content_begin;
+    // An assistant turn left open at the prompt end is the generation prompt
+    // ("<|im_start|>assistant\n<think>\n"): template machinery, never query.
+    size_t usable = turns.size();
+    const Turn & last = turns.back();
+    if (!last.closed && (last.role == "assistant" || last.role == "model")) {
+        --usable;
     }
-    return tail;
+    // The query comes from the latest user turn; a conversation without one
+    // falls back to its latest turn with content.
+    size_t query_index = turns.size();
+    for (size_t index = usable; index-- > 0;) {
+        const Turn & turn = turns[index];
+        if (turn.content_end <= turn.content_at) continue;
+        if (turn.role == "user") { query_index = index; break; }
+        if (query_index == turns.size()) query_index = index;
+    }
+    if (query_index == turns.size()) return chosen;
+    const Turn * query = &turns[query_index];
+
+    // Content bounds in tokens: the first token starting at-or-after each
+    // character offset, so a token merged across a boundary stays with the
+    // content it ends.
+    const auto token_from = [&decoded] (size_t at) {
+        return (int) (std::lower_bound(
+            decoded.token_begin.begin(), decoded.token_begin.end(), at) -
+            decoded.token_begin.begin());
+    };
+    chosen.role_begin = token_at_offset(decoded, query->role_at);
+    chosen.content_begin = token_from(query->content_at);
+    chosen.content_end = token_from(query->content_end);
+    chosen.turn_end = token_from(query->close_end);
+    chosen.generation_begin = usable < turns.size()
+        ? token_at_offset(decoded, turns.back().role_at)
+        : (int) prompt.size();
+    chosen.later_turns = query_index + 1 < usable;
+    if (chosen.role_begin > chosen.content_begin) {
+        chosen.role_begin = chosen.content_begin;
+    }
+    for (size_t index = 0; index < usable; ++index) {
+        const Turn & turn = turns[index];
+        PflashChatTurn out;
+        out.role_begin = token_at_offset(decoded, turn.role_at);
+        out.content_begin = token_from(turn.content_at);
+        out.content_end = token_from(turn.content_end);
+        out.turn_end = token_from(turn.close_end);
+        out.role_begin = (std::min)(out.role_begin, out.content_begin);
+        out.role = turn.role;
+        chosen.turns.push_back(std::move(out));
+    }
+    chosen.query_turn = (int) query_index;
+    return chosen;
+}
+
+int pflash_chat_skeleton_tokens() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_SKELETON_TOKENS");
+    if (!raw || !*raw) return 256;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) return 256;
+    return (int) (std::min)(value, 1L << 20);
+}
+
+bool pflash_paragraph_join() noexcept {
+    const char * raw = std::getenv("PFLASH_SELECT_PARAGRAPH_JOIN");
+    return !(raw && std::string(raw) == "0");
+}
+
+std::string pflash_join_kept_spans(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & ids,
+        const std::vector<PFlashTokenSpan> & spans) {
+    std::string out;
+    int previous_end = -1;
+    for (const auto & span : spans) {
+        if (span.begin < 0 || span.end > (int) ids.size() || span.end <= span.begin) {
+            continue;
+        }
+        std::string piece = tokenizer.decode(std::vector<int32_t>(
+            ids.begin() + span.begin, ids.begin() + span.end));
+        if (previous_end >= 0 && span.begin > previous_end && !out.empty() &&
+            !piece.empty()) {
+            const bool left_break = out.back() == '\n';
+            const bool right_break = piece.front() == '\n';
+            if (!left_break && !right_break) {
+                out += "\n\n";
+            } else if (left_break != right_break &&
+                       !(out.size() >= 2 && out[out.size() - 2] == '\n') &&
+                       !(piece.size() >= 2 && piece[1] == '\n')) {
+                out += "\n";
+            }
+        }
+        out += piece;
+        previous_end = span.end;
+    }
+    return out;
+}
+
+bool pflash_chat_recall() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_RECALL");
+    return !(raw && std::string(raw) == "0");
+}
+
+int pflash_chat_compress_new_tokens() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_COMPRESS_NEW_TOKENS");
+    if (!raw || !*raw) return 16384;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 1) return 16384;
+    return (int) (std::min)(value, 1L << 30);
+}
+
+int pflash_chat_history_queries() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_HISTORY_QUERIES");
+    if (!raw || !*raw) return 3;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) return 3;
+    return (int) (std::min)(value, 8L);
+}
+
+std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
+        const std::vector<PFlashTokenSpan> & spans,
+        const std::vector<PFlashTokenSpan> & minus) {
+    std::vector<PFlashTokenSpan> out;
+    size_t cut = 0;
+    for (const auto & span : spans) {
+        int begin = span.begin;
+        while (cut < minus.size() && minus[cut].end <= begin) ++cut;
+        for (size_t index = cut;
+             index < minus.size() && minus[index].begin < span.end; ++index) {
+            if (minus[index].begin > begin) {
+                out.push_back({begin, minus[index].begin});
+            }
+            begin = (std::max)(begin, minus[index].end);
+        }
+        if (begin < span.end) out.push_back({begin, span.end});
+    }
+    return out;
+}
+
+std::string pflash_recall_excerpt(
+        const std::string & text,
+        const std::vector<std::string> & role_markers,
+        const std::vector<std::string> & end_markers,
+        bool generic_role_lines) {
+    std::string out;
+    out.reserve(text.size());
+    size_t at = 0;
+    while (at < text.size()) {
+        bool matched = false;
+        for (const auto & marker : role_markers) {
+            if (marker.empty() || text.compare(at, marker.size(), marker) != 0) {
+                continue;
+            }
+            at += marker.size();
+            if (generic_role_lines) {
+                size_t name_end = at;
+                while (name_end < text.size() && name_end - at < 16 &&
+                       std::isalpha((unsigned char) text[name_end])) {
+                    ++name_end;
+                }
+                if (name_end < text.size() && text[name_end] == '\n') {
+                    at = name_end + 1;
+                }
+            }
+            out += '\n';
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+        for (const auto & marker : end_markers) {
+            if (marker.empty() || text.compare(at, marker.size(), marker) != 0) {
+                continue;
+            }
+            at += marker.size();
+            out += '\n';
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+        out += text[at++];
+    }
+    const size_t first = out.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const size_t last = out.find_last_not_of(" \t\r\n");
+    return out.substr(first, last - first + 1);
+}
+
+bool PflashChatViewStore::find(
+        const std::vector<int32_t> & raw_tokens,
+        const std::vector<int32_t> & drafter_ids,
+        PflashChatView & out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const PflashChatView * best = nullptr;
+    for (const auto & view : views_) {
+        if (view.raw_gen_begin <= 0 || view.drafter_gen_begin <= 0 ||
+            (size_t) view.raw_gen_begin > raw_tokens.size() ||
+            (size_t) view.drafter_gen_begin > drafter_ids.size()) {
+            continue;
+        }
+        if (!std::equal(view.raw_tokens.begin(),
+                        view.raw_tokens.begin() + view.raw_gen_begin,
+                        raw_tokens.begin()) ||
+            !std::equal(view.drafter_ids.begin(),
+                        view.drafter_ids.begin() + view.drafter_gen_begin,
+                        drafter_ids.begin())) {
+            continue;
+        }
+        if (!best || view.raw_gen_begin > best->raw_gen_begin) best = &view;
+    }
+    if (!best) return false;
+    out = *best;
+    return true;
+}
+
+void PflashChatViewStore::remember(PflashChatView view) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Drop the views this one continues: same conversation, older turn.
+    views_.erase(std::remove_if(views_.begin(), views_.end(),
+        [&view] (const PflashChatView & old) {
+            return old.raw_gen_begin > 0 &&
+                old.raw_gen_begin <= view.raw_gen_begin &&
+                (size_t) old.raw_gen_begin <= view.raw_tokens.size() &&
+                std::equal(old.raw_tokens.begin(),
+                           old.raw_tokens.begin() + old.raw_gen_begin,
+                           view.raw_tokens.begin());
+        }), views_.end());
+    views_.push_back(std::move(view));
+    while (views_.size() > capacity_) views_.erase(views_.begin());
+}
+
+size_t PflashChatViewStore::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return views_.size();
 }
 
 bool pflash_full_cache_restore_allowed(
         bool selection_environment_present) noexcept {
     return !selection_environment_present;
+}
+
+int pflash_kept_tokens(
+        int input_tokens,
+        int chunk_size,
+        int query_begin,
+        int query_end,
+        const std::vector<PFlashTokenSpan> & kept_spans,
+        bool query_suffix_structural) noexcept {
+    if (input_tokens <= 0 || chunk_size <= 0) return 0;
+    int kept = 0;
+    for (int begin = 0; begin < input_tokens; begin += chunk_size) {
+        const int end = (std::min)(input_tokens, begin + chunk_size);
+        if (luce::pflash::pflash_chunk_is_structurally_required(
+                begin, end, query_begin, query_end, input_tokens,
+                kept_spans, query_suffix_structural)) {
+            kept += end - begin;
+        }
+    }
+    return kept;
+}
+
+double pflash_effective_keep_ratio(
+        int input_tokens, int kept_tokens, double keep_ratio) noexcept {
+    if (input_tokens <= 0 || !std::isfinite(keep_ratio) || keep_ratio <= 0.0) {
+        return keep_ratio;
+    }
+    const int kept = (std::max)(0, (std::min)(kept_tokens, input_tokens));
+    // One token of slack so flooring the budget never lands below `kept`.
+    const double budget =
+        (double) kept + keep_ratio * (double) (input_tokens - kept) + 1.0;
+    return (std::min)(1.0, budget / (double) input_tokens);
 }
 
 int pflash_target_token_ceiling(
@@ -3802,24 +4055,42 @@ std::string HttpServer::apply_pflash_compression(
     std::string last_user_text;
     int query_content_begin = -1;
     int query_content_end = -1;
-    // Complete token span of an explicit pflash_query inside the boundary
-    // content, when it was mapped against the decoded token text. The strict
-    // selector keeps the whole span mandatory; the scorer window is its tail.
-    PFlashTokenSpan explicit_query_span{-1, -1};
-    // Header ("<|im_start|>user\n") opening the last message, when the chat
+    // Complete token span of the scorer query: an explicit pflash_query
+    // (benchmark override) mapped against the decoded token text, or the
+    // tail of the latest user turn (chat default). The strict selector keeps
+    // the whole span mandatory; the scorer window is its tail.
+    PFlashTokenSpan query_span{-1, -1};
+    std::string query_span_rule;
+    // Assistant and tool turns after the query's turn are context the query
+    // scores, not a kept suffix (strict selection only).
+    bool query_suffix_candidates = false;
+    // Earlier user questions of a multi-turn chat, most recent first: they
+    // score the context alongside the current query at halving weights.
+    std::vector<PFlashTokenSpan> history_query_spans;
+    // The latest user turn's tail (PFLASH_SELECT_QUERY_TOKENS), a second
+    // query window next to the prompt-end query: literal strings in the
+    // question (an identifier, a described function) match their passage.
+    PFlashTokenSpan turn_query_span{-1, -1};
+    // Header ("<|im_start|>user\n") opening the query's turn, when the chat
     // markers resolved it — pinned mandatory so a compressed prompt keeps
     // the current turn's role envelope.
-    PFlashTokenSpan last_role_header{-1, -1};
+    PFlashTokenSpan query_role_header{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
-    // Chat-first scorer query: the last message's content span, located by
-    // the rendered prompt's own control markers. Feeds the strict tail
+    // Kept verbatim like the required spans. The system prompt never loses
+    // its pin: when it alone does not fit the context the request fails.
+    // Developer messages and tool definitions that do not fit are scored
+    // like any other context.
+    std::vector<PFlashTokenSpan> system_spans;
+    std::vector<PFlashTokenSpan> instruction_role_spans;
+    // Chat-first scorer query: the latest user turn's content span, located
+    // by the rendered prompt's own control markers. Feeds the strict tail
     // parser and the legacy window; unused when a benchmark parser
     // (latest_user) or a marker-less prompt needs the sentinel mapping.
-    http_detail::PflashChatTailSpan chat_tail;
+    http_detail::PflashChatTurnSpan chat_turn;
     if (!experiment.configured || tail_parser) {
         ChatMarkers chat_markers;
         if (resolve_chat_markers(tokenizer_, chat_markers)) {
-            chat_tail = http_detail::pflash_last_message_content_span(
+            chat_turn = http_detail::pflash_chat_query_turn(
                 tokenizer_, chat_markers, *drafter_tokenizer_, drafter_ids);
         }
     }
@@ -3848,8 +4119,10 @@ std::string HttpServer::apply_pflash_compression(
 
             const bool semantic_parser = experiment.query_parser ==
                 luce::pflash::PFlashQueryParser::SemanticUser;
+            // The latest user message bounds the query; the chat parser
+            // falls back to the last message when there is none.
             int boundary_index = (int) messages.size() - 1;
-            if (!raw_text_input && semantic_parser) {
+            if (!raw_text_input && (semantic_parser || last_user_index >= 0)) {
                 boundary_index = last_user_index;
             }
 
@@ -3933,15 +4206,15 @@ std::string HttpServer::apply_pflash_compression(
             };
 
             std::string boundary_error;
-            // Chat default: the last message's content bounds come from the
-            // rendered prompt's control markers — no sentinel re-renders.
-            if (tail_parser && chat_tail.valid()) {
-                query_content_begin = chat_tail.content_begin;
-                query_content_end = chat_tail.content_end;
-                if (chat_tail.role_begin >= 0 &&
-                    chat_tail.role_begin < chat_tail.content_begin) {
-                    last_role_header = {chat_tail.role_begin,
-                                        chat_tail.content_begin};
+            // Chat default: the latest user turn's content bounds come from
+            // the rendered prompt's control markers — no sentinel re-renders.
+            if (tail_parser && chat_turn.valid()) {
+                query_content_begin = chat_turn.content_begin;
+                query_content_end = chat_turn.content_end;
+                if (chat_turn.role_begin >= 0 &&
+                    chat_turn.role_begin < chat_turn.content_begin) {
+                    query_role_header = {chat_turn.role_begin,
+                                         chat_turn.content_begin};
                 }
             }
             if (query_content_begin < 0) {
@@ -3965,6 +4238,37 @@ std::string HttpServer::apply_pflash_compression(
                 query_content_end > (int) drafter_ids.size()) {
                 return "PFlash strict selection content boundary mapping failed";
             }
+            // Chat default: without an explicit pflash_query the scorer
+            // query is the prompt's last token -- where the model starts
+            // answering, having read the whole request wherever the question
+            // sits in it. Nothing is parsed out of the user's text: the
+            // latest turn is scored like the rest of the conversation. A
+            // prompt without chat markers falls back to its content's tail.
+            if (tail_parser && req.pflash_query.empty()) {
+                const int prompt_end = (int) drafter_ids.size();
+                if (chat_turn.valid() &&
+                    chat_turn.generation_begin > 0 &&
+                    chat_turn.generation_begin < prompt_end) {
+                    query_span = {prompt_end - 1, prompt_end};
+                    query_span_rule = "prompt_end";
+                    const auto tail = http_detail::pflash_tail_query_window(
+                        drafter_ids, experiment.query_tokens,
+                        chat_turn.content_end, chat_turn.content_begin);
+                    if (tail.valid()) {
+                        turn_query_span = {tail.end - tail.tokens, tail.end};
+                    }
+                } else {
+                    const auto window = http_detail::pflash_tail_query_window(
+                        drafter_ids, experiment.query_tokens,
+                        query_content_end, query_content_begin);
+                    if (window.valid()) {
+                        query_span = {window.end - window.tokens, window.end};
+                        query_span_rule =
+                            raw_text_input ? "content_tail" : "prompt_tail";
+                    }
+                }
+            }
+            const bool prompt_end_query = query_span_rule == "prompt_end";
 
             if (experiment.selection_active) {
                 const auto instruction_plan =
@@ -3979,7 +4283,9 @@ std::string HttpServer::apply_pflash_compression(
                         return "PFlash strict selection instruction mapping failed: " +
                             boundary_error;
                     }
-                    required_instruction_spans.push_back(instruction_span);
+                    (messages[instruction_index].role == "system"
+                        ? system_spans : instruction_role_spans)
+                        .push_back(instruction_span);
                 }
 
                 if (!req.tools.is_null() && !req.tools.empty()) {
@@ -4003,7 +4309,7 @@ std::string HttpServer::apply_pflash_compression(
                         return "PFlash strict selection tool mapping failed: "
                             "tools did not produce a retained prompt span";
                     }
-                    required_instruction_spans.push_back(tool_span);
+                    instruction_role_spans.push_back(tool_span);
                 }
 
                 // Client-declared literal text that must survive compression
@@ -4024,27 +4330,23 @@ std::string HttpServer::apply_pflash_compression(
                     }
                     required_instruction_spans.push_back(required_span);
                 }
-                // An explicit scorer query also pins its complete span: the
-                // whole question is mandatory even though the scorer only
-                // consumes its bounded tail. Mapping against the decoded
-                // content text (not a standalone encoding) keeps BPE boundary
-                // merges like " What" inside the span. Benchmark-only: under
-                // the chat tail parser the query may sit anywhere before the
-                // closing markers; latest_user still scopes it to the user
-                // message.
+                // An explicit scorer query replaces the chat-derived one and
+                // pins its complete span: the whole question is mandatory
+                // even though the scorer only consumes its bounded tail.
+                // Mapping against the decoded content text (not a standalone
+                // encoding) keeps BPE boundary merges like " What" inside the
+                // span. Benchmark-only: under the chat tail parser the query
+                // may sit anywhere before the user turn's closing marker;
+                // latest_user still scopes it to the user message.
                 if (!req.pflash_query.empty()) {
                     const int query_search_begin =
                         semantic_parser ? query_content_begin : 0;
-                    const int query_search_end = semantic_parser
-                        ? query_content_end
-                        : (query_content_end > 0
-                               ? query_content_end : (int) drafter_ids.size());
-                    explicit_query_span =
-                        http_detail::pflash_decoded_text_span(
-                            *drafter_tokenizer_, drafter_ids,
-                            query_search_begin, query_search_end,
-                            req.pflash_query);
-                    if (explicit_query_span.begin < 0) {
+                    query_span = http_detail::pflash_decoded_text_span(
+                        *drafter_tokenizer_, drafter_ids,
+                        query_search_begin, query_content_end,
+                        req.pflash_query);
+                    query_span_rule = "explicit_query_span";
+                    if (query_span.begin < 0) {
                         return semantic_parser
                             ? "PFlash strict selection explicit query mapping "
                               "failed: pflash_query does not occur in the "
@@ -4053,17 +4355,119 @@ std::string HttpServer::apply_pflash_compression(
                               "failed: pflash_query does not occur in the "
                               "prompt";
                     }
-                    required_instruction_spans.push_back(explicit_query_span);
                 }
-                if (last_role_header.begin >= 0) {
-                    required_instruction_spans.push_back(last_role_header);
+                if (query_span.begin >= 0) {
+                    required_instruction_spans.push_back(query_span);
+                }
+                if (prompt_end_query) {
+                    // The whole generation prompt stays verbatim; the query
+                    // is its last token.
+                    required_instruction_spans.push_back(
+                        {chat_turn.generation_begin, (int) drafter_ids.size()});
+                }
+                if (query_role_header.begin >= 0) {
+                    required_instruction_spans.push_back(query_role_header);
+                }
+                // An agent loop puts assistant and tool turns after the
+                // user's: they compete for the budget like the context before
+                // the query. What stays is the rest of the query's turn
+                // through its closing marker, and the generation prompt.
+                if (chat_turn.valid() && chat_turn.later_turns &&
+                    query_span.begin >= chat_turn.content_begin &&
+                    query_span.end <= chat_turn.content_end) {
+                    query_suffix_candidates = true;
+                    if (chat_turn.turn_end > query_span.end) {
+                        required_instruction_spans.push_back(
+                            {query_span.end, chat_turn.turn_end});
+                    }
+                    if (chat_turn.generation_begin < (int) drafter_ids.size()) {
+                        required_instruction_spans.push_back(
+                            {chat_turn.generation_begin,
+                             (int) drafter_ids.size()});
+                    }
+                }
+                // Multi-turn skeleton: every other turn keeps its role
+                // header, and short user turns and assistant answers stay
+                // whole -- what the conversation said rather than the
+                // material it quoted. Like instructions, they are scored as
+                // context when they alone would not fit.
+                if (chat_turn.valid()) {
+                    const int skeleton_tokens =
+                        http_detail::pflash_chat_skeleton_tokens();
+                    for (size_t index = 0; index < chat_turn.turns.size();
+                         ++index) {
+                        // With a prompt-end query the latest user turn is
+                        // no longer pinned as the query: it follows the same
+                        // rule as every other turn.
+                        if ((int) index == chat_turn.query_turn &&
+                            !prompt_end_query) {
+                            continue;
+                        }
+                        const auto & turn = chat_turn.turns[index];
+                        if (turn.role == "system") continue;
+                        if (turn.content_begin > turn.role_begin) {
+                            instruction_role_spans.push_back(
+                                {turn.role_begin, turn.content_begin});
+                        }
+                        const bool conversational = turn.role == "user" ||
+                            turn.role == "assistant" || turn.role == "model";
+                        if (conversational && skeleton_tokens > 0 &&
+                            turn.content_end - turn.content_begin <=
+                                skeleton_tokens &&
+                            turn.turn_end > turn.role_begin) {
+                            instruction_role_spans.push_back(
+                                {turn.role_begin, turn.turn_end});
+                        }
+                    }
+                    const size_t history_queries =
+                        (size_t) http_detail::pflash_chat_history_queries();
+                    for (int index = chat_turn.query_turn - 1;
+                         index >= 0 &&
+                             history_query_spans.size() < history_queries;
+                         --index) {
+                        const auto & turn = chat_turn.turns[(size_t) index];
+                        if (turn.role != "user") continue;
+                        if (prompt_end_query) {
+                            // The earlier question's counterpart of the
+                            // prompt's last token: the last token of the
+                            // header of the reply that followed it.
+                            const size_t reply = (size_t) index + 1;
+                            if (reply < chat_turn.turns.size() &&
+                                chat_turn.turns[reply].role != "user" &&
+                                chat_turn.turns[reply].content_begin >
+                                    chat_turn.turns[reply].role_begin) {
+                                const int end = chat_turn.turns[reply].content_begin;
+                                history_query_spans.push_back({end - 1, end});
+                            }
+                            continue;
+                        }
+                        const auto window = http_detail::pflash_tail_query_window(
+                            drafter_ids, experiment.query_tokens,
+                            turn.content_end, turn.content_begin);
+                        if (window.valid()) {
+                            history_query_spans.push_back(
+                                {window.end - window.tokens, window.end});
+                        }
+                    }
                 }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
+                instruction_role_spans =
+                    http_detail::canonicalize_pflash_token_spans(
+                        std::move(instruction_role_spans));
+                system_spans =
+                    http_detail::canonicalize_pflash_token_spans(
+                        std::move(system_spans));
                 std::string instruction_error;
                 if (!luce::pflash::validate_pflash_instruction_spans(
                         required_instruction_spans,
+                        (int) drafter_ids.size(), instruction_error) ||
+                    !luce::pflash::validate_pflash_instruction_spans(
+                        instruction_role_spans,
+                        (int) drafter_ids.size(), instruction_error) ||
+                    !luce::pflash::validate_pflash_instruction_spans(
+                        system_spans,
                         (int) drafter_ids.size(), instruction_error)) {
                     return "PFlash strict selection instruction mapping failed: " +
                         instruction_error;
@@ -4106,30 +4510,37 @@ std::string HttpServer::apply_pflash_compression(
     if (!last_user_text.empty()) {
         semantic_query_ids = drafter_tokenizer_->encode(last_user_text);
     }
-    if (explicit_query_span.begin >= 0) {
-        // The explicit query was already mapped against the decoded content
-        // text and pinned as a mandatory span. The scorer consumes the span's
-        // bounded tail window; the complete span stays in the target prompt.
-        parser_selection_rule = "explicit_query_span";
-        query_window.end = explicit_query_span.end;
+    // Unconfigured (legacy) chat mode derives the query the same way, from
+    // the latest user turn's tail.
+    if (!experiment.configured && req.pflash_query.empty() &&
+        chat_turn.valid()) {
+        const auto window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens,
+            chat_turn.content_end, chat_turn.content_begin);
+        if (window.valid()) {
+            query_span = {window.end - window.tokens, window.end};
+            query_span_rule = "chat_user_tail";
+        }
+    }
+    if (query_span.begin >= 0) {
+        // The query span — explicit or chat-derived — was mapped onto the
+        // prompt's own tokens and, under strict selection, pinned mandatory.
+        // The scorer consumes the span's bounded tail window; the complete
+        // span stays in the target prompt.
+        parser_selection_rule = query_span_rule;
+        query_window.end = query_span.end;
         query_window.tokens = (std::min)(
-            experiment.query_tokens,
-            explicit_query_span.end - explicit_query_span.begin);
+            experiment.query_tokens, query_span.end - query_span.begin);
         expected_query_ids.assign(
             drafter_ids.begin() + (query_window.end - query_window.tokens),
             drafter_ids.begin() + query_window.end);
     } else if (experiment.configured && (raw_text_input || tail_parser)) {
-        // Chat default: the scorer query is the tail of the last message's
-        // content — the prompt region before the closing/generation markers,
-        // clamped so it never swallows the role header.
+        // Content located, but no query span (a parser without a derived
+        // query, or selection inactive): score the content's tail.
         parser_selection_rule = raw_text_input ? "content_tail" : "prompt_tail";
         query_window = http_detail::pflash_tail_query_window(
             drafter_ids, experiment.query_tokens,
             query_content_end, query_content_begin);
-    } else if (!experiment.configured && chat_tail.valid()) {
-        // Legacy (unconfigured) chat mode uses the same marker-derived tail.
-        query_window = http_detail::pflash_tail_query_window(
-            drafter_ids, 8, chat_tail.content_end, chat_tail.content_begin);
     } else if (!semantic_query_ids.empty()) {
         if (experiment.configured) parser_selection_rule = "semantic_suffix";
         query_window = http_detail::find_pflash_query_window(
@@ -4146,12 +4557,101 @@ std::string HttpServer::apply_pflash_compression(
         }
     }
 
+    // Strict selection spends the keep ratio on the droppable tokens only:
+    // what it keeps anyway (instructions, tools, the query and its turn's
+    // envelope, the generation prompt) is already cheap -- a stable system
+    // prefix hits the prefix cache from the second turn on -- and must not
+    // exhaust the budget of the history it rides with.
+    int kept_tokens = 0;
+    if (experiment.selection_active && query_window.valid()) {
+        const int input_tokens = (int) drafter_ids.size();
+        const int query_begin = query_window.end - query_window.tokens;
+        const auto kept_with = [&] (
+                const std::vector<PFlashTokenSpan> & spans) {
+            return http_detail::pflash_kept_tokens(
+                input_tokens, experiment.chunk_size, query_begin,
+                query_window.end, spans, !query_suffix_candidates);
+        };
+        const auto target_estimate = [&] (int drafter_tokens) {
+            return (int) std::ceil((double) prompt_tokens *
+                (double) drafter_tokens / (double) input_tokens);
+        };
+        const auto merged = [&] (bool with_instructions) {
+            auto spans = required_instruction_spans;
+            spans.insert(spans.end(), system_spans.begin(), system_spans.end());
+            if (with_instructions) {
+                spans.insert(spans.end(), instruction_role_spans.begin(),
+                             instruction_role_spans.end());
+            }
+            return http_detail::canonicalize_pflash_token_spans(
+                std::move(spans));
+        };
+        const auto fits = [&] (int drafter_tokens) {
+            return config_.max_ctx <= 0 ||
+                target_estimate(drafter_tokens) + req.max_output <=
+                    config_.max_ctx;
+        };
+        auto kept_spans = merged(/*with_instructions=*/true);
+        kept_tokens = kept_with(kept_spans);
+        // Developer messages and tool definitions that alone overflow the
+        // context are data (a document pasted into them), not a preamble:
+        // they compete for the budget against the query like any other
+        // context. The system prompt keeps its pin whatever its size.
+        if (!fits(kept_tokens) && !instruction_role_spans.empty()) {
+            std::fprintf(stderr,
+                "[pflash-select] kept instructions do not fit the context "
+                "(~%d + %d > %d target tokens); scoring developer and tool "
+                "spans as context\n",
+                target_estimate(kept_tokens), req.max_output, config_.max_ctx);
+            kept_spans = merged(/*with_instructions=*/false);
+            kept_tokens = kept_with(kept_spans);
+        }
+        if (!fits(kept_with(system_spans))) {
+            return "PFlash strict selection: the system prompt alone does not "
+                "fit the context (~" +
+                std::to_string(target_estimate(kept_with(system_spans))) +
+                " + " + std::to_string(req.max_output) + " > " +
+                std::to_string(config_.max_ctx) +
+                " target tokens); PFlash does not compress system prompts";
+        }
+        required_instruction_spans = std::move(kept_spans);
+        // Auto mode compresses when the droppable part is long enough, not
+        // the whole prompt: a large system prompt plus a short chat has
+        // nothing worth selecting.
+        const int droppable_target =
+            prompt_tokens - target_estimate(kept_tokens);
+        if (config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
+            droppable_target < config_.pflash_threshold) {
+            std::fprintf(stderr,
+                "[pflash] skip-compress (droppable ~%d < threshold %d; "
+                "kept %d of %d drafter tokens)\n",
+                droppable_target, config_.pflash_threshold, kept_tokens,
+                input_tokens);
+            return {};
+        }
+    }
+
     ModelBackend::CompressRequest compress_request;
     compress_request.input_ids = std::move(drafter_ids);
     compress_request.required_instruction_spans =
         std::move(required_instruction_spans);
+    compress_request.query_suffix_candidates = query_suffix_candidates;
+    compress_request.history_query_spans = history_query_spans;
+    compress_request.turn_query_span = turn_query_span;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
+    if (experiment.selection_active && query_window.valid()) {
+        const double effective = http_detail::pflash_effective_keep_ratio(
+            (int) compress_request.input_ids.size(), kept_tokens,
+            compress_request.keep_ratio);
+        std::fprintf(stderr,
+            "[pflash-select] kept=%d droppable=%d keep_ratio=%.6f "
+            "effective=%.6f\n",
+            kept_tokens,
+            (int) compress_request.input_ids.size() - kept_tokens,
+            (double) compress_request.keep_ratio, effective);
+        compress_request.keep_ratio = (float) effective;
+    }
     if (query_window.valid()) {
         compress_request.score_query_end = query_window.end;
         compress_request.score_query_tokens = query_window.tokens;
@@ -4177,8 +4677,12 @@ std::string HttpServer::apply_pflash_compression(
                 {"content_end", query_content_end},
                 {"query_begin", query_begin},
                 {"query_end", query_window.end},
-                {"query_span_begin", explicit_query_span.begin},
-                {"query_span_end", explicit_query_span.end},
+                {"query_span_begin", query_span.begin},
+                {"query_span_end", query_span.end},
+                {"query_suffix_candidates", query_suffix_candidates},
+                {"history_queries", history_query_spans.size()},
+                {"turn_query_begin", turn_query_span.begin},
+                {"turn_query_end", turn_query_span.end},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},
@@ -4223,8 +4727,33 @@ std::string HttpServer::apply_pflash_compression(
     }
     const float requested_keep_ratio = compress_request.keep_ratio;
 
+    // A turn the conversation's view serves without scoring -- the same
+    // prompt again, or a small follow-up appended verbatim with recall off
+    // -- skips the drafter altogether.
+    if (experiment.selection_active && messages_input && chat_turn.valid() &&
+        !config_.pflash_remote_drafter) {
+        std::vector<int32_t> served;
+        json view_stats;
+        if (serve_pflash_chat_view(
+                req, compress_request.input_ids, chat_turn, nullptr, nullptr,
+                served, prepared.snapshot_cut, view_stats)) {
+            prepared.tokens = std::move(served);
+            prepared.compressed = true;
+            prepared.pflash_stats = {
+                {"compress_ms", 0.0},
+                {"drafter_input_tokens", compress_request.input_ids.size()},
+                {"query_rule", parser_selection_rule},
+                {"view", view_stats},
+            };
+            trace_pflash_served(req, prepared);
+            return {};
+        }
+    }
+
     ModelBackend::CompressResult result;
     std::vector<int32_t> final_tokens;
+    const auto compress_started = std::chrono::steady_clock::now();
+    int join_overhead = 0;
     for (int attempt = 0; ; ++attempt) {
         result = {};
         if (config_.pflash_remote_drafter) {
@@ -4256,6 +4785,21 @@ std::string HttpServer::apply_pflash_compression(
 
         std::string compressed_text =
             drafter_tokenizer_->decode(result.compressed_ids);
+        join_overhead = 0;
+        // Kept pieces that were not adjacent
+        // in the prompt are joined by a paragraph break when neither side
+        // already has one, so a cut does not glue two passages into one
+        // run-on line ("...other bands.Document 1:").
+        if (http_detail::pflash_paragraph_join() && !result.kept_spans.empty()) {
+            const int plain = (int) tokenizer_.encode(compressed_text).size();
+            compressed_text = http_detail::pflash_join_kept_spans(
+                *drafter_tokenizer_, compress_request.input_ids,
+                result.kept_spans);
+            // The breaks are layout, not retained context: the ceiling
+            // bounds what the selection kept.
+            join_overhead = (std::max)(
+                0, (int) tokenizer_.encode(compressed_text).size() - plain);
+        }
 
         // Compression is allowed to be lossy, but the active user query must
         // survive. Re-append short queries when fewer than 80% of their tokens do.
@@ -4290,10 +4834,11 @@ std::string HttpServer::apply_pflash_compression(
 
         final_tokens = tokenizer_.encode(compressed_text);
         if (!experiment.selection_active ||
-            (int) final_tokens.size() <= target_ceiling) {
+            (int) final_tokens.size() - join_overhead <= target_ceiling) {
             break;
         }
-        const int overflow = (int) final_tokens.size() - target_ceiling;
+        const int overflow =
+            (int) final_tokens.size() - join_overhead - target_ceiling;
         const int tightened = target_ceiling - overflow - 1;
         if (attempt >= 2 || tightened <= 0) {
             break;
@@ -4316,20 +4861,295 @@ std::string HttpServer::apply_pflash_compression(
             "[pflash-select] final target tokens=%zu ceiling=%d\n",
             final_tokens.size(), target_ceiling);
         std::fflush(stderr);
-        if ((int) final_tokens.size() > target_ceiling) {
+        if ((int) final_tokens.size() - join_overhead > target_ceiling) {
             return "PFlash strict selection final prompt exceeds target-token ceiling "
                 "(" + std::to_string(final_tokens.size()) + " > " +
                 std::to_string(target_ceiling) + ")";
         }
     }
+    prepared.pflash_stats = {
+        {"compress_ms", std::round(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - compress_started).count() * 10.0) / 10.0},
+        {"drafter_input_tokens", compress_request.input_ids.size()},
+        {"kept_tokens", kept_tokens},
+        {"keep_ratio", compress_request.keep_ratio},
+        {"compressed_tokens", final_tokens.size()},
+        {"query_rule", parser_selection_rule},
+        {"history_queries", history_query_spans.size()},
+        {"scorer_resume", result.scorer_resume},
+        {"scorer_new_tokens", result.scorer_new_tokens},
+        {"scorer_forward_ms", std::round(result.scorer_forward_s * 10000.0) / 10.0},
+    };
+    if (experiment.selection_active && messages_input && chat_turn.valid() &&
+        !result.kept_spans.empty()) {
+        std::vector<int32_t> served;
+        if (serve_pflash_chat_view(
+                req, compress_request.input_ids, chat_turn, &final_tokens,
+                &result.kept_spans, served,
+                prepared.snapshot_cut, prepared.pflash_stats["view"])) {
+            final_tokens = std::move(served);
+        }
+    }
     prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
+    trace_pflash_served(req, prepared);
     std::fprintf(stderr,
         "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
         prompt_tokens, (int) result.compressed_ids.size(),
         (int) prepared.tokens.size(),
         100.0 * prepared.tokens.size() / prompt_tokens);
     return {};
+}
+
+void HttpServer::trace_pflash_served(
+        const ParsedRequest & req, const PreparedPrompt & prepared) {
+    const char * path = std::getenv("PFLASH_VIEW_TRACE_PATH");
+    if (!path || !*path) return;
+    const json record = {
+        {"schema_version", 1},
+        {"prompt_tokens", req.prompt_tokens.size()},
+        {"served_tokens", prepared.tokens.size()},
+        {"pflash", prepared.pflash_stats},
+        {"served_text", tokenizer_.decode(prepared.tokens)},
+    };
+    std::ofstream out(path, std::ios::app);
+    if (out) out << record.dump(-1, ' ', false, json::error_handler_t::replace) << "\n";
+}
+
+bool HttpServer::serve_pflash_chat_view(
+        const ParsedRequest & req,
+        const std::vector<int32_t> & drafter_ids,
+        const http_detail::PflashChatTurnSpan & turn,
+        const std::vector<int32_t> * fresh,
+        const std::vector<PFlashTokenSpan> * kept_spans,
+        std::vector<int32_t> & served,
+        int & snapshot_cut,
+        json & stats) {
+    snapshot_cut = -1;
+    stats = nullptr;
+    const bool compressed = fresh != nullptr && kept_spans != nullptr;
+    const char * disabled = std::getenv("PFLASH_CHAT_VIEW");
+    if (disabled && std::string(disabled) == "0") return false;
+    const int input = (int) drafter_ids.size();
+    if (turn.generation_begin <= 0 || turn.generation_begin >= input) {
+        return false;
+    }
+    // The generation prompt, in target tokens: the raw prompt and every
+    // served prompt end with it (strict selection keeps it verbatim).
+    const auto generation = tokenizer_.encode(drafter_tokenizer_->decode(
+        std::vector<int32_t>(drafter_ids.begin() + turn.generation_begin,
+                             drafter_ids.end())));
+    const auto ends_with_generation = [&generation] (
+            const std::vector<int32_t> & tokens) {
+        return !generation.empty() && tokens.size() > generation.size() &&
+            std::equal(generation.begin(), generation.end(),
+                       tokens.end() - (long) generation.size());
+    };
+    if (!ends_with_generation(req.prompt_tokens) ||
+        (compressed && !ends_with_generation(*fresh))) {
+        return false;
+    }
+    const int raw_gen_begin =
+        (int) (req.prompt_tokens.size() - generation.size());
+
+    http_detail::PflashChatView next;
+    next.raw_tokens = req.prompt_tokens;
+    next.raw_gen_begin = raw_gen_begin;
+    next.drafter_ids = drafter_ids;
+    next.drafter_gen_begin = turn.generation_begin;
+
+    http_detail::PflashChatView view;
+    const bool continues =
+        pflash_views_.find(req.prompt_tokens, drafter_ids, view);
+    const auto serve_fresh = [&] (const char * why, int turns) {
+        next.view_tokens = *fresh;
+        next.view_gen_begin = (int) (fresh->size() - generation.size());
+        next.spans = *kept_spans;
+        next.turns = turns;
+        snapshot_cut = next.view_gen_begin;
+        std::fprintf(stderr,
+            "[pflash-view] %s turn=%d served=%zu\n", why, turns, fresh->size());
+        std::fflush(stderr);
+        stats = {{"mode", why}, {"turn", turns}, {"served_tokens", fresh->size()},
+                 {"fresh_tokens", fresh->size()}};
+        served = *fresh;
+        pflash_views_.remember(std::move(next));
+        return true;
+    };
+    if (continues && view.raw_tokens == req.prompt_tokens) {
+        // The same prompt again (a retry): serve what was served.
+        std::fprintf(stderr, "[pflash-view] repeat turn=%d served=%zu\n",
+                     view.turns, view.view_tokens.size());
+        std::fflush(stderr);
+        stats = {{"mode", "repeat"}, {"turn", view.turns},
+                 {"served_tokens", view.view_tokens.size()}};
+        if (compressed) stats["fresh_tokens"] = fresh->size();
+        snapshot_cut = view.view_gen_begin;
+        served = view.view_tokens;
+        return true;
+    }
+    const bool usable = continues &&
+        view.drafter_gen_begin < turn.generation_begin &&
+        view.view_gen_begin > 0 &&
+        (size_t) view.view_gen_begin <= view.view_tokens.size();
+    if (!usable) return compressed && serve_fresh("fresh", 1);
+
+    // What this turn adds to the conversation, in target tokens. A small
+    // follow-up is appended verbatim, the way full prefill appends it; one
+    // of PFLASH_CHAT_COMPRESS_NEW_TOKENS or more (a pasted document, a large
+    // tool output) goes through the compressor, and only the new material
+    // is compressed, so the view it extends stays cached.
+    const int new_tokens = raw_gen_begin + (int) generation.size() -
+        view.raw_gen_begin;
+    const bool compress_new =
+        new_tokens >= http_detail::pflash_chat_compress_new_tokens();
+    const bool new_question = turn.role_begin >= view.drafter_gen_begin;
+    const bool recall = new_question && http_detail::pflash_chat_recall();
+    if (!compressed && (compress_new || recall)) return false;
+
+    // Recall: what a fresh selection for the new question keeps that the
+    // view does not hold. Only a new user turn brings a new question; an
+    // agent step (assistant call plus tool output) appends without
+    // recalling. What is missing is appended, whatever its size, so the
+    // cached view is never thrown away for a new topic; the view starts over
+    // from the fresh selection only when it outgrows it (below).
+    std::vector<PFlashTokenSpan> recalled;
+    if (compressed && recall) {
+        auto in_view = view.spans;
+        in_view.push_back({view.drafter_gen_begin, input});
+        in_view = http_detail::canonicalize_pflash_token_spans(std::move(in_view));
+        const auto missing =
+            http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
+        // Whole kept pieces: a passage the view holds only part of comes
+        // back in one piece, in order, not as a fragment far from the rest.
+        for (const auto & span : *kept_spans) {
+            for (const auto & part : missing) {
+                if (part.begin < span.end && part.end > span.begin) {
+                    recalled.push_back(span);
+                    break;
+                }
+            }
+        }
+        recalled = http_detail::canonicalize_pflash_token_spans(std::move(recalled));
+    }
+    std::string recall_block;
+    int recalled_tokens = 0;
+    if (!recalled.empty()) {
+        ChatMarkers markers;
+        std::vector<std::string> role_markers;
+        std::vector<std::string> end_markers;
+        bool generic_roles = false;
+        if (resolve_chat_markers(tokenizer_, markers)) {
+            const auto seq_text = [this] (const std::vector<int32_t> & seq) {
+                std::string text;
+                for (const int32_t id : seq) text += tokenizer_.token_text(id);
+                return text;
+            };
+            for (const auto & seq : markers.next_role_starts) {
+                role_markers.push_back(seq_text(seq));
+            }
+            for (const auto & seq : markers.end_msg_seqs) {
+                end_markers.push_back(seq_text(seq));
+            }
+            generic_roles = !markers.role_starts_delimit &&
+                markers.family != "laguna";
+        }
+        std::string excerpts;
+        for (const auto & span : recalled) {
+            const std::string excerpt = http_detail::pflash_recall_excerpt(
+                drafter_tokenizer_->decode(std::vector<int32_t>(
+                    drafter_ids.begin() + span.begin,
+                    drafter_ids.begin() + span.end)),
+                role_markers, end_markers, generic_roles);
+            if (excerpt.empty()) continue;
+            if (!excerpts.empty()) excerpts += "\n\n";
+            excerpts += excerpt;
+            recalled_tokens += span.end - span.begin;
+        }
+        if (!excerpts.empty()) {
+            recall_block = "[Earlier in this conversation]\n" + excerpts +
+                "\n[End of earlier excerpts]\n\n";
+        }
+    }
+
+    // This turn's new tokens from where the previous generation prompt
+    // started: all of them, or the parts the fresh selection keeps when they
+    // are compressed. Recalled excerpts open the new user turn's content,
+    // after everything the target cached.
+    const auto decode_range = [&] (int begin, int end) {
+        return end > begin
+            ? drafter_tokenizer_->decode(std::vector<int32_t>(
+                  drafter_ids.begin() + begin, drafter_ids.begin() + end))
+            : std::string();
+    };
+    std::vector<PFlashTokenSpan> delta_spans;
+    if (compress_new) {
+        delta_spans = http_detail::pflash_subtract_token_spans(
+            *kept_spans, {{0, view.drafter_gen_begin}});
+    } else {
+        delta_spans.push_back({view.drafter_gen_begin, input});
+    }
+    const int split = new_question && !recall_block.empty()
+        ? turn.content_begin : input;
+    std::vector<PFlashTokenSpan> before_split;
+    std::vector<PFlashTokenSpan> after_split;
+    for (const auto & span : delta_spans) {
+        if (span.begin < split) {
+            before_split.push_back({span.begin, (std::min)(span.end, split)});
+        }
+        if (span.end > split) {
+            after_split.push_back({(std::max)(span.begin, split), span.end});
+        }
+    }
+    const auto join = [&] (const std::vector<PFlashTokenSpan> & spans) {
+        if (compress_new && http_detail::pflash_paragraph_join()) {
+            return http_detail::pflash_join_kept_spans(
+                *drafter_tokenizer_, drafter_ids, spans);
+        }
+        std::string text;
+        for (const auto & span : spans) text += decode_range(span.begin, span.end);
+        return text;
+    };
+    const std::string delta = join(before_split) + recall_block + join(after_split);
+    served.assign(view.view_tokens.begin(),
+                  view.view_tokens.begin() + view.view_gen_begin);
+    const auto delta_tokens = tokenizer_.encode(delta);
+    served.insert(served.end(), delta_tokens.begin(), delta_tokens.end());
+    if (!ends_with_generation(served)) {
+        return compressed && serve_fresh("fresh", 1);
+    }
+    // Rebuild when the view outgrew what a fresh selection keeps, or the
+    // context: the fresh prompt starts a new view, prefilled from scratch.
+    const bool too_long = config_.max_ctx > 0 &&
+        (int) served.size() + req.max_output > config_.max_ctx;
+    const bool outgrown = compressed && served.size() > 2 * fresh->size();
+    if (too_long || outgrown) {
+        return compressed && serve_fresh("rebuild", view.turns + 1);
+    }
+
+    auto spans = view.spans;
+    spans.insert(spans.end(), delta_spans.begin(), delta_spans.end());
+    spans.insert(spans.end(), recalled.begin(), recalled.end());
+    next.view_tokens = served;
+    next.view_gen_begin = (int) (served.size() - generation.size());
+    next.spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
+    next.turns = view.turns + 1;
+    snapshot_cut = next.view_gen_begin;
+    const char * mode = compress_new ? "continue-compressed" : "continue";
+    std::fprintf(stderr,
+        "[pflash-view] %s turn=%d served=%zu reused=%d new=%d delta=%zu "
+        "recalled=%d fresh=%d\n",
+        mode, next.turns, served.size(), view.view_gen_begin, new_tokens,
+        delta_tokens.size(), recalled_tokens,
+        compressed ? (int) fresh->size() : -1);
+    std::fflush(stderr);
+    stats = {{"mode", mode}, {"turn", next.turns},
+             {"served_tokens", served.size()}, {"reused_tokens", view.view_gen_begin},
+             {"new_tokens", new_tokens}, {"delta_tokens", delta_tokens.size()},
+             {"recalled_tokens", recalled_tokens}};
+    if (compressed) stats["fresh_tokens"] = fresh->size();
+    pflash_views_.remember(std::move(next));
+    return true;
 }
 
 HttpServer::PreparedPrompt HttpServer::prepare_prompt(
@@ -4519,6 +5339,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     const bool prefer_tools_boundary =
         ppp_prefers_tools_boundary(config_.ppp_enabled, prefer_inline_snap);
     int forced_cut = req.pin_end_token;
+    if (forced_cut <= 0) forced_cut = prepared.snapshot_cut;
 
     // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
     // pin_end only — never mutate tokens. Token-level DiffPin rewrite
@@ -5894,6 +6715,7 @@ void HttpServer::process_job(ServerJob * job) {
         effective_prompt_tokens - cached_prefix_tokens,
         effective_prompt_tokens,
         agent_turn_cache_hit,
+        prepared.pflash_stats,
     };
 
     // Record performance for /status page.

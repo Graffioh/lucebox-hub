@@ -60,6 +60,9 @@ struct PFlashSelectionResult {
     std::string error;
 };
 
+// A chunk is kept whatever its score when it overlaps the query window or a
+// required instruction span, or -- with ``query_suffix_structural`` -- any
+// token after the query window.
 bool pflash_chunk_is_structurally_required(
     int begin,
     int end,
@@ -67,7 +70,8 @@ bool pflash_chunk_is_structurally_required(
     int query_end,
     int input_tokens,
     const std::vector<luce::common::PFlashTokenSpan> &
-        required_instruction_spans = {}) noexcept;
+        required_instruction_spans = {},
+    bool query_suffix_structural = true) noexcept;
 
 bool validate_pflash_instruction_spans(
     const std::vector<luce::common::PFlashTokenSpan> & spans,
@@ -95,8 +99,8 @@ enum class PFlashScorer { Head, Legacy, Split };
 
 struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
-    // Chat-first default: the scorer query is the tail of the last message's
-    // content. latest_user stays selectable for benchmark experiments.
+    // Chat-first default: the scorer query is the tail of the latest user
+    // turn. latest_user stays selectable for benchmark experiments.
     PFlashQueryParser query_parser = PFlashQueryParser::ArbitraryTail;
     int chunk_size = 0;
     int query_tokens = 8;
@@ -108,6 +112,21 @@ struct PFlashSelectionConfig {
     double split_fraction = 0.5;
     bool configured = false;
     bool selection_active = false;
+    // Per request, never from the environment: the tokens after the query
+    // window are candidates scored against it instead of a kept suffix (a
+    // chat whose latest user turn is followed by assistant and tool turns).
+    // The caller pins whatever of that suffix must stay.
+    bool query_suffix_candidates = false;
+    // Per request: earlier user questions' scorer windows, most recent
+    // first. The head scores the context against each and mixes the masses
+    // with the query's at weights 1/2, 1/4, ... (multi-turn chats).
+    std::vector<luce::common::PFlashTokenSpan> history_queries;
+    // Per request: the tail of the latest user turn, scored as a second
+    // query window at full weight next to the prompt-end query. The last
+    // token reads the whole request; the user's own tokens match literal
+    // strings (an identifier, a function description) the last token does
+    // not carry.
+    luce::common::PFlashTokenSpan turn_query{-1, -1};
 };
 
 // Segment probe: cut the context before every token whose boundary score is

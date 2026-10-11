@@ -362,6 +362,10 @@ bool load_qwen35_drafter(const std::string & gguf_path,
 
 void free_qwen35_drafter_state(DrafterContext & ctx) {
     auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
+    for (auto & session : st->sessions) {
+        if (session) free_qwen35_scoring_session(*session);
+    }
+    st->sessions.clear();
     free_qwen35_head(*st);
     free_qwen35_segment_probe(*st);
     free_target_weights(st->weights);
