@@ -298,7 +298,8 @@ static void print_usage(const char * prog) {
         "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
-        "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
+        "  --kv-cache-budget <MB>      Max disk usage in MB, hard cap with LRU eviction (default: 4096)\n"
+        "  --kv-cache-ttl <hours>      Delete snapshots unused for this long (default: 72, 0 = never)\n"
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
         "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
         "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
@@ -902,6 +903,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
             sconfig.disk_cache_budget_mb = (size_t)std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-ttl") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            const double hours = std::strtod(argv[++i], &end);
+            if (!end || *end != '\0' || !(hours >= 0.0)) {
+                std::fprintf(stderr, "--kv-cache-ttl expects hours >= 0 (0 = never), got %s\n",
+                             argv[i]);
+                return 1;
+            }
+            sconfig.disk_cache_ttl_hours = hours;
         } else if (std::strcmp(argv[i], "--kv-cache-min-tokens") == 0 && i + 1 < argc) {
             sconfig.disk_cache_min_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-interval") == 0 && i + 1 < argc) {

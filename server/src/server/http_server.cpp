@@ -2074,6 +2074,9 @@ json build_props_body(const ServerConfig & config,
             {"disk_bytes",    pcfs.disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
             {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
+            {"disk_enabled",  !config.disk_cache_dir.empty()},
+            {"disk_budget_mb", config.disk_cache_budget_mb},
+            {"disk_ttl_hours", config.disk_cache_ttl_hours},
         }},
         {"tool_replay", {
             {"max_entries",     tms.max_entries},
@@ -2354,7 +2357,58 @@ std::vector<ChatMessage> normalize_chat_messages(
 //   max_ctx, sha1(chat_template_src), and the effective K-rotation basis
 //   (LUCE_KV_ROTATE resolves against the K-cache type; a cache written
 //   rotated must never be adopted by an un-rotated session or vice versa).
+// Also covered: the KV cache types (a q8_0 snapshot must never be adopted by
+// a q4_0 session), the draft model (it decides the captured target-feature
+// layers), and a content fingerprint of the model file (SHA-1 of its first
+// and last MiB plus its size; hashing the whole multi-GB file at every
+// startup would cost tens of seconds, and a re-quantized or replaced file
+// changes its header and tail).
 // Returns all-zeroes if model_path is empty (back-compat / disk disabled).
+static void append_file_identity(std::vector<uint8_t> & buf,
+                                 const std::string & path, bool content) {
+    uint32_t plen = (uint32_t)path.size();
+    buf.insert(buf.end(), (uint8_t *)&plen, (uint8_t *)&plen + 4);
+    buf.insert(buf.end(), path.begin(), path.end());
+    if (path.empty()) return;
+    struct stat st{};
+    int64_t file_size = 0, file_mtime = 0;
+    if (::stat(path.c_str(), &st) == 0) {
+        file_size  = (int64_t)st.st_size;
+        file_mtime = (int64_t)st.st_mtime;
+    }
+    buf.insert(buf.end(), (uint8_t *)&file_size,  (uint8_t *)&file_size  + 8);
+    buf.insert(buf.end(), (uint8_t *)&file_mtime, (uint8_t *)&file_mtime + 8);
+    if (!content) return;
+    uint8_t digest[20] = {};
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+        constexpr int64_t kChunk = 1 << 20;
+        std::vector<uint8_t> data;
+        auto read_at = [&](int64_t off, int64_t len) {
+            if (len <= 0) return;
+            in.clear();
+            in.seekg((std::streamoff)off);
+            const size_t start = data.size();
+            data.resize(start + (size_t)len);
+            in.read((char *)data.data() + start, (std::streamsize)len);
+            data.resize(start + (size_t)std::max<std::streamsize>(0, in.gcount()));
+        };
+        read_at(0, std::min(kChunk, file_size));
+        if (file_size > kChunk) {
+            const int64_t tail = std::max(kChunk, file_size - kChunk);
+            read_at(tail, file_size - tail);
+        }
+        sha1_hash(data.data(), data.size(), digest);
+    }
+    buf.insert(buf.end(), digest, digest + 20);
+}
+
+static uint64_t disk_cache_ttl_seconds(double hours) {
+    if (!(hours > 0.0)) return 0;  // 0 (or invalid) = never expire
+    const double secs = hours * 3600.0;
+    return secs < 1.0 ? 1 : (uint64_t)std::llround(secs);
+}
+
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
     std::array<uint8_t, 16> salt{};
     if (cfg.model_path.empty()) return salt;
@@ -2387,6 +2441,14 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
     uint8_t k_rotated = dflash_kv_k_rotation_enabled(cfg.kv_cache_k) ? 1 : 0;
     buf.push_back(k_rotated);
+    // Snapshot bytes are stored in the cache's own type.
+    for (const std::string * kv : {&cfg.kv_cache_k, &cfg.kv_cache_v}) {
+        uint32_t n = (uint32_t)kv->size();
+        buf.insert(buf.end(), (uint8_t *)&n, (uint8_t *)&n + 4);
+        buf.insert(buf.end(), kv->begin(), kv->end());
+    }
+    append_file_identity(buf, cfg.model_path, /*content=*/true);
+    append_file_identity(buf, cfg.draft_path, /*content=*/false);
 
     uint8_t digest[20];
     sha1_hash(buf.data(), buf.size(), digest);
@@ -2546,7 +2608,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens}, backend_)
+                   config.disk_cache_cold_max_tokens,
+                   disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, backend_)
 {
     config_.image_input_enabled = backend_.supports_images() &&
         config_.pflash_upstream_base.empty() &&

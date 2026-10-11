@@ -329,7 +329,8 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
 | `--decode-kv-offload-mb <auto\|N>` | `auto` | Automatically size the RAM budget for active KV suspension; `N` sets a per-model cap in MiB, `0` disables. Applies to concurrent serving. |
 | `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
-| `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
+| `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap (hard cap, LRU eviction). |
+| `--kv-cache-ttl <hours>` | `72` | Delete disk snapshots unused this long; `0` = never. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
 | `--kv-cache-interval <N>` | `10240` | Continued-checkpoint interval. |
 | `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |

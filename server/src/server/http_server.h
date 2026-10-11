@@ -260,6 +260,7 @@ struct ServerConfig {
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
+    double      disk_cache_ttl_hours = 72.0;  // delete files unused this long (0 = never)
     DiskPrefixCachePolicy disk_cache_policy;
 
     // Optional Jinja chat template (overrides the hardcoded ChatFormat::QWEN3
