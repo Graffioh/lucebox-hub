@@ -110,7 +110,8 @@ std::vector<int32_t> drafter_score_and_compress(
     const std::vector<PFlashTokenSpan> & history_queries,
     PFlashTokenSpan turn_query,
     const std::vector<PFlashTokenSpan> & extra_queries,
-    const PFlashRequestMessages * request_messages) {
+    const PFlashRequestMessages * request_messages,
+    const std::vector<PFlashTokenSpan> & spread_regions) {
     pflash_clear_kept_spans();
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
@@ -140,6 +141,18 @@ std::vector<int32_t> drafter_score_and_compress(
         if (turn_query.begin >= 0 && turn_query.end > turn_query.begin &&
             turn_query.end <= (int) ids.size()) {
             experiment.turn_query = turn_query;
+        }
+        for (const auto & region : spread_regions) {
+            if (region.end <= region.begin) continue;
+            if (region.begin < 0 || region.end > (int) ids.size()) {
+                set_last_error("PFlash spread region outside the input");
+                std::fprintf(stderr,
+                    "[pflash-select] ERROR spread region [%d,%d) outside the %zu-token input\n",
+                    region.begin, region.end, ids.size());
+                std::fflush(stderr);
+                return {};
+            }
+            experiment.spread_regions.push_back(region);
         }
         for (const auto & window : extra_queries) {
             if (window.begin >= 0 && window.end > window.begin &&

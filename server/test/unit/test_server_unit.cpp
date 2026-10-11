@@ -10308,6 +10308,140 @@ TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
     TEST_ASSERT(!pflash_relevance_spread({1, INFINITY}, {1, 0}, {0, 0}).valid);
 }
 
+// Region plan (mid-chat paste): the spread covers only the candidates that
+// overlap the regions; without regions it is the single-turn function, bit
+// for bit.
+TEST_CASE(ServerUnitFixture, test_pflash_region_relevance_spread) {
+    using luce::common::PFlashTokenSpan;
+    using luce::common::pflash_region_relevance_spread;
+    using luce::common::pflash_relevance_spread;
+    const auto same = [](const luce::common::PFlashRelevanceSpread & a,
+                         const luce::common::PFlashRelevanceSpread & b) {
+        return a.valid == b.valid && a.k == b.k && a.candidates == b.candidates &&
+               std::memcmp(&a.spread, &b.spread, sizeof(double)) == 0 &&
+               std::memcmp(&a.entropy, &b.entropy, sizeof(double)) == 0;
+    };
+    // No region: identical to the single-turn function on random selections,
+    // forced candidates included, whatever spans are passed.
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    for (int trial = 0; trial < 500; ++trial) {
+        const size_t n = 1 + (size_t) (rng() % 64);
+        std::vector<double> scores(n);
+        std::vector<uint8_t> selected(n), forced(n);
+        std::vector<PFlashTokenSpan> spans(n);
+        for (size_t i = 0; i < n; ++i) {
+            scores[i] = unit(rng) < 0.1 ? 0.0 : unit(rng) * unit(rng);
+            forced[i] = unit(rng) < 0.2;
+            selected[i] = forced[i] || unit(rng) < 0.3;
+            spans[i] = {(int) i * 32, (int) i * 32 + 32};
+        }
+        const auto old_value = pflash_relevance_spread(scores, selected, forced);
+        TEST_ASSERT(same(pflash_region_relevance_spread(scores, selected, forced, spans, {}),
+                         old_value));
+        TEST_ASSERT(same(pflash_region_relevance_spread(scores, selected, forced, {}, {}),
+                         old_value));
+    }
+    // Region plan: candidates 0..3 lie before the region [128, 256) and are
+    // forced by the plan; 4..7 are inside (6 forced there, a query pin).
+    std::vector<PFlashTokenSpan> spans;
+    for (int i = 0; i < 8; ++i) spans.push_back({i * 32, i * 32 + 32});
+    const std::vector<PFlashTokenSpan> region{{128, 256}};
+    const std::vector<uint8_t> selected{1, 1, 1, 1, 1, 0, 1, 1};
+    const std::vector<uint8_t> forced{1, 1, 1, 1, 0, 0, 1, 0};
+    const std::vector<double> inside{0.5, 0.05, 0.2, 0.25};
+    const auto reference = pflash_relevance_spread(inside, {1, 0, 1, 1}, {0, 0, 1, 0});
+    TEST_ASSERT(reference.valid && reference.k == 2 && reference.candidates == 4);
+    for (const double outside : {0.0, 0.01, 0.3, 5.0}) {
+        std::vector<double> scores{outside, outside * 2, outside, outside * 3};
+        scores.insert(scores.end(), inside.begin(), inside.end());
+        const auto scoped = pflash_region_relevance_spread(scores, selected, forced, spans, region);
+        TEST_ASSERT(same(scoped, reference));
+        // The old definition moves with the history the plan forces.
+        if (outside > 0.0) {
+            TEST_ASSERT(pflash_relevance_spread(scores, selected, forced).spread != reference.spread);
+        }
+    }
+    // A candidate straddling the region edge is inside.
+    std::vector<PFlashTokenSpan> straddle = spans;
+    straddle[3] = {96, 140};
+    std::vector<double> scores{0.1, 0.1, 0.1, 0.4, 0.5, 0.05, 0.2, 0.25};
+    const auto with_edge = pflash_region_relevance_spread(scores, selected, forced, straddle, region);
+    TEST_ASSERT(with_edge.valid && with_edge.candidates == 5);
+    // No candidate in the regions, or mismatched sizes: invalid.
+    TEST_ASSERT(!pflash_region_relevance_spread(scores, selected, forced, spans,
+                                                {{300, 400}}).valid);
+    TEST_ASSERT(!pflash_region_relevance_spread(scores, selected, forced,
+                                                {spans.begin(), spans.end() - 1}, region).valid);
+}
+
+// Through select_pflash_chunks: spread_regions changes the spread only (the
+// selection and every other trace field stay), records the regions, and an
+// empty list leaves the trace record byte-identical.
+TEST_CASE(ServerUnitFixture, test_pflash_region_spread_in_selection) {
+    char trace_path[] = "/tmp/pflash_region_spread_trace_XXXXXX";
+    const int fd = mkstemp(trace_path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    luce_test::ScopedEnvVar trace{"PFLASH_TRACE_PATH", trace_path};
+    std::vector<int32_t> ids(128);
+    for (int i = 0; i < 128; ++i) ids[(size_t) i] = 100 + i;
+    std::vector<float> mass(128, 0.001f);
+    for (int i = 0; i < 64; ++i) mass[(size_t) i] = 0.004f + 0.0001f * (float) (i % 7);  // history
+    for (int i = 80; i < 88; ++i) mass[(size_t) i] = 0.05f;
+    for (int i = 104; i < 108; ++i) mass[(size_t) i] = 0.03f;
+    luce::pflash::PFlashSelectionConfig config;
+    config.mode = luce::pflash::PFlashSelectionMode::BudgetOnly;
+    config.selection_active = true;
+    config.configured = true;
+    config.chunk_size = 8;
+    config.fallback_spread = 0.11;
+    // The plan forces the history [0, 64) whole.
+    const std::vector<luce::common::PFlashTokenSpan> history{{0, 64}};
+    const auto run = [&] {
+        return luce::common::select_pflash_chunks(
+            ids, mass, /*keep_ratio=*/0.7f, /*n_lookahead=*/4, /*score_query_end=*/128,
+            /*pool_kernel=*/1, config, history, /*direct_mass=*/true, /*write_trace=*/true);
+    };
+    const auto out_all = run();
+    const auto all = luce::common::pflash_last_relevance_spread();
+    const auto out_again = run();
+    config.spread_regions = {{64, 128}};
+    const auto out_region = run();
+    const auto region = luce::common::pflash_last_relevance_spread();
+    TEST_ASSERT(!out_all.empty() && out_all == out_again && out_all == out_region);
+    TEST_ASSERT(all.valid && region.valid);
+    TEST_ASSERT(all.candidates == 16 && region.candidates == 8);
+    TEST_ASSERT(all.k == region.k);
+    TEST_ASSERT(region.spread < all.spread);
+    std::ifstream in(trace_path);
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty()) lines.push_back(line);
+    }
+    unlink(trace_path);
+    TEST_ASSERT(lines.size() == 3);
+    TEST_ASSERT(lines[0] == lines[1]);                 // deterministic, no region field
+    TEST_ASSERT(lines[0].find("spread_regions") == std::string::npos);
+    json a = json::parse(lines[0]), b = json::parse(lines[2]);
+    TEST_ASSERT(b["spread_regions"] == json::array({json::array({64, 128})}));
+    TEST_ASSERT(b.value("spread", -1.0) == region.spread);
+    // Recompute from the record (what the offline check reads).
+    std::vector<double> scores = b["chunk_scores"].get<std::vector<double>>();
+    std::vector<uint8_t> selected(scores.size(), 0), forced(scores.size(), 0);
+    std::vector<luce::common::PFlashTokenSpan> spans;
+    for (size_t i = 0; i < scores.size(); ++i) spans.push_back({(int) i * 8, (int) i * 8 + 8});
+    for (int i : b["selected_chunks"].get<std::vector<int>>()) selected[(size_t) i] = 1;
+    for (int i : b["forced_chunks"].get<std::vector<int>>()) forced[(size_t) i] = 1;
+    const auto again = luce::common::pflash_region_relevance_spread(
+        scores, selected, forced, spans, {{64, 128}});
+    TEST_ASSERT(again.valid && again.spread == region.spread);
+    b.erase("spread_regions");
+    b.erase("spread");
+    a.erase("spread");
+    TEST_ASSERT(a == b);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_spread_threshold_boundary) {
     using luce::common::http_detail::pflash_spread_fires;
     TEST_ASSERT(pflash_spread_fires(0.11, true, 0.11));           // >= fires

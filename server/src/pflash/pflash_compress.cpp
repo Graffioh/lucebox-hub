@@ -460,6 +460,14 @@ void write_compression_trace(
     if (trace_fields && trace_fields->spread_threshold > 0.0) {
         std::fprintf(file, ",\"spread\":%.17g,\"spread_threshold\":%.17g",
                      trace_fields->spread, trace_fields->spread_threshold);
+        if (trace_fields->spread_regions && !trace_fields->spread_regions->empty()) {
+            std::fputs(",\"spread_regions\":[", file);
+            for (size_t i = 0; i < trace_fields->spread_regions->size(); ++i) {
+                const auto & region = (*trace_fields->spread_regions)[i];
+                std::fprintf(file, "%s[%d,%d]", i ? "," : "", region.begin, region.end);
+            }
+            std::fputc(']', file);
+        }
     }
     std::fputs("}\n", file);
     std::fclose(file);
@@ -502,6 +510,37 @@ PFlashRelevanceSpread pflash_relevance_spread(
     out.candidates = (int) scores.size();
     out.spread = std::exp(entropy) / (double) std::max(k, 1);
     return out;
+}
+
+PFlashRelevanceSpread pflash_region_relevance_spread(
+        const std::vector<double> & scores,
+        const std::vector<uint8_t> & selected,
+        const std::vector<uint8_t> & forced,
+        const std::vector<PFlashTokenSpan> & spans,
+        const std::vector<PFlashTokenSpan> & regions) {
+    if (regions.empty()) return pflash_relevance_spread(scores, selected, forced);
+    if (spans.size() != scores.size() || selected.size() != scores.size() ||
+        forced.size() != scores.size()) {
+        return {};
+    }
+    std::vector<double> in_scores;
+    std::vector<uint8_t> in_selected;
+    std::vector<uint8_t> in_forced;
+    for (size_t index = 0; index < scores.size(); ++index) {
+        bool inside = false;
+        for (const auto & region : regions) {
+            if (spans[index].begin < region.end && region.begin < spans[index].end) {
+                inside = true;
+                break;
+            }
+        }
+        if (!inside) continue;
+        in_scores.push_back(scores[index]);
+        in_selected.push_back(selected[index]);
+        in_forced.push_back(forced[index]);
+    }
+    if (in_scores.empty()) return {};
+    return pflash_relevance_spread(in_scores, in_selected, in_forced);
 }
 
 const PFlashRelevanceSpread & pflash_last_relevance_spread() {
@@ -593,6 +632,15 @@ std::vector<int32_t> select_pflash_chunks(
         chunk_means.push_back({(float) score, chunk});
         exact_chunk_scores.push_back(score);
     }
+    // The candidates' spans, for a region plan's spread scope.
+    const auto candidate_spans = [&candidates] {
+        std::vector<PFlashTokenSpan> spans;
+        spans.reserve(candidates.size());
+        for (const auto & candidate : candidates) {
+            spans.push_back({candidate.begin, candidate.end});
+        }
+        return spans;
+    };
     // Two-scorer selection: the other scorer's mean per-token score over the
     // same spans (its native ranking rule).
     std::vector<luce::pflash::PFlashSelectionCandidate> other_candidates;
@@ -664,8 +712,9 @@ std::vector<int32_t> select_pflash_chunks(
             for (const auto & candidate : candidates) {
                 if (candidate.mandatory) mandatory_mask[candidate.ordinal] = 1;
             }
-            g_last_relevance_spread = pflash_relevance_spread(
-                exact_chunk_scores, anchor_mask, mandatory_mask);
+            g_last_relevance_spread = pflash_region_relevance_spread(
+                exact_chunk_scores, anchor_mask, mandatory_mask,
+                candidate_spans(), config.spread_regions);
             PFlashTraceFields fields{
                 &ids, query_begin, query_end, config.mode, config.query_parser,
                 selector_budget, fold.stop, fold.retained_tokens, kept_mass,
@@ -690,6 +739,9 @@ std::vector<int32_t> select_pflash_chunks(
             if (config.fallback_spread > 0.0) {
                 fields.spread = g_last_relevance_spread.spread;
                 fields.spread_threshold = config.fallback_spread;
+                if (!config.spread_regions.empty()) {
+                    fields.spread_regions = &config.spread_regions;
+                }
             }
             write_compression_trace(
                 input_tokens, keep_ratio, segments ? 0 : config.chunk_size, query_tokens,
@@ -774,8 +826,9 @@ std::vector<int32_t> select_pflash_chunks(
     std::fflush(stderr);
 
     if (write_trace) {
-        g_last_relevance_spread = pflash_relevance_spread(
-            exact_chunk_scores, selected_mask, mandatory_mask);
+        g_last_relevance_spread = pflash_region_relevance_spread(
+            exact_chunk_scores, selected_mask, mandatory_mask,
+            candidate_spans(), config.spread_regions);
         const int trace_chunk = segments ? 0 : config.chunk_size;
         const int n_keep_approx = segments
             ? (int) selected.ordinals.size()
@@ -799,6 +852,9 @@ std::vector<int32_t> select_pflash_chunks(
         if (config.fallback_spread > 0.0) {
             strict_fields.spread = g_last_relevance_spread.spread;
             strict_fields.spread_threshold = config.fallback_spread;
+            if (!config.spread_regions.empty()) {
+                strict_fields.spread_regions = &config.spread_regions;
+            }
         }
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
