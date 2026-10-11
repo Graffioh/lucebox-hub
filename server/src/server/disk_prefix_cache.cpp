@@ -8,6 +8,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -17,6 +18,13 @@
 #include <ctime>
 #include <filesystem>
 #include <system_error>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace luce::common {
 
@@ -198,10 +206,148 @@ static bool read_u64(FILE * f, uint64_t & out) { return std::fread(&out, 8, 1, f
 static bool read_i64(FILE * f, int64_t & out)  { return std::fread(&out, 8, 1, f) == 1; }
 static bool read_u16(FILE * f, uint16_t & out) { return std::fread(&out, 2, 1, f) == 1; }
 
+// 64-bit safe absolute seek.
+static bool seek_to(FILE * f, uint64_t offset) {
+#if defined(_WIN32)
+    return _fseeki64(f, (__int64)offset, SEEK_SET) == 0;
+#else
+    return fseeko(f, (off_t)offset, SEEK_SET) == 0;
+#endif
+}
+
+// Skip the tensor table and key tokens of a file positioned after its
+// header, then read the auxiliary blob.
+static bool read_aux_section(FILE * f, uint32_t n_tensors, uint32_t token_count,
+                             std::string & aux) {
+    for (uint32_t i = 0; i < n_tensors; ++i) {
+        uint16_t name_len = 0;
+        if (!read_u16(f, name_len) ||
+            std::fseek(f, (long)name_len + 4 + 32 + 8, SEEK_CUR) != 0) {
+            return false;
+        }
+    }
+    // Key tokens: up to 4 * 2^32 bytes, so step in bounded seeks.
+    uint64_t skip = 4ull * token_count;
+    while (skip > 0) {
+        const long step = (long)std::min<uint64_t>(skip, 1u << 30);
+        if (std::fseek(f, step, SEEK_CUR) != 0) return false;
+        skip -= (uint64_t)step;
+    }
+    uint32_t len = 0;
+    if (!read_u32(f, len) || len > (64u << 20)) return false;
+    aux.resize(len);
+    return len == 0 || std::fread(aux.data(), 1, len, f) == len;
+}
+
+// Flush a written file to stable storage.
+static bool sync_file(FILE * f) {
+#if defined(_WIN32)
+    return _commit(_fileno(f)) == 0;
+#else
+    return ::fdatasync(fileno(f)) == 0;
+#endif
+}
+
+// Make a rename inside `dir` durable (POSIX; a no-op elsewhere).
+static void sync_directory(const std::string & dir) {
+#if !defined(_WIN32)
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        (void)::fsync(fd);
+        ::close(fd);
+    }
+#else
+    (void)dir;
+#endif
+}
+
 // ─── Construction ───────────────────────────────────────────────────────
 
 DiskPrefixCache::DiskPrefixCache(const DiskCacheConfig & cfg, ModelBackend & backend)
     : config_(cfg), backend_(backend) {}
+
+uint64_t DiskPrefixCache::now() const {
+    return clock_ ? clock_() : now_unix();
+}
+
+static bool has_suffix(const std::string & s, const char * suffix) {
+    const size_t n = std::strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+// Validate a snapshot file without reading tensor data: header, version,
+// tensor table, payload sum and exact file size. A file cut short by a crash
+// or a full disk, or written by an older format, fails here.
+static bool validate_snapshot_file(const std::string & path,
+                                   DiskCacheHeader & hdr,
+                                   uint64_t & file_size,
+                                   const char *& why) {
+    std::error_code ec;
+    file_size = (uint64_t) fs::file_size(path, ec);
+    if (ec) { why = "unreadable size"; return false; }
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) { why = "unreadable"; return false; }
+    bool ok = false;
+    do {
+        DiskCacheHeader h{};
+        if (std::fread(h.magic, 1, 4, f) != 4 ||
+            std::memcmp(h.magic, "DKVC", 4) != 0) { why = "bad magic"; break; }
+        if (!read_u32(f, h.version) || h.version != DISK_CACHE_VERSION) {
+            why = "old or unknown version"; break;
+        }
+        if (std::fseek(f, 0, SEEK_SET) != 0) { why = "seek"; break; }
+        // Re-read through the regular header parser.
+        uint8_t raw[DISK_CACHE_HEADER_SIZE];
+        if (std::fread(raw, 1, sizeof(raw), f) != sizeof(raw)) {
+            why = "short header"; break;
+        }
+        std::memcpy(&h.cur_pos,       raw + 24, 4);
+        std::memcpy(&h.n_tensors,     raw + 28, 4);
+        std::memcpy(&h.token_count,   raw + 32, 4);
+        std::memcpy(h.layout_id,      raw + 8, 16);
+        std::memcpy(h.token_hash,     raw + 36, 16);
+        std::memcpy(&h.payload_bytes, raw + 52, 8);
+        std::memcpy(&h.created_at,    raw + 60, 8);
+        std::memcpy(&h.last_used,     raw + DISK_CACHE_LAST_USED_OFFSET, 8);
+        std::memcpy(&h.last_tok,      raw + 76, 4);
+        std::memcpy(h.identity_salt,  raw + 80, 16);
+        if (h.cur_pos == 0 || h.cur_pos > h.token_count) {
+            why = "snapshot past key"; break;
+        }
+        if (h.n_tensors == 0 || h.n_tensors > 4096) { why = "tensor count"; break; }
+        uint64_t table_bytes = 0;
+        uint64_t payload = 0;
+        bool table_ok = true;
+        for (uint32_t i = 0; i < h.n_tensors && table_ok; ++i) {
+            uint16_t name_len = 0;
+            uint32_t type = 0;
+            int64_t ne = 0;
+            uint64_t nbytes = 0;
+            table_ok = read_u16(f, name_len) && name_len < GGML_MAX_NAME &&
+                std::fseek(f, name_len, SEEK_CUR) == 0 && read_u32(f, type) &&
+                type < GGML_TYPE_COUNT;
+            for (int d = 0; d < 4 && table_ok; ++d) table_ok = read_i64(f, ne) && ne >= 0;
+            table_ok = table_ok && read_u64(f, nbytes);
+            payload += nbytes;
+            table_bytes += 2 + name_len + 4 + 32 + 8;
+        }
+        if (!table_ok) { why = "bad tensor table"; break; }
+        if (payload != h.payload_bytes) { why = "payload mismatch"; break; }
+        uint32_t aux_len = 0;
+        const uint64_t aux_at = DISK_CACHE_HEADER_SIZE + table_bytes +
+            4ull * h.token_count;
+        if (aux_at + 4 > file_size ||
+            !seek_to(f, aux_at) || !read_u32(f, aux_len)) {
+            why = "truncated metadata"; break;
+        }
+        const uint64_t expected = aux_at + 4 + aux_len + payload;
+        if (file_size != expected) { why = "truncated or oversized"; break; }
+        hdr = h;
+        ok = true;
+    } while (false);
+    std::fclose(f);
+    return ok;
+}
 
 // ─── Initialization ─────────────────────────────────────────────────────
 
@@ -214,12 +360,34 @@ bool DiskPrefixCache::init() {
         return false;
     }
 
-    // Try to learn layout from existing files (enables first-request disk hits).
-    try_learn_from_disk();
+    std::lock_guard<std::mutex> lock(mu_);
+    scan_all();
+    // Budget and TTL hold from the first moment, before any request.
+    expire_locked();
+    make_room_locked(0);
 
-    std::fprintf(stderr, "[disk-cache] initialized dir=%s budget=%.1f GB layout=%s\n",
+    // Restore into the layout this identity used most recently; learn_layout
+    // confirms it against the live model before anything is written.
+    const DiskEntry * best = nullptr;
+    for (const auto & e : entries_) {
+        if (e.own_salt && (!best || e.last_used > best->last_used)) best = &e;
+    }
+    if (best) {
+        layout_id_ = best->layout_id;
+        layout_known_ = true;
+        layout_from_disk_ = true;
+        layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
+    }
+
+    std::fprintf(stderr,
+                 "[disk-cache] initialized dir=%s budget=%.1f GB ttl=%s "
+                 "files=%zu used=%.1f MB layout=%s\n",
                  config_.cache_dir.c_str(),
                  (double)config_.budget_bytes / (1024.0 * 1024.0 * 1024.0),
+                 config_.ttl_seconds
+                     ? (std::to_string(config_.ttl_seconds) + "s").c_str()
+                     : "never",
+                 entries_.size(), (double)total_bytes_ / (1024.0 * 1024.0),
                  layout_known_ ? hex(layout_id_.data(), 16).c_str() : "pending");
     return true;
 }
@@ -246,8 +414,8 @@ void DiskPrefixCache::compute_layout_id(ggml_context * ctx) {
 
     // Build a single buffer and hash it.
     // Prepend identity_salt_ so that config/model differences (model file,
-    // max_ctx, chat_template) rotate the layout_id independently of tensor
-    // structure. All-zero salt (the default) is back-compatible.
+    // KV types, max_ctx, chat_template) rotate the layout_id independently of
+    // tensor structure. All-zero salt (the default) is back-compatible.
     std::vector<uint8_t> buf;
     buf.insert(buf.end(), identity_salt_.begin(), identity_salt_.end());
     for (const auto & ti : tensors) {
@@ -282,12 +450,10 @@ void DiskPrefixCache::learn_layout(int slot) {
     compute_layout_id(ref.ctx);
 
     if (had_disk_layout && std::memcmp(prev_id.data(), layout_id_.data(), 16) != 0) {
-        // Model layout differs from what was learned from disk files.
+        // The files stay indexed (budget/TTL) but are never restored.
         std::fprintf(stderr, "[disk-cache] layout mismatch: disk=%s model=%s — switching\n",
                      hex(prev_id.data(), 16).c_str(),
                      hex(layout_id_.data(), 16).c_str());
-        entries_.clear();
-        total_bytes_ = 0;
     }
 
     layout_known_ = true;
@@ -297,92 +463,107 @@ void DiskPrefixCache::learn_layout(int slot) {
 
     std::fprintf(stderr, "[disk-cache] layout learned: %s\n",
                  hex(layout_id_.data(), 16).c_str());
-
-    // Scan for previously saved files matching this layout.
-    scan_directory();
 }
 
 // ─── Directory scanning ─────────────────────────────────────────────────
 
-void DiskPrefixCache::scan_directory() {
+void DiskPrefixCache::scan_all() {
     entries_.clear();
     total_bytes_ = 0;
+    size_t removed = 0;
 
-    if (layout_dir_.empty()) return;
-
-    std::error_code ec;
-    for (const auto & de : fs::directory_iterator(layout_dir_, ec)) {
-        const std::string name = de.path().filename().string();
-        size_t nlen = name.size();
-        if (nlen < 36 || name.compare(nlen - 4, 4, ".dkv") != 0) continue;
-
-        std::string path = de.path().string();
-        FILE * f = std::fopen(path.c_str(), "rb");
-        if (!f) continue;
-
-        DiskCacheHeader hdr{};
-        if (!read_header(f, hdr)) { std::fclose(f); continue; }
-        std::fclose(f);
-
-        // Validate magic and layout.
-        if (std::memcmp(hdr.magic, "DKVC", 4) != 0) continue;
-        if (std::memcmp(hdr.layout_id, layout_id_.data(), 16) != 0) continue;
-
-        DiskEntry entry;
-        entry.path = path;
-        std::memcpy(entry.token_hash.data(), hdr.token_hash, 16);
-        entry.token_count = hdr.token_count;
-        entry.cur_pos     = hdr.cur_pos;
-        entry.last_used   = hdr.last_used;
-
-        std::error_code fec;
-        auto fsz = fs::file_size(path, fec);
-        if (!fec) entry.file_size = (uint64_t)fsz;
-
-        total_bytes_ += entry.file_size;
-        entries_.push_back(std::move(entry));
-    }
-
-    std::fprintf(stderr, "[disk-cache] scanned %zu files, %.1f MB\n",
-                 entries_.size(), (double)total_bytes_ / (1024.0 * 1024.0));
-}
-
-// ─── Cold start: learn layout from existing files ───────────────────────
-
-void DiskPrefixCache::try_learn_from_disk() {
-    // Scan cache_dir for subdirectories (each is a layout fingerprint).
     std::error_code ec;
     for (const auto & de : fs::directory_iterator(config_.cache_dir, ec)) {
         const std::string base = de.path().filename().string();
-        if (!base.empty() && base[0] == '.') continue;
         std::error_code dec;
-        if (!de.is_directory(dec)) continue;
-        const std::string subdir = de.path().string();
-
-        // Check if this subdir has any .dkv files.
+        if (base.empty() || base[0] == '.' || !de.is_directory(dec)) continue;
+        bool kept_any = false;
         std::error_code sec;
-        for (const auto & se : fs::directory_iterator(subdir, sec)) {
-            const std::string sname = se.path().filename().string();
-            size_t nlen = sname.size();
-            if (nlen < 4 || sname.compare(nlen - 4, 4, ".dkv") != 0) continue;
-
-            // Read the header to get the layout_id.
-            std::string fpath = se.path().string();
-            FILE * f = std::fopen(fpath.c_str(), "rb");
-            if (!f) continue;
+        for (const auto & se : fs::directory_iterator(de.path(), sec)) {
+            const std::string name = se.path().filename().string();
+            const std::string path = se.path().string();
+            std::error_code rec;
+            if (has_suffix(name, ".dkv.tmp")) {
+                // A write the previous process never renamed into place.
+                fs::remove(path, rec);
+                ++removed;
+                continue;
+            }
+            if (!has_suffix(name, ".dkv")) continue;
 
             DiskCacheHeader hdr{};
-            if (read_header(f, hdr) && std::memcmp(hdr.magic, "DKVC", 4) == 0) {
-                std::memcpy(layout_id_.data(), hdr.layout_id, 16);
-                layout_known_ = true;
-                layout_from_disk_ = true;  // unverified — must be confirmed by learn_layout()
-                layout_dir_ = subdir;
-                std::fclose(f);
-                scan_directory();
-                return;
+            uint64_t size = 0;
+            const char * why = "";
+            bool ok = validate_snapshot_file(path, hdr, size, why);
+            if (ok && (hex(hdr.layout_id, 16) != base ||
+                       hex(hdr.token_hash, 16) + ".dkv" != name)) {
+                ok = false;
+                why = "name does not match header";
             }
-            std::fclose(f);
+            if (!ok) {
+                std::fprintf(stderr, "[disk-cache] removing %s: %s\n",
+                             path.c_str(), why);
+                fs::remove(path, rec);
+                ++removed;
+                continue;
+            }
+
+            DiskEntry entry;
+            entry.path = path;
+            std::memcpy(entry.token_hash.data(), hdr.token_hash, 16);
+            std::memcpy(entry.layout_id.data(), hdr.layout_id, 16);
+            entry.token_count = hdr.token_count;
+            entry.cur_pos     = hdr.cur_pos;
+            entry.last_used   = hdr.last_used;
+            entry.file_size   = size;
+            entry.own_salt    = std::memcmp(hdr.identity_salt,
+                                            identity_salt_.data(), 16) == 0;
+            total_bytes_ += entry.file_size;
+            entries_.push_back(std::move(entry));
+            kept_any = true;
         }
+        std::error_code rec;
+        if (!kept_any) fs::remove(de.path(), rec);  // only removes if empty
+    }
+
+    std::fprintf(stderr, "[disk-cache] scanned %zu files, %.1f MB (%zu removed)\n",
+                 entries_.size(), (double)total_bytes_ / (1024.0 * 1024.0),
+                 removed);
+}
+
+// ─── Index maintenance ──────────────────────────────────────────────────
+
+bool DiskPrefixCache::expired(const DiskEntry & e, uint64_t t) const {
+    return config_.ttl_seconds > 0 && t > e.last_used &&
+           t - e.last_used > config_.ttl_seconds;
+}
+
+void DiskPrefixCache::remove_entry(size_t idx, const char * why) {
+    const DiskEntry & e = entries_[idx];
+    std::fprintf(stderr, "[disk-cache] %s: removing %s (%u tokens, %.1f MB)\n",
+                 why, e.path.c_str(), e.token_count,
+                 (double)e.file_size / (1024.0 * 1024.0));
+    std::error_code ec;
+    fs::remove(e.path, ec);
+    total_bytes_ -= std::min<size_t>(total_bytes_, e.file_size);
+    entries_.erase(entries_.begin() + (long)idx);
+}
+
+void DiskPrefixCache::expire_locked() {
+    const uint64_t t = now();
+    for (size_t i = entries_.size(); i-- > 0;) {
+        if (expired(entries_[i], t)) remove_entry(i, "ttl expired");
+    }
+}
+
+void DiskPrefixCache::make_room_locked(uint64_t incoming) {
+    while (!entries_.empty() &&
+           (uint64_t)total_bytes_ + incoming > (uint64_t)config_.budget_bytes) {
+        size_t lru = 0;
+        for (size_t i = 1; i < entries_.size(); ++i) {
+            if (entries_[i].last_used < entries_[lru].last_used) lru = i;
+        }
+        remove_entry(lru, "budget (lru)");
     }
 }
 
@@ -397,14 +578,13 @@ bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) 
     int idx = find_entry(hash);
     if (idx < 0) return false;
 
-    auto & entry = entries_[idx];
-    if (!read_file(entry.path, slot)) {
+    if (expired(entries_[(size_t)idx], now())) {
+        remove_entry((size_t)idx, "ttl expired");
+        return false;
+    }
+    if (!read_file(entries_[(size_t)idx].path, slot, prompt_ids)) {
         // File is corrupt or incompatible — remove it.
-        std::fprintf(stderr, "[disk-cache] lookup failed, removing %s\n",
-                     entry.path.c_str());
-        std::remove(entry.path.c_str());
-        total_bytes_ -= entry.file_size;
-        entries_.erase(entries_.begin() + idx);
+        remove_entry((size_t)idx, "lookup failed");
         return false;
     }
 
@@ -422,28 +602,96 @@ bool DiskPrefixCache::lookup(const std::vector<int32_t> & prompt_ids, int slot) 
                          hex(disk_id.data(), 16).c_str(),
                          hex(layout_id_.data(), 16).c_str());
             backend_.snapshot_free(slot);
-            entries_.clear();
-            total_bytes_ = 0;
             layout_from_disk_ = false;
             layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
             mkdir_p(layout_dir_);
-            scan_directory();
             return false;
         }
         layout_from_disk_ = false;
-        layout_dir_ = config_.cache_dir + "/" + hex(layout_id_.data(), 16);
     }
 
-    // Update last_used on disk.
-    entry.last_used = now_unix();
-    entry.hits++;
-    // Optionally rewrite header timestamp (non-critical, skip for perf).
+    // Persist last_used in the file so LRU order and the TTL survive a
+    // restart. Not fsynced: losing it in a crash only ages the entry.
+    DiskEntry & entry = entries_[(size_t)idx];
+    entry.last_used = now();
+    if (FILE * f = std::fopen(entry.path.c_str(), "r+b")) {
+        if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) {
+            write_u64(f, entry.last_used);
+        }
+        std::fclose(f);
+    }
     return true;
+}
+
+void DiskPrefixCache::for_each_aux(
+        const std::function<void(const std::string &)> & visit) {
+    if (disabled()) return;
+    std::vector<std::pair<uint64_t, std::string>> files;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto & e : entries_) {
+            if (e.own_salt) files.push_back({e.last_used, e.path});
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto & file : files) {
+        FILE * f = std::fopen(file.second.c_str(), "rb");
+        if (!f) continue;
+        DiskCacheHeader hdr{};
+        std::string aux;
+        const bool ok = read_header(f, hdr) &&
+            read_aux_section(f, hdr.n_tensors, hdr.token_count, aux);
+        std::fclose(f);
+        if (ok && !aux.empty()) visit(aux);
+    }
+}
+
+DiskPrefixCache::PrefixProbe DiskPrefixCache::longest_prefix(
+        const std::vector<int32_t> & prompt_ids) {
+    PrefixProbe out;
+    if (disabled() || !layout_known_) return out;
+    std::lock_guard<std::mutex> lock(mu_);
+    const uint64_t t = now();
+    std::vector<uint32_t> lengths;
+    for (const auto & e : entries_) {
+        if (e.layout_id != layout_id_ || expired(e, t)) continue;
+        if (e.token_count > prompt_ids.size()) continue;
+        if ((int)e.token_count < config_.min_tokens) continue;
+        lengths.push_back(e.token_count);
+    }
+    std::sort(lengths.begin(), lengths.end(), std::greater<uint32_t>());
+    lengths.erase(std::unique(lengths.begin(), lengths.end()), lengths.end());
+    for (uint32_t len : lengths) {
+        const int idx = find_entry(hash_prefix(prompt_ids.data(), (int)len));
+        if (idx >= 0) {
+            out.len = (int)len;
+            out.cur_pos = (int)entries_[(size_t)idx].cur_pos;
+            return out;
+        }
+    }
+    return out;
+}
+
+int DiskPrefixCache::prune_ancestors(const std::vector<int32_t> & tokens,
+                                     int keep_max) {
+    if (disabled() || !layout_known_) return 0;
+    std::lock_guard<std::mutex> lock(mu_);
+    int removed = 0;
+    for (size_t i = entries_.size(); i-- > 0;) {
+        const DiskEntry & e = entries_[i];
+        if (e.layout_id != layout_id_) continue;
+        if ((int)e.token_count <= keep_max || e.token_count >= tokens.size()) continue;
+        if (hash_prefix(tokens.data(), (int)e.token_count) != e.token_hash) continue;
+        remove_entry(i, "superseded by deeper session state");
+        ++removed;
+    }
+    return removed;
 }
 
 // ─── Save ───────────────────────────────────────────────────────────────
 
-bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids) {
+bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids,
+                           const std::string & aux) {
     if (disabled()) return false;
 
     // Learn layout on first save.
@@ -472,34 +720,40 @@ bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids) {
     PrefixHash hash = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
 
     std::lock_guard<std::mutex> lock(mu_);
+    expire_locked();
 
-    // Skip if already on disk.
-    if (find_entry(hash) >= 0) return true;
-
-    // Pre-write budget check: estimate file size and reject if it would
-    // exceed budget even after evicting all evictable entries.
-    if (config_.budget_bytes > 0) {
-        uint64_t payload = 0;
-        uint32_t ntens = 0;
-        size_t table_est = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); t;
-             t = ggml_get_next_tensor(ref.ctx, t)) {
-            ntens++;
-            payload += ggml_nbytes(t);
-            table_est += 2 + std::strlen(t->name) + 4 + 32 + 8; // name_len + name + type + ne[4] + nbytes
-        }
-        size_t est_size = DISK_CACHE_HEADER_SIZE + table_est + payload;
-        if (est_size > config_.budget_bytes) {
-            std::fprintf(stderr, "[disk-cache] skip save: estimated %.1f MB exceeds budget\n",
-                         (double)est_size / (1024.0 * 1024.0));
-            return false;
-        }
+    // Already on disk: count it as a use.
+    const int existing = find_entry(hash);
+    if (existing >= 0) {
+        entries_[(size_t)existing].last_used = now();
+        return true;
     }
+
+    // Make room first, so the budget holds while the file is being written.
+    uint64_t payload = 0;
+    size_t table_bytes = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); t;
+         t = ggml_get_next_tensor(ref.ctx, t)) {
+        payload += ggml_nbytes(t);
+        table_bytes += 2 + std::strlen(t->name) + 4 + 32 + 8;
+    }
+    const uint64_t est_size = DISK_CACHE_HEADER_SIZE + table_bytes +
+        4ull * prompt_ids.size() + 4 + aux.size() + payload;
+    if (est_size > (uint64_t)config_.budget_bytes) {
+        std::fprintf(stderr, "[disk-cache] skip save: %.1f MB exceeds budget\n",
+                     (double)est_size / (1024.0 * 1024.0));
+        return false;
+    }
+    make_room_locked(est_size);
 
     std::string path = make_path(hash);
     std::string tmp_path = path + ".tmp";
+    mkdir_p(layout_dir_);
 
-    if (!write_file(tmp_path, ref, prompt_ids)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!write_file(tmp_path, ref, prompt_ids, aux)) {
+        std::fprintf(stderr, "[disk-cache] write failed (%s), skipping %s\n",
+                     std::strerror(errno), path.c_str());
         std::remove(tmp_path.c_str());
         return false;
     }
@@ -509,28 +763,28 @@ bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids) {
         std::remove(tmp_path.c_str());
         return false;
     }
+    sync_directory(layout_dir_);
 
     // Update index.
     DiskEntry entry;
     entry.path        = path;
     std::memcpy(entry.token_hash.data(), hash.data(), 16);
+    entry.layout_id   = layout_id_;
     entry.token_count = (uint32_t)prompt_ids.size();
     entry.cur_pos     = (uint32_t)ref.cur_pos;
-    entry.last_used   = now_unix();
-    entry.created_at  = entry.last_used;
-    std::error_code fec;
-    auto fsz = fs::file_size(path, fec);
-    if (!fec) entry.file_size = (uint64_t)fsz;
+    entry.last_used   = now();
+    entry.own_salt    = true;
+    entry.file_size   = est_size;
 
     total_bytes_ += entry.file_size;
     entries_.push_back(std::move(entry));
 
-    std::fprintf(stderr, "[disk-cache] saved %s (%u tokens, %d pos, %.1f MB)\n",
+    const double secs = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[disk-cache] saved %s (%u tokens, %d pos, %.1f MB, %.2fs)\n",
                  hex(hash.data(), 16).c_str(),
                  (uint32_t)prompt_ids.size(), ref.cur_pos,
-                 (double)entries_.back().file_size / (1024.0 * 1024.0));
-
-    enforce_budget();
+                 (double)est_size / (1024.0 * 1024.0), secs);
     return true;
 }
 
@@ -590,56 +844,6 @@ int DiskPrefixCache::cold_prefix_boundary(const std::vector<int32_t> & prompt_id
     return best;
 }
 
-// ─── Budget enforcement ─────────────────────────────────────────────────
-
-void DiskPrefixCache::enforce_budget() {
-    uint64_t now = now_unix();
-
-    // DS4-style eviction scoring: (effective_hits + 1) * tokens / file_size
-    // with exponential decay on hits (6-hour half-life).
-    auto score = [now](const DiskEntry & e) -> double {
-        // Protect recently-saved entries (< 60 seconds old).
-        if (e.created_at > 0 && now > 0 && (now - e.created_at) < 60) {
-            return 1e18;
-        }
-        // Decay hits: half-life 6h → decay_rate = ln(2) / (6*3600) ≈ 3.2e-5
-        double age_s = (now > e.last_used) ? (double)(now - e.last_used) : 0.0;
-        double effective_hits = (double)e.hits * std::exp(-age_s * 3.2e-5);
-        double size_factor = (e.file_size > 0) ? (double)e.file_size : 1.0;
-        return (effective_hits + 1.0) * (double)e.token_count / size_factor;
-    };
-
-    while (total_bytes_ > config_.budget_bytes && !entries_.empty()) {
-        // Find entry with lowest eviction score.
-        auto it = std::min_element(entries_.begin(), entries_.end(),
-            [&score](const DiskEntry & a, const DiskEntry & b) {
-                return score(a) < score(b);
-            });
-
-        // Don't evict protected entries.
-        if (score(*it) >= 1e18) break;
-
-        std::fprintf(stderr, "[disk-cache] evicting %s (%.1f MB, hits=%u, score=%.3f)\n",
-                     hex(it->token_hash.data(), 16).c_str(),
-                     (double)it->file_size / (1024.0 * 1024.0),
-                     it->hits, score(*it));
-
-        std::remove(it->path.c_str());
-        total_bytes_ -= it->file_size;
-        entries_.erase(it);
-    }
-}
-
-// ─── Touch ──────────────────────────────────────────────────────────────
-
-void DiskPrefixCache::touch(const PrefixHash & hash) {
-    std::lock_guard<std::mutex> lock(mu_);
-    int idx = find_entry(hash);
-    if (idx >= 0) {
-        entries_[idx].last_used = now_unix();
-    }
-}
-
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 std::string DiskPrefixCache::make_path(const PrefixHash & hash) const {
@@ -648,7 +852,8 @@ std::string DiskPrefixCache::make_path(const PrefixHash & hash) const {
 
 int DiskPrefixCache::find_entry(const PrefixHash & hash) const {
     for (int i = 0; i < (int)entries_.size(); ++i) {
-        if (entries_[i].token_hash == hash) return i;
+        if (entries_[i].token_hash == hash &&
+            entries_[i].layout_id == layout_id_) return i;
     }
     return -1;
 }
@@ -657,7 +862,8 @@ int DiskPrefixCache::find_entry(const PrefixHash & hash) const {
 
 bool DiskPrefixCache::write_file(const std::string & path,
                                  const ModelBackend::SnapshotRef & ref,
-                                 const std::vector<int32_t> & prompt_ids) {
+                                 const std::vector<int32_t> & prompt_ids,
+                                 const std::string & aux) {
     FILE * f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
 
@@ -680,45 +886,53 @@ bool DiskPrefixCache::write_file(const std::string & path,
     PrefixHash ph = hash_prefix(prompt_ids.data(), (int)prompt_ids.size());
     std::memcpy(hdr.token_hash, ph.data(), 16);
     hdr.payload_bytes = payload_bytes;
-    hdr.created_at    = now_unix();
+    hdr.created_at    = now();
     hdr.last_used     = hdr.created_at;
     hdr.last_tok      = ref.last_tok;
+    std::memcpy(hdr.identity_salt, identity_salt_.data(), 16);
 
-    if (!write_header(f, hdr)) { std::fclose(f); return false; }
+    bool ok = write_header(f, hdr);
 
     // Write tensor table.
-    for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); t; t = ggml_get_next_tensor(ref.ctx, t)) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); ok && t; t = ggml_get_next_tensor(ref.ctx, t)) {
         uint16_t name_len = (uint16_t)std::strlen(t->name);
         write_u16(f, name_len);
         std::fwrite(t->name, 1, name_len, f);
         write_u32(f, (uint32_t)t->type);
         for (int d = 0; d < 4; ++d) write_i64(f, t->ne[d]);
         write_u64(f, ggml_nbytes(t));
+        ok = !std::ferror(f);
     }
 
-    // Write tensor data.
+    // The exact key: a hit compares it with the prompt before restoring.
+    ok = ok && std::fwrite(prompt_ids.data(), sizeof(int32_t), prompt_ids.size(), f) ==
+        prompt_ids.size();
+    write_u32(f, (uint32_t)aux.size());
+    ok = ok && (aux.empty() || std::fwrite(aux.data(), 1, aux.size(), f) == aux.size());
+
+    // Write tensor data: the snapshot's bytes as stored, no conversion.
     std::vector<uint8_t> buf(4 * 1024 * 1024);  // 4 MB transfer buffer
-    for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); t; t = ggml_get_next_tensor(ref.ctx, t)) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ref.ctx); ok && t; t = ggml_get_next_tensor(ref.ctx, t)) {
         size_t nbytes = ggml_nbytes(t);
         size_t offset = 0;
-        while (offset < nbytes) {
+        while (ok && offset < nbytes) {
             size_t chunk = std::min(buf.size(), nbytes - offset);
             ggml_backend_tensor_get(t, buf.data(), offset, chunk);
-            if (std::fwrite(buf.data(), 1, chunk, f) != chunk) {
-                std::fclose(f);
-                return false;
-            }
+            ok = std::fwrite(buf.data(), 1, chunk, f) == chunk;
             offset += chunk;
         }
     }
 
-    std::fclose(f);
-    return true;
+    // Durable before the rename publishes it.
+    ok = ok && std::fflush(f) == 0 && sync_file(f);
+    ok = (std::fclose(f) == 0) && ok;
+    return ok;
 }
 
 // ─── File I/O: Read ─────────────────────────────────────────────────────
 
-bool DiskPrefixCache::read_file(const std::string & path, int slot) {
+bool DiskPrefixCache::read_file(const std::string & path, int slot,
+                                const std::vector<int32_t> & prompt_ids) {
     FILE * f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
 
@@ -729,6 +943,12 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
     if (std::memcmp(hdr.magic, "DKVC", 4) != 0) { std::fclose(f); return false; }
     if (hdr.version != DISK_CACHE_VERSION) { std::fclose(f); return false; }
     if (std::memcmp(hdr.layout_id, layout_id_.data(), 16) != 0) { std::fclose(f); return false; }
+    if (std::memcmp(hdr.identity_salt, identity_salt_.data(), 16) != 0) {
+        std::fprintf(stderr, "[disk-cache] rejecting %s: written by another "
+                     "model/KV type/config\n", path.c_str());
+        std::fclose(f);
+        return false;
+    }
     // Never restore a snapshot that extends past the tokens its key covers
     // (see save()). Older files written that way are dropped by the caller.
     if (hdr.cur_pos > hdr.token_count) {
@@ -738,6 +958,7 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
         std::fclose(f);
         return false;
     }
+    if (hdr.token_count != prompt_ids.size()) { std::fclose(f); return false; }
 
     // Read tensor table.
     std::vector<DiskTensorEntry> table;
@@ -750,7 +971,7 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
         char name_buf[GGML_MAX_NAME] = {};
         if (std::fread(name_buf, 1, name_len, f) != name_len) { std::fclose(f); return false; }
         ent.name = name_buf;
-        if (!read_u32(f, ent.type)) { std::fclose(f); return false; }
+        if (!read_u32(f, ent.type) || ent.type >= GGML_TYPE_COUNT) { std::fclose(f); return false; }
         for (int d = 0; d < 4; ++d) {
             if (!read_i64(f, ent.ne[d])) { std::fclose(f); return false; }
         }
@@ -758,6 +979,23 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
         if (!read_u64(f, nbytes_raw)) { std::fclose(f); return false; }
         ent.nbytes = (size_t)nbytes_raw;
         table.push_back(std::move(ent));
+    }
+
+    // The stored key must be exactly this prompt (not just its hash): a
+    // state keyed on another token stream, e.g. a compressed view, can
+    // never be restored for it.
+    std::vector<int32_t> stored(prompt_ids.size());
+    if (std::fread(stored.data(), sizeof(int32_t), stored.size(), f) != stored.size() ||
+        stored != prompt_ids) {
+        std::fprintf(stderr, "[disk-cache] rejecting %s: stored tokens differ "
+                     "from the prompt\n", path.c_str());
+        std::fclose(f);
+        return false;
+    }
+    uint32_t aux_len = 0;
+    if (!read_u32(f, aux_len) || std::fseek(f, (long)aux_len, SEEK_CUR) != 0) {
+        std::fclose(f);
+        return false;
     }
 
     // Allocate ggml context + buffer.
@@ -770,7 +1008,7 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
     // Create tensors.
     for (const auto & ent : table) {
         ggml_tensor * t = ggml_new_tensor(ctx, (ggml_type)ent.type, 4, ent.ne);
-        if (!t) {
+        if (!t || ggml_nbytes(t) != ent.nbytes) {
             ggml_free(ctx);
             std::fclose(f);
             return false;
@@ -830,7 +1068,8 @@ bool DiskPrefixCache::write_header(FILE * f, const DiskCacheHeader & hdr) {
     write_u64(f, hdr.created_at);
     write_u64(f, hdr.last_used);
     write_u32(f, (uint32_t)hdr.last_tok);  // stored as u32, cast back on read
-    // Total: 4+4+16+4+4+4+16+8+8+8+4 = 80 bytes. No extra padding needed.
+    std::fwrite(hdr.identity_salt, 1, 16, f);
+    // Total: 4+4+16+4+4+4+16+8+8+8+4+16 = 96 bytes. No extra padding needed.
     return !std::ferror(f);
 }
 
@@ -848,6 +1087,7 @@ bool DiskPrefixCache::read_header(FILE * f, DiskCacheHeader & hdr) {
     uint32_t last_tok_raw;
     if (!read_u32(f, last_tok_raw)) return false;
     hdr.last_tok = (int32_t)last_tok_raw;
+    if (std::fread(hdr.identity_salt, 1, 16, f) != 16) return false;
     return true;
 }
 

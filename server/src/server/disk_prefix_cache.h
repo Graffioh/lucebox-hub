@@ -3,13 +3,21 @@
 // Complements the in-memory PrefixCache by serializing snapshot tensors to
 // files, enabling cache survival across restarts and overflow to disk.
 //
-// File format: 80-byte header + tensor table + raw tensor data.
-// Files are keyed by SHA-1 of prompt token IDs (same as in-memory cache).
-// A layout fingerprint (SHA-1 of tensor names/types/shapes) prevents loading
-// snapshots from incompatible models.
+// File format (v4): 96-byte header + tensor table + the exact key token ids
+// + an auxiliary blob (u32 length + bytes; the server stores the session's
+// tool-call replay text there) + raw tensor data. Tensor bytes are copied verbatim in the cache's own
+// type (e.g. q4_0 KV stays q4_0): no requantization on save or restore.
+// Files are keyed by SHA-1 of prompt token IDs (same as in-memory cache);
+// a hit also compares the stored token ids with the prompt before reading
+// any tensor data. A layout fingerprint (SHA-1 of an identity salt plus the
+// tensor names/types/shapes) and the identity salt itself prevent loading
+// snapshots from another model, KV type or config.
 //
 // Directory structure:
 //   <cache_dir>/<layout_fingerprint_hex>/<token_hash_hex>.dkv
+//
+// Every layout directory is indexed for the disk budget and the TTL; only
+// the live layout's files are ever restored.
 
 #pragma once
 
@@ -18,6 +26,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -32,6 +41,9 @@ struct DiskCacheConfig {
     int         min_tokens   = 512; // only persist snapshots >= this many tokens
     int         continued_interval = 10240; // save every N tokens during long sessions
     int         cold_max_tokens = 10240;    // create cold checkpoint for prompts longer than this
+    // Files unused for longer than this are deleted (at startup, before each
+    // save, and when a lookup meets one). 0 = never expire.
+    uint64_t    ttl_seconds = 72ull * 3600;
 };
 
 enum class DiskPrefixCacheMode {
@@ -80,7 +92,7 @@ int disk_prefix_cache_auto_boundary(
     const std::vector<int> & safe_boundaries,
     int min_tokens);
 
-// ─── File header (80 bytes, little-endian) ──────────────────────────────
+// ─── File header (96 bytes, little-endian) ──────────────────────────────
 
 struct DiskCacheHeader {
     char     magic[4];          // "DKVC"
@@ -94,15 +106,18 @@ struct DiskCacheHeader {
     uint64_t created_at;       // unix seconds
     uint64_t last_used;        // unix seconds (updated on hit)
     int32_t  last_tok;         // last prefill token (needed for decode seeding)
-    // Padding to 80 bytes.
+    uint8_t  identity_salt[16]; // model/KV-type/config identity (v4)
 };
 // NOTE: The header is serialized field-by-field, not as a raw struct,
-// to avoid alignment/packing issues. The on-disk size is exactly 80 bytes.
+// to avoid alignment/packing issues. The on-disk size is exactly 96 bytes.
 
-static constexpr size_t DISK_CACHE_HEADER_SIZE = 80;
-// v3: ggml_type id 42 changed meaning (TQ3_0 -> Q2_0). Bump so cache files
-// written before the Q2_0 type existed are rejected instead of misread.
-static constexpr uint32_t DISK_CACHE_VERSION = 3;
+static constexpr size_t DISK_CACHE_HEADER_SIZE = 96;
+// Byte offset of last_used, rewritten in place when a hit touches a file.
+static constexpr long DISK_CACHE_LAST_USED_OFFSET = 68;
+// v3: ggml_type id 42 changed meaning (TQ3_0 -> Q2_0).
+// v4: identity salt in the header and the key token ids after the tensor
+// table. Older files are deleted at startup.
+static constexpr uint32_t DISK_CACHE_VERSION = 4;
 
 // ─── Tensor table entry (on-disk) ──────────────────────────────────────
 
@@ -127,17 +142,38 @@ public:
         return config_.cache_dir.empty() || backend_snapshot_unsupported_;
     }
 
-    // Initialize: create directory, scan existing files, learn layout from
-    // first available snapshot. Returns false on fatal error.
+    // Initialize: create directory, index every snapshot file, delete
+    // corrupt/partial/outdated files and leftover temporaries, apply the TTL
+    // and the budget, and pick the most recently used layout written with
+    // this identity salt (enables first-request disk hits). Returns false on
+    // fatal error.
     bool init();
 
     // Look up a prompt on disk. On hit, loads the snapshot into `out_slot`
     // using backend.snapshot_adopt(). Returns true if loaded successfully.
     bool lookup(const std::vector<int32_t> & prompt_ids, int slot);
 
-    // Save the snapshot in `slot` to disk, keyed by prompt_ids.
-    // Returns true on success.
-    bool save(int slot, const std::vector<int32_t> & prompt_ids);
+    // Save the snapshot in `slot` to disk, keyed by prompt_ids, with an
+    // optional auxiliary blob stored alongside it.
+    // Returns true on success (or when the entry already exists).
+    bool save(int slot, const std::vector<int32_t> & prompt_ids,
+              const std::string & aux = std::string());
+
+    // Visit the auxiliary blobs of the restorable files (this identity),
+    // least recently used first. Reads only the small metadata sections.
+    void for_each_aux(const std::function<void(const std::string &)> & visit);
+
+    // Index-only probe (no file read): the deepest restorable entry whose
+    // key is a prefix of `prompt_ids`. len = key tokens, cur_pos = KV rows
+    // the snapshot holds (<= len). {0, 0} on miss.
+    struct PrefixProbe { int len = 0; int cur_pos = 0; };
+    PrefixProbe longest_prefix(const std::vector<int32_t> & prompt_ids);
+
+    // Delete live-layout entries whose key is a strict prefix of `tokens`
+    // and longer than `keep_max` tokens: a deeper state of the same session
+    // supersedes them. Entries up to keep_max (the shared system/tools head)
+    // stay for other sessions. Returns the number of files removed.
+    int prune_ancestors(const std::vector<int32_t> & tokens, int keep_max);
 
     // Check if a continued checkpoint should be saved after generation.
     // `all_tokens` = prompt + generated tokens, `cur_pos` = final position.
@@ -156,14 +192,10 @@ public:
     int cold_prefix_boundary(const std::vector<int32_t> & prompt_ids,
                              const std::vector<int> & boundaries);
 
-    // Evict files until total disk usage is within budget.
-    void enforce_budget();
-
-    // Update last_used timestamp for a file (on cache hit).
-    void touch(const PrefixHash & hash);
-
-    // Get total bytes used on disk.
+    // Get total bytes used on disk (all layouts).
     size_t total_bytes() const { return total_bytes_; }
+    size_t entry_count() const { return entries_.size(); }
+    int    cold_max_tokens() const { return config_.cold_max_tokens; }
 
     // Get the continued-interval setting.
     int continued_interval() const { return config_.continued_interval; }
@@ -179,9 +211,13 @@ public:
         identity_salt_ = salt;
     }
 
+    // Unix-seconds clock for created_at/last_used/TTL. Tests inject one.
+    void set_clock(std::function<uint64_t()> clock) { clock_ = std::move(clock); }
+
 private:
     DiskCacheConfig config_;
     ModelBackend &  backend_;
+    std::function<uint64_t()> clock_;
     // Some backends support in-memory snapshots but deliberately do not
     // implement SnapshotRef/adoption. Detect that once from a live slot and
     // stop scheduling disk work for the rest of the process.
@@ -200,32 +236,39 @@ private:
     bool layout_from_disk_ = false;  // true if learned from file, unverified
     std::string layout_dir_;  // <cache_dir>/<fingerprint_hex>/
 
-    // In-memory index of on-disk files.
+    // In-memory index of on-disk files (every layout directory).
     struct DiskEntry {
         std::string path;
         PrefixHash  token_hash;
+        std::array<uint8_t, 16> layout_id{};
         uint32_t    token_count = 0;
         uint32_t    cur_pos     = 0;
         uint64_t    file_size   = 0;
         uint64_t    last_used   = 0;
-        uint32_t    hits        = 0;
-        uint64_t    created_at  = 0;  // for eviction protection
+        bool        own_salt    = false;  // written with identity_salt_
     };
     std::vector<DiskEntry> entries_;
     size_t total_bytes_ = 0;
     std::mutex mu_;
 
     // Helpers.
+    uint64_t now() const;
     void compute_layout_id(ggml_context * ctx);
-    void scan_directory();
-    void try_learn_from_disk();
+    void scan_all();
     std::string make_path(const PrefixHash & hash) const;
     int find_entry(const PrefixHash & hash) const;
+    bool expired(const DiskEntry & e, uint64_t t) const;
+    void remove_entry(size_t idx, const char * why);
+    void expire_locked();
+    // Evict least-recently-used files until `incoming` more bytes fit.
+    void make_room_locked(uint64_t incoming);
 
     bool write_file(const std::string & path,
                     const ModelBackend::SnapshotRef & ref,
-                    const std::vector<int32_t> & prompt_ids);
-    bool read_file(const std::string & path, int slot);
+                    const std::vector<int32_t> & prompt_ids,
+                    const std::string & aux);
+    bool read_file(const std::string & path, int slot,
+                   const std::vector<int32_t> & prompt_ids);
 
     // Header I/O.
     static bool write_header(FILE * f, const DiskCacheHeader & hdr);

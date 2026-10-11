@@ -11137,6 +11137,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_config_defaults) {
     TEST_ASSERT(cfg.min_tokens == 512);
     TEST_ASSERT(cfg.continued_interval == 10240);
     TEST_ASSERT(cfg.cold_max_tokens == 10240);
+    TEST_ASSERT(cfg.ttl_seconds == 72ull * 3600);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_policy_parse) {
@@ -11289,12 +11290,14 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
-    // The header should be exactly 80 bytes.
-    TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 80);
+    // The header should be exactly 96 bytes.
+    TEST_ASSERT(DISK_CACHE_HEADER_SIZE == 96);
+    TEST_ASSERT(DISK_CACHE_LAST_USED_OFFSET == 68);
     // Bumped to 2 when the K-rotation default changed: a cache written by an
     // older binary stores K in the rotated basis, and the layout id does not
     // cover that, so the version is what rejects it.
-    TEST_ASSERT(DISK_CACHE_VERSION == 3);
+    // v4 added the identity salt and the stored key tokens.
+    TEST_ASSERT(DISK_CACHE_VERSION == 4);
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
@@ -11315,6 +11318,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     hdr.created_at = 1700000000;
     hdr.last_used = 1700000100;
     hdr.last_tok = 151643;
+    std::memset(hdr.identity_salt, 0xEF, 16);
 
     // Use DiskPrefixCache's static write/read_header (they are private, so
     // we test indirectly through file I/O matching the on-disk format).
@@ -11333,6 +11337,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     u64 = hdr.created_at; std::fwrite(&u64, 8, 1, f);
     u64 = hdr.last_used; std::fwrite(&u64, 8, 1, f);
     int32_t i32 = hdr.last_tok; std::fwrite(&i32, 4, 1, f);
+    std::fwrite(hdr.identity_salt, 16, 1, f);
     std::fclose(f);
 
     // Verify file size is DISK_CACHE_HEADER_SIZE.
@@ -11356,6 +11361,8 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000000);  // created_at
     std::fread(&ru64, 8, 1, f); TEST_ASSERT(ru64 == 1700000100);  // last_used
     int32_t ri32; std::fread(&ri32, 4, 1, f); TEST_ASSERT(ri32 == 151643);  // last_tok
+    uint8_t salt[16]; std::fread(salt, 16, 1, f);
+    TEST_ASSERT(salt[0] == 0xEF && salt[15] == 0xEF);
     std::fclose(f);
 
     remove_test_path(path);
@@ -11768,6 +11775,343 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
 
     rm_rf(dir1);
     rm_rf(dir2);
+}
+
+// ─── Session persistence: TTL, LRU budget, restart, validation ──────────
+
+namespace {
+
+std::vector<int32_t> disk_test_key(int n, int32_t base = 1) {
+    std::vector<int32_t> key;
+    for (int i = 0; i < n; ++i) key.push_back(base + i);
+    return key;
+}
+
+std::vector<std::string> dkv_files(const std::string & dir) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (auto & e : fs::recursive_directory_iterator(dir, ec)) {
+        if (e.is_regular_file()) out.push_back(e.path().string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Size of one snapshot file the mock produces for a key of `n` tokens.
+uint64_t one_file_size(MockBackendWithAdopt & backend, const std::string & dir, int n) {
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    cache.init();
+    cache.learn_layout(0);
+    cache.save(0, disk_test_key(n));
+    const uint64_t size = cache.total_bytes();
+    rm_rf(dir);
+    return size;
+}
+
+}  // namespace
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_ttl_expiry) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_ttl").string();
+    rm_rf(dir);
+    uint64_t clock = 1000;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    cfg.ttl_seconds = 100;
+    const auto a = disk_test_key(40, 1);
+    const auto b = disk_test_key(40, 500);
+    const auto c = disk_test_key(40, 900);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, a));
+        clock = 1090;
+        TEST_ASSERT(cache.lookup(a, 1));          // used at 1090
+        clock = 1180;
+        TEST_ASSERT(cache.lookup(a, 1));          // 90 s idle: still alive
+        clock = 1281;
+        TEST_ASSERT(!cache.lookup(a, 1));         // 101 s idle: expired + deleted
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(dkv_files(dir).empty());
+
+        // Insertion sweep: saving b deletes an expired c.
+        TEST_ASSERT(cache.save(0, c));
+        clock = 1400;
+        TEST_ASSERT(cache.save(0, b));
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(!cache.lookup(c, 1));
+    }
+    {
+        // Startup sweep: b expires while the server is down.
+        clock = 1600;
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 0);
+        TEST_ASSERT(dkv_files(dir).empty());
+    }
+    {
+        // ttl 0 = never expire.
+        DiskCacheConfig never = cfg; never.ttl_seconds = 0;
+        DiskPrefixCache cache(never, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, a));
+        clock += 10ull * 365 * 24 * 3600;
+        TEST_ASSERT(cache.lookup(a, 1));
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_budget_lru_survives_restart) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_lru").string();
+    const uint64_t one = one_file_size(backend, dir, 40);
+    TEST_ASSERT(one > 0);
+    uint64_t clock = 1;
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    cfg.ttl_seconds = 0;
+    cfg.budget_bytes = (size_t)(one * 2 + one / 2);  // room for two files
+    const auto a = disk_test_key(40, 1);
+    const auto b = disk_test_key(40, 500);
+    const auto c = disk_test_key(40, 900);
+    const auto d = disk_test_key(40, 1300);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        clock = 1; TEST_ASSERT(cache.save(0, a));
+        clock = 2; TEST_ASSERT(cache.save(0, b));
+        clock = 3; TEST_ASSERT(cache.lookup(a, 1));  // a is now newer than b
+    }
+    {
+        // last_used came from the file: b (2) is the LRU, not a (created 1).
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 2);
+        cache.learn_layout(0);
+        clock = 4; TEST_ASSERT(cache.save(0, c));
+        TEST_ASSERT(cache.total_bytes() <= cfg.budget_bytes);
+        TEST_ASSERT(cache.entry_count() == 2);
+        TEST_ASSERT(!cache.lookup(b, 1));
+        clock = 5; TEST_ASSERT(cache.lookup(a, 1));
+        clock = 6; TEST_ASSERT(cache.save(0, d));   // evicts c (4)
+        TEST_ASSERT(cache.total_bytes() <= cfg.budget_bytes);
+        TEST_ASSERT(!cache.lookup(c, 1));
+        TEST_ASSERT(cache.lookup(a, 1));
+        TEST_ASSERT(cache.lookup(d, 1));
+    }
+    {
+        // A smaller budget is enforced at startup, before any request.
+        DiskCacheConfig small = cfg; small.budget_bytes = (size_t)(one + one / 2);
+        DiskPrefixCache cache(small, backend);
+        cache.set_clock([&]() { return clock; });
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(cache.total_bytes() <= small.budget_bytes);
+        // A snapshot larger than the whole budget is never written.
+        DiskCacheConfig tiny = cfg; tiny.budget_bytes = (size_t)(one / 2);
+        DiskPrefixCache t(tiny, backend);
+        TEST_ASSERT(t.init());
+        t.learn_layout(0);
+        TEST_ASSERT(!t.save(0, disk_test_key(40, 7000)));
+        TEST_ASSERT(t.total_bytes() <= tiny.budget_bytes);
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_restart_restores_and_rejects_other_identity) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_restart").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    std::array<uint8_t, 16> q4{}; q4[0] = 4;
+    std::array<uint8_t, 16> q8{}; q8[0] = 8;
+    const auto key = disk_test_key(40);
+    {
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_identity_salt(q4);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, key, "replay-text"));
+    }
+    {
+        // Same identity after a restart: the index is rebuilt from disk and
+        // the first lookup hits before any live snapshot exists.
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_identity_salt(q4);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        std::vector<std::string> aux;
+        cache.for_each_aux([&](const std::string & blob) { aux.push_back(blob); });
+        TEST_ASSERT(aux.size() == 1 && aux[0] == "replay-text");
+        TEST_ASSERT(cache.longest_prefix(key).len == 40);
+        backend.adopted_cur_pos_ = 0;
+        TEST_ASSERT(cache.lookup(key, 1));
+        TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
+    }
+    {
+        // Another KV type/model identity: never restored, still indexed so
+        // the budget and the TTL cover it.
+        DiskPrefixCache cache(cfg, backend);
+        cache.set_identity_salt(q8);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        size_t other_aux = 0;
+        cache.for_each_aux([&](const std::string &) { ++other_aux; });
+        TEST_ASSERT(other_aux == 0);
+        TEST_ASSERT(cache.longest_prefix(key).len == 0);
+        TEST_ASSERT(!cache.lookup(key, 1));
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.longest_prefix(key).len == 0);
+        TEST_ASSERT(!cache.lookup(key, 1));
+        TEST_ASSERT(dkv_files(dir).size() == 1);
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_init_deletes_corrupt_files) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_corrupt").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    const auto good = disk_test_key(40, 1);
+    const auto cut = disk_test_key(40, 300);
+    const auto old = disk_test_key(40, 600);
+    std::string layout_dir;
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        cache.learn_layout(0);
+        TEST_ASSERT(cache.save(0, good));
+        TEST_ASSERT(cache.save(0, cut));
+        TEST_ASSERT(cache.save(0, old));
+    }
+    auto files = dkv_files(dir);
+    TEST_ASSERT(files.size() == 3);
+    layout_dir = fs::path(files[0]).parent_path().string();
+    auto path_of = [&](const std::vector<int32_t> & k) {
+        const PrefixHash h = hash_prefix(k.data(), (int)k.size());
+        static const char * hx = "0123456789abcdef";
+        std::string name;
+        for (uint8_t byte : h) { name += hx[byte >> 4]; name += hx[byte & 15]; }
+        return layout_dir + "/" + name + ".dkv";
+    };
+    // Truncated (crash or full disk mid-write).
+    fs::resize_file(path_of(cut), fs::file_size(path_of(cut)) - 7);
+    // Older format version.
+    if (FILE * f = std::fopen(path_of(old).c_str(), "r+b")) {
+        const uint32_t v3 = 3;
+        std::fseek(f, 4, SEEK_SET);
+        std::fwrite(&v3, 4, 1, f);
+        std::fclose(f);
+    }
+    // Garbage and a temp file left by an interrupted write.
+    { FILE * f = std::fopen((layout_dir + "/" + std::string(32, 'a') + ".dkv").c_str(), "wb");
+      std::fputs("not a snapshot", f); std::fclose(f); }
+    { FILE * f = std::fopen((layout_dir + "/" + std::string(32, 'b') + ".dkv.tmp").c_str(), "wb");
+      std::fputs("partial", f); std::fclose(f); }
+    {
+        DiskPrefixCache cache(cfg, backend);
+        TEST_ASSERT(cache.init());
+        TEST_ASSERT(cache.entry_count() == 1);
+        files = dkv_files(dir);
+        TEST_ASSERT(files.size() == 1 && files[0] == path_of(good));
+        TEST_ASSERT(cache.lookup(good, 1));
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_verifies_stored_tokens) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_tokens").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    const auto key = disk_test_key(40);
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    TEST_ASSERT(cache.save(0, key));
+    const auto files = dkv_files(dir);
+    TEST_ASSERT(files.size() == 1);
+    // The stored key sits right before the (empty) aux blob and the payload.
+    uint64_t payload = 0;
+    FILE * f = std::fopen(files[0].c_str(), "r+b");
+    TEST_ASSERT(f != nullptr);
+    std::fseek(f, 52, SEEK_SET);
+    TEST_ASSERT(std::fread(&payload, 8, 1, f) == 1);
+    const long tokens_at = (long)(fs::file_size(files[0]) - payload - 4 - 4 * key.size());
+    const int32_t other = 999999;
+    std::fseek(f, tokens_at + 4 * 10, SEEK_SET);
+    std::fwrite(&other, 4, 1, f);
+    std::fclose(f);
+    // Same hash in the index, different stored tokens: rejected and deleted.
+    TEST_ASSERT(!cache.lookup(key, 1));
+    TEST_ASSERT(dkv_files(dir).empty());
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_longest_prefix_and_prune_ancestors) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_prefix_probe").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    const auto turn3 = disk_test_key(60);
+    const std::vector<int32_t> turn1(turn3.begin(), turn3.begin() + 40);
+    const std::vector<int32_t> turn2(turn3.begin(), turn3.begin() + 48);
+    TEST_ASSERT(cache.save(0, turn1));
+    TEST_ASSERT(cache.save(0, turn2));
+
+    // Deepest restorable prefix, without reading any file.
+    auto probe = cache.longest_prefix(turn3);
+    TEST_ASSERT(probe.len == 48 && probe.cur_pos == MockBackendWithLayout::kMaxPos);
+    auto diverged = turn3; diverged[45] = -7;
+    TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
+    TEST_ASSERT(cache.longest_prefix(disk_test_key(60, 5000)).len == 0);
+    TEST_ASSERT(cache.longest_prefix(turn1).len == 40);
+
+    // A deeper state of the session supersedes turn2, but the shared head
+    // (<= keep_max) stays for other sessions.
+    TEST_ASSERT(cache.save(0, turn3));
+    TEST_ASSERT(cache.prune_ancestors(turn3, 40) == 1);
+    TEST_ASSERT(cache.entry_count() == 2);
+    TEST_ASSERT(cache.longest_prefix(diverged).len == 40);
+    TEST_ASSERT(cache.prune_ancestors(turn3, 0) == 1);
+    TEST_ASSERT(cache.entry_count() == 1);
+    TEST_ASSERT(cache.longest_prefix(turn3).len == 60);
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_write_failure_is_not_fatal) {
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_disk_write_fail").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    TEST_ASSERT(cache.save(0, disk_test_key(40)));
+    const std::string layout_dir = fs::path(dkv_files(dir)[0]).parent_path().string();
+    // Unwritable directory (stands in for a full disk): the save fails
+    // cleanly, leaves no temp file and keeps the index consistent.
+    fs::permissions(layout_dir, fs::perms::owner_read | fs::perms::owner_exec);
+    const bool saved = cache.save(0, disk_test_key(40, 800));
+    fs::permissions(layout_dir, fs::perms::owner_all);
+    if (::geteuid() != 0) {
+        TEST_ASSERT(!saved);
+        TEST_ASSERT(cache.entry_count() == 1);
+        TEST_ASSERT(dkv_files(dir).size() == 1);
+    }
+    rm_rf(dir);
 }
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
