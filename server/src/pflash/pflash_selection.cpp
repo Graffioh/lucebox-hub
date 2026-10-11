@@ -35,6 +35,7 @@ constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
 constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
 constexpr const char * kQueryProbeEnv = "PFLASH_SELECT_QUERY_PROBE";
 constexpr const char * kQueryIdentEnv = "PFLASH_EVAL_REF_IDENT_QUERY";
+constexpr const char * kFallbackSpreadEnv = "PFLASH_FALLBACK_SPREAD";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -562,6 +563,23 @@ bool resolve_pflash_selection(
             return false;
         }
         config.fold_paragraphs = raw[0] == '1';
+    }
+    // Relevance-spread fallback: off unless set to a positive threshold
+    // ("0" / "off" / empty = off). Not a selection knob of its own.
+    if (const char * raw = std::getenv(kFallbackSpreadEnv)) {
+        if (*raw && std::strcmp(raw, "0") != 0 && std::strcmp(raw, "off") != 0) {
+            double threshold = 0.0;
+            if (!parse_double(raw, threshold) || !(threshold > 0.0)) {
+                error = std::string(kFallbackSpreadEnv) +
+                    " must be a positive number (or 0 / off)";
+                return false;
+            }
+            if (config.mode == PFlashSelectionMode::Legacy) {
+                error = std::string(kFallbackSpreadEnv) + " needs strict selection";
+                return false;
+            }
+            config.fallback_spread = threshold;
+        }
     }
     if (config.strategy == PFlashSelectStrategy::Fold) {
         // Fold spends the budget itself: it needs the budget rule and one

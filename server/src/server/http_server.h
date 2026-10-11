@@ -424,6 +424,10 @@ public:
               PflashChatView & out) const;
     // Store a view, replacing the one it continues.
     void remember(PflashChatView view);
+    // Drop every view the prompt continues (as ``find`` matches them); the
+    // number dropped. A conversation served raw continues from the raw view.
+    size_t forget(const std::vector<int32_t> & raw_tokens,
+                  const std::vector<int32_t> & drafter_ids);
     size_t size() const;
 
 private:
@@ -634,9 +638,13 @@ bool pflash_fail_closed_from_env() noexcept;
 // Short machine-readable reason for a PFlash error string (and the backend's
 // last error, when the drafter reported one): "nonfinite_scores",
 // "compress_failed", "ceiling_exceeded", "mapping_failed", "remote_drafter",
-// "selection_failed" or "other".
+// "selection_failed", "spread" (the relevance-spread fallback, not a failure),
+// "spread_unavailable" or "other".
 std::string pflash_failure_reason(const std::string & error,
                                   const std::string & detail);
+// PFLASH_FALLBACK_SPREAD decision: fire when the threshold is on (> 0), the
+// spread is valid and spread >= threshold.
+bool pflash_spread_fires(double threshold, bool spread_valid, double spread) noexcept;
 bool pflash_failure_is_config_error(const std::string & error);
 PflashFallbackDecision pflash_fallback_decision(
     const std::string & error, bool fail_closed, int raw_prompt_tokens,
@@ -881,6 +889,9 @@ private:
         // The drafter's own error when compression failed in the backend
         // (luce_last_error at that moment), for the fallback record.
         std::string pflash_failure_detail;
+        // PFLASH_FALLBACK_SPREAD fired: the spread record for the fallback
+        // (null otherwise). Not a failure: PFLASH_FAIL_CLOSED does not apply.
+        nlohmann::json pflash_spread_fallback;
     };
 
     // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies

@@ -128,6 +128,10 @@ struct PFlashTraceFields {
     const luce::pflash::PFlashRequestProbeTrace * request_probe = nullptr;
     // ``"ident_query":{...}`` (PFLASH_EVAL_REF_IDENT_QUERY only; absent otherwise).
     const luce::pflash::PFlashIdentQueryTrace * ident_query = nullptr;
+    // PFLASH_FALLBACK_SPREAD on (threshold > 0): ``"spread":x,
+    // "spread_threshold":T`` close the record; absent when off.
+    double spread = 0.0;
+    double spread_threshold = 0.0;
 };
 
 void write_compression_trace(
@@ -183,6 +187,28 @@ struct PFlashCandidateLift {
     double lift = 0.0;
 };
 const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts();
+
+// Relevance spread of one selection (PFLASH_FALLBACK_SPREAD): with
+// p_i = s_i / sum(s) over every candidate's score (the trace's
+// ``chunk_scores``), H = -sum_{p_i > 0} p_i ln p_i and k = the selected
+// candidates that are not forced (``selected_chunks`` minus
+// ``forced_chunks``), spread = exp(H) / max(k, 1). A sum <= 0 gives H = 0
+// (spread 1 / max(k, 1)). ``valid`` is false on mismatched sizes or a
+// non-finite score; then no decision may be taken from it.
+struct PFlashRelevanceSpread {
+    bool valid = false;
+    double spread = 0.0;
+    double entropy = 0.0;
+    int k = 0;              // selected, not forced
+    int candidates = 0;
+};
+PFlashRelevanceSpread pflash_relevance_spread(
+        const std::vector<double> & scores,
+        const std::vector<uint8_t> & selected,
+        const std::vector<uint8_t> & forced);
+// The spread of the last traced (served) strict selection on this thread;
+// invalid when none ran. Cleared with the kept spans.
+const PFlashRelevanceSpread & pflash_last_relevance_spread();
 
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,

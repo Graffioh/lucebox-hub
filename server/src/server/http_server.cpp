@@ -1015,6 +1015,26 @@ void PflashChatViewStore::remember(PflashChatView view) {
     while (views_.size() > capacity_) views_.erase(views_.begin());
 }
 
+size_t PflashChatViewStore::forget(
+        const std::vector<int32_t> & raw_tokens,
+        const std::vector<int32_t> & drafter_ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t before = views_.size();
+    views_.erase(std::remove_if(views_.begin(), views_.end(),
+        [&] (const PflashChatView & view) {
+            return view.raw_gen_begin > 0 && view.drafter_gen_begin > 0 &&
+                (size_t) view.raw_gen_begin <= raw_tokens.size() &&
+                (size_t) view.drafter_gen_begin <= drafter_ids.size() &&
+                std::equal(view.raw_tokens.begin(),
+                           view.raw_tokens.begin() + view.raw_gen_begin,
+                           raw_tokens.begin()) &&
+                std::equal(view.drafter_ids.begin(),
+                           view.drafter_ids.begin() + view.drafter_gen_begin,
+                           drafter_ids.begin());
+        }), views_.end());
+    return before - views_.size();
+}
+
 size_t PflashChatViewStore::size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return views_.size();
@@ -1166,6 +1186,8 @@ std::string pflash_failure_reason(const std::string & error,
     const auto has = [](const std::string & text, const char * needle) {
         return text.find(needle) != std::string::npos;
     };
+    if (has(error, "PFlash relevance spread fallback")) return "spread";
+    if (has(error, "PFlash relevance spread unavailable")) return "spread_unavailable";
     if (has(detail, "non-finite") || has(error, "non-finite")) return "nonfinite_scores";
     if (has(error, "remote PFlash drafter")) return "remote_drafter";
     if (has(error, "PFlash compression failed")) return "compress_failed";
@@ -1175,6 +1197,10 @@ std::string pflash_failure_reason(const std::string & error,
     if (has(error, "PFlash strict selection") || has(error, "PFlash query head") ||
         has(error, "PFlash region plan")) return "selection_failed";
     return "other";
+}
+
+bool pflash_spread_fires(double threshold, bool spread_valid, double spread) noexcept {
+    return threshold > 0.0 && spread_valid && std::isfinite(spread) && spread >= threshold;
 }
 
 bool pflash_failure_is_config_error(const std::string & error) {
@@ -4402,6 +4428,10 @@ std::string HttpServer::apply_pflash_compression(
     if (!experiment.selection_active && !req.pflash_required.empty()) {
         return "PFlash pflash_required needs strict budget selection";
     }
+    if (experiment.fallback_spread > 0.0 && config_.pflash_remote_drafter) {
+        return "invalid PFlash strict selection config: PFLASH_FALLBACK_SPREAD needs the "
+            "in-process drafter";
+    }
 
     const bool messages_input =
         req.messages.is_array() && !req.messages.empty();
@@ -5710,6 +5740,54 @@ std::string HttpServer::apply_pflash_compression(
                 std::to_string(target_ceiling) + ")";
         }
     }
+    // Relevance-spread fallback (PFLASH_FALLBACK_SPREAD, opt-in): diffuse
+    // relevance over the scored segments -> full prefill of the raw prompt
+    // through the failure-policy (D5) path, reason "spread".
+    json spread_record;
+    if (experiment.fallback_spread > 0.0) {
+        if (!result.spread_valid) {
+            return "PFlash relevance spread unavailable";
+        }
+        const bool fires = http_detail::pflash_spread_fires(
+            experiment.fallback_spread, result.spread_valid, result.spread);
+        spread_record = {{"spread", result.spread},
+                         {"spread_threshold", experiment.fallback_spread},
+                         {"spread_k", result.spread_k},
+                         {"fired", fires}};
+        if (fires) {
+            if (!effective_prompt_overflows(prompt_tokens, -1, req.max_output,
+                                            config_.max_ctx)) {
+                size_t forgotten = 0;
+                if (messages_input) {
+                    forgotten = pflash_views_.forget(req.prompt_tokens,
+                                                     compress_request.input_ids);
+                }
+                spread_record["views_forgotten"] = forgotten;
+                std::fprintf(stderr,
+                    "[pflash-spread] spread=%.6f >= %.6f (k=%d): full prefill of the raw "
+                    "prompt (%d tokens), views forgotten=%zu\n",
+                    result.spread, experiment.fallback_spread, result.spread_k,
+                    prompt_tokens, forgotten);
+                std::fflush(stderr);
+                prepared.pflash_spread_fallback = spread_record;
+                char message[160];
+                std::snprintf(message, sizeof(message),
+                    "PFlash relevance spread fallback (spread %.6f >= %.6f)",
+                    result.spread, experiment.fallback_spread);
+                return message;
+            }
+            spread_record["refused"] = "raw_exceeds_max_ctx";
+            std::fprintf(stderr,
+                "[pflash-spread] spread=%.6f >= %.6f but the raw prompt (%d tokens) does "
+                "not fit max_ctx %d: serving the compressed prompt\n",
+                result.spread, experiment.fallback_spread, prompt_tokens, config_.max_ctx);
+            std::fflush(stderr);
+        } else {
+            std::fprintf(stderr, "[pflash-spread] spread=%.6f < %.6f (k=%d)\n",
+                         result.spread, experiment.fallback_spread, result.spread_k);
+            std::fflush(stderr);
+        }
+    }
     prepared.pflash_stats = {
         {"compress_ms", std::round(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - compress_started).count() * 10.0) / 10.0},
@@ -5723,6 +5801,7 @@ std::string HttpServer::apply_pflash_compression(
         {"scorer_new_tokens", result.scorer_new_tokens},
         {"scorer_forward_ms", std::round(result.scorer_forward_s * 10000.0) / 10.0},
     };
+    if (!spread_record.is_null()) prepared.pflash_stats["spread"] = spread_record;
     if (result.budget_widened) {
         prepared.pflash_stats["stage2"] = {{"widened", true}, {"raw_fits", false},
                                            {"budget", result.stage2_budget},
@@ -6312,10 +6391,13 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
             if (!prepared.error.empty()) {
                 // Failure policy D5: serve the raw prompt when it is admissible,
                 // and record the fallback; PFLASH_FAIL_CLOSED=1 keeps the error.
+                // A relevance-spread fallback is a policy decision, not a
+                // failure: PFLASH_FAIL_CLOSED does not refuse it.
+                const bool spread_fallback = !prepared.pflash_spread_fallback.is_null();
                 const bool fail_closed = http_detail::pflash_fail_closed_from_env();
                 const auto decision = http_detail::pflash_fallback_decision(
-                    prepared.error, fail_closed, prompt_tokens, req.max_output,
-                    config_.max_ctx);
+                    prepared.error, fail_closed && !spread_fallback, prompt_tokens,
+                    req.max_output, config_.max_ctx);
                 const std::string reason = http_detail::pflash_failure_reason(
                     prepared.error, prepared.pflash_failure_detail);
                 {
@@ -6353,6 +6435,11 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
                 };
                 if (!prepared.pflash_failure_detail.empty()) {
                     record["detail"] = prepared.pflash_failure_detail;
+                }
+                if (spread_fallback) {
+                    for (const auto & [key, value] : prepared.pflash_spread_fallback.items()) {
+                        record[key] = value;
+                    }
                 }
                 prepared = std::move(uncompressed);
                 prepared.pflash_stats = {{"pflash_fallback", std::move(record)}};
