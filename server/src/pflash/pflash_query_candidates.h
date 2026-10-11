@@ -262,6 +262,13 @@ struct PFlashQueryTrace {
     float tw_score = 0.0f;         // TW's unit score (NaN when TW is not a candidate or has no content token)
     PFlashQueryBlend blend;
     std::string error;
+    // Drafter sessions on (PFLASH_DRAFTER_SESSIONS > 0) only, so a sessions-off record stays as before: the token
+    // the scoring resumed from (pflash_scoring_resume.h) and whether this request was redone from token 0 because a
+    // query row it needed was not exactly available (redo_reason names the missing input).
+    bool sessions = false;
+    int session_resume = 0;
+    bool redo = false;
+    std::string redo_reason;
 };
 
 } // namespace luce::pflash

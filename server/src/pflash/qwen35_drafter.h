@@ -11,6 +11,7 @@
 #include "pflash_selection.h"
 #include "pflash_request_probe.h"
 #include "pflash_request_stage2.h"
+#include "pflash_scoring_resume.h"
 #include "common/pflash_types.h"
 #include "internal.h"
 #include "server/tokenizer.h"
@@ -38,7 +39,9 @@ static constexpr int kQwen35HeadBlock = 15;
 // carry no position (NoPE), and the probe's raw logits are per token.
 struct Qwen35ScoringSession {
     std::vector<int32_t> ids;       // prompt tokens the state covers
-    int checkpoint = 0;             // recurrent-state snapshot position
+    // Recurrent-state snapshot position: pflash_scoring_checkpoint(ids.size()), on the 8192 grid, the only point a
+    // later call resumes from (pflash_scoring_resume.h: a resumed call is then bit-identical to a fresh one).
+    int checkpoint = 0;
     int capacity = 0;               // tokens the cache and keys can hold
     TargetCache cache;              // blocks 0..14 only
     ggml_context *        key_ctx = nullptr;
@@ -65,6 +68,9 @@ struct Qwen35ScoringSession {
         std::vector<float> rows;            // [hidden, end - begin]
     };
     std::vector<QueryRows> query_windows;
+    // The query step's (PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN) query token sets, F32 rows exact for later
+    // prompts that share them (never the BF16 request_rows).
+    luce::pflash::PFlashExactRowSets query_sets;
     uint64_t              last_used = 0;
 };
 
