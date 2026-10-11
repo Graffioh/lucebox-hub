@@ -1221,8 +1221,55 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
         return false;
     }
 
+    // Names alone do not prove compatibility: a snapshot taken with another
+    // KV type or model shape would be restored as garbage. Every tensor must
+    // match the live cache's type and per-row shape, and hold cur_pos rows.
+    const auto same_rows = [](const ggml_tensor * s, const ggml_tensor * c) {
+        return s && c && s->type == c->type && s->ne[0] == c->ne[0] &&
+               s->ne[2] == c->ne[2] && s->ne[3] == c->ne[3];
+    };
+    const auto same_shape = [&](const ggml_tensor * s, const ggml_tensor * c) {
+        return same_rows(s, c) && s->ne[1] == c->ne[1];
+    };
+    const char * mismatch = nullptr;
+    for (int i = 0; i < n_full_attn && !mismatch; ++i) {
+        const ggml_tensor * ck = i < (int)cache_.attn_k.size() ? cache_.attn_k[i] : nullptr;
+        const ggml_tensor * cv = i < (int)cache_.attn_v.size() ? cache_.attn_v[i] : nullptr;
+        if (!same_rows(snap.attn_k_snap[i], ck) ||
+            !same_rows(snap.attn_v_snap[i], cv) ||
+            snap.attn_k_snap[i]->ne[1] != cur_pos ||
+            snap.attn_v_snap[i]->ne[1] != cur_pos) {
+            mismatch = "attention KV";
+        }
+    }
+    for (int i = 0; i < n_delta && !mismatch; ++i) {
+        const ggml_tensor * cs = i < (int)cache_.ssm_state.size() ? cache_.ssm_state[i] : nullptr;
+        const ggml_tensor * cc = i < (int)cache_.conv_state.size() ? cache_.conv_state[i] : nullptr;
+        if (!same_shape(snap.ssm_state_snap[i], cs) ||
+            !same_shape(snap.conv_state_snap[i], cc)) {
+            mismatch = "recurrent state";
+        }
+    }
+    if (!mismatch && cache_.target_feat &&
+        (snap.target_feat_snap->type != cache_.target_feat->type ||
+         snap.target_feat_snap->ne[0] != cache_.target_feat->ne[0] ||
+         snap.target_feat_snap->ne[1] !=
+             std::min<int64_t>(cur_pos, cache_.target_feat_cap))) {
+        mismatch = "target features";
+    }
+    if (mismatch) {
+        std::fprintf(stderr,
+                     "[qwen35] snapshot adopt rejected slot=%d: %s type/shape "
+                     "differs from the live cache\n", slot, mismatch);
+        snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+        snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+        snap.target_feat_snap = nullptr;
+        return false;
+    }
+
     snap.ctx     = ctx;
     snap.buf     = buf;
+    snap.layout  = PrefixSnapshot::Layout::dense;  // restore_target_cache requires it
     snap.cur_pos = cur_pos;
     snap.last_tok        = last_tok;
     snap.kv_k_type       = cache_.kv_k_type;
@@ -1770,7 +1817,16 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // mask-less FA span, so rows beyond the restored prefix must be ZERO,
         // not leftovers from the previous request. cudaMemset is ~0.2ms.
         if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
-        restore_target_cache(prefix_snapshots_[slot], cache_);
+        // Decoding on a cache the restore did not fill yields garbage.
+        if (!restore_target_cache(prefix_snapshots_[slot], cache_)) {
+            std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
+                         slot, luce_last_error());
+            cache_.cur_pos = 0;
+            result.fail(GenerateErrorCode::InvalidSnapshotSlot,
+                        std::string("snapshot restore failed: ") + luce_last_error());
+            out_io.emit(-1);
+            return result;
+        }
     }
 
     // Now generate from restored state
