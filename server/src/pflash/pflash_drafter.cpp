@@ -90,6 +90,10 @@ void free_drafter(DrafterContext & ctx) {
     ctx.gpu = -1;
 }
 
+void drafter_offload_sessions(DrafterContext & ctx) {
+    if (ctx.state) qwen35_offload_sessions(ctx);
+}
+
 void free_drafter_weights(DrafterContext & ctx) {
     if (ctx.state) {
         free_qwen35_drafter_state(ctx);

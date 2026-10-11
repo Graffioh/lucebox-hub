@@ -801,6 +801,170 @@ Qwen35ScoringSession * acquire_scoring_session(
 
 } // namespace
 
+std::vector<ggml_tensor *> qwen35_session_tensors(const Qwen35ScoringSession & session) {
+    std::vector<ggml_tensor *> out = luce::pflash::pflash_owned_tensors(session.cache.base_ctx);
+    for (ggml_tensor * t : luce::pflash::pflash_owned_tensors(session.cache.rollback_ctx)) out.push_back(t);
+    for (ggml_tensor * t : luce::pflash::pflash_owned_tensors(session.key_ctx)) out.push_back(t);
+    return out;
+}
+
+std::string qwen35_session_identity(const DrafterContext & ctx, const Qwen35DrafterState & st) {
+    const auto env_file = [](const char * name) {
+        const char * value = std::getenv(name);
+        return luce::pflash::pflash_file_identity(value ? value : "");
+    };
+    const TargetWeights & w = st.weights;
+    std::ostringstream id;
+    // The store lives in this process's memory, so the build cannot change under it; the stamp names it anyway.
+    id << "format=1\n"
+       << "build=" << __DATE__ << ' ' << __TIME__ << '\n'
+       << "drafter=" << luce::pflash::pflash_file_identity(st.gguf_path) << '\n'
+       << "drafter_sha256=" << st.gguf_sha256 << '\n'
+       << "gpu=" << ctx.gpu << '\n'
+       << "dims=" << w.n_layer << ',' << w.n_embd << ',' << w.n_head << ',' << w.n_head_kv << ','
+       << w.n_embd_head_k << '\n'
+       << "head=" << env_file("PFLASH_SCORING_HEAD_GGUF") << '|' << st.head_loaded << '\n'
+       << "segment_probe=" << env_file("PFLASH_SEGMENT_PROBE_GGUF") << '|' << st.probe_loaded << '|'
+       << (st.probe_sub_fc2_w != nullptr) << '\n'
+       << "request_probe=" << env_file("PFLASH_REQUEST_PROBE_GGUF") << '|' << st.request_loaded << '|'
+       << st.request_stub << '|' << st.request_checkpoint_sha256 << '\n'
+       << "stage2=" << env_file(luce::pflash::kStage2GgufEnv) << '|' << st.stage2_loaded << '\n'
+       << "sessions=" << scoring_session_limit() << '\n'
+       << "grid=" << luce::pflash::kScoringResumeGrid << ',' << luce::pflash::kScoringUbatch << ','
+       << luce::pflash::kScoringCutBack << '\n';
+    return id.str();
+}
+
+void qwen35_offload_sessions(DrafterContext & ctx) {
+    auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
+    if (!st) return;
+    size_t live = 0;
+    for (const auto & owned : st->sessions) live += owned && !owned->ids.empty();
+    // Nothing scored since the last restore: a store that was not restored yet stays as it is.
+    if (live == 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(st->weights.backend);
+    auto store = std::make_shared<DrafterHostSessions>();
+    store->identity = qwen35_session_identity(ctx, *st);
+    store->clock = st->session_clock;
+    for (auto & owned : st->sessions) {
+        if (!owned || owned->ids.empty()) continue;
+        Qwen35ScoringSession & session = *owned;
+        Qwen35HostSession host;
+        std::string error;
+        if (!luce::pflash::pflash_tensors_to_host(qwen35_session_tensors(session), host.tensors, error)) {
+            std::fprintf(stderr, "[qwen35-sessions] session not offloaded (%zu tokens): %s\n",
+                         session.ids.size(), error.c_str());
+            continue;
+        }
+        host.cache_max_ctx = session.cache.max_ctx;
+        host.cache_cur_pos = session.cache.cur_pos;
+        host.cache_last_tok = session.cache.last_tok;
+        Qwen35ScoringSession & b = host.bookkeeping;
+        b.ids = std::move(session.ids);
+        b.checkpoint = session.checkpoint;
+        b.capacity = session.capacity;
+        b.keys_trained = session.keys_trained;
+        b.probe_raw = std::move(session.probe_raw);
+        b.subunit_raw = std::move(session.subunit_raw);
+        b.request_raw = std::move(session.request_raw);
+        b.request_rows = std::move(session.request_rows);
+        b.stage2_cand = std::move(session.stage2_cand);
+        b.query_windows = std::move(session.query_windows);
+        b.query_sets = std::move(session.query_sets);
+        b.last_used = session.last_used;
+        session.ids.clear();
+        store->host_bytes += luce::pflash::pflash_host_tensor_bytes(host.tensors);
+        store->sessions.push_back(std::move(host));
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ctx.host_sessions && !ctx.host_sessions->sessions.empty()) {
+        std::fprintf(stderr, "[qwen35-sessions] dropped %zu older stored session(s): superseded by this offload\n",
+                     ctx.host_sessions->sessions.size());
+    }
+    std::fprintf(stderr, "[qwen35-sessions] offloaded %zu of %zu session(s) to host: %.1f MiB device tensors "
+                 "held in host RAM (%.0f ms)\n", store->sessions.size(), live,
+                 store->host_bytes / (1024.0 * 1024.0), ms);
+    std::fflush(stderr);
+    ctx.host_sessions = store->sessions.empty() ? nullptr : std::move(store);
+}
+
+void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st) {
+    if (!ctx.host_sessions) return;
+    std::shared_ptr<DrafterHostSessions> store = std::move(ctx.host_sessions);
+    ctx.host_sessions = nullptr;
+    const auto drop_all = [&](const std::string & reason) {
+        std::fprintf(stderr, "[qwen35-sessions] dropped %zu stored session(s) (%.1f MiB): %s; scoring fresh\n",
+                     store->sessions.size(), store->host_bytes / (1024.0 * 1024.0), reason.c_str());
+        std::fflush(stderr);
+    };
+    const int limit = st.stage2_loaded ? 0 : scoring_session_limit();
+    if (limit == 0) {
+        drop_all("sessions are off for this drafter");
+        return;
+    }
+    const std::string mismatch = luce::pflash::pflash_identity_mismatch(store->identity,
+                                                                         qwen35_session_identity(ctx, st));
+    if (!mismatch.empty()) {
+        drop_all("identity mismatch: " + mismatch);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t restored = 0, bytes = 0;
+    for (auto & host : store->sessions) {
+        const size_t n_ids = host.bookkeeping.ids.size();
+        const auto drop = [&](const std::string & reason) {
+            std::fprintf(stderr, "[qwen35-sessions] dropped stored session (%zu tokens): %s; scoring fresh\n",
+                         n_ids, reason.c_str());
+        };
+        if ((int) st.sessions.size() >= limit) {
+            drop("session limit reached");
+            continue;
+        }
+        auto session = std::make_unique<Qwen35ScoringSession>();
+        if (host.bookkeeping.capacity <= 0 ||
+            !allocate_scoring_session(st.weights, host.bookkeeping.capacity, *session)) {
+            free_qwen35_scoring_session(*session);
+            drop(std::string("allocation failed: ") + luce_last_error());
+            continue;
+        }
+        std::string error;
+        if (session->cache.max_ctx != host.cache_max_ctx) {
+            error = "cache size differs";
+        } else if (!luce::pflash::pflash_tensors_from_host(host.tensors, qwen35_session_tensors(*session), error)) {
+            // error set
+        }
+        if (!error.empty()) {
+            free_qwen35_scoring_session(*session);
+            drop(error);
+            continue;
+        }
+        session->cache.cur_pos = host.cache_cur_pos;
+        session->cache.last_tok = host.cache_last_tok;
+        Qwen35ScoringSession & b = host.bookkeeping;
+        session->ids = std::move(b.ids);
+        session->checkpoint = b.checkpoint;
+        session->keys_trained = b.keys_trained;
+        session->probe_raw = std::move(b.probe_raw);
+        session->subunit_raw = std::move(b.subunit_raw);
+        session->request_raw = std::move(b.request_raw);
+        session->request_rows = std::move(b.request_rows);
+        session->stage2_cand = std::move(b.stage2_cand);
+        session->query_windows = std::move(b.query_windows);
+        session->query_sets = std::move(b.query_sets);
+        session->last_used = b.last_used;
+        bytes += luce::pflash::pflash_host_tensor_bytes(host.tensors);
+        st.sessions.push_back(std::move(session));
+        ++restored;
+    }
+    ggml_backend_synchronize(st.weights.backend);
+    st.session_clock = std::max(st.session_clock, store->clock);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[qwen35-sessions] restored %zu of %zu stored session(s): %.1f MiB host to device "
+                 "(%.0f ms); host RAM released\n", restored, store->sessions.size(), bytes / (1024.0 * 1024.0), ms);
+    std::fflush(stderr);
+}
+
 // Scoring-head selection for the Qwen3.5-0.8B drafter: run blocks 0..14, then
 // score every context token against the query window with block 15's NoPE
 // Q/K (or a trained replacement) and select chunks by attention mass. This
@@ -2897,6 +3061,9 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
         return {};
     }
     auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
+    // Sessions offloaded when the drafter was last released come back before
+    // any scoring (the strict scorer is the only one that reads them).
+    qwen35_restore_sessions(ctx, *st);
     // Strict budget selection scores with the block-15 head; the
     // legacy all-layer running-max scorer stays available for legacy
     // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
