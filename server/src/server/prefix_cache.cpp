@@ -648,7 +648,15 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const size_t bytes = estimate_bytes ? estimate_bytes((int) prompt_ids.size()) : 0;
         return bytes != 0 && bytes <= max_resident_bytes_;
     };
-    if (deep_first_min > 0 && prefer_tools_boundary && !candidates.empty() &&
+    // LUCE_PC_SINGLE_TURN_DEEP=1 extends the same rule to a single-turn
+    // request without tools (a system head plus one long user message): its
+    // default cut is the head, so the first follow-up would re-prefill the
+    // whole message. Off by default: the user turn is otherwise kept out of
+    // the cache in case it is edited or resent (see prefix_cache.h).
+    static const bool single_turn_deep = env_nonneg_int("LUCE_PC_SINGLE_TURN_DEEP", 0) == 1;
+    const bool single_turn = single_turn_deep && !prefer_tools_boundary &&
+        !include_last_message && candidates.size() == 2;
+    if (deep_first_min > 0 && (prefer_tools_boundary || single_turn) && !candidates.empty() &&
         restored_prefix_len <= candidates.front() &&
         forced_cut <= restored_prefix_len &&
         candidates.front() <= deep_first_max_head &&
