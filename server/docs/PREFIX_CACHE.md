@@ -90,10 +90,108 @@ when the selected boundary advances beyond the restored prefix.
 The disk prefix cache is a separate persistence/overflow layer for token-keyed
 snapshots. Today it is integrated with the inline/effective-prompt path; exact
 prefill snapshots are kept in RAM unless a dedicated raw-prompt disk path is
-added. With the default `full` policy a lookup probes the whole prompt and
-then every chat boundary, deepest first, so a restart recovers the inline
-snapshots the previous process persisted (probes are index lookups; only a
-hit reads a file).
+added. With the default `full` policy a lookup probes the whole prompt, every
+chat boundary and the deepest stored entry that prefixes the prompt, deepest
+first, so a restart recovers the sessions the previous process persisted
+(probes are index lookups; only a hit reads a file). See
+[Disk Session Cache](#disk-session-cache).
+
+## Disk Session Cache
+
+`--kv-cache-dir <path>` keeps agent and chat sessions on disk so a session
+whose RAM snapshots are gone (server restart, model switch, or another
+session evicted it) restores its KV and prefills only the new suffix.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--kv-cache-dir <path>` | none | Enables the disk cache in this directory. |
+| `--kv-cache-budget <MB>` | `4096` | Hard cap on the bytes of all snapshot files. |
+| `--kv-cache-ttl <hours>` | `72` | Delete files unused for this long; `0` = never. |
+| `--kv-cache-cold-max <N>` | `10240` | Longest shared head saved for a cold prompt. |
+| `--kv-cache-interval <N>` | `10240` | Continued checkpoint pacing (fallback, see below). |
+
+**What is persisted.** With the default `full` policy, after every request
+the deepest raw snapshot the session holds in RAM (the agent-turn snapshot of
+a tool-call turn, else the inline snapshot of this request, else the restored
+one) becomes that session's pending disk write. The write is deferred
+(write-behind) and happens when one of these comes first:
+
+- the session has had no follow-up for 30 s (`disk_cache_persist_idle_s`);
+- its RAM snapshot is about to be evicted for another session;
+- the server shuts down gracefully (SIGTERM/SIGINT).
+
+An agent that keeps working therefore writes nothing per turn: a 90-120K token
+Qwen3.8-27B session with q4_0 KV is 1.5-2.2 GB per snapshot, and rewriting it
+after every step would cost about a second of I/O per turn and tens of GB of
+SSD writes per session. The 30 s debounce sits above the gap between agent
+steps (tool calls such as reads, edits and searches return in seconds) and
+well below a human reply, so a session is written once per pause, not once
+per step. A crash loses only the not-yet-written tail; the previous persisted
+state (if any) still restores. When the session state is written, the files
+of its shallower states longer than `--kv-cache-cold-max` are deleted: they are
+strict prefixes of the new file. The shared system/tools head stays.
+
+A session's prompt is rendered with the exact text the model generated for
+its earlier tool calls (ToolMemory, which a new process does not have).
+Without it a restarted server renders those turns from the structured calls,
+the tokens differ from the stored key, and nothing deep would restore. Each
+session file therefore also stores the tool-call replay text its prompt was
+rendered with, and startup loads it back into ToolMemory (files of this
+identity only, least recently used first).
+
+`--kv-cache-cold-max` only seeds a shallow shared head: a cold prompt longer
+than it first prefills to the last chat boundary at or below it, saves that
+(synchronously, once per distinct head), then continues. `--kv-cache-interval`
+paces continued checkpoints (prompt plus generated tokens, at each multiple
+of the interval). With RAM prefix slots enabled the session write-behind
+replaces them; they remain the fallback for `--prefix-cache-slots 0`.
+
+**Budget.** Every layout directory under `--kv-cache-dir` is indexed, also
+files of another model or KV type, so the cap covers the whole directory.
+Before a write the least recently used files are deleted until the new file
+fits, so the cap holds while the file is being written; a snapshot larger than
+the whole budget is not written. A hit rewrites the file's `last_used` field
+in place, so LRU order survives restarts. The budget is enforced at startup,
+before the first request.
+
+**TTL.** A file unused for longer than `--kv-cache-ttl` hours is deleted at
+startup, before each write, and when a lookup meets it (miss). There is no
+background thread: an idle server keeps expired files until its next start,
+write or lookup, and the budget still bounds them.
+
+**Safety.**
+
+- Writes go to `<file>.tmp`, are `fdatasync`ed, renamed into place, and the
+  directory is synced. At startup leftover `.tmp` files, files of an older
+  format, and truncated or corrupt files are deleted. A failed write (for
+  example a full disk) is logged and skipped; the request is unaffected.
+- A file is restored only when its identity matches: model path, size, mtime
+  and a content fingerprint (SHA-1 of the first and last MiB; hashing a whole
+  multi-GB model at every start would take tens of seconds), KV cache types,
+  K rotation, `--max-ctx`, chat template and draft model, plus the snapshot's
+  tensor names, types and shapes. Qwen additionally checks every adopted
+  tensor's type and shape against the live cache.
+- Each file stores the exact key token ids. A hit compares them with the
+  prompt before reading any KV data.
+- Snapshot bytes are copied verbatim in the cache's type (q4_0 stays q4_0):
+  `snapshot_target_cache()` strip-copies the KV rows and the disk layer writes
+  and reads raw bytes, so a restore is bit-exact with the RAM snapshot.
+
+**Compression (PFlash, FlowKV).** A compressed prompt is not raw history.
+Its states never get a disk key, its cold-head and continued checkpoints are
+skipped, so nothing compressed is ever written. A lookup for a compressed
+prompt can only hit a file whose stored tokens equal that prompt exactly.
+FlowKV keeps its existing clamp to the stable system prefix (raw tokens).
+
+**Follow-up: cache-aware admission.** Compression admission that counts the
+cached prefix as warm (only on the PFlash branches today, not on `main`)
+consults RAM only, so after a restart a session on disk would count as cold.
+`DiskPrefixCache::longest_prefix(prompt)` is the index-only probe for that
+case: it returns the deepest restorable key length and KV position without
+reading a file, so admission can take the max of the RAM and disk prefixes.
+
+The cache assumes one server per directory: a second server would delete the
+first one's in-flight temporaries at startup.
 
 ## Snapshot Memory Management
 
@@ -230,7 +328,7 @@ behind, keyed by the prompt plus the generated tokens the next request renders
 identically (see [Agent Turn Cache](API.md#agent-turn-cache)). Qwen defers that
 snapshot: while the next request continues the conversation it is never copied
 to system RAM, and it is copied out only before other work would overwrite the
-live state, or when the disk cache persists it at shutdown. Restoring the
+live state, or when the disk cache persists the session (write-behind). Restoring the
 snapshot the live state already holds copies nothing back either.
 
 Coding agents grow one conversation turn by turn, and each turn's snapshot is a
@@ -284,6 +382,7 @@ cache staging, preventing disk loads from overwriting a live in-memory entry.
 | File | Role |
 |------|------|
 | `server/prefix_cache.{h,cpp}` | LRU logic, boundary detection, hashing |
+| `server/disk_prefix_cache.{h,cpp}` | Disk snapshots: file format, index, budget, TTL |
 | `common/snapshot_backend.h` | Platform-aware snapshot backend selection |
 | `common/model_backend.h` | `snapshot_save/free/used/cur_pos` interface |
 | `qwen35/qwen35_target_graph.cpp` | `snapshot_target_cache()`, `restore_target_cache()` |
