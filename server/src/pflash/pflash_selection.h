@@ -3,6 +3,7 @@
 #include "common/pflash_types.h"
 #include "pflash_ident_query.h"
 #include "pflash_request_probe.h"
+#include "pflash_query_candidates.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -176,6 +177,9 @@ struct PFlashSelectionConfig {
     // Trace only: what the request probe did on this call (not owned; set
     // by the scorer for the selection it calls).
     const PFlashRequestProbeTrace * request_probe_trace = nullptr;
+    // Query step 1 (pflash_query_candidates.h): PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN and their knobs;
+    // all off by default. Needs PFLASH_SELECT_QUERY_PROBE=1.
+    PFlashQueryConfig query;
     // PFLASH_EVAL_REF_IDENT_QUERY=heur (strict selection, head
     // scorer, not with the request probe): the scorer query is the
     // identifiers of the last turns (pflash_ident_query.h), scored and not

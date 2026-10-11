@@ -530,6 +530,12 @@ bool resolve_pflash_selection(
             "head scorer";
         return false;
     }
+    // Query step 1: relative candidates / the verbatim pin (pflash_query_candidates.h); request probe only.
+    if (!pflash_query_config_from_env(config.query, error)) return false;
+    if (config.query.any() && !config.query_probe) {
+        error = "PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN need " + std::string(kQueryProbeEnv) + "=1";
+        return false;
+    }
     // Identifier query: like the probe, not a selection knob of its own; it
     // changes where the strict head scorer's query comes from.
     if (const char * raw = std::getenv(kQueryIdentEnv)) {

@@ -5344,6 +5344,34 @@ TEST_CASE(ServerUnitFixture, test_ppp_master_toggle_gates_tools_boundary_pinning
     TEST_ASSERT(!ppp_prefers_tools_boundary(false, false));
 }
 
+TEST_CASE(ServerUnitFixture, test_ppp_tool_prefix_source_ignores_pflash_view) {
+    // A 600-token system/tools turn closed by im_end (50) + '\n' (10), then
+    // the next turn's role start (40): the head boundary follows it.
+    std::vector<int32_t> raw = {40, 1, 10};
+    raw.insert(raw.end(), 600, 7);
+    const int content_end = (int) raw.size();
+    raw.insert(raw.end(), {50, 10, 40});
+    const int boundary = (int) raw.size();
+    raw.insert(raw.end(), {2, 10, 9, 9, 9});
+    const std::vector<int> boundaries = {boundary};
+    // A PFlash view that kept the system content but not its closer.
+    std::vector<int32_t> view(raw.begin(), raw.begin() + content_end);
+    view.insert(view.end(), raw.begin() + content_end + 2, raw.end());
+
+    TEST_ASSERT(&ppp_tool_prefix_source(true, raw, view) == &raw);
+    TEST_ASSERT(&ppp_tool_prefix_source(false, raw, view) == &view);
+
+    // Learning the view pins the next uncompressed request mid-message, at
+    // the view's divergence point ...
+    std::vector<std::vector<int32_t>> ring = {view};
+    TEST_ASSERT(PinFriendlyPrompt::annotate_pin_end(
+        raw, boundaries, ring, /*window=*/8, /*min=*/512) == content_end);
+    // ... learning what the client sent pins it at the head boundary.
+    ring = {ppp_tool_prefix_source(true, raw, view)};
+    TEST_ASSERT(PinFriendlyPrompt::annotate_pin_end(
+        raw, boundaries, ring, /*window=*/8, /*min=*/512) == boundary);
+}
+
 // ── Pin-Friendly Prompt Processor (PPP) ─────────────────────────────────
 
 TEST_CASE(ServerUnitFixture, test_ppp_lcp_and_safe_boundary) {

@@ -15,6 +15,7 @@
 #include "pflash_drafter.h"
 #include "pflash_compress.h"
 #include "pflash_selection.h"
+#include "pflash_query_candidates.h"
 #include "common/gguf_inspect.h"
 #include "anchor_params.h"
 #include "internal.h"
@@ -30,6 +31,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <map>
 #include <mutex>
@@ -863,6 +867,45 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         const int latest = luce::pflash::pflash_request_latest_user(experiment.request_messages_all);
         if (latest >= 0) stage2_latest_span = experiment.request_messages_all[(size_t) latest].span;
     }
+    // Query step 1 (pflash_query_candidates.h): relative candidates (qcand), the verbatim pin (qpin) and the
+    // dev-only replay grid (qgrid). Fail closed on any missing input; never today's windows while qcand is on.
+    const luce::pflash::PFlashQueryConfig & qcfg = experiment.query;
+    const bool qcand = request_probe && qcfg.candidates > 0;
+    const bool qpin = request_probe && qcfg.pin_tokens > 0;
+    const char * qgrid_path = request_probe ? std::getenv("PFLASH_QUERY_GRID") : nullptr;
+    const bool qgrid = qgrid_path && *qgrid_path;
+    const bool qstep = qcand || qpin || qgrid;
+    if (qstep && st.stage2_loaded) {
+        set_last_error("PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN / PFLASH_QUERY_GRID do not combine with request "
+                       "stage 2 (PFLASH_REQUEST_STAGE2_GGUF)");
+        return {};
+    }
+    if (qstep && !use_probe) {
+        set_last_error("PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN / PFLASH_QUERY_GRID need the segment probe");
+        return {};
+    }
+    if (qstep && (!experiment.request_messages_all_error.empty() || experiment.request_messages_all.empty())) {
+        set_last_error("query step: no message mapping from the caller" +
+                       (experiment.request_messages_all_error.empty()
+                            ? std::string() : ": " + experiment.request_messages_all_error));
+        return {};
+    }
+    std::vector<luce::pflash::PFlashGridConfig> qgrid_configs;
+    if (qgrid) {
+        std::ifstream in(qgrid_path);
+        std::stringstream text;
+        text << in.rdbuf();
+        std::string grid_error;
+        if (!in || !luce::pflash::pflash_query_grid_parse(text.str(), qgrid_configs, grid_error)) {
+            set_last_error("PFLASH_QUERY_GRID: " + (grid_error.empty() ? std::string("unreadable file") : grid_error));
+            return {};
+        }
+        const char * out_path = std::getenv("PFLASH_QUERY_GRID_OUT");
+        if (!out_path || !*out_path) {
+            set_last_error("PFLASH_QUERY_GRID needs PFLASH_QUERY_GRID_OUT");
+            return {};
+        }
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     int resume = 0;
@@ -886,7 +929,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
         use_probe && st.probe_sub_fc2_w != nullptr, request_probe, other_windows,
-        /*force_fresh=*/st.stage2_loaded, resume, shared_prefix, scratch);
+        /*force_fresh=*/st.stage2_loaded || qstep, resume, shared_prefix, scratch);
     if (!session) return {};
     // Retained request rows past the shared prefix belong to a prompt that
     // diverged there (an edit, a truncation, another conversation).
@@ -1317,6 +1360,116 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         if (!key_ok) return fail("qwen35 key graph compute failed");
     }
 
+    const std::vector<float> & probe_raw = session->probe_raw;
+    const std::vector<float> & subunit_raw = session->subunit_raw;
+
+    // Candidates: probe segments cut at the pinned spans' edges, or fixed
+    // chunks when the probe is off or finds too few boundaries.
+    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
+                             std::vector<PFlashTokenSpan> & segments, bool & density) {
+        segments.clear();
+        density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
+        if (!use_probe) return;
+        // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
+        // padding) plus the residual logit, then sigmoid: the boundary score
+        // per token.
+        const auto smooth = [&](const std::vector<float> & raw,
+                                const std::vector<float> & conv_w, float conv_b,
+                                std::vector<float> & out) {
+            const int taps = (int) conv_w.size();
+            const int radius = taps / 2;
+            out.assign((size_t) S, 0.0f);
+            for (int t = 0; t < S; ++t) {
+                float acc = raw[(size_t) t] + conv_b;
+                for (int k = 0; k < taps; ++k) {
+                    const int u = t + k - radius;
+                    if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
+                }
+                out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
+            }
+        };
+        std::vector<float> boundary;
+        smooth(probe_raw, st.probe_conv_w, st.probe_conv_b, boundary);
+        // Sub-unit scores feed only the oversize interior argmax below.
+        std::vector<float> split_scores;
+        if (!subunit_raw.empty()) {
+            smooth(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, split_scores);
+        }
+        const int query_end = score_query_end < 0 ? S : score_query_end;
+        const int query_begin = query_end - std::min(n_lookahead, query_end);
+        std::vector<int> forced{query_begin, query_end};
+        for (const auto & span : pins) {
+            forced.push_back(span.begin);
+            forced.push_back(span.end);
+        }
+        int boundaries_in_context = 0;
+        for (int t = 1; t < S; ++t) {
+            if (t >= query_begin &&
+                (t < query_end || !experiment.query_suffix_candidates)) {
+                continue;
+            }
+            if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
+        }
+        const bool forced_probe =
+            experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
+        if (boundaries_in_context >= 4 || forced_probe) {
+            if (st.probe_line_aligned && st.probe_vocab) {
+                std::vector<std::string> texts((size_t) S);
+                for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
+                const auto lines = luce::pflash::pflash_line_flags(texts);
+                segments = luce::pflash::pflash_probe_segments(
+                    boundary, S, st.probe_threshold, st.probe_min_segment,
+                    st.probe_max_segment, forced, split_scores, &lines);
+            } else {
+                segments = luce::pflash::pflash_probe_segments(
+                    boundary, S, st.probe_threshold, st.probe_min_segment,
+                    st.probe_max_segment, forced, split_scores);
+            }
+        }
+        if (segments.empty()) {
+            std::fprintf(stderr,
+                "[qwen35-segment-probe] %d boundaries in the context, "
+                "falling back to fixed %d-token chunks\n",
+                boundaries_in_context, experiment.chunk_size);
+        } else {
+            if (experiment.candidate_score == luce::pflash::PFlashCandidateScore::Auto) {
+                density = true;
+            }
+            std::fprintf(stderr,
+                "[qwen35-segment-probe] %d boundaries in the context -> %zu segments "
+                "(threshold %.2f, %d-%d tokens), score=%s\n",
+                boundaries_in_context, segments.size(), st.probe_threshold,
+                st.probe_min_segment, st.probe_max_segment,
+                density ? "density" : "sum");
+        }
+        std::fflush(stderr);
+    };
+
+    // Tokens the selector keeps whatever their score, counted the way it charges them
+    // (pflash_chunk_is_structurally_required over the candidates).
+    const int sel_query_end = score_query_end < 0 ? S : score_query_end;
+    const int sel_query_begin = sel_query_end - std::min(n_lookahead, sel_query_end);
+    const auto charged = [&](const std::vector<PFlashTokenSpan> & candidates_pins,
+                             const std::vector<PFlashTokenSpan> & candidate_segments) {
+        int total = 0;
+        const int n_chunks = candidate_segments.empty()
+            ? (S + experiment.chunk_size - 1) / experiment.chunk_size
+            : (int) candidate_segments.size();
+        for (int c = 0; c < n_chunks; ++c) {
+            const int begin = candidate_segments.empty()
+                ? c * experiment.chunk_size : candidate_segments[(size_t) c].begin;
+            const int end = candidate_segments.empty()
+                ? std::min(S, begin + experiment.chunk_size)
+                : candidate_segments[(size_t) c].end;
+            if (luce::pflash::pflash_chunk_is_structurally_required(
+                    begin, end, sel_query_begin, sel_query_end, S, candidates_pins,
+                    !experiment.query_suffix_candidates)) {
+                total += end - begin;
+            }
+        }
+        return total;
+    };
+
     // Request probe (PFLASH_SELECT_QUERY_PROBE=1): the query set from the
     // request logits of the human messages, its block-14 rows, and the rows
     // later turns will need -- all read here, while this call's activations
@@ -1325,6 +1478,16 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     // today's windows.
     luce::pflash::PFlashRequestProbeTrace request_trace;
     std::vector<float> request_query_rows;      // [hidden, query tokens]
+    // Query step 1 state: units, the served candidate set and pin, the grid's candidate sets and oracle, and the
+    // block-14 rows of every query token set any of them scores (keyed by the ascending token list).
+    luce::pflash::PFlashQueryTrace query_trace;
+    luce::pflash::PFlashQueryUnits qunits;
+    std::vector<luce::pflash::PFlashQueryCandidateSet> qgrid_sets;   // per grid config (empty unless cand)
+    luce::pflash::PFlashQueryOracle qoracle;
+    std::string qoracle_error = "no_oracle_dir";
+    std::string qfingerprint;
+    std::map<std::vector<int>, std::vector<float>> qrows;
+    int qrows_new = 0;
     // Stage 2's pass-1 assembly (STAGE2-CONTRACT.md section 5), when it ran.
     luce::pflash::PFlashStage2Assembly stage2_asm;
     bool stage2_assembled = false;
@@ -1654,6 +1817,71 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                     session->request_raw.begin() + message.message.end);
             }
         }
+        if (qstep) {
+            // Units from the selector's own segmentation of this request (cut at the caller's pins), ranked by the
+            // stage-1 logits; every query token set's rows are read now (fresh session: resume is 0).
+            const auto r0 = std::chrono::steady_clock::now();
+            std::vector<PFlashTokenSpan> unit_segments;
+            bool unit_density = false;
+            segment(required_instruction_spans, unit_segments, unit_density);
+            if (unit_segments.empty()) return fail("query step: the segment probe gave no segments");
+            qunits = luce::pflash::pflash_query_units(unit_segments, experiment.request_messages_all,
+                                                      session->request_raw);
+            if (!qunits.error.empty()) {
+                const std::string message = "query step: units: " + qunits.error;
+                return fail(message.c_str());
+            }
+            query_trace.evaluated = qcand || qpin;
+            query_trace.config = qcfg;
+            query_trace.units = (int) qunits.units.size();
+            query_trace.system_used = qunits.system_used;
+            std::vector<std::vector<int>> wanted;
+            if (qcand) {
+                query_trace.set = luce::pflash::pflash_query_candidate_set(qunits, session->request_raw, qcfg);
+                if (query_trace.set.candidates.empty()) return fail("query step: no message content to rank");
+                for (const auto & c : query_trace.set.candidates) {
+                    wanted.push_back(c.tokens);
+                    query_trace.query_tokens += (int) c.tokens.size();
+                }
+                if (qcfg.end_share > 0.0f) wanted.push_back({query_end - 1});
+            }
+            if (qgrid) {
+                qfingerprint = luce::pflash::pflash_ids_fingerprint(ids);
+                for (const auto & g : qgrid_configs) {
+                    luce::pflash::PFlashQueryCandidateSet set;
+                    if (g.mode == luce::pflash::PFlashGridMode::Candidates) {
+                        set = luce::pflash::pflash_query_candidate_set(qunits, session->request_raw, g.query);
+                        for (const auto & c : set.candidates) wanted.push_back(c.tokens);
+                        if (g.query.end_share > 0.0f) wanted.push_back({query_end - 1});
+                    }
+                    qgrid_sets.push_back(std::move(set));
+                }
+                if (const char * dir = std::getenv("PFLASH_QUERY_ORACLE_DIR")) {
+                    std::ifstream in(std::string(dir) + "/" + qfingerprint + ".json");
+                    if (!in) {
+                        qoracle_error = "no_oracle_file";
+                    } else {
+                        std::stringstream text;
+                        text << in.rdbuf();
+                        if (luce::pflash::pflash_query_oracle_parse(text.str(), S, qoracle, qoracle_error)) {
+                            qoracle_error.clear();
+                            wanted.push_back(qoracle.query);
+                        }
+                    }
+                }
+            }
+            for (const auto & tokens : wanted) {
+                if (tokens.empty() || qrows.count(tokens)) continue;
+                std::vector<float> rows;
+                int fresh = 0;
+                int stored = 0;
+                if (!gather(tokens, rows, fresh, stored)) return fail("query step: query rows unavailable");
+                qrows_new += fresh;
+                qrows.emplace(tokens, std::move(rows));
+            }
+            query_trace.rank_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - r0).count();
+        }
     }
     // PFLASH_EVAL_REF_IDENT_QUERY: the identifier query's block-14 rows, read
     // while this call's activations exist. Positions before ``resume`` have
@@ -1975,11 +2203,347 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         for (int j = 0; j < S; ++j) token_mass[(size_t) j] = (float) (sum[(size_t) j] / denominator);
         return true;
     };
+    // ---------------------------------------------------------------- query step 1
+    // Masses of query token sets, cached per set (one tile stream per set; tiles never mix sets).
+    std::map<std::vector<int>, std::vector<float>> qmass;
+    int qtiles = 0;
+    const auto query_mass = [&](const std::vector<int> & tokens) -> const std::vector<float> * {
+        auto hit = qmass.find(tokens);
+        if (hit != qmass.end()) return &hit->second;
+        auto rows = qrows.find(tokens);
+        if (rows == qrows.end()) {
+            set_last_error("query step: the rows of a query set are missing");
+            return nullptr;
+        }
+        if (!score_request_set(tokens, rows->second, /*mask_query_tokens=*/true, qtiles)) return nullptr;
+        return &qmass.emplace(tokens, token_mass).first->second;
+    };
+    // Today's windows as a blend candidate (PFLASH_QUERY_TW): its mass, scored and mixed exactly as today (cached),
+    // and its score = the unit score of s1 over the window tokens inside non-system message content.
+    std::vector<float> qwindows_mass;
+    bool qwindows_ready = false;
+    const auto windows_mass_cached = [&]() -> const std::vector<float> * {
+        if (!qwindows_ready) {
+            if (!score_windows()) return nullptr;
+            qwindows_mass = token_mass;
+            qwindows_ready = true;
+        }
+        return &qwindows_mass;
+    };
+    const auto tw_unit_score = [&](luce::pflash::PFlashUnitScore mode) -> float {
+        std::vector<uint8_t> content((size_t) S, 0);
+        for (const auto & m : experiment.request_messages_all) {
+            if (m.role == luce::pflash::PFlashRequestRole::System) continue;
+            for (int t = std::max(0, m.span.begin); t < std::min(S, m.span.end); ++t) content[(size_t) t] = 1;
+        }
+        std::vector<uint8_t> in_tw((size_t) S, 0);
+        for (const auto & w : windows) {
+            for (int t = std::max(0, w.begin); t < std::min(S, w.end); ++t) in_tw[(size_t) t] = 1;
+        }
+        double sum = 0.0;
+        int n = 0;
+        float mx = -std::numeric_limits<float>::infinity();
+        for (int t = 0; t < S && t < (int) session->request_raw.size(); ++t) {
+            if (!in_tw[(size_t) t] || !content[(size_t) t]) continue;
+            const float v = session->request_raw[(size_t) t];
+            if (!std::isfinite(v)) continue;
+            sum += v;
+            ++n;
+            mx = std::max(mx, v);
+        }
+        if (n == 0) return std::numeric_limits<float>::quiet_NaN();
+        return mode == luce::pflash::PFlashUnitScore::Max ? mx : (float) (sum / n);
+    };
+    // The blend (pflash_query_candidates.h): probe candidates, TW, END, with their weights.
+    const auto query_blend_mass = [&](const luce::pflash::PFlashQueryCandidateSet & set,
+                                      const luce::pflash::PFlashQueryConfig & q, std::vector<float> & out,
+                                      luce::pflash::PFlashQueryBlend & blend, float & tw_score_out) -> bool {
+        tw_score_out = q.tw_score ? tw_unit_score(q.unit_score) : std::numeric_limits<float>::quiet_NaN();
+        blend = luce::pflash::pflash_query_blend(set, q, tw_score_out);
+        std::vector<std::vector<float>> masses;
+        std::vector<double> weights;
+        for (size_t i = 0; i < set.candidates.size(); ++i) {
+            const auto * m = query_mass(set.candidates[i].tokens);
+            if (!m) return false;
+            masses.push_back(*m);
+            weights.push_back(blend.probe[i]);
+        }
+        if (blend.tw > 0.0) {
+            const auto * m = windows_mass_cached();
+            if (!m) return false;
+            masses.push_back(*m);
+            weights.push_back(blend.tw);
+        }
+        if (blend.end > 0.0) {
+            const auto * m = query_mass({query_end - 1});
+            if (!m) return false;
+            masses.push_back(*m);
+            weights.push_back(blend.end);
+        }
+        std::string error;
+        if (!luce::pflash::pflash_query_aggregate(masses, weights, q.aggregate, out, error)) {
+            set_last_error(error);
+            return false;
+        }
+        return true;
+    };
+    // No stage 2 with the query step: the selector budget is floor(S * keep_ratio).
+    const int qbudget = (int) std::floor((double) S * (double) keep_ratio);
+    const auto merge_spans = [](std::vector<PFlashTokenSpan> spans) {
+        std::sort(spans.begin(), spans.end(), [](const PFlashTokenSpan & a, const PFlashTokenSpan & b) {
+            return a.begin != b.begin ? a.begin < b.begin : a.end < b.end;
+        });
+        std::vector<PFlashTokenSpan> merged;
+        for (const auto & span : spans) {
+            if (span.end <= span.begin) continue;
+            if (!merged.empty() && span.begin <= merged.back().end) {
+                merged.back().end = std::max(merged.back().end, span.end);
+            } else {
+                merged.push_back(span);
+            }
+        }
+        return merged;
+    };
+    // The verbatim pin on top of ``base``; its cap halves until the charged pins fit the budget (0 at worst).
+    const auto fit_pin = [&](const std::vector<PFlashTokenSpan> & base, const luce::pflash::PFlashQueryConfig & q,
+                             luce::pflash::PFlashQueryPin & pin_out, int & cap_out) {
+        int cap = q.pin_tokens;
+        for (;;) {
+            pin_out = luce::pflash::pflash_query_pin(qunits, cap, q.unit_score, q.pin_margin, q.pin_gap);
+            auto p = base;
+            p.insert(p.end(), pin_out.spans.begin(), pin_out.spans.end());
+            p = merge_spans(std::move(p));
+            if (cap <= 0 || pin_out.spans.empty()) {
+                cap_out = cap;
+                return p;
+            }
+            std::vector<PFlashTokenSpan> segs;
+            bool dens = false;
+            segment(p, segs, dens);
+            if (charged(p, segs) <= qbudget) {
+                cap_out = cap;
+                return p;
+            }
+            cap /= 2;
+        }
+    };
+    const auto spans_json = [](const std::vector<PFlashTokenSpan> & spans) {
+        std::string out = "[";
+        for (size_t i = 0; i < spans.size(); ++i) {
+            out += (i ? ",[" : "[") + std::to_string(spans[i].begin) + "," + std::to_string(spans[i].end) + "]";
+        }
+        return out + "]";
+    };
+    const auto json_str = [](const std::string & text) {
+        std::string out = "\"";
+        for (const char c : text) {
+            if (c == '"' || c == '\\') out += '\\';
+            if ((unsigned char) c >= 0x20) out += c;
+        }
+        return out + "\"";
+    };
+    const auto num = [](double v) {
+        if (!std::isfinite(v)) return std::string("null");
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.9g", v);
+        return std::string(buf);
+    };
+    const auto candidates_json = [&](const luce::pflash::PFlashQueryCandidateSet & set) {
+        std::string out = "[";
+        for (size_t i = 0; i < set.candidates.size(); ++i) {
+            const auto & c = set.candidates[i];
+            std::vector<PFlashTokenSpan> unit_spans;
+            for (const int u : c.units) unit_spans.push_back(qunits.units[(size_t) u].span);
+            out += std::string(i ? "," : "") + "{\"message\":" + std::to_string(c.message) + ",\"units\":" +
+                spans_json(merge_spans(unit_spans)) + ",\"tokens\":" + std::to_string(c.tokens.size()) +
+                ",\"score\":" + num(c.score) + ",\"weight\":" + num(c.weight) + "}";
+        }
+        return out + "]";
+    };
+    // Dev-only replay grid: every config's selection on this forward, then the served selection below.
+    if (qgrid) {
+        const auto grid_started = std::chrono::steady_clock::now();
+        std::vector<float> windows_mass;
+        bool have_windows = false;
+        std::vector<float> p1_mass;
+        bool have_p1 = false;
+        int p1_tiles = 0;
+        std::string record = "{\"fp\":\"" + qfingerprint + "\",\"n_tokens\":" + std::to_string(S) +
+            ",\"budget\":" + std::to_string(qbudget) + ",\"keep_ratio\":" + num(keep_ratio) +
+            ",\"query_window\":[" + std::to_string(query_start) + "," + std::to_string(query_end) + "]" +
+            ",\"units\":" + std::to_string(qunits.units.size()) + ",\"latest\":" + std::to_string(qunits.latest) +
+            ",\"system_used\":" + (qunits.system_used ? "true" : "false") +
+            ",\"p1_fallback\":" + json_str(request_trace.fallback) +
+            ",\"oracle\":" + json_str(qoracle_error) + ",\"configs\":{";
+        for (size_t gi = 0; gi < qgrid_configs.size(); ++gi) {
+            const auto & g = qgrid_configs[gi];
+            const auto c0 = std::chrono::steady_clock::now();
+            std::vector<float> mass;
+            std::vector<PFlashTokenSpan> cpins = required_instruction_spans;
+            std::string fallback, error, cand = "[]", blend_json;
+            int query_tokens = 0;
+            bool ok = true;
+            if (g.mode == luce::pflash::PFlashGridMode::S1 ||
+                (g.mode == luce::pflash::PFlashGridMode::P1 && !request_trace.fallback.empty())) {
+                if (g.mode == luce::pflash::PFlashGridMode::P1) fallback = request_trace.fallback;
+                if (!have_windows) {
+                    if (!score_windows()) { session->ids.clear(); return {}; }
+                    windows_mass = token_mass;
+                    have_windows = true;
+                }
+                mass = windows_mass;
+            } else if (g.mode == luce::pflash::PFlashGridMode::P1) {
+                // The served P1 path: the set's tokens pinned (+ the policy recency pin), or today's windows and
+                // pins when they do not fit while the caller's pins do (pins_exceed_budget).
+                auto p1pins = cpins;
+                for (const auto & span : luce::pflash::pflash_request_token_spans(request_trace.set.tokens)) {
+                    p1pins.push_back(span);
+                }
+                if (!request_trace.set.messages.empty()) {
+                    const auto recency = luce::pflash::pflash_request_recency_pin(
+                        request_trace.set.messages[0].message, st.request_policy.recency_pin_tokens);
+                    if (recency.begin >= 0) p1pins.push_back(recency);
+                }
+                p1pins = merge_spans(std::move(p1pins));
+                std::vector<PFlashTokenSpan> segs, base;
+                bool dens = false;
+                segment(p1pins, segs, dens);
+                segment(required_instruction_spans, base, dens);
+                if (charged(p1pins, segs) > qbudget && charged(required_instruction_spans, base) <= qbudget) {
+                    fallback = "pins_exceed_budget";
+                    if (!have_windows) {
+                        if (!score_windows()) { session->ids.clear(); return {}; }
+                        windows_mass = token_mass;
+                        have_windows = true;
+                    }
+                    mass = windows_mass;
+                } else {
+                    if (!have_p1) {
+                        if (!score_request_set(request_trace.set.tokens, request_query_rows,
+                                               /*mask_query_tokens=*/true, p1_tiles)) {
+                            session->ids.clear();
+                            return {};
+                        }
+                        p1_mass = token_mass;
+                        have_p1 = true;
+                    }
+                    mass = p1_mass;
+                    cpins = p1pins;
+                    query_tokens = (int) request_trace.set.tokens.size();
+                }
+            } else if (g.mode == luce::pflash::PFlashGridMode::Candidates) {
+                const auto & set = qgrid_sets[gi];
+                if (set.candidates.empty()) {
+                    error = "no_candidates";
+                    ok = false;
+                } else {
+                    luce::pflash::PFlashQueryBlend blend;
+                    float tws = 0.0f;
+                    if (!query_blend_mass(set, g.query, mass, blend, tws)) { session->ids.clear(); return {}; }
+                    for (const auto & c : set.candidates) query_tokens += (int) c.tokens.size();
+                    cand = candidates_json(set);
+                    std::string probe_w = "[";
+                    for (size_t i = 0; i < blend.probe.size(); ++i) probe_w += (i ? "," : "") + num(blend.probe[i]);
+                    blend_json = ",\"blend\":{\"probe\":" + probe_w + "],\"tw\":" + num(blend.tw) + ",\"end\":" +
+                        num(blend.end) + ",\"tw_score\":" + num(tws) + "}";
+                }
+            } else {
+                if (!qoracle_error.empty()) {
+                    error = qoracle_error;
+                    ok = false;
+                } else {
+                    const auto * m = query_mass(qoracle.query);
+                    if (!m) { session->ids.clear(); return {}; }
+                    mass = *m;
+                    query_tokens = (int) qoracle.query.size();
+                    if (g.oracle_pin) {
+                        auto p = cpins;
+                        p.insert(p.end(), qoracle.pin.begin(), qoracle.pin.end());
+                        p = merge_spans(std::move(p));
+                        std::vector<PFlashTokenSpan> segs;
+                        bool dens = false;
+                        segment(p, segs, dens);
+                        if (charged(p, segs) <= qbudget) cpins = p;
+                        else fallback = "oracle_pin_exceeds_budget";
+                    }
+                }
+            }
+            luce::pflash::PFlashQueryPin pin;
+            int cap_used = 0;
+            std::vector<PFlashTokenSpan> kept;
+            int kept_tokens = 0;
+            if (ok && g.query.pin_tokens > 0) cpins = fit_pin(cpins, g.query, pin, cap_used);
+            if (ok) {
+                std::vector<PFlashTokenSpan> segs;
+                bool dens = false;
+                segment(cpins, segs, dens);
+                const auto out = select_pflash_chunks(
+                    ids, mass, keep_ratio, n_lookahead, score_query_end, /*pool_kernel=*/1, experiment, cpins,
+                    /*direct_mass=*/true, /*write_trace=*/false, segs.empty() ? nullptr : &segs, dens,
+                    /*other_token_scores=*/nullptr, /*split_fraction=*/0.0, st.fold_vocab.get());
+                if (out.empty()) {
+                    error = std::string("select: ") + luce_last_error();
+                    ok = false;
+                } else {
+                    kept = pflash_last_kept_spans();
+                    kept_tokens = (int) out.size();
+                }
+            }
+            int pin_tokens = 0;
+            for (const auto & span : cpins) pin_tokens += span.end - span.begin;
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - c0).count();
+            record += std::string(gi ? "," : "") + json_str(g.name) + ":{\"mode\":\"" +
+                luce::pflash::pflash_grid_mode_name(g.mode) + "\",\"kept\":" + spans_json(kept) +
+                ",\"kept_tokens\":" + std::to_string(kept_tokens) + ",\"pins\":" + spans_json(cpins) +
+                ",\"pin_tokens\":" + std::to_string(pin_tokens) + ",\"verbatim_pin\":" + spans_json(pin.spans) +
+                ",\"verbatim_pin_tokens\":" + std::to_string(pin.tokens) + ",\"pin_cap_used\":" +
+                std::to_string(cap_used) + ",\"query_tokens\":" + std::to_string(query_tokens) +
+                ",\"fallback\":" + json_str(fallback) + ",\"candidates\":" + cand +
+                (g.mode == luce::pflash::PFlashGridMode::Candidates
+                     ? ",\"latest_z\":" + num(qgrid_sets[gi].latest_z) + ",\"latest_null\":" +
+                           (qgrid_sets[gi].latest_null ? "true" : "false")
+                     : std::string()) +
+                blend_json + ",\"ms\":" + num(ms) +
+                (error.empty() ? std::string() : ",\"error\":" + json_str(error)) + "}";
+        }
+        const double grid_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - grid_started).count();
+        record += "},\"timing_ms\":{\"grid\":" + num(grid_ms) + ",\"rank\":" + num(query_trace.rank_us / 1000.0) +
+            ",\"forward\":" + num(std::chrono::duration<double, std::milli>(t1 - t0).count()) +
+            "},\"query_tiles\":" + std::to_string(qtiles) + ",\"p1_tiles\":" + std::to_string(p1_tiles) +
+            ",\"rows_new\":" + std::to_string(qrows_new) + "}\n";
+        FILE * file = std::fopen(std::getenv("PFLASH_QUERY_GRID_OUT"), "ab");
+        const bool written = file && std::fwrite(record.data(), 1, record.size(), file) == record.size();
+        if (file) std::fclose(file);
+        if (!written) {
+            session->ids.clear();
+            set_last_error("PFLASH_QUERY_GRID_OUT: write failed");
+            return {};
+        }
+    }
+    // The served candidates replace the request set (named, not a fallback to windows).
+    if (qcand) request_trace.fallback = "replaced_by_query_candidates";
+    if (qcand || qpin) request_trace.query = &query_trace;
     bool request_set = request_probe && request_trace.fallback.empty();
     const bool ident_set = ident_mode != luce::pflash::PFlashIdentQuery::Off &&
         ident_trace.fallback.empty();
     const auto pass2_started = std::chrono::steady_clock::now();
-    if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows,
+    if (qcand) {
+        // The served candidates: one mass per candidate (cached from the grid when it ran), aggregated.
+        const int tiles_before = qtiles;
+        qmass.clear();   // timing and tiles of the served path alone
+        qwindows_ready = false;
+        std::vector<float> aggregated;
+        if (!query_blend_mass(query_trace.set, qcfg, aggregated, query_trace.blend, query_trace.tw_score)) {
+            session->ids.clear();
+            return {};
+        }
+        token_mass = std::move(aggregated);
+        query_trace.tiles = qtiles - tiles_before;
+        query_trace.score_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - pass2_started).count();
+    } else if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows,
                                          /*mask_query_tokens=*/true, request_trace.query_tiles)
         : ident_set ? !score_request_set(ident_trace.tokens, ident_query_rows,
                                          /*mask_query_tokens=*/false, ident_trace.query_tiles)
@@ -2035,8 +2599,6 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             ident_trace.query_tiles);
         std::fflush(stderr);
     }
-    const std::vector<float> & probe_raw = session->probe_raw;
-    const std::vector<float> & subunit_raw = session->subunit_raw;
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
         "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d, resumed at %d, "
@@ -2044,94 +2606,14 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
         std::chrono::duration<double>(t2 - t1).count(),
-        request_set || ident_set ? (size_t) 1 : windows.size(),
+        qcand ? query_trace.set.candidates.size() : request_set || ident_set ? (size_t) 1 : windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);
-    pflash_set_scoring_stats({resume, n_new, request_set || ident_set ? 1 : (int) windows.size(),
+    pflash_set_scoring_stats({resume, n_new,
+                              qcand ? (int) query_trace.set.candidates.size()
+                                    : request_set || ident_set ? 1 : (int) windows.size(),
                               std::chrono::duration<double>(t1 - t0).count()});
-
-    // Candidates: probe segments cut at the pinned spans' edges, or fixed
-    // chunks when the probe is off or finds too few boundaries.
-    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
-                             std::vector<PFlashTokenSpan> & segments, bool & density) {
-        segments.clear();
-        density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
-        if (!use_probe) return;
-        // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
-        // padding) plus the residual logit, then sigmoid: the boundary score
-        // per token.
-        const auto smooth = [&](const std::vector<float> & raw,
-                                const std::vector<float> & conv_w, float conv_b,
-                                std::vector<float> & out) {
-            const int taps = (int) conv_w.size();
-            const int radius = taps / 2;
-            out.assign((size_t) S, 0.0f);
-            for (int t = 0; t < S; ++t) {
-                float acc = raw[(size_t) t] + conv_b;
-                for (int k = 0; k < taps; ++k) {
-                    const int u = t + k - radius;
-                    if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
-                }
-                out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
-            }
-        };
-        std::vector<float> boundary;
-        smooth(probe_raw, st.probe_conv_w, st.probe_conv_b, boundary);
-        // Sub-unit scores feed only the oversize interior argmax below.
-        std::vector<float> split_scores;
-        if (!subunit_raw.empty()) {
-            smooth(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, split_scores);
-        }
-        const int query_end = score_query_end < 0 ? S : score_query_end;
-        const int query_begin = query_end - std::min(n_lookahead, query_end);
-        std::vector<int> forced{query_begin, query_end};
-        for (const auto & span : pins) {
-            forced.push_back(span.begin);
-            forced.push_back(span.end);
-        }
-        int boundaries_in_context = 0;
-        for (int t = 1; t < S; ++t) {
-            if (t >= query_begin &&
-                (t < query_end || !experiment.query_suffix_candidates)) {
-                continue;
-            }
-            if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
-        }
-        const bool forced_probe =
-            experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
-        if (boundaries_in_context >= 4 || forced_probe) {
-            if (st.probe_line_aligned && st.probe_vocab) {
-                std::vector<std::string> texts((size_t) S);
-                for (int t = 0; t < S; ++t) texts[(size_t) t] = st.probe_vocab->token_text(ids[(size_t) t]);
-                const auto lines = luce::pflash::pflash_line_flags(texts);
-                segments = luce::pflash::pflash_probe_segments(
-                    boundary, S, st.probe_threshold, st.probe_min_segment,
-                    st.probe_max_segment, forced, split_scores, &lines);
-            } else {
-                segments = luce::pflash::pflash_probe_segments(
-                    boundary, S, st.probe_threshold, st.probe_min_segment,
-                    st.probe_max_segment, forced, split_scores);
-            }
-        }
-        if (segments.empty()) {
-            std::fprintf(stderr,
-                "[qwen35-segment-probe] %d boundaries in the context, "
-                "falling back to fixed %d-token chunks\n",
-                boundaries_in_context, experiment.chunk_size);
-        } else {
-            if (experiment.candidate_score == luce::pflash::PFlashCandidateScore::Auto) {
-                density = true;
-            }
-            std::fprintf(stderr,
-                "[qwen35-segment-probe] %d boundaries in the context -> %zu segments "
-                "(threshold %.2f, %d-%d tokens), score=%s\n",
-                boundaries_in_context, segments.size(), st.probe_threshold,
-                st.probe_min_segment, st.probe_max_segment,
-                density ? "density" : "sum");
-        }
-        std::fflush(stderr);
-    };
 
     std::vector<PFlashTokenSpan> segments;
     bool density = false;
@@ -2161,6 +2643,8 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
         pins.swap(merged);
     }
+    // PFLASH_QUERY_PIN: the latest user message's top whole units, charged, shrunk to fit the budget.
+    if (qpin) pins = fit_pin(pins, qcfg, query_trace.pin, query_trace.pin_cap_used);
     segment(pins, segments, density);
 
     if (request_probe) {
@@ -2168,28 +2652,6 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         // way it charges them (pflash_chunk_is_structurally_required over
         // the candidates); the query pins must fit the reader budget, or
         // the whole request falls back to today's windows and pins.
-        const int sel_query_end = score_query_end < 0 ? S : score_query_end;
-        const int sel_query_begin = sel_query_end - std::min(n_lookahead, sel_query_end);
-        const auto charged = [&](const std::vector<PFlashTokenSpan> & candidates_pins,
-                                 const std::vector<PFlashTokenSpan> & candidate_segments) {
-            int total = 0;
-            const int n_chunks = candidate_segments.empty()
-                ? (S + experiment.chunk_size - 1) / experiment.chunk_size
-                : (int) candidate_segments.size();
-            for (int c = 0; c < n_chunks; ++c) {
-                const int begin = candidate_segments.empty()
-                    ? c * experiment.chunk_size : candidate_segments[(size_t) c].begin;
-                const int end = candidate_segments.empty()
-                    ? std::min(S, begin + experiment.chunk_size)
-                    : candidate_segments[(size_t) c].end;
-                if (luce::pflash::pflash_chunk_is_structurally_required(
-                        begin, end, sel_query_begin, sel_query_end, S, candidates_pins,
-                        !experiment.query_suffix_candidates)) {
-                    total += end - begin;
-                }
-            }
-            return total;
-        };
         request_trace.token_budget = select_budget;
         if (request_set) {
             request_trace.query_tokens = (int) request_trace.set.tokens.size();
@@ -2268,10 +2730,32 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             request_trace.store_evicted_turns, request_trace.store_invalidated_turns,
             runs.empty() ? " none" : runs.c_str(), request_trace.stub ? " (stub row)" : "",
             policy_note.c_str());
+        if (query_trace.evaluated) {
+            const auto & qs = query_trace.set;
+            std::string cands;
+            for (const auto & c : qs.candidates) {
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), " m%d:%zut/%zuu s=%.3f w=%.3f", c.message, c.tokens.size(),
+                              c.units.size(), (double) c.score, c.weight);
+                cands += buf;
+            }
+            std::fprintf(stderr,
+                "[pflash-query] candidates=%d/%d unit_score=%s agg=%s T=%.3g extent=%s%.3g null_margin=%.3g units=%d%s "
+                "latest=%d (units %d, z %.3f%s) query_tokens=%d tiles=%d pin=%d/%d (cap %d, units %d, skipped %d) "
+                "rank=%.1fms score=%.1fms tw=%.3f (score %.3f) end=%.3f%s\n",
+                (int) qs.candidates.size(), qcfg.candidates, luce::pflash::pflash_unit_score_name(qcfg.unit_score),
+                luce::pflash::pflash_query_aggregate_name(qcfg.aggregate), (double) qcfg.temperature,
+                qcfg.extent_gap ? "gap/" : "", (double) qcfg.extent_margin, (double) qcfg.null_margin, query_trace.units,
+                query_trace.system_used ? " (system)" : "", qs.latest, qs.latest_units, (double) qs.latest_z,
+                qs.latest_null ? ", NULL" : "", query_trace.query_tokens, query_trace.tiles, query_trace.pin.tokens,
+                qcfg.pin_tokens, query_trace.pin_cap_used, query_trace.pin.units, query_trace.pin.skipped,
+                query_trace.rank_us / 1000.0, query_trace.score_us / 1000.0, query_trace.blend.tw,
+                (double) query_trace.tw_score, query_trace.blend.end, cands.c_str());
+        }
         auto & s2t = request_trace.stage2;
         if (s2t.evaluated) {
             // Every request that does not score the stage-2 query is a named, counted reason.
-            s2t.fallback = request_set ? std::string() : request_trace.fallback;
+            s2t.fallback = request_set || qcand ? std::string() : request_trace.fallback;
             if (!s2t.fallback.empty()) {
                 s2t.fallback_count = stage2_count_fallback(s2t.fallback);
                 std::fprintf(stderr, "[pflash-request-stage2] FALLBACK reason=\"%s\" count=%ld\n",
