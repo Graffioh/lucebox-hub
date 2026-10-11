@@ -162,6 +162,18 @@ struct PFlashScoringStats {
 const PFlashScoringStats & pflash_last_scoring_stats();
 void pflash_set_scoring_stats(const PFlashScoringStats & stats);
 
+// Stage 2's budget decision on the last strict scoring on this thread (STAGE2-CONTRACT.md section 5 step 5):
+// ``widened`` when l_vague >= tau_fb (B' = min(n, B + B/2) drafter tokens), ``raw_fits`` when B' >= n (the
+// caller serves the raw prompt). Cleared with the kept spans.
+struct PFlashStage2Outcome {
+    bool widened = false;
+    bool raw_fits = false;
+    int budget = -1;            // B
+    int budget_widened = -1;    // B'
+};
+const PFlashStage2Outcome & pflash_last_stage2_outcome();
+void pflash_set_stage2_outcome(const PFlashStage2Outcome & outcome);
+
 // Every candidate of the last strict selection on this thread with its
 // attention lift: mean per-token mass relative to uniform attention over
 // the input (1 = average, 20 = twenty times average). Cleared with the

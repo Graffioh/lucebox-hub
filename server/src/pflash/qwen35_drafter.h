@@ -10,6 +10,7 @@
 #include "pflash_drafter.h"
 #include "pflash_selection.h"
 #include "pflash_request_probe.h"
+#include "pflash_request_stage2.h"
 #include "common/pflash_types.h"
 #include "internal.h"
 #include "server/tokenizer.h"
@@ -51,6 +52,9 @@ struct Qwen35ScoringSession {
     // token position) for later turns, whose activations are gone.
     std::vector<float>    request_raw;
     luce::pflash::PFlashRequestRowStore request_rows;
+    // Stage 2 (PFLASH_REQUEST_STAGE2_GGUF): c(t) of every token ([32] F32 each, from the key graph). Stage 2 forces
+    // fresh scoring (no session resume), so this covers the whole prompt of the current call.
+    std::vector<float>    stage2_cand;
     // Block-14 output of recent query windows (the query and earlier
     // questions), reused while they sit in the shared prefix: an agent step
     // appends tool output after the same user turn, and a new turn's history
@@ -119,12 +123,22 @@ struct Qwen35DrafterState {
     // Candidate rule of the loaded GGUF: false = human messages only, true =
     // the V2-A3 rule (requestprobe.candidate_rule == kRequestCandidateRule).
     bool                  request_turns = false;
+    // cand_v5 (requestprobe.candidate_rule == kRequestCandidateRuleV5): seed + score fill; the only rule a
+    // stage-2 GGUF pairs with. ``request_checkpoint_sha256`` = requestprobe.checkpoint_sha256 ("" when absent).
+    bool                  request_v5 = false;
+    std::string           request_checkpoint_sha256;
     int                   request_width = 0;
     bool                  request_loaded = false;
     bool                  request_stub = false;
     // v2 policy (abstention, recency pin): GGUF requestprobe.policy.*, then the PFLASH_REQUEST_PROBE_POLICY JSON
     // file, then PFLASH_SELECT_QUERY_PROBE_RECENCY_PIN. Defaults never abstain and pin nothing.
     luce::pflash::PFlashRequestPolicy request_policy;
+    // Stage 2 (PFLASH_REQUEST_STAGE2_GGUF, with a cand_v5 request probe and the scoring head): host weights,
+    // the device copies the graphs read, and a host copy of blk.15.attn_norm (x̂ of the seed rows on the CPU).
+    bool                  stage2_loaded = false;
+    luce::pflash::PFlashStage2Weights stage2;
+    luce::pflash::PFlashStage2Device  stage2_dev;
+    std::vector<float>    stage2_w_in;
     // Strict scorer sessions, least recently used evicted
     // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
     // PFLASH_SELECT_STRATEGY=fold: the drafter's own vocabulary, to read

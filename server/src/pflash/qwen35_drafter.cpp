@@ -31,6 +31,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -587,10 +589,19 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.subunit_raw.clear();
     session.request_raw.clear();
     session.request_rows.clear();
+    session.stage2_cand.clear();
     session.query_windows.clear();
 }
 
 namespace {
+
+// Stage-2 fallbacks since the process started, by reason (the text before ": ").
+long stage2_count_fallback(const std::string & reason) {
+    static std::mutex mutex;
+    static std::map<std::string, long> counts;
+    const std::lock_guard<std::mutex> lock(mutex);
+    return ++counts[reason.substr(0, reason.find(": "))];
+}
 
 int scoring_session_limit() {
     const char * raw = std::getenv("PFLASH_DRAFTER_SESSIONS");
@@ -660,6 +671,7 @@ Qwen35ScoringSession * acquire_scoring_session(
         bool need_subunit,
         bool need_request,
         const std::vector<PFlashTokenSpan> & other_windows,
+        bool force_fresh,
         int & resume,
         int & shared_prefix,
         std::unique_ptr<Qwen35ScoringSession> & scratch) {
@@ -669,7 +681,9 @@ Qwen35ScoringSession * acquire_scoring_session(
     // padded K view and moves the tail ubatches off the MMA kernel, which
     // changes the scores (resident drafter vs a freshly loaded one).
     const int S_padded = align_up_i(S, 256);
-    const int limit = scoring_session_limit();
+    // Stage 2 (force_fresh): no session resume, every call scores the whole prompt from fresh rows, as
+    // PFLASH_DRAFTER_SESSIONS=0 does (the contract's stage-2 inputs are F32 rows only).
+    const int limit = force_fresh ? 0 : scoring_session_limit();
     const size_t row_floats = (size_t) w.n_embd * (size_t) (query_end - query_start);
     resume = 0;
     shared_prefix = 0;
@@ -679,6 +693,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     int best_shared = 0;
     for (auto & owned : st.sessions) {
         Qwen35ScoringSession * session = owned.get();
+        if (force_fresh) break;
         if (!session || session->capacity < S_padded || session->ids.empty() ||
             session->keys_trained != st.head_loaded) {
             continue;
@@ -785,6 +800,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     target->subunit_raw.clear();
     target->request_raw.clear();
     target->request_rows.clear();
+    target->stage2_cand.clear();
     target->query_windows.clear();
     return target;
 }
@@ -838,6 +854,15 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         set_last_error("PFLASH_SELECT_QUERY_PROBE=1: the drafter has no request probe");
         return {};
     }
+    // cand_v5 and stage 2 (STAGE2-CONTRACT.md): stage 2 runs only with a cand_v5 probe and its own GGUF. The
+    // latest user message's span is known before the forward: its x̂ sums ride in the key graph while it is fresh.
+    const bool request_v5 = request_probe && st.request_v5;
+    const bool stage2_on = request_v5 && st.stage2_loaded;
+    PFlashTokenSpan stage2_latest_span{-1, -1};
+    if (stage2_on && experiment.request_messages_all_error.empty()) {
+        const int latest = luce::pflash::pflash_request_latest_user(experiment.request_messages_all);
+        if (latest >= 0) stage2_latest_span = experiment.request_messages_all[(size_t) latest].span;
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     int resume = 0;
@@ -851,13 +876,17 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     for (const auto & span : experiment.extra_queries) {
         if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
     }
+    // Stage 2 alone decides look-back: the fixed earlier-question windows (PFLASH_CHAT_HISTORY_QUERIES) are
+    // dropped while it is loaded, also from today's windows on a fallback.
+    const bool drop_history = st.stage2_loaded;
     for (const auto & span : experiment.history_queries) {
+        if (drop_history) break;
         if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
     }
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
         use_probe && st.probe_sub_fc2_w != nullptr, request_probe, other_windows,
-        resume, shared_prefix, scratch);
+        /*force_fresh=*/st.stage2_loaded, resume, shared_prefix, scratch);
     if (!session) return {};
     // Retained request rows past the shared prefix belong to a prompt that
     // diverged there (an edit, a truncation, another conversation).
@@ -1103,6 +1132,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
         double weight = 1.0;
         for (const auto & span : experiment.history_queries) {
+            if (drop_history) break;
             weight *= 0.5;
             if (span.end > query_start || span.end - span.begin < 1) continue;
             ScoredWindow history;
@@ -1121,6 +1151,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     session->subunit_raw.resize(
         use_probe && st.probe_sub_fc2_w ? (size_t) resume : 0);
     session->request_raw.resize(request_probe ? (size_t) resume : 0);
+    session->stage2_cand.resize(stage2_on ? (size_t) resume * luce::pflash::kStage2Embed : 0);
+    // Stage 2: the fresh latest user message's x̂ column sums, one per key chunk it overlaps ([parts][hidden]).
+    const bool stage2_latest_fresh = stage2_on && stage2_latest_span.end > stage2_latest_span.begin &&
+        stage2_latest_span.begin >= resume;
+    std::vector<float> stage2_msum;
 
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
@@ -1143,9 +1178,39 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             return fail("qwen35 probe buffer allocation failed");
         }
         const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
+        // Stage 2: c(t) of the new tokens, and the fresh latest message's x̂ column sums.
+        ggml_context * s2ctx = nullptr;
+        ggml_backend_buffer_t s2buf = nullptr;
+        ggml_tensor * cand_new = nullptr;
+        ggml_tensor * msum_new = nullptr;
+        int msum_parts = 0;
+        if (stage2_on) {
+            for (int b = 0; b < n_new && stage2_latest_fresh; b += key_chunk) {
+                const int n = std::min(key_chunk, n_new - b);
+                if (std::max(stage2_latest_span.begin, resume + b) <
+                    std::min(stage2_latest_span.end, resume + b + n)) ++msum_parts;
+            }
+            ggml_init_params sip2{};
+            sip2.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
+            sip2.no_alloc = true;
+            s2ctx = ggml_init(sip2);
+            if (s2ctx) {
+                cand_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, luce::pflash::kStage2Embed, n_new);
+                msum_new = ggml_new_tensor_2d(s2ctx, GGML_TYPE_F32, hidden, std::max(1, msum_parts));
+                s2buf = ggml_backend_alloc_ctx_tensors(s2ctx, w.backend);
+            }
+            if (!s2buf) {
+                if (s2ctx) ggml_free(s2ctx);
+                if (nbuf) ggml_backend_buffer_free(nbuf);
+                ggml_free(nctx);
+                return fail("qwen35 stage-2 buffer allocation failed");
+            }
+            if (msum_parts == 0) msum_new = nullptr;
+        }
         ggml_init_params kip{};
         kip.mem_size = ggml_tensor_overhead() *
-                           (size_t)(64 + (request_probe ? 40 : 24) * n_key_chunks) +
+                           (size_t)(64 + (request_probe ? 40 : 24) * n_key_chunks +
+                                    (stage2_on ? 24 * n_key_chunks : 0)) +
                        ggml_graph_overhead_custom(4096, false) + 64 * 1024;
         kip.no_alloc = true;
         ggml_context * kctx = ggml_init(kip);
@@ -1196,6 +1261,25 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 ggml_build_forward_expand(kgf,
                     ggml_cpy(kctx, ggml_reshape_1d(kctx, req, n), r_dst));
             }
+            if (cand_new) {
+                // Stage 2: c(t) = cand(x̂_t), kept per token while the session covers it.
+                ggml_tensor * c = luce::pflash::pflash_stage2_build_cand(kctx, st.stage2_dev, x_norm);
+                ggml_tensor * c_dst = ggml_view_2d(kctx, cand_new, luce::pflash::kStage2Embed, n,
+                                                   cand_new->nb[1], (size_t) b * cand_new->nb[1]);
+                ggml_build_forward_expand(kgf, ggml_cpy(kctx, c, c_dst));
+            }
+            if (msum_new) {
+                const int lo = std::max(stage2_latest_span.begin, resume + b);
+                const int hi = std::min(stage2_latest_span.end, resume + b + n);
+                if (lo < hi) {
+                    ggml_tensor * col = luce::pflash::pflash_stage2_build_column_sum(
+                        kctx, x_norm, lo - (resume + b), hi - (resume + b));
+                    const int part = (int) (stage2_msum.size() / (size_t) hidden);
+                    stage2_msum.resize(stage2_msum.size() + (size_t) hidden);
+                    ggml_tensor * m_dst = ggml_view_1d(kctx, msum_new, hidden, (size_t) part * msum_new->nb[1]);
+                    ggml_build_forward_expand(kgf, ggml_cpy(kctx, col, m_dst));
+                }
+            }
         }
         ggml_gallocr_t kalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
         const bool key_ok = ggml_gallocr_alloc_graph(kalloc, kgf) &&
@@ -1217,6 +1301,17 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             ggml_backend_tensor_get(request_new, session->request_raw.data() + resume, 0,
                                     (size_t) n_new * sizeof(float));
         }
+        if (key_ok && cand_new) {
+            session->stage2_cand.resize((size_t) S * luce::pflash::kStage2Embed);
+            ggml_backend_tensor_get(cand_new,
+                session->stage2_cand.data() + (size_t) resume * luce::pflash::kStage2Embed, 0,
+                (size_t) n_new * luce::pflash::kStage2Embed * sizeof(float));
+        }
+        if (key_ok && msum_new && !stage2_msum.empty()) {
+            ggml_backend_tensor_get(msum_new, stage2_msum.data(), 0, stage2_msum.size() * sizeof(float));
+        }
+        if (s2buf) ggml_backend_buffer_free(s2buf);
+        if (s2ctx) ggml_free(s2ctx);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         ggml_free(nctx);
         if (!key_ok) return fail("qwen35 key graph compute failed");
@@ -1230,6 +1325,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     // today's windows.
     luce::pflash::PFlashRequestProbeTrace request_trace;
     std::vector<float> request_query_rows;      // [hidden, query tokens]
+    // Stage 2's pass-1 assembly (STAGE2-CONTRACT.md section 5), when it ran.
+    luce::pflash::PFlashStage2Assembly stage2_asm;
+    bool stage2_assembled = false;
     if (request_probe) {
         request_trace.tau = st.request_tau;
         request_trace.stub = st.request_stub;
@@ -1269,7 +1367,180 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             }
             return true;
         };
-        if (!experiment.request_messages_error.empty()) {
+        // Stage 2 pass 1 on the cand_v5 set (contract section 4): seed, m_all / m_s1, message head, look-back
+        // attention over E, the token model, then the assembly (seed > promoted > post-latest, widening).
+        const auto stage2_pass1 = [&]() -> bool {
+            auto & s2t = request_trace.stage2;
+            const auto & msgs = experiment.request_messages_all;
+            const auto started = std::chrono::steady_clock::now();
+            const auto finish = [&]() {
+                s2t.pass1_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+            };
+            luce::pflash::PFlashStage2Layout layout;
+            std::string layout_error;
+            if (!luce::pflash::pflash_stage2_layout(msgs, S, layout, layout_error)) {
+                s2t.reason = "message_mapping";
+                request_trace.fallback = "message_mapping: " + layout_error;
+                finish();
+                return true;
+            }
+            const std::vector<float> & s1 = session->request_raw;
+            if (layout.latest < 0) {
+                s2t.reason = "no_user_message";     // the cand_v5 set alone
+                finish();
+                return true;
+            }
+            const PFlashTokenSpan latest = layout.latest_span;
+            bool seed_capped = false;
+            int reserve = 0;
+            std::vector<int> post_latest;
+            // Contract v3: R slots reserved for the post-latest cues; the seed (m_s1, the look-back queries) is
+            // capped at 1024 - R.
+            const std::vector<int> seed = luce::pflash::pflash_request_capped_seed(
+                s1, st.request_tau, msgs, luce::pflash::kRequestQueryCap, luce::pflash::kRequestPostReserve, reserve,
+                post_latest, &seed_capped);
+            s2t.post_reserve = reserve;
+            luce::pflash::PFlashStage2Latest lat;
+            lat.m_all.assign((size_t) hidden, 0.0);
+            std::vector<float> seed_rows((size_t) hidden * seed.size());
+            if (latest.end <= latest.begin || latest.begin >= resume) {
+                // Fresh: m_all from the key graph's column sums, the seed rows from this call's activations.
+                const size_t parts = stage2_msum.size() / (size_t) hidden;
+                if (latest.end > latest.begin && parts == 0) {
+                    s2t.reason = "rows_missing";
+                    request_trace.fallback = "rows_missing";
+                    finish();
+                    return true;
+                }
+                for (size_t p = 0; p < parts; ++p) {
+                    for (int k = 0; k < hidden; ++k) lat.m_all[(size_t) k] += (double) stage2_msum[p * hidden + (size_t) k];
+                }
+                if (latest.end > latest.begin) {
+                    for (auto & v : lat.m_all) v /= (double) (latest.end - latest.begin);
+                }
+                for (size_t q = 0; q < seed.size(); ++q) {
+                    ggml_backend_tensor_get(act_in, seed_rows.data() + q * (size_t) hidden,
+                                            (size_t) (seed[q] - resume) * act_in->nb[1],
+                                            (size_t) hidden * sizeof(float));
+                }
+            } else {
+                // Unreachable while stage 2 forces fresh scoring (resume 0); fail closed, traced and counted.
+                s2t.reason = "rows_missing";
+                request_trace.fallback = "rows_missing";
+                finish();
+                return true;
+            }
+            if (seed.empty()) {
+                lat.m_s1 = lat.m_all;
+            } else {
+                lat.m_s1.assign((size_t) hidden, 0.0);
+                std::vector<double> xh((size_t) hidden);
+                for (size_t q = 0; q < seed.size(); ++q) {
+                    luce::pflash::pflash_stage2_xhat(seed_rows.data() + q * (size_t) hidden, st.stage2_w_in.data(),
+                                                     hidden, w.rms_eps, xh.data());
+                    for (int k = 0; k < hidden; ++k) lat.m_s1[(size_t) k] += xh[(size_t) k];
+                }
+                for (auto & v : lat.m_s1) v /= (double) seed.size();
+            }
+            luce::pflash::pflash_stage2_message_head(st.stage2, lat);
+            const char * dump = std::getenv(luce::pflash::kStage2FeaturesEnv);
+            const bool dumping = dump && *dump;
+            const size_t N = layout.earlier.size();
+            const bool look = lat.lookback_logit >= st.stage2.tau_lb && N > 0;   // NaN -> false
+            std::vector<float> a, x, s2;
+            if (N > 0 && (look || dumping)) {
+                luce::pflash::PFlashStage2AttentionInputs in;
+                in.backend = w.backend;
+                in.keys = session->keys;
+                in.wq = st.head_wq;
+                in.w_in = L.attn_norm;
+                in.w_qn = L.q_norm;
+                in.rms_eps = w.rms_eps;
+                std::string error;
+                if (!luce::pflash::pflash_stage2_attention_gpu(in, layout.earlier, seed_rows.data(),
+                                                                (int) seed.size(), a, s2t.attention_tiles, error)) {
+                    set_last_error(error);
+                    return false;
+                }
+                std::vector<float> cand(N * (size_t) luce::pflash::kStage2Embed);
+                for (size_t i = 0; i < N; ++i) {
+                    std::copy_n(session->stage2_cand.data() +
+                                    (size_t) layout.earlier[i] * luce::pflash::kStage2Embed,
+                                (size_t) luce::pflash::kStage2Embed, cand.data() + i * luce::pflash::kStage2Embed);
+                }
+                luce::pflash::pflash_stage2_features(layout, a, s1, cand, lat, x);
+                if (!luce::pflash::pflash_stage2_mlp_gpu(w.backend, st.stage2_dev, st.stage2.norm_eps, x, (int) N,
+                                                         s2, error)) {
+                    set_last_error(error);
+                    return false;
+                }
+                s2t.s2_computed = true;
+            }
+            const int budget = (int) std::floor((double) S * (double) keep_ratio);
+            stage2_asm = luce::pflash::pflash_stage2_assemble(
+                msgs, s1, luce::pflash::pflash_stage2_full_s2(layout, s2, S), lat.lookback_logit,
+                lat.vague_logit, st.request_tau, st.stage2.tau2, st.stage2.tau_lb, st.stage2.tau_fb, budget, S);
+            stage2_assembled = true;
+            if (stage2_asm.seed != seed || stage2_asm.reserve != reserve) {
+                set_last_error("stage 2: the assembly's seed or reserve differs from pass 1's");
+                return false;
+            }
+            if (dumping && !luce::pflash::pflash_stage2_dump_features(dump, S, msgs, layout, seed, lat, a, x, s2)) {
+                set_last_error(std::string(luce::pflash::kStage2FeaturesEnv) + ": feature dump write failed");
+                return false;
+            }
+            // The assembled query replaces the cand_v5 set's tokens; the set keeps its runs for the row store.
+            request_trace.set.tokens = stage2_asm.query;
+            request_trace.set.latest_tokens = (int) stage2_asm.seed.size();
+            request_trace.set.turn_tokens = (int) (stage2_asm.promoted.size() + stage2_asm.post.size());
+            request_trace.set.capped = stage2_asm.seed_capped || stage2_asm.promoted_capped;
+            request_trace.set.fallback = stage2_asm.reason;
+            request_trace.fallback = stage2_asm.reason;
+            s2t.active = true;
+            s2t.latest_message = layout.latest;
+            s2t.latest_span = latest;
+            s2t.seed_tokens = (int) stage2_asm.seed.size();
+            s2t.seed_capped = stage2_asm.seed_capped;
+            s2t.latest_tokens = std::max(0, latest.end - latest.begin);
+            s2t.lookback_logit = lat.lookback_logit;
+            s2t.vague_logit = lat.vague_logit;
+            s2t.lookback = stage2_asm.lookback;
+            s2t.earlier_tokens = (int) N;
+            s2t.promoted_tokens = (int) stage2_asm.promoted.size();
+            s2t.promoted_capped = stage2_asm.promoted_capped;
+            s2t.promoted_runs = stage2_asm.promoted_runs;
+            s2t.post_tokens = (int) stage2_asm.post.size();
+            s2t.widened = stage2_asm.widened;
+            s2t.budget = budget;
+            s2t.budget_widened = stage2_asm.budget;
+            s2t.raw_fits = stage2_asm.raw_fits;
+            finish();
+            return true;
+        };
+        if (request_v5) {
+            request_trace.stage2.evaluated = true;
+            request_trace.stage2.resume = resume;
+            request_trace.stage2.history_dropped = drop_history ? (int) experiment.history_queries.size() : 0;
+            if (!experiment.request_messages_all_error.empty()) {
+                request_trace.fallback = "message_mapping: " + experiment.request_messages_all_error;
+                request_trace.stage2.reason = "message_mapping";
+            } else {
+                request_trace.set = luce::pflash::pflash_request_query_set_v5(
+                    session->request_raw, experiment.request_messages_all, st.request_tau);
+                request_trace.fallback = request_trace.set.fallback;
+                request_trace.stage2.seed_tokens = (int) request_trace.set.seed.size();
+                request_trace.stage2.seed_capped = request_trace.set.seed_capped;
+                request_trace.stage2.post_reserve = request_trace.set.reserve;
+                if (!stage2_on) {
+                    request_trace.stage2.reason = "stage2_not_loaded";
+                } else if (request_trace.fallback != "logits_missing" && !stage2_pass1()) {
+                    session->ids.clear();
+                    cleanup();
+                    return {};
+                }
+            }
+        } else if (!experiment.request_messages_error.empty()) {
             request_trace.fallback = "message_mapping: " + experiment.request_messages_error;
         } else {
             if (st.request_turns) {
@@ -1331,7 +1602,16 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             retained.push_back(request_trace.set.messages[k]);
         }
         for (const auto & message : retained) {
-            const std::vector<int> turn = luce::pflash::pflash_request_turn_tokens(message);
+            std::vector<int> turn = luce::pflash::pflash_request_turn_tokens(message);
+            if (stage2_assembled && !stage2_asm.promoted.empty()) {
+                // Promoted earlier tokens are query rows too: keep them with their message's turn.
+                for (const int t : stage2_asm.promoted) {
+                    if (t >= message.message.begin && t < message.message.end) turn.push_back(t);
+                }
+                std::sort(turn.begin(), turn.end());
+                turn.erase(std::unique(turn.begin(), turn.end()), turn.end());
+                turn = luce::pflash::pflash_request_cap_tail(turn, luce::pflash::kRequestQueryCap);
+            }
             if (turn.empty()) continue;
             std::vector<float> rows;
             int fresh = 0;
@@ -1698,6 +1978,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     bool request_set = request_probe && request_trace.fallback.empty();
     const bool ident_set = ident_mode != luce::pflash::PFlashIdentQuery::Off &&
         ident_trace.fallback.empty();
+    const auto pass2_started = std::chrono::steady_clock::now();
     if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows,
                                          /*mask_query_tokens=*/true, request_trace.query_tiles)
         : ident_set ? !score_request_set(ident_trace.tokens, ident_query_rows,
@@ -1705,6 +1986,43 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                     : !score_windows()) {
         session->ids.clear();
         return {};
+    }
+    if (request_trace.stage2.evaluated) {
+        request_trace.stage2.pass2_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - pass2_started).count();
+    }
+    // Stage 2's budget (contract section 5 step 5): B' = min(n, B + B/2) when l_vague >= tau_fb, whatever query
+    // the request ends up scoring; raw_fits keeps every token (the caller serves the raw prompt). The selector
+    // budget is floor(S * ratio), so the ratio is the float whose budget is exactly B'.
+    float select_keep_ratio = keep_ratio;
+    int select_budget = (int) std::floor((double) S * (double) keep_ratio);
+    if (stage2_assembled && stage2_asm.widened) {
+        select_budget = stage2_asm.budget;
+        if (stage2_asm.raw_fits) {
+            select_keep_ratio = 1.0f;
+        } else {
+            float r = (float) (((double) select_budget + 0.5) / (double) S);
+            for (int k = 0; k < 8 && (int) std::floor((double) S * (double) r) > select_budget; ++k) {
+                r = std::nextafter(r, 0.0f);
+            }
+            for (int k = 0; k < 8 && (int) std::floor((double) S * (double) r) < select_budget; ++k) {
+                r = std::nextafter(r, 2.0f);
+            }
+            if ((int) std::floor((double) S * (double) r) != select_budget) {
+                set_last_error("stage 2: no keep ratio gives the widened budget");
+                session->ids.clear();
+                return {};
+            }
+            select_keep_ratio = r;
+        }
+    }
+    if (stage2_assembled) {
+        luce::common::PFlashStage2Outcome outcome;
+        outcome.widened = stage2_asm.widened;
+        outcome.raw_fits = stage2_asm.raw_fits;
+        outcome.budget = (int) std::floor((double) S * (double) keep_ratio);
+        outcome.budget_widened = stage2_asm.budget;
+        pflash_set_stage2_outcome(outcome);
     }
     if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
         ident_trace.query_tokens = ident_set ? (int) ident_trace.tokens.size() : 0;
@@ -1872,7 +2190,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             }
             return total;
         };
-        request_trace.token_budget = (int) std::floor((double) S * (double) keep_ratio);
+        request_trace.token_budget = select_budget;
         if (request_set) {
             request_trace.query_tokens = (int) request_trace.set.tokens.size();
             int already = 0;
@@ -1950,6 +2268,27 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             request_trace.store_evicted_turns, request_trace.store_invalidated_turns,
             runs.empty() ? " none" : runs.c_str(), request_trace.stub ? " (stub row)" : "",
             policy_note.c_str());
+        auto & s2t = request_trace.stage2;
+        if (s2t.evaluated) {
+            // Every request that does not score the stage-2 query is a named, counted reason.
+            s2t.fallback = request_set ? std::string() : request_trace.fallback;
+            if (!s2t.fallback.empty()) {
+                s2t.fallback_count = stage2_count_fallback(s2t.fallback);
+                std::fprintf(stderr, "[pflash-request-stage2] FALLBACK reason=\"%s\" count=%ld\n",
+                             s2t.fallback.c_str(), s2t.fallback_count);
+            }
+            std::fprintf(stderr,
+                "[pflash-request-stage2] %s%s L=%d [%d,%d) seed=%d%s latest=%d l_lb=%.4f l_vague=%.4f lookback=%d "
+                "earlier=%d promoted=%d%s (runs %d) post=%d widened=%d budget=%d->%d raw_fits=%d s2=%d resume=%d "
+                "history_dropped=%d tiles=%d pass1=%.1fms pass2=%.1fms\n",
+                s2t.active ? "active" : "inactive", s2t.reason.empty() ? "" : (" reason=" + s2t.reason).c_str(),
+                s2t.latest_message, s2t.latest_span.begin, s2t.latest_span.end,
+                s2t.seed_tokens, s2t.seed_capped ? " (capped)" : "", s2t.latest_tokens,
+                (double) s2t.lookback_logit, (double) s2t.vague_logit, (int) s2t.lookback, s2t.earlier_tokens,
+                s2t.promoted_tokens, s2t.promoted_capped ? " (capped)" : "", s2t.promoted_runs, s2t.post_tokens,
+                (int) s2t.widened, s2t.budget, s2t.budget_widened, (int) s2t.raw_fits, (int) s2t.s2_computed,
+                s2t.resume, s2t.history_dropped, s2t.attention_tiles, s2t.pass1_us / 1000.0, s2t.pass2_us / 1000.0);
+        }
         std::fflush(stderr);
     }
 
@@ -1972,7 +2311,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
     }
     return select_pflash_chunks(
-        ids, token_mass, keep_ratio, n_lookahead, score_query_end,
+        ids, token_mass, select_keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, traced_query ? request_config : experiment, pins,
         /*direct_mass=*/true, /*write_trace=*/true,
         segments.empty() ? nullptr : &segments, density,

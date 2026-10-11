@@ -696,6 +696,55 @@ PflashChatTurnSpan pflash_chat_query_turn(
     return chosen;
 }
 
+bool pflash_content_char_spans(
+        const std::string & placeholder_render,
+        const std::vector<std::string> & placeholders,
+        const std::vector<std::string> & contents,
+        const std::string & prompt_text,
+        std::vector<std::pair<size_t, size_t>> & spans,
+        std::string & error) {
+    spans.assign(placeholders.size(), {0, 0});
+    if (contents.size() != placeholders.size()) {
+        error = "placeholder and content counts differ";
+        return false;
+    }
+    std::string rebuilt;
+    rebuilt.reserve(prompt_text.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < placeholders.size(); ++i) {
+        const std::string & ph = placeholders[i];
+        if (ph.empty()) continue;
+        const size_t at = placeholder_render.find(ph, cursor);
+        if (at == std::string::npos ||
+            placeholder_render.find(ph, at + ph.size()) != std::string::npos) {
+            error = "message " + std::to_string(i) + " is not rendered exactly once, in order";
+            return false;
+        }
+        rebuilt.append(placeholder_render, cursor, at - cursor);
+        spans[i] = {rebuilt.size(), rebuilt.size() + contents[i].size()};
+        rebuilt += contents[i];
+        cursor = at + ph.size();
+    }
+    rebuilt.append(placeholder_render, cursor, std::string::npos);
+    if (rebuilt != prompt_text) {
+        error = "the template does not render message contents verbatim";
+        spans.assign(placeholders.size(), {0, 0});
+        return false;
+    }
+    return true;
+}
+
+PFlashTokenSpan pflash_char_span_tokens(
+        const std::vector<size_t> & token_begin, size_t text_size, size_t begin, size_t end) {
+    if (end <= begin || begin >= text_size || token_begin.empty()) return {0, 0};
+    // First token whose extent reaches past ``begin`` (the one containing it), and the first token starting at or
+    // after ``end``.
+    const auto upper = std::upper_bound(token_begin.begin(), token_begin.end(), begin);
+    const int first = upper == token_begin.begin() ? 0 : (int) (upper - token_begin.begin() - 1);
+    const int last = (int) (std::lower_bound(token_begin.begin(), token_begin.end(), end) - token_begin.begin());
+    return last > first ? PFlashTokenSpan{first, last} : PFlashTokenSpan{0, 0};
+}
+
 bool pflash_human_message_spans(
         const Tokenizer & tokenizer,
         const std::vector<int32_t> & prompt,
@@ -4831,6 +4880,49 @@ std::string HttpServer::apply_pflash_compression(
                                         request_probe_messages.recent,
                                         request_probe_messages.recent_index,
                                         request_probe_messages.recent_error);
+                    // cand_v5 / stage 2 (STAGE2-CONTRACT.md section 1): every message's role and the tokens
+                    // overlapping its exact content, from one render with a placeholder per content (read only
+                    // by a cand_v5 probe; any failure falls the request back to today's windows).
+                    {
+                        auto & all = request_probe_messages;
+                        std::vector<ChatMessage> placeholder_messages = messages;
+                        std::vector<std::string> placeholders(messages.size());
+                        std::vector<std::string> contents(messages.size());
+                        for (size_t index = 0; index < messages.size() && all.all_error.empty(); ++index) {
+                            const std::string & role = messages[index].role;
+                            if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
+                                all.all_error = "unsupported message role " + role;
+                                break;
+                            }
+                            all.all_roles.push_back(role);
+                            contents[index] = messages[index].content;
+                            if (role == "system") continue;   // never a candidate nor in E
+                            placeholders[index] = "\x1e" "PFLASH-MESSAGE-" + std::to_string(index) + "\x1f";
+                            placeholder_messages[index].content = placeholders[index];
+                        }
+                        std::string placeholder_render;
+                        if (all.all_error.empty() &&
+                            !render_messages_to_text(placeholder_messages, req, /*add_generation_prompt=*/true,
+                                                     placeholder_render, all.all_error)) {
+                            all.all_error = "placeholder render failed: " + all.all_error;
+                        }
+                        if (all.all_error.empty()) {
+                            const http_detail::DecodedPrompt decoded =
+                                http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
+                            std::vector<std::pair<size_t, size_t>> chars;
+                            if (http_detail::pflash_content_char_spans(placeholder_render, placeholders, contents,
+                                                                       decoded.text, chars, all.all_error)) {
+                                for (const auto & span : chars) {
+                                    all.all_spans.push_back(http_detail::pflash_char_span_tokens(
+                                        decoded.token_begin, decoded.text.size(), span.first, span.second));
+                                }
+                            }
+                        }
+                        if (!all.all_error.empty()) {
+                            all.all_roles.clear();
+                            all.all_spans.clear();
+                        }
+                    }
                     std::string spans;
                     for (const auto & span : request_probe_messages.human) {
                         spans += " [" + std::to_string(span.begin) + "," +
@@ -5370,10 +5462,12 @@ std::string HttpServer::apply_pflash_compression(
     // enforced on the re-encoded target-token prompt. Vocabulary mismatches
     // between the two tokenizers can inflate the re-encode past the ceiling,
     // so retry with a tightened keep ratio; fail closed if it persists.
-    const int target_ceiling = experiment.selection_active
+    int target_ceiling = experiment.selection_active
         ? http_detail::pflash_target_token_ceiling(
             prompt_tokens, compress_request.keep_ratio)
         : -1;
+    // Request stage 2 widens the keep budget x1.5 (STAGE2-CONTRACT.md section 5 step 5): the ceiling follows, once.
+    bool stage2_ceiling_widened = false;
     if (experiment.selection_active && target_ceiling < 0) {
         return "PFlash strict selection target-token ceiling is invalid";
     }
@@ -5436,6 +5530,12 @@ std::string HttpServer::apply_pflash_compression(
             return config_.pflash_remote_drafter
                 ? "remote PFlash drafter compression failed"
                 : "PFlash compression failed";
+        }
+        // Stage 2 widened the budget past the prompt: it is served raw (below).
+        if (result.raw_fits) break;
+        if (result.budget_widened && !stage2_ceiling_widened && target_ceiling >= 0) {
+            target_ceiling = (std::min)(prompt_tokens, target_ceiling + target_ceiling / 2);
+            stage2_ceiling_widened = true;
         }
 
         std::string compressed_text =
@@ -5511,6 +5611,20 @@ std::string HttpServer::apply_pflash_compression(
             (double) compress_request.keep_ratio);
         std::fflush(stderr);
     }
+    if (result.raw_fits) {
+        std::fprintf(stderr,
+            "[pflash-request-stage2] widened budget %d covers the %zu-token prompt: serving it raw\n",
+            result.stage2_budget_widened, compress_request.input_ids.size());
+        std::fflush(stderr);
+        prepared.pflash_stats = {{"stage2", {{"widened", true}, {"raw_fits", true},
+                                             {"budget", result.stage2_budget},
+                                             {"budget_widened", result.stage2_budget_widened}}}};
+        if (!admission_stats.is_null()) prepared.pflash_stats["admission"] = admission_stats;
+        prepared.compressed = false;
+        prepared.tokens = req.prompt_tokens;
+        prepared.snapshot_cut = -1;
+        return {};
+    }
     if (experiment.selection_active) {
         std::fprintf(stderr,
             "[pflash-select] final target tokens=%zu ceiling=%d\n",
@@ -5535,6 +5649,12 @@ std::string HttpServer::apply_pflash_compression(
         {"scorer_new_tokens", result.scorer_new_tokens},
         {"scorer_forward_ms", std::round(result.scorer_forward_s * 10000.0) / 10.0},
     };
+    if (result.budget_widened) {
+        prepared.pflash_stats["stage2"] = {{"widened", true}, {"raw_fits", false},
+                                           {"budget", result.stage2_budget},
+                                           {"budget_widened", result.stage2_budget_widened},
+                                           {"target_ceiling", target_ceiling}};
+    }
     if (region_plan.active) {
         std::vector<int32_t> served;
         if (!result.kept_spans.empty() && serve_pflash_region_view(

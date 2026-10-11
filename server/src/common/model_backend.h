@@ -418,6 +418,12 @@ struct ModelBackend {
         int                  scorer_resume = -1;
         int                  scorer_new_tokens = -1;
         double               scorer_forward_s = 0.0;
+        // Request stage 2 (STAGE2-CONTRACT.md section 5 step 5): the keep budget was widened x1.5 (drafter
+        // tokens B -> B'), and when B' covers the prompt the caller serves it raw.
+        bool                 budget_widened = false;
+        bool                 raw_fits = false;
+        int                  stage2_budget = -1;
+        int                  stage2_budget_widened = -1;
 
         static CompressResult from_compressed_ids(
                 std::vector<int32_t> ids) {

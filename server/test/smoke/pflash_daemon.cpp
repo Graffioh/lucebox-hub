@@ -103,10 +103,16 @@ int main(int argc, char ** argv) {
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
-        if (cmd == "request") {
+        if (cmd == "request" || cmd == "request2") {
             // request <lookahead> <score_query_end> <suffix 0|1> <n_spans> [<b> <e>]... <n_human> [<b> <e>]... <path>
             // As segment, plus the human user messages' content spans (latest first) the request probe reads
             // (PFLASH_SELECT_QUERY_PROBE=1); compressed ids go to --stream-fd like compress.
+            // request2 <lookahead> <score_query_end> <suffix 0|1> <n_spans> [<b> <e>]... <n_messages>
+            //          [<role> <b> <e>]... <path>
+            // As request, with EVERY normalised message in order (role system|user|assistant|tool, content span):
+            // the cand_v5 / stage-2 inputs the server maps (STAGE2-CONTRACT.md section 1); the human spans (the
+            // latest two user messages, latest first) are derived from them.
+            const bool all_messages = cmd == "request2";
             int lookahead = 0, query_end = -1, suffix = 0, n_spans = 0, n_human = 0;
             iss >> lookahead >> query_end >> suffix >> n_spans;
             std::vector<luce::common::PFlashTokenSpan> spans;
@@ -118,13 +124,28 @@ int main(int argc, char ** argv) {
                 spans.push_back({b, e});
             }
             if (ok) iss >> n_human;
-            ok = ok && (bool) iss && n_human >= 0 && n_human <= 2;
+            ok = ok && (bool) iss && n_human >= 0 && (all_messages || n_human <= 2);
             luce::common::PFlashRequestMessages human;
             for (int i = 0; ok && i < n_human; ++i) {
+                std::string role;
+                if (all_messages) iss >> role;
                 int b = 0, e = 0;
                 iss >> b >> e;
                 ok = (bool) iss && 0 <= b && b <= e;
-                human.human.push_back({b, e});
+                if (!all_messages) {
+                    human.human.push_back({b, e});
+                } else {
+                    ok = ok && (role == "system" || role == "user" || role == "assistant" || role == "tool");
+                    human.all_roles.push_back(role);
+                    human.all_spans.push_back({b, e});
+                }
+            }
+            if (all_messages) {
+                for (size_t i = human.all_roles.size(); i-- > 0 && human.human.size() < 2;) {
+                    if (human.all_roles[i] != "user") continue;
+                    human.human.push_back(human.all_spans[i]);
+                    human.human_index.push_back((int) i);
+                }
             }
             std::string path;
             std::getline(iss, path);

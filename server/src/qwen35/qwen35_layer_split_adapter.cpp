@@ -1403,6 +1403,11 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
         result.scorer_resume = scoring.resume;
         result.scorer_new_tokens = scoring.new_tokens;
         result.scorer_forward_s = scoring.forward_s;
+        const auto & stage2 = pflash_last_stage2_outcome();
+        result.budget_widened = stage2.widened;
+        result.raw_fits = stage2.raw_fits;
+        result.stage2_budget = stage2.budget;
+        result.stage2_budget_widened = stage2.budget_widened;
         for (const auto & candidate : pflash_last_candidate_lifts()) {
             result.candidate_lifts.push_back({candidate.span, candidate.lift});
         }

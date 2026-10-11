@@ -176,6 +176,30 @@ std::vector<int32_t> drafter_score_and_compress(
                 experiment.request_recent_index = request_messages->recent_index;
                 experiment.request_recent_error = request_messages->recent_error;
             }
+            // cand_v5 / stage 2 inputs: every message's role and content span (read only by a cand_v5 probe).
+            if (request_messages) {
+                experiment.request_messages_all_error = request_messages->all_error;
+                if (experiment.request_messages_all_error.empty() &&
+                    request_messages->all_roles.size() != request_messages->all_spans.size()) {
+                    experiment.request_messages_all_error = "message roles and spans differ in count";
+                }
+                for (size_t i = 0; experiment.request_messages_all_error.empty() &&
+                                   i < request_messages->all_spans.size(); ++i) {
+                    luce::pflash::PFlashRequestMessage m;
+                    m.span = request_messages->all_spans[i];
+                    if (!luce::pflash::pflash_request_role_from_name(request_messages->all_roles[i], m.role)) {
+                        experiment.request_messages_all_error = "unknown message role " + request_messages->all_roles[i];
+                    } else if (m.span.end > m.span.begin &&
+                               (m.span.begin < 0 || m.span.end > (int) ids.size())) {
+                        experiment.request_messages_all_error = "message span outside the input";
+                    } else {
+                        experiment.request_messages_all.push_back(m);
+                    }
+                }
+                if (!experiment.request_messages_all_error.empty()) experiment.request_messages_all.clear();
+            } else {
+                experiment.request_messages_all_error = "no message spans from the caller";
+            }
         }
         if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {
             if (!request_messages) {

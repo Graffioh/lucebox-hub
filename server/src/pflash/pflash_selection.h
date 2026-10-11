@@ -2,6 +2,7 @@
 
 #include "common/pflash_types.h"
 #include "pflash_ident_query.h"
+#include "pflash_request_probe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -169,6 +170,9 @@ struct PFlashSelectionConfig {
     std::vector<luce::common::PFlashTokenSpan> request_recent;
     std::vector<int> request_recent_index;
     std::string request_recent_error;
+    // cand_v5 / stage 2: every normalised message (role, content span), and why the server could not map them.
+    std::vector<luce::pflash::PFlashRequestMessage> request_messages_all;
+    std::string request_messages_all_error;
     // Trace only: what the request probe did on this call (not owned; set
     // by the scorer for the selection it calls).
     const PFlashRequestProbeTrace * request_probe_trace = nullptr;
