@@ -8,6 +8,7 @@
 
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
+#include <fstream>
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
@@ -218,6 +219,7 @@ struct SchedulerTestHarness {
 };
 
 struct HttpServerTestAccess {
+    using PreparedPrompt = HttpServer::PreparedPrompt;
     static std::string apply_pflash_compression(
             HttpServer & server, const ParsedRequest & req) {
         HttpServer::PreparedPrompt prepared;
@@ -226,6 +228,9 @@ struct HttpServerTestAccess {
     static HttpServer::PreparedPrompt prepare_prompt(
             HttpServer & server, const ParsedRequest & req) {
         return server.prepare_prompt(req);
+    }
+    static json pflash_failure_counters(const HttpServer & server) {
+        return server.pflash_failure_counters_json();
     }
 };
 }
@@ -9975,6 +9980,171 @@ TEST_CASE(ServerUnitFixture,
     }
     TEST_ASSERT(backend.compress_calls == 0);
     unlink(path.c_str());
+}
+
+// Failure policy D5: the drafter fails the way the R9700 did on 9 Oct
+// (non-finite request-probe scores, empty result).
+namespace luce::common { void set_last_error(std::string msg); }
+
+struct MockPflashFailingBackend : MockBackend {
+    int compress_calls = 0;
+    CompressResult compress(const CompressRequest &) override {
+        ++compress_calls;
+        luce::common::set_last_error(
+            "non-finite Qwen3.5 scoring-head scores (request probe): 7/7");
+        return {};
+    }
+};
+
+struct PflashFallbackRun {
+    HttpServerTestAccess::PreparedPrompt prepared;
+    json counters;
+    std::vector<int32_t> ids;
+    int compress_calls = 0;
+    std::vector<json> view_records;
+};
+
+template <typename Backend>
+static PflashFallbackRun run_pflash_fallback_case(int max_ctx, int max_output) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    char trace_path[] = "/tmp/pflash_fallback_view_XXXXXX";
+    const int trace_fd = mkstemp(trace_path);
+    TEST_ASSERT(trace_fd >= 0);
+    close(trace_fd);
+    luce_test::ScopedEnvVar view_trace{"PFLASH_VIEW_TRACE_PATH", trace_path};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PflashFallbackRun run;
+    run.ids = tokenizer.encode(prompt.rendered);
+
+    auto backend_owner = std::make_unique<Backend>();
+    Backend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = max_ctx;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = run.ids;
+        request.max_output = max_output;
+        run.prepared = HttpServerTestAccess::prepare_prompt(server, request);
+        run.counters = HttpServerTestAccess::pflash_failure_counters(server);
+    }
+    run.compress_calls = backend.compress_calls;
+    std::ifstream in(trace_path);
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty()) run.view_records.push_back(json::parse(line));
+    }
+    unlink(trace_path);
+    unlink(path.c_str());
+    return run;
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_failure_falls_back_to_raw_prompt_with_flag) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto run = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 16);
+    TEST_ASSERT(run.compress_calls >= 1);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.prepared.error_status == 0);
+    TEST_ASSERT(!run.prepared.compressed);
+    TEST_ASSERT(run.prepared.tokens == run.ids);   // the raw prompt, untouched
+    TEST_ASSERT(run.prepared.snapshot_cut == -1);
+    const json & flag = run.prepared.pflash_stats["pflash_fallback"];
+    TEST_ASSERT(flag.value("reason", "") == "nonfinite_scores");
+    TEST_ASSERT(flag.value("error", "") == "PFlash compression failed");
+    TEST_ASSERT(flag.value("detail", "").find("non-finite") != std::string::npos);
+    TEST_ASSERT(flag.value("prompt_tokens", 0) == (int) run.ids.size());
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 1);
+    TEST_ASSERT(run.counters.value("fallback_refused", 0) == 0);
+    TEST_ASSERT(run.counters["fallback_reasons"].value("nonfinite_scores", 0) == 1);
+    // One view-trace record, kind raw, carrying the flag at the top level.
+    TEST_ASSERT(run.view_records.size() == 1);
+    TEST_ASSERT(run.view_records[0].value("kind", "") == "raw");
+    TEST_ASSERT(run.view_records[0]["pflash_fallback"].value("reason", "") == "nonfinite_scores");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_failure_fallback_refused_when_raw_prompt_does_not_fit) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // max_ctx admits the compressed prompt but not the raw one plus the reply.
+    const auto probe = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 16);
+    const int raw = (int) probe.ids.size();
+    const auto run = run_pflash_fallback_case<MockPflashFailingBackend>(raw + 15, 16);
+    TEST_ASSERT(run.prepared.error == "PFlash compression failed");
+    TEST_ASSERT(run.prepared.error_status == 500);
+    TEST_ASSERT(!run.prepared.pflash_stats.is_object() ||
+                !run.prepared.pflash_stats.contains("pflash_fallback"));
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+    TEST_ASSERT(run.counters.value("fallback_refused", 0) == 1);
+    TEST_ASSERT(run.counters["refused_reasons"].value("raw_exceeds_max_ctx", 0) == 1);
+    TEST_ASSERT(run.view_records.empty());
+    // Exactly at the limit the raw prompt is admissible.
+    const auto edge = run_pflash_fallback_case<MockPflashFailingBackend>(raw + 16, 16);
+    TEST_ASSERT_MSG(edge.prepared.error.empty(), edge.prepared.error);
+    TEST_ASSERT(edge.prepared.tokens == edge.ids);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_fail_closed_switch_keeps_the_error) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
+    const auto run = run_pflash_fallback_case<MockPflashFailingBackend>(8192, 16);
+    TEST_ASSERT(run.prepared.error == "PFlash compression failed");
+    TEST_ASSERT(run.prepared.error_status == 500);
+    TEST_ASSERT(run.view_records.empty());
+    TEST_ASSERT(run.counters.value("fail_closed", false));
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+    TEST_ASSERT(run.counters["refused_reasons"].value("fail_closed", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_success_path_has_no_fallback) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto run = run_pflash_fallback_case<MockPflashBudgetBackend>(8192, 16);
+    TEST_ASSERT(run.compress_calls >= 1);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.prepared.compressed);
+    TEST_ASSERT(run.prepared.tokens.size() < run.ids.size());
+    TEST_ASSERT(!run.prepared.pflash_stats.contains("pflash_fallback"));
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+    TEST_ASSERT(run.counters.value("fallback_refused", 0) == 0);
+    TEST_ASSERT(run.view_records.size() == 1);
+    TEST_ASSERT(run.view_records[0].value("kind", "") == "compressed");
+    TEST_ASSERT(!run.view_records[0].contains("pflash_fallback"));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_fallback_decision_and_reasons) {
+    using luce::common::http_detail::pflash_fallback_decision;
+    using luce::common::http_detail::pflash_failure_reason;
+    // Config / request-contract errors never fall back.
+    TEST_ASSERT(pflash_fallback_decision("invalid PFlash strict selection config: x",
+                                         false, 100, 10, 1000).refused == "config_error");
+    TEST_ASSERT(pflash_fallback_decision("PFlash pflash_required needs strict budget selection",
+                                         false, 100, 10, 1000).refused == "config_error");
+    TEST_ASSERT(pflash_fallback_decision("PFlash compression failed", true, 100, 10, 1000).refused
+                == "fail_closed");
+    TEST_ASSERT(pflash_fallback_decision("PFlash compression failed", false, 991, 10, 1000).refused
+                == "raw_exceeds_max_ctx");
+    TEST_ASSERT(pflash_fallback_decision("PFlash compression failed", false, 990, 10, 1000).fallback);
+    TEST_ASSERT(pflash_fallback_decision(
+        "PFlash strict selection final prompt exceeds target-token ceiling (5 > 4)",
+        false, 100, 10, 1000).fallback);
+    TEST_ASSERT(pflash_failure_reason("PFlash compression failed", "") == "compress_failed");
+    TEST_ASSERT(pflash_failure_reason("PFlash compression failed",
+                                      "non-finite Qwen3.5 scoring-head scores: 3/9") == "nonfinite_scores");
+    TEST_ASSERT(pflash_failure_reason("remote PFlash drafter compression failed", "") == "remote_drafter");
+    TEST_ASSERT(pflash_failure_reason(
+        "PFlash strict selection final prompt exceeds target-token ceiling (5 > 4)", "") == "ceiling_exceeded");
+    TEST_ASSERT(pflash_failure_reason("PFlash scorer query mapping failed", "") == "mapping_failed");
+    TEST_ASSERT(pflash_failure_reason("PFlash strict selection: the system prompt alone does not fit", "")
+                == "selection_failed");
 }
 
 // Keeps the required spans, the query window through the end, and whatever
