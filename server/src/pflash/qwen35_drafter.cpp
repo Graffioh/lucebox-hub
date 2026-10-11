@@ -595,6 +595,7 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.request_rows.clear();
     session.stage2_cand.clear();
     session.query_windows.clear();
+    session.query_sets.clear();
 }
 
 namespace {
@@ -660,12 +661,14 @@ void zero_recurrent_state(TargetCache & cache) {
     }
 }
 
-// The session to score ``ids`` with, and the token it resumes from: the
-// longest prefix a stored session already covers -- its live end, or its
-// checkpoint when the prompt diverged before the end (the previous turn's
-// generation prompt) -- provided the query rows and probe logits the
-// scoring needs are covered too. Otherwise the least recently used session
-// (or ``scratch`` with sessions off) starts over from token 0.
+// The session to score ``ids`` with, and the token it resumes from: a stored
+// session's checkpoint (pflash_scoring_resume: on the 8192 grid, inside the
+// shared prefix, at or before S - 64 and at or before ``resume_cap``), so the
+// resumed call computes every value exactly as a fresh call does -- provided
+// the query rows and probe logits the scoring needs are covered too.
+// Otherwise a session that holds no prompt (one that just failed), else the
+// least recently used session (or ``scratch`` with sessions off) starts over
+// from token 0.
 Qwen35ScoringSession * acquire_scoring_session(
         Qwen35DrafterState & st,
         const std::vector<int32_t> & ids,
@@ -676,6 +679,7 @@ Qwen35ScoringSession * acquire_scoring_session(
         bool need_request,
         const std::vector<PFlashTokenSpan> & other_windows,
         bool force_fresh,
+        int resume_cap,
         int & resume,
         int & shared_prefix,
         std::unique_ptr<Qwen35ScoringSession> & scratch) {
@@ -692,12 +696,22 @@ Qwen35ScoringSession * acquire_scoring_session(
     resume = 0;
     shared_prefix = 0;
 
+    // Stored windows hold exact rows only (see the store below): one is
+    // reusable while it sits in the shared prefix.
+    const auto stored_window = [&](const Qwen35ScoringSession & session, int begin, int end, int shared) {
+        const size_t floats = (size_t) w.n_embd * (size_t) (end - begin);
+        for (const auto & window : session.query_windows) {
+            if (window.begin == begin && window.end == end && end <= shared && window.rows.size() == floats) {
+                return true;
+            }
+        }
+        return false;
+    };
     Qwen35ScoringSession * best = nullptr;
-    bool best_restore = false;
     int best_shared = 0;
     for (auto & owned : st.sessions) {
         Qwen35ScoringSession * session = owned.get();
-        if (force_fresh) break;
+        if (limit == 0) break;
         if (!session || session->capacity < S_padded || session->ids.empty() ||
             session->keys_trained != st.head_loaded) {
             continue;
@@ -706,51 +720,18 @@ Qwen35ScoringSession * acquire_scoring_session(
         const int shared = (int) (std::mismatch(session->ids.begin(),
             session->ids.begin() + (long) n, ids.begin()).first -
             session->ids.begin());
-        int r = 0;
-        bool restore = false;
-        if (shared == (int) session->ids.size()) {
-            r = shared;
-        } else if (session->checkpoint > 0 && session->checkpoint <= shared) {
-            r = session->checkpoint;
-            restore = true;
+        int r = luce::pflash::pflash_scoring_resume(session->checkpoint, shared, S, resume_cap);
+        // The query window and every other window this call scores that
+        // starts before the resume point need their exact stored rows; with
+        // one snapshot per session, the call otherwise starts at 0.
+        if (r > query_start && !(query_end <= shared && row_floats > 0 &&
+                                 stored_window(*session, query_start, query_end, shared))) {
+            r = 0;
         }
-        if (r > query_start) {
-            bool rows = false;
-            for (const auto & window : session->query_windows) {
-                rows = rows || (window.begin == query_start &&
-                    window.end == query_end && query_end <= shared &&
-                    window.rows.size() == row_floats);
-            }
-            if (!rows) {
-                r = session->checkpoint > 0 && session->checkpoint <= query_start &&
-                        session->checkpoint <= shared
-                    ? session->checkpoint : 0;
-                restore = r > 0;
-            }
-        }
-        // Every other window this call scores must be reproducible as well:
-        // one that starts before the resume point needs its exact stored
-        // rows, or the resume point drops to a checkpoint before it (else 0),
-        // so a resumed call scores the same windows as a fresh one.
-        if (r > 0) {
-            int floor = r;
-            for (const auto & span : other_windows) {
-                if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
-                const size_t floats = (size_t) w.n_embd * (size_t) (span.end - span.begin);
-                bool stored = false;
-                for (const auto & window : session->query_windows) {
-                    stored = stored || (window.begin == span.begin &&
-                        window.end == span.end && span.end <= shared &&
-                        window.rows.size() == floats);
-                }
-                if (!stored) floor = std::min(floor, span.begin);
-            }
-            if (floor < r) {
-                r = session->checkpoint > 0 && session->checkpoint <= floor &&
-                        session->checkpoint <= shared
-                    ? session->checkpoint : 0;
-                restore = r > 0;
-            }
+        for (const auto & span : other_windows) {
+            if (r == 0) break;
+            if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
+            if (!stored_window(*session, span.begin, span.end, shared)) r = 0;
         }
         if ((need_probe && (int) session->probe_raw.size() < r) ||
             (need_subunit && (int) session->subunit_raw.size() < r) ||
@@ -760,12 +741,11 @@ Qwen35ScoringSession * acquire_scoring_session(
         if (r > resume) {
             resume = r;
             best = session;
-            best_restore = restore;
             best_shared = shared;
         }
     }
     if (best) {
-        if (best_restore && !restore_ssm_state(best->cache, w.backend)) {
+        if (!restore_ssm_state(best->cache, w.backend)) {
             resume = 0;
         } else {
             shared_prefix = best_shared;
@@ -778,14 +758,23 @@ Qwen35ScoringSession * acquire_scoring_session(
         if (limit == 0) {
             scratch = std::make_unique<Qwen35ScoringSession>();
             target = scratch.get();
-        } else if ((int) st.sessions.size() < limit) {
-            st.sessions.push_back(std::make_unique<Qwen35ScoringSession>());
-            target = st.sessions.back().get();
         } else {
-            target = std::min_element(st.sessions.begin(), st.sessions.end(),
-                [] (const auto & a, const auto & b) {
-                    return a->last_used < b->last_used;
-                })->get();
+            // A session that holds no prompt (never used, or its last call
+            // failed or was redone) before evicting another conversation.
+            for (auto & owned : st.sessions) {
+                if (owned->ids.empty() && (!target || owned->last_used < target->last_used)) {
+                    target = owned.get();
+                }
+            }
+            if (!target && (int) st.sessions.size() < limit) {
+                st.sessions.push_back(std::make_unique<Qwen35ScoringSession>());
+                target = st.sessions.back().get();
+            } else if (!target) {
+                target = std::min_element(st.sessions.begin(), st.sessions.end(),
+                    [] (const auto & a, const auto & b) {
+                        return a->last_used < b->last_used;
+                    })->get();
+            }
         }
     }
     if (target->capacity < S_padded) {
@@ -806,6 +795,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     target->request_rows.clear();
     target->stage2_cand.clear();
     target->query_windows.clear();
+    target->query_sets.clear();
     return target;
 }
 
@@ -815,7 +805,13 @@ Qwen35ScoringSession * acquire_scoring_session(
 // score every context token against the query window with block 15's NoPE
 // Q/K (or a trained replacement) and select chunks by attention mass. This
 // is the runtime counterpart of the Python retention screen (trial 0075).
-std::vector<int32_t> qwen35_strict_score_and_compress(
+//
+// ``resume_cap`` bounds the session resume point (0: start over); ``redone``
+// names why this call is a redo (empty on a first call). A query-step call
+// that needs a query row a resumed session cannot give exactly returns empty
+// with ``redo`` set to the missing input, its session forgotten; the caller
+// then scores the prompt again from token 0.
+static std::vector<int32_t> strict_score_impl(
     Qwen35DrafterState & st,
     const std::vector<int32_t> & ids,
     float keep_ratio,
@@ -825,8 +821,12 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out,
     std::vector<PFlashTokenSpan> * segments_out,
-    bool * density_out) {
+    bool * density_out,
+    int resume_cap,
+    const std::string & redone,
+    std::string & redo) {
 
+    redo.clear();
     TargetWeights & w = st.weights;
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -926,15 +926,25 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         if (drop_history) break;
         if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
     }
+    // The query step resumes like every other request (pflash_scoring_resume.h: exact by construction); its query
+    // rows come from this call's activations or the session's exact F32 sets, else the request is redone from 0.
+    const bool sessions_on = !st.stage2_loaded && scoring_session_limit() > 0;
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
         use_probe && st.probe_sub_fc2_w != nullptr, request_probe, other_windows,
-        /*force_fresh=*/st.stage2_loaded || qstep, resume, shared_prefix, scratch);
+        /*force_fresh=*/st.stage2_loaded, resume_cap, resume, shared_prefix, scratch);
     if (!session) return {};
+    if (resume > 0 && (resume % luce::pflash::kScoringResumeGrid != 0 ||
+                       resume > S - luce::pflash::kScoringCutBack)) {
+        session->ids.clear();
+        set_last_error("qwen35 scorer: resume point off the exact grid");
+        return {};
+    }
     // Retained request rows past the shared prefix belong to a prompt that
     // diverged there (an edit, a truncation, another conversation).
     const int request_rows_invalidated = request_probe
         ? session->request_rows.invalidate_from(shared_prefix) : 0;
+    session->query_sets.invalidate_from(shared_prefix);
     // A session is released (freed or kept) on every exit below.
     struct SessionExit {
         std::unique_ptr<Qwen35ScoringSession> & scratch;
@@ -944,11 +954,15 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     } session_exit{scratch};
     TargetCache & cache = session->cache;
     const int n_new = S - resume;
-    // The next turn replaces this prompt's generation prompt; checkpoint the
-    // recurrent state a little before the end so it can resume there. The
-    // same prompt again (a retry) keeps the checkpoint it has.
-    const int checkpoint = n_new == 0 && session->checkpoint > 0
-        ? session->checkpoint : std::max(resume, S - 64);
+    // Ubatches are cut once at S - 64, exactly as in a fresh call, and the
+    // recurrent state is snapshotted at the last 8192-grid point at or before
+    // that cut: the next turn (which replaces this prompt's generation prompt,
+    // or repeats it) resumes there and recomputes the rest on the fresh
+    // call's own partition.
+    const int cut = std::max(resume, S - luce::pflash::kScoringCutBack);
+    const int checkpoint = luce::pflash::pflash_scoring_checkpoint(S);
+    // Block-14 rows below this are exact for later prompts (pflash_scoring_resume.h).
+    const int exact_rows_end = luce::pflash::pflash_scoring_exact_rows_end(S);
 
     ggml_init_params act_ip{};
     act_ip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
@@ -1011,10 +1025,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
     };
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
-    const int ubatch = 1024;
-    // Ubatches stop at the checkpoint, so the state there can be copied.
+    const int ubatch = luce::pflash::kScoringUbatch;
+    // Ubatches on the 1024 grid from the (grid) resume point, cut at S - 64;
+    // the checkpoint is a grid point, so the state there can be copied.
     const auto ubatch_at = [&](int start) {
-        return std::min(ubatch, (start < checkpoint ? checkpoint : S) - start);
+        return std::min(ubatch, (start < cut ? cut : S) - start);
     };
     // Graph of layer il over tokens [start, start + n), writing act_out.
     // nullptr (error set) on failure.
@@ -1202,8 +1217,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
 
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
-    // into a HIP grid y/z dimension (65,535 limit).
-    const int key_chunk = 8192;
+    // into a HIP grid y/z dimension (65,535 limit). The chunks start at the
+    // (grid) resume point, so they fall where a fresh call's do.
+    const int key_chunk = luce::pflash::kScoringResumeGrid;
     if (n_new > 0) {
         ggml_init_params nip{};
         nip.mem_size = (size_t)4 * ggml_tensor_overhead() + 4096;
@@ -1754,6 +1770,13 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             request_query_rows.clear();
             request_trace.rows_new = request_trace.rows_stored = 0;
         }
+        // The query pin alone (no candidates) serves this request set: its rows must be exact, never BF16 stored
+        // rows nor a resume-dependent "rows_missing" fallback.
+        if (qpin && !qcand && resume > 0 &&
+            (request_trace.rows_stored > 0 || request_trace.fallback == "rows_missing")) {
+            redo = "request_set_rows_before_resume";
+            return fail("query step: request-set rows not exactly available; redo from token 0");
+        }
         // Retain each message's turn (previous first, so the latest is the
         // most recently used), whatever this call decided; with the v3 rule
         // the recent turns' runs too (oldest first).
@@ -1819,7 +1842,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
         if (qstep) {
             // Units from the selector's own segmentation of this request (cut at the caller's pins), ranked by the
-            // stage-1 logits; every query token set's rows are read now (fresh session: resume is 0).
+            // stage-1 logits; every query token set's rows are read now, exactly (see the gather below).
             const auto r0 = std::chrono::steady_clock::now();
             std::vector<PFlashTokenSpan> unit_segments;
             bool unit_density = false;
@@ -1870,12 +1893,22 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                     }
                 }
             }
+            // Exact rows only: a set after the resume point from this call's activations, a set before it from
+            // the session's F32 sets; anything else (a set that spans the resume point, or one never stored) redoes
+            // the request from token 0. Never the BF16 request-row store.
             for (const auto & tokens : wanted) {
                 if (tokens.empty() || qrows.count(tokens)) continue;
                 std::vector<float> rows;
                 int fresh = 0;
                 int stored = 0;
-                if (!gather(tokens, rows, fresh, stored)) return fail("query step: query rows unavailable");
+                if (tokens.front() >= resume) {
+                    if (!gather(tokens, rows, fresh, stored) || stored != 0) {
+                        return fail("query step: query rows unavailable");
+                    }
+                } else if (tokens.back() >= resume || !session->query_sets.lookup(tokens, hidden, rows)) {
+                    redo = tokens.back() >= resume ? "query_set_spans_resume" : "query_set_not_stored";
+                    return fail("query step: query rows not exactly available; redo from token 0");
+                }
                 qrows_new += fresh;
                 qrows.emplace(tokens, std::move(rows));
             }
@@ -1900,6 +1933,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         } else if (query.empty()) {
             ident_trace.fallback = "no_identifiers";
         } else {
+            if (qstep && resume > 0 && query.front() < resume) {
+                // Served by the query pin path: never a resume-dependent fallback.
+                redo = "ident_rows_before_resume";
+                return fail("query step: identifier rows not exactly available; redo from token 0");
+            }
             if (query.front() < resume || query.back() >= S) {
                 ident_trace.fallback = "rows_missing";
             } else {
@@ -1921,7 +1959,13 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     // while the query stays put, reusing its rows.
     session->ids = ids;
     session->checkpoint = checkpoint;
+    // Only exact rows are kept for later prompts: those in full grid ubatches
+    // (pflash_scoring_resume.h).
+    for (const auto & [tokens, rows] : qrows) {
+        session->query_sets.put(tokens, rows.data(), hidden, exact_rows_end);
+    }
     for (const auto & window : windows) {
+        if (window.end > exact_rows_end) continue;
         auto & stored = session->query_windows;
         stored.erase(std::remove_if(stored.begin(), stored.end(),
             [&window] (const Qwen35ScoringSession::QueryRows & old) {
@@ -2525,6 +2569,10 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     // The served candidates replace the request set (named, not a fallback to windows).
     if (qcand) request_trace.fallback = "replaced_by_query_candidates";
     if (qcand || qpin) request_trace.query = &query_trace;
+    query_trace.sessions = sessions_on;
+    query_trace.session_resume = resume;
+    query_trace.redo = !redone.empty();
+    query_trace.redo_reason = redone;
     bool request_set = request_probe && request_trace.fallback.empty();
     const bool ident_set = ident_mode != luce::pflash::PFlashIdentQuery::Off &&
         ident_trace.fallback.empty();
@@ -2803,6 +2851,36 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         st.fold_vocab.get());
 }
 
+std::vector<int32_t> qwen35_strict_score_and_compress(
+    Qwen35DrafterState & st,
+    const std::vector<int32_t> & ids,
+    float keep_ratio,
+    int n_lookahead,
+    int score_query_end,
+    const luce::pflash::PFlashSelectionConfig & experiment,
+    const std::vector<PFlashTokenSpan> & required_instruction_spans,
+    std::vector<float> * token_mass_out,
+    std::vector<PFlashTokenSpan> * segments_out,
+    bool * density_out) {
+    std::string redo;
+    auto kept = strict_score_impl(st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+                                  required_instruction_spans, token_mass_out, segments_out, density_out,
+                                  std::numeric_limits<int>::max(), std::string(), redo);
+    if (redo.empty()) return kept;
+    // A query row the resumed session could not give exactly: the whole request again from token 0 (its session
+    // was forgotten, so it is the one reused), never an approximation.
+    std::fprintf(stderr, "[qwen35-scorer] redo from token 0: %s\n", redo.c_str());
+    std::fflush(stderr);
+    const std::string reason = redo;
+    kept = strict_score_impl(st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+                             required_instruction_spans, token_mass_out, segments_out, density_out,
+                             /*resume_cap=*/0, reason, redo);
+    if (!redo.empty()) {
+        set_last_error("query step: redo from token 0 asked for another redo");
+        return {};
+    }
+    return kept;
+}
 
 std::vector<int32_t> qwen35_drafter_score_and_compress(
     DrafterContext & ctx,

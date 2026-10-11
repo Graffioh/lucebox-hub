@@ -236,9 +236,24 @@ void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestPro
         std::fprintf(file, ",\"query_tokens\":%d,\"tiles\":%d,\"pin\":", q.query_tokens, q.tiles);
         write_spans(file, q.pin.spans);
         std::fprintf(file, ",\"pin_tokens\":%d,\"pin_units\":%d,\"pin_skipped\":%d,\"pin_cap_used\":%d,"
-                     "\"rank_us\":%lld,\"score_us\":%lld}",
+                     "\"rank_us\":%lld,\"score_us\":%lld",
                      q.pin.tokens, q.pin.units, q.pin.skipped, q.pin_cap_used, (long long) q.rank_us,
                      (long long) q.score_us);
+        if (q.sessions) {
+            std::fprintf(file, ",\"session_resume\":%d,\"redo\":%s,\"redo_reason\":", q.session_resume,
+                         q.redo ? "true" : "false");
+            if (!q.redo) {
+                std::fputs("null", file);
+            } else {
+                std::fputc('"', file);
+                for (const char c : q.redo_reason) {
+                    if (c == '"' || c == '\\') std::fputc('\\', file);
+                    if ((unsigned char) c >= 0x20) std::fputc(c, file);
+                }
+                std::fputc('"', file);
+            }
+        }
+        std::fputc('}', file);
     }
     std::fputc('}', file);
 }
