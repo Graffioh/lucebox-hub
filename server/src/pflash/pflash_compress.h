@@ -132,10 +132,6 @@ struct PFlashTraceFields {
     // "spread_threshold":T`` close the record; absent when off.
     double spread = 0.0;
     double spread_threshold = 0.0;
-    // Region plan: the spans the spread was taken over
-    // (``"spread_regions":[[b,e],...]`` after the threshold); absent when
-    // empty (no region plan, spread over every candidate).
-    const std::vector<PFlashTokenSpan> * spread_regions = nullptr;
 };
 
 void write_compression_trace(
@@ -210,18 +206,6 @@ PFlashRelevanceSpread pflash_relevance_spread(
         const std::vector<double> & scores,
         const std::vector<uint8_t> & selected,
         const std::vector<uint8_t> & forced);
-// The spread over what a region plan's selection chooses among: only the
-// candidates that overlap one of ``regions`` (candidate ``spans``, same order
-// as ``scores``) enter p, H and k; the candidates entirely outside, which the
-// plan forces whole, do not. Empty ``regions`` (no region plan) is exactly
-// pflash_relevance_spread(scores, selected, forced). ``valid`` is false on
-// mismatched sizes, a non-finite score or no candidate in the regions.
-PFlashRelevanceSpread pflash_region_relevance_spread(
-        const std::vector<double> & scores,
-        const std::vector<uint8_t> & selected,
-        const std::vector<uint8_t> & forced,
-        const std::vector<PFlashTokenSpan> & spans,
-        const std::vector<PFlashTokenSpan> & regions);
 // The spread of the last traced (served) strict selection on this thread;
 // invalid when none ran. Cleared with the kept spans.
 const PFlashRelevanceSpread & pflash_last_relevance_spread();

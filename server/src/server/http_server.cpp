@@ -5618,7 +5618,6 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.turn_query_span = turn_query_span;
     compress_request.extra_query_spans = extra_query_spans;
     compress_request.request_messages = request_probe_messages;
-    if (region_plan.active) compress_request.spread_regions = region_plan.regions;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, region_plan.active
             ? (std::max)(1, region_plan.region_droppable) : prompt_tokens),

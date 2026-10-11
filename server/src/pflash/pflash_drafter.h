@@ -84,10 +84,6 @@ void free_drafter_weights(DrafterContext & ctx);
 //                    messages' content spans the request probe reads
 //                    (nullptr: none, the request falls back to today's
 //                    windows)
-//   spread_regions  strict selection with PFLASH_FALLBACK_SPREAD only: a
-//                    region plan's regions; the relevance spread is taken
-//                    over the candidates overlapping them (empty: every
-//                    candidate, the single-turn definition)
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -104,7 +100,6 @@ std::vector<int32_t> drafter_score_and_compress(
     const std::vector<PFlashTokenSpan> & history_queries = {},
     PFlashTokenSpan turn_query = {-1, -1},
     const std::vector<PFlashTokenSpan> & extra_queries = {},
-    const PFlashRequestMessages * request_messages = nullptr,
-    const std::vector<PFlashTokenSpan> & spread_regions = {});
+    const PFlashRequestMessages * request_messages = nullptr);
 
 } // namespace luce::common

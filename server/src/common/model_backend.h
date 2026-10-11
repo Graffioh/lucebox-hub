@@ -398,10 +398,6 @@ struct ModelBackend {
         // PFLASH_SELECT_QUERY_PROBE=1: the human user messages' content
         // spans (latest first) the request probe reads.
         PFlashRequestMessages request_messages;
-        // Region plan (a turn compressing only part of the prompt): the
-        // regions, so the relevance spread covers only the candidates the
-        // selection chooses among. Empty otherwise.
-        std::vector<PFlashTokenSpan> spread_regions;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

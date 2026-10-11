@@ -195,11 +195,6 @@ struct PFlashSelectionConfig {
     // served by full prefill of the raw prompt (failure policy D5 path,
     // reason "spread"). 0 = off.
     double fallback_spread = 0.0;
-    // Region plan (a turn that compresses only part of the prompt, e.g. a
-    // mid-chat paste): the spread is taken over the candidates overlapping
-    // these spans only (pflash_region_relevance_spread). Empty = every
-    // candidate. Set per request by drafter_score_and_compress.
-    std::vector<luce::common::PFlashTokenSpan> spread_regions;
 };
 
 // Segment probe: cut the context before every token whose boundary score is
