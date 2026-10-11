@@ -1443,6 +1443,132 @@ TEST_CASE(ServerUnitFixture, test_pflash_cache_admission_flag_defaults_off) {
     luce_unsetenv("PFLASH_ADMISSION");
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_cold_history_decision) {
+    using http_detail::PflashAdmission;
+    using http_detail::pflash_cache_admission;
+    using http_detail::pflash_cold_history_admission;
+    const int t = 16384;
+    // Cold agent history: the cache holds nothing, the earlier turns carry
+    // a threshold of droppable tokens -> raw, full prefill.
+    TEST_ASSERT(pflash_cold_history_admission(
+        pflash_cache_admission(40000, 0, t), true, true, 38000, t) ==
+        PflashAdmission::ColdHistory);
+    TEST_ASSERT(pflash_cold_history_admission(
+        PflashAdmission::Compress, true, true, t, t) == PflashAdmission::ColdHistory);
+    TEST_ASSERT(pflash_cold_history_admission(
+        PflashAdmission::Compress, true, true, t - 1, t) == PflashAdmission::Compress);
+    // First-turn paste with tools defined: no earlier conversation -> today's
+    // decision (compress).
+    TEST_ASSERT(pflash_cold_history_admission(
+        pflash_cache_admission(30000, 0, t), true, true, 0, t) ==
+        PflashAdmission::Compress);
+    // Warm cache stays warm, under-threshold stays under (never Compress, so
+    // never touched).
+    TEST_ASSERT(pflash_cold_history_admission(
+        pflash_cache_admission(30000, 50000, t), true, true, 60000, t) ==
+        PflashAdmission::WarmCache);
+    TEST_ASSERT(pflash_cold_history_admission(
+        pflash_cache_admission(2000, 90000, t), true, true, 60000, t) ==
+        PflashAdmission::UnderThreshold);
+    // A chat without tools keeps today's decision.
+    TEST_ASSERT(pflash_cold_history_admission(
+        PflashAdmission::Compress, true, false, 60000, t) == PflashAdmission::Compress);
+    // A raw prompt over the context limit still compresses.
+    TEST_ASSERT(pflash_cold_history_admission(
+        pflash_cache_admission(150000, 0, t, false), false, true, 140000, t) ==
+        PflashAdmission::Compress);
+    TEST_ASSERT(std::string(http_detail::pflash_admission_name(
+        PflashAdmission::ColdHistory)) == "cold_history");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cold_history_flag_defaults_off) {
+    luce_unsetenv("PFLASH_COLD_HISTORY");
+    TEST_ASSERT(!http_detail::pflash_cold_history_enabled());
+    // Only "raw" turns it on; anything else is today's behaviour (the chat
+    // and admission flags fall back to their defaults).
+    for (const char * off : {"", "0", "1", "on", "RAW", "compress", "raw "}) {
+        luce_setenv("PFLASH_COLD_HISTORY", off);
+        TEST_ASSERT_MSG(!http_detail::pflash_cold_history_enabled(), off);
+    }
+    luce_setenv("PFLASH_COLD_HISTORY", "raw");
+    TEST_ASSERT(http_detail::pflash_cold_history_enabled());
+    luce_unsetenv("PFLASH_COLD_HISTORY");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_has_tool_activity) {
+    const json tools = json::array({{{"type", "function"},
+        {"function", {{"name", "read_file"}}}}});
+    const std::vector<ChatMessage> plain{
+        {"system", "You are helpful.", ""}, {"user", "hi", ""},
+        {"assistant", "Sure.", ""}, {"user", "and?", ""}};
+    TEST_ASSERT(!http_detail::pflash_has_tool_activity(json(), plain));
+    TEST_ASSERT(!http_detail::pflash_has_tool_activity(json::array(), plain));
+    TEST_ASSERT(http_detail::pflash_has_tool_activity(tools, plain));
+    auto with_result = plain;
+    with_result.push_back({"tool", "output", "call-1"});
+    TEST_ASSERT(http_detail::pflash_has_tool_activity(json(), with_result));
+    auto with_call = plain;
+    with_call[2].tool_calls.push_back({"call-1", "read_file", json::object()});
+    TEST_ASSERT(http_detail::pflash_has_tool_activity(json(), with_call));
+}
+
+// The earlier conversation of a rendered Qwen prompt, decoded.
+static std::string pflash_history_region_text(const std::vector<ChatMessage> & messages) {
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true, false);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"user", "assistant", "system", "\n"}, rendered);
+    Tokenizer tok;
+    if (!tok.load_from_gguf(path.c_str())) {
+        unlink(path.c_str());
+        return "<tokenizer>";
+    }
+    unlink(path.c_str());
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    if (!resolve_chat_markers(tok, markers)) return "<markers>";
+    const auto turns = http_detail::pflash_chat_query_turn(tok, markers, tok, prompt).turns;
+    const auto region = http_detail::pflash_chat_history_region(turns);
+    if (region.begin < 0) return "<none>";
+    return tok.decode({prompt.begin() + region.begin, prompt.begin() + region.end});
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_chat_history_region) {
+    // Agent loop: from the first turn after the system preamble up to and
+    // including the last assistant turn; the trailing tool result and the
+    // generation prompt are new content.
+    const std::string agent = pflash_history_region_text({
+        {"system", "You are a coding agent.", ""},
+        {"user", "Fix the parser.", ""},
+        {"assistant", "Reading it.", ""},
+        {"tool", "old tool output", "call-1"},
+        {"assistant", "Running the tests.", ""},
+        {"tool", "new tool output", "call-2"},
+    });
+    TEST_ASSERT_MSG(agent.rfind("<|im_start|>user\nFix the parser.", 0) == 0, agent);
+    TEST_ASSERT_MSG(agent.find("old tool output") != std::string::npos, agent);
+    TEST_ASSERT_MSG(agent.size() >= std::string("Running the tests.<|im_end|>").size() &&
+                    agent.substr(agent.size() - std::string("Running the tests.<|im_end|>").size()) ==
+                        "Running the tests.<|im_end|>", agent);
+    TEST_ASSERT_MSG(agent.find("new tool output") == std::string::npos, agent);
+    TEST_ASSERT_MSG(agent.find("You are a coding agent") == std::string::npos, agent);
+    // A new user message after the last assistant turn is new content too.
+    const std::string chat = pflash_history_region_text({
+        {"user", "first question", ""},
+        {"assistant", "first answer", ""},
+        {"user", "second question", ""},
+    });
+    TEST_ASSERT_MSG(chat.find("first question") != std::string::npos, chat);
+    TEST_ASSERT_MSG(chat.find("first answer") != std::string::npos, chat);
+    TEST_ASSERT_MSG(chat.find("second question") == std::string::npos, chat);
+    // First turn (no assistant turn yet): no earlier conversation.
+    TEST_ASSERT(pflash_history_region_text({
+        {"system", "You are a coding agent.", ""},
+        {"user", "a long pasted document", ""},
+    }) == "<none>");
+    TEST_ASSERT(http_detail::pflash_chat_history_region({}).begin == -1);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_span_tokens_within_clips) {
     const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
     TEST_ASSERT(http_detail::pflash_span_tokens_within(spans, 0, 100) == 30);
@@ -14485,4 +14611,213 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_head_plan_windows_and_caps) {
         plain_ids.push_back(tok.token_to_id(test_gpt2_encode(std::string(1, ch))));
     plan = http_detail::pflash_query_head_plan(tok, plain_ids, 0, (int) plain_ids.size(), 256, 256);
     TEST_ASSERT(!plan.structured && plan.extra.empty() && plan.tail.begin < 0);
+}
+
+// Cold agent history (PFLASH_COLD_HISTORY=raw) through prepare_prompt with
+// cache-aware admission and no prefix cache (every request arrives cold).
+struct PflashColdHistoryRun {
+    HttpServerTestAccess::PreparedPrompt prepared;
+    json counters;
+    std::vector<int32_t> ids;
+    int compress_calls = 0;
+    std::vector<json> view_records;
+};
+
+static std::string pflash_cold_history_filler(const char * line, int count) {
+    std::string out;
+    for (int i = 0; i < count; ++i) out += line;
+    return out;
+}
+
+static json pflash_cold_history_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {{"name", "read_file"}, {"description", "Read a file"},
+                       {"parameters", {{"type", "object"},
+                                       {"properties", {{"path", {{"type", "string"}}}}}}}}}},
+    });
+}
+
+// system + task + (assistant tool call + long tool result) + assistant tool
+// call + a short new tool result.
+static json pflash_cold_agent_messages() {
+    const json call1 = json::array({{{"id", "call-1"}, {"type", "function"},
+        {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"parser.py\"}"}}}}});
+    const json call2 = json::array({{{"id", "call-2"}, {"type", "function"},
+        {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"test_parser.py\"}"}}}}});
+    return json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "Fix the bug in parser.py."}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", call1}},
+        {{"role", "tool"}, {"tool_call_id", "call-1"},
+         {"content", pflash_cold_history_filler("def parse(x): return x.strip()\n", 60)}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", call2}},
+        {{"role", "tool"}, {"tool_call_id", "call-2"}, {"content", "def test(): pass"}},
+    });
+}
+
+static PflashColdHistoryRun run_cold_history_case(
+        const json & messages, const json & tools, const char * flag,
+        int threshold, int max_ctx = 8192, int max_output = 16) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
+    luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", "1"};
+    luce_test::ScopedEnvVar cold{"PFLASH_COLD_HISTORY", flag};
+    char trace_path[] = "/tmp/pflash_cold_history_view_XXXXXX";
+    const int trace_fd = mkstemp(trace_path);
+    TEST_ASSERT(trace_fd >= 0);
+    close(trace_fd);
+    luce_test::ScopedEnvVar view_trace{"PFLASH_VIEW_TRACE_PATH", trace_path};
+    ToolMemory tool_memory;
+    const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    const std::string rendered = render_chat_template(
+        chat, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true, tools.is_array() && !tools.empty() ? tools.dump() : "");
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"user", "assistant", "system", "\n", "tool"}, rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PflashColdHistoryRun run;
+    run.ids = tokenizer.encode(rendered);
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = threshold;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = max_ctx;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = messages;
+        if (tools.is_array() && !tools.empty()) request.tools = tools;
+        request.prompt_tokens = run.ids;
+        request.max_output = max_output;
+        run.prepared = HttpServerTestAccess::prepare_prompt(server, request);
+        run.counters = HttpServerTestAccess::pflash_failure_counters(server);
+    }
+    run.compress_calls = backend.compress_calls;
+    std::ifstream in(trace_path);
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty()) run.view_records.push_back(json::parse(line));
+    }
+    unlink(trace_path);
+    unlink(path.c_str());
+    return run;
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cold_agent_history_serves_raw) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto run = run_cold_history_case(
+        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.compress_calls == 0);          // decided before the drafter
+    TEST_ASSERT(!run.prepared.compressed);
+    TEST_ASSERT(run.prepared.tokens == run.ids);   // the raw prompt
+    const json & admission = run.prepared.pflash_stats["admission"];
+    TEST_ASSERT_MSG(admission.value("decision", "") == "cold_history", admission.dump());
+    TEST_ASSERT(admission["cold_history"].value("fired", false));
+    TEST_ASSERT(admission["cold_history"].value("history_uncached_droppable", 0) >= 400);
+    TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") == "cold_history");
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 1);
+    TEST_ASSERT(run.counters["fallback_reasons"].value("cold_history", 0) == 1);
+    TEST_ASSERT(run.view_records.size() == 1);
+    TEST_ASSERT(run.view_records[0].value("kind", "") == "raw");
+    TEST_ASSERT(run.view_records[0]["pflash"]["admission"].value("decision", "") == "cold_history");
+    TEST_ASSERT(run.view_records[0]["pflash_fallback"].value("reason", "") == "cold_history");
+    // Tool activity from the history alone (no tools field) is in scope too.
+    const auto no_field = run_cold_history_case(
+        pflash_cold_agent_messages(), json(), "raw", 400);
+    TEST_ASSERT(no_field.compress_calls == 0 && !no_field.prepared.compressed);
+    // Fail-closed never turns it into an error.
+    luce_test::ScopedEnvVar closed{"PFLASH_FAIL_CLOSED", "1"};
+    const auto strict = run_cold_history_case(
+        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400);
+    TEST_ASSERT_MSG(strict.prepared.error.empty(), strict.prepared.error);
+    TEST_ASSERT(strict.prepared.tokens == strict.ids);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cold_history_flag_off_is_todays_decision) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    for (const char * off : {(const char *) nullptr, "0", "compress"}) {
+        const auto run = run_cold_history_case(
+            pflash_cold_agent_messages(), pflash_cold_history_tools(), off, 400);
+        TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+        TEST_ASSERT(run.compress_calls == 1);
+        TEST_ASSERT(run.prepared.compressed);
+        const json & admission = run.prepared.pflash_stats["admission"];
+        TEST_ASSERT(admission.value("decision", "") == "compress");
+        TEST_ASSERT(!admission.contains("cold_history"));
+        TEST_ASSERT(!run.prepared.pflash_stats.contains("pflash_fallback"));
+        TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+        TEST_ASSERT(run.counters["fallback_reasons"].empty());
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cold_history_first_turn_paste_still_compresses) {
+    // Tools defined, no assistant turn yet: the paste is new content.
+    const json messages = json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content",
+            pflash_cold_history_filler("The parser strips every line.\n", 60) +
+            "What does the parser do?"}},
+    });
+    const auto on = run_cold_history_case(messages, pflash_cold_history_tools(), "raw", 400);
+    const auto off = run_cold_history_case(messages, pflash_cold_history_tools(), nullptr, 400);
+    TEST_ASSERT_MSG(on.prepared.error.empty(), on.prepared.error);
+    TEST_ASSERT(on.compress_calls == 1 && on.prepared.compressed);
+    TEST_ASSERT(on.prepared.tokens == off.prepared.tokens);
+    const json & admission = on.prepared.pflash_stats["admission"];
+    TEST_ASSERT(admission.value("decision", "") == "compress");
+    TEST_ASSERT(!admission["cold_history"].value("fired", true));
+    TEST_ASSERT(admission["cold_history"].value("history_begin", 0) == -1);
+    TEST_ASSERT(on.counters.value("fallback_served", 0) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cold_history_chat_without_tools_unchanged) {
+    // A plain multi-turn chat with a long earlier turn: out of scope, served
+    // and traced exactly as with the flag off.
+    const json messages = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content",
+            pflash_cold_history_filler("The parser strips every line.\n", 60)}},
+        {{"role", "assistant"}, {"content", "Noted."}},
+        {{"role", "user"}, {"content", "What does the parser do?"}},
+    });
+    const auto on = run_cold_history_case(messages, json(), "raw", 400);
+    const auto off = run_cold_history_case(messages, json(), nullptr, 400);
+    TEST_ASSERT_MSG(on.prepared.error.empty(), on.prepared.error);
+    TEST_ASSERT(on.compress_calls == 1 && off.compress_calls == 1);
+    TEST_ASSERT(on.prepared.compressed);
+    TEST_ASSERT(on.prepared.tokens == off.prepared.tokens);
+    json stats_on = on.prepared.pflash_stats;
+    json stats_off = off.prepared.pflash_stats;
+    stats_on.erase("compress_ms");
+    stats_off.erase("compress_ms");
+    TEST_ASSERT_MSG(stats_on == stats_off, stats_on.dump() + " vs " + stats_off.dump());
+    TEST_ASSERT(!stats_on["admission"].contains("cold_history"));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cold_history_raw_over_max_ctx_still_compresses) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto probe = run_cold_history_case(
+        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400);
+    // The raw prompt plus the reply budget no longer fits; compressed it does.
+    const int max_ctx = (int) probe.ids.size() + 15;
+    const auto run = run_cold_history_case(
+        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400, max_ctx);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.compress_calls == 1 && run.prepared.compressed);
+    const json & admission = run.prepared.pflash_stats["admission"];
+    TEST_ASSERT(admission.value("decision", "") == "compress");
+    TEST_ASSERT(!admission.value("raw_fits", true));
+    TEST_ASSERT(!admission.contains("cold_history"));
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
 }

@@ -657,12 +657,44 @@ PflashFallbackDecision pflash_fallback_decision(
 // hold, and that cache holds less than ``threshold`` droppable tokens:
 // compressing never throws away a threshold's worth of reusable cache. A raw
 // prompt that does not fit the context is always compressed.
-enum class PflashAdmission { Compress, UnderThreshold, WarmCache };
+enum class PflashAdmission { Compress, UnderThreshold, WarmCache, ColdHistory };
 const char * pflash_admission_name(PflashAdmission admission) noexcept;
 bool pflash_cache_admission_enabled() noexcept;
 PflashAdmission pflash_cache_admission(
     int uncached_droppable, int cached_droppable, int threshold,
     bool raw_fits = true) noexcept;
+// Cold agent history (PFLASH_COLD_HISTORY=raw, cache admission only; unset
+// or any other value = off, today's decisions). A coding-agent conversation
+// arrives cold after a restart, an eviction, a model switch, a session new
+// to this server or an early client edit; compressing it then drops the
+// agent's working state (its tool calls and tool results). So when the
+// no-view admission would compress a conversation with tool activity and
+// the uncached droppable tokens INSIDE its earlier conversation reach the
+// threshold, the request is served raw with full prefill instead
+// (``ColdHistory``) and no chat view is built from it. New content keeps
+// today's rule: a first-turn paste has no earlier conversation, and on a
+// warm history only the new tail is uncached. A raw prompt that does not fit
+// the context still compresses. Never a refusal.
+bool pflash_cold_history_enabled() noexcept;
+// Tool activity: the request defines tools, or its history carries an
+// assistant tool call or a tool result (normalized messages, any API format).
+bool pflash_has_tool_activity(const json & tools,
+                              const std::vector<ChatMessage> & messages) noexcept;
+// The earlier conversation of a rendered chat prompt, in ``turns``' token
+// offsets: from the first turn after the leading system/developer preamble
+// (tool definitions render inside it) up to and including the last
+// assistant turn (with its tool calls). The new messages after that
+// assistant turn (tool results and/or the new user message) and the
+// generation prompt are outside. {-1, -1} when there is no assistant turn.
+PFlashTokenSpan pflash_chat_history_region(
+    const std::vector<PflashChatTurn> & turns) noexcept;
+// The cold-history decision on top of ``pflash_cache_admission``: Compress
+// becomes ColdHistory when the raw prompt fits, the conversation has tool
+// activity and ``history_uncached_droppable`` reaches ``threshold``; every
+// other decision is returned unchanged.
+PflashAdmission pflash_cold_history_admission(
+    PflashAdmission admission, bool raw_fits, bool tool_activity,
+    int history_uncached_droppable, int threshold) noexcept;
 // Tokens of the canonical ``spans`` inside [begin, end).
 int pflash_span_tokens_within(
     const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept;
