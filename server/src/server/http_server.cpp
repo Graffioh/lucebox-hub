@@ -1251,6 +1251,17 @@ bool pflash_spread_fires(double threshold, bool spread_valid, double spread) noe
     return threshold > 0.0 && spread_valid && std::isfinite(spread) && spread >= threshold;
 }
 
+PflashSpreadDecision pflash_spread_decision(double threshold, bool spread_valid,
+                                            double spread, bool region_plan) noexcept {
+    PflashSpreadDecision decision;
+    if (region_plan) {
+        decision.skipped = "region_plan";
+        return decision;
+    }
+    decision.fires = pflash_spread_fires(threshold, spread_valid, spread);
+    return decision;
+}
+
 bool pflash_failure_is_config_error(const std::string & error) {
     // Deterministic for every request of the run (a bad PFLASH_* setting) or
     // a request contract the raw prompt cannot honour: falling back would
@@ -5891,16 +5902,25 @@ std::string HttpServer::apply_pflash_compression(
     // through the failure-policy (D5) path, reason "spread".
     json spread_record;
     if (experiment.fallback_spread > 0.0) {
-        if (!result.spread_valid) {
+        if (!result.spread_valid && !region_plan.active) {
             return "PFlash relevance spread unavailable";
         }
-        const bool fires = http_detail::pflash_spread_fires(
-            experiment.fallback_spread, result.spread_valid, result.spread);
+        const auto decision = http_detail::pflash_spread_decision(
+            experiment.fallback_spread, result.spread_valid, result.spread,
+            region_plan.active);
+        const bool fires = decision.fires;
         spread_record = {{"spread", result.spread},
                          {"spread_threshold", experiment.fallback_spread},
                          {"spread_k", result.spread_k},
                          {"fired", fires}};
-        if (fires) {
+        if (decision.skipped) {
+            spread_record["skipped"] = decision.skipped;
+            spread_record["spread_valid"] = result.spread_valid;
+            std::fprintf(stderr,
+                "[pflash-spread] spread=%.6f (k=%d): no decision on a region plan (%s)\n",
+                result.spread, result.spread_k, region_plan.mode.c_str());
+            std::fflush(stderr);
+        } else if (fires) {
             if (!effective_prompt_overflows(prompt_tokens, -1, req.max_output,
                                             config_.max_ctx)) {
                 size_t forgotten = 0;
