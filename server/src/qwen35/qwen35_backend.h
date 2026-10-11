@@ -155,6 +155,8 @@ public:
     bool snapshot_adopt(int slot, ggml_context * ctx,
                         ggml_backend_buffer_t buf, int cur_pos,
                         int32_t last_tok = -1) override;
+    OwnedSnapshot snapshot_detach(int slot) override;
+    OwnedSnapshot snapshot_take_displaced(int slot) override;
 
     CompressResult compress(const CompressRequest & req) override;
     std::vector<CompressResult> compress_batch(
@@ -325,6 +327,13 @@ private:
     // ── Prefix cache (snapshots) ─────────────────────────────────────
     static constexpr int PREFIX_SLOTS = 64;
     PrefixSnapshot prefix_snapshots_[PREFIX_SLOTS];
+    // Paged checkpoints a capture replaced (see snapshot_take_displaced()).
+    PrefixSnapshot displaced_snapshots_[PREFIX_SLOTS];
+    // snapshot_adopt() for a paged (continuous-batching) checkpoint read
+    // from disk; restore_paged_target_cache() validates it against the page
+    // table before any copy.
+    bool adopt_paged_snapshot(int slot, ggml_context * ctx,
+                              ggml_backend_buffer_t buf, int cur_pos);
 
     // ── Park state ───────────────────────────────────────────────────
     bool target_parked_ = false;

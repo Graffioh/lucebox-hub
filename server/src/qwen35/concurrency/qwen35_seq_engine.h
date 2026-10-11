@@ -73,6 +73,7 @@ public:
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
     bool supports_prefix_store() const override { return true; }
+    bool prefix_store_in_backend_snapshots() const override { return true; }
     size_t estimate_prefix_store_bytes(int tokens) const override;
 
     void discard_prefix_store(PrefixStoreRef checkpoint) override;
