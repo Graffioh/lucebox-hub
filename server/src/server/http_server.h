@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -615,6 +616,32 @@ float pflash_ceiling_retry_keep_ratio(float requested_keep_ratio, int target_cei
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;
 
+// PFlash failure policy (user decision D5, 9 Oct 2026). When compression of a
+// prompt fails at runtime (non-finite scores, scorer / probe / selection or
+// mapping errors), the request is served uncompressed -- if the raw prompt
+// passes the same admission an uncompressed request gets (max_ctx with the
+// reply budget) -- and the fallback is recorded (log line, view-trace record,
+// usage.timings.pflash.pflash_fallback, /props counters). PFLASH_FAIL_CLOSED=1
+// restores the previous behaviour: the request fails with the PFlash error.
+// Configuration and request-contract errors never fall back.
+struct PflashFallbackDecision {
+    bool fallback = false;
+    // Why the fallback was not taken: "fail_closed", "config_error" or
+    // "raw_exceeds_max_ctx"; empty when ``fallback``.
+    std::string refused;
+};
+bool pflash_fail_closed_from_env() noexcept;
+// Short machine-readable reason for a PFlash error string (and the backend's
+// last error, when the drafter reported one): "nonfinite_scores",
+// "compress_failed", "ceiling_exceeded", "mapping_failed", "remote_drafter",
+// "selection_failed" or "other".
+std::string pflash_failure_reason(const std::string & error,
+                                  const std::string & detail);
+bool pflash_failure_is_config_error(const std::string & error);
+PflashFallbackDecision pflash_fallback_decision(
+    const std::string & error, bool fail_closed, int raw_prompt_tokens,
+    int max_output, int max_ctx);
+
 // Cache-aware admission (PFLASH_ADMISSION=cache; default "length" = today's
 // rule, droppable tokens >= threshold). A conversation without a PFlash view
 // is compressed only when the reader would have to prefill at least
@@ -851,6 +878,9 @@ private:
         nlohmann::json pflash_stats;
         int error_status = 0;
         std::string error;
+        // The drafter's own error when compression failed in the backend
+        // (luce_last_error at that moment), for the fallback record.
+        std::string pflash_failure_detail;
     };
 
     // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies
@@ -1140,6 +1170,13 @@ private:
     ServerJob *                     queue_head_ = nullptr;
     ServerJob *                     queue_tail_ = nullptr;
     std::atomic<bool>               stopping_{false};
+    // PFlash failure policy counters (D5), exposed under /props pflash.failures.
+    mutable std::mutex              pflash_failure_mu_;
+    uint64_t                        pflash_fallback_served_ = 0;
+    uint64_t                        pflash_fallback_refused_ = 0;
+    std::map<std::string, uint64_t> pflash_fallback_reasons_;   // served, by reason
+    std::map<std::string, uint64_t> pflash_refused_reasons_;    // refused, by why
+    nlohmann::json pflash_failure_counters_json() const;
 
     // Active client thread tracking.
     std::atomic<int>                active_clients_{0};

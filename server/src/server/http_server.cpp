@@ -20,6 +20,7 @@
 #include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
+#include "luce.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/model_capabilities.h"
 #include "response_error.h"
@@ -1153,6 +1154,53 @@ int pflash_target_token_ceiling(
         return -1;
     }
     return static_cast<int>(ceiling);
+}
+
+bool pflash_fail_closed_from_env() noexcept {
+    const char * value = std::getenv("PFLASH_FAIL_CLOSED");
+    return value != nullptr && *value && std::strcmp(value, "0") != 0;
+}
+
+std::string pflash_failure_reason(const std::string & error,
+                                  const std::string & detail) {
+    const auto has = [](const std::string & text, const char * needle) {
+        return text.find(needle) != std::string::npos;
+    };
+    if (has(detail, "non-finite") || has(error, "non-finite")) return "nonfinite_scores";
+    if (has(error, "remote PFlash drafter")) return "remote_drafter";
+    if (has(error, "PFlash compression failed")) return "compress_failed";
+    if (has(error, "target-token ceiling")) return "ceiling_exceeded";
+    if (has(error, "mapping failed") || has(error, "boundary") ||
+        has(error, "normalization failed")) return "mapping_failed";
+    if (has(error, "PFlash strict selection") || has(error, "PFlash query head") ||
+        has(error, "PFlash region plan")) return "selection_failed";
+    return "other";
+}
+
+bool pflash_failure_is_config_error(const std::string & error) {
+    // Deterministic for every request of the run (a bad PFLASH_* setting) or
+    // a request contract the raw prompt cannot honour: falling back would
+    // hide the misconfiguration behind a counter.
+    return error.rfind("invalid PFlash strict selection config", 0) == 0 ||
+           error.rfind("PFlash pflash_required needs strict budget selection", 0) == 0;
+}
+
+PflashFallbackDecision pflash_fallback_decision(
+        const std::string & error, bool fail_closed, int raw_prompt_tokens,
+        int max_output, int max_ctx) {
+    PflashFallbackDecision decision;
+    if (fail_closed) {
+        decision.refused = "fail_closed";
+    } else if (pflash_failure_is_config_error(error)) {
+        decision.refused = "config_error";
+    } else if (effective_prompt_overflows(raw_prompt_tokens, -1, max_output, max_ctx)) {
+        // The admission an uncompressed request gets (validate_request_context /
+        // prepare_prompt): the raw prompt plus the reply budget within max_ctx.
+        decision.refused = "raw_exceeds_max_ctx";
+    } else {
+        decision.fallback = true;
+    }
+    return decision;
 }
 
 }  // namespace http_detail
@@ -2908,6 +2956,10 @@ void HttpServer::handle_client(SocketHandle fd) {
                 ? build_props_body(config_, prefix_cache_, tool_memory_)
                 : status_.to_json();
             if (hr.path == "/props") body["memory"] = memory_json();
+            if (hr.path == "/props" && body.contains("pflash") &&
+                body["pflash"].value("enabled", false)) {
+                body["pflash"]["failures"] = pflash_failure_counters_json();
+            }
             body.update(model_routing_status());
             send_response(fd, 200, "application/json", body.dump() + "\n");
             socket_close(fd);
@@ -2924,6 +2976,9 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/props") {
         json body = build_props_body(config_, prefix_cache_, tool_memory_);
         body["memory"] = memory_json();
+        if (body.contains("pflash") && body["pflash"].value("enabled", false)) {
+            body["pflash"]["failures"] = pflash_failure_counters_json();
+        }
         send_response(fd, 200, "application/json", body.dump() + "\n");
         socket_close(fd);
         return;
@@ -5552,6 +5607,10 @@ std::string HttpServer::apply_pflash_compression(
         }
 
         if (!result.ok || result.compressed_ids.empty()) {
+            if (!config_.pflash_remote_drafter) {
+                const char * detail = luce_last_error();
+                prepared.pflash_failure_detail = detail ? detail : "";
+            }
             return config_.pflash_remote_drafter
                 ? "remote PFlash drafter compression failed"
                 : "PFlash compression failed";
@@ -5748,11 +5807,22 @@ int HttpServer::restorable_prefix_tokens(
     return 0;
 }
 
+json HttpServer::pflash_failure_counters_json() const {
+    std::lock_guard<std::mutex> lk(pflash_failure_mu_);
+    return {
+        {"fail_closed", http_detail::pflash_fail_closed_from_env()},
+        {"fallback_served", pflash_fallback_served_},
+        {"fallback_refused", pflash_fallback_refused_},
+        {"fallback_reasons", pflash_fallback_reasons_},
+        {"refused_reasons", pflash_refused_reasons_},
+    };
+}
+
 void HttpServer::trace_pflash_served(
         const ParsedRequest & req, const PreparedPrompt & prepared) {
     const char * path = std::getenv("PFLASH_VIEW_TRACE_PATH");
     if (!path || !*path) return;
-    const json record = {
+    json record = {
         {"schema_version", 2},
         {"kind", prepared.compressed ? "compressed" : "raw"},
         {"request_id", req.response_id},
@@ -5761,6 +5831,10 @@ void HttpServer::trace_pflash_served(
         {"pflash", prepared.pflash_stats},
         {"served_text", tokenizer_.decode(prepared.tokens)},
     };
+    // Failure policy D5: a raw record served because compression failed says so.
+    if (prepared.pflash_stats.is_object() && prepared.pflash_stats.contains("pflash_fallback")) {
+        record["pflash_fallback"] = prepared.pflash_stats["pflash_fallback"];
+    }
     std::ofstream out(path, std::ios::app);
     if (out) out << record.dump(-1, ' ', false, json::error_handler_t::replace) << "\n";
 }
@@ -6243,10 +6317,55 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         }
 
         if (should_compress) {
+            PreparedPrompt uncompressed = prepared;
             prepared.error = apply_pflash_compression(req, prepared);
             if (!prepared.error.empty()) {
-                prepared.error_status = 500;
-                return prepared;
+                // Failure policy D5: serve the raw prompt when it is admissible,
+                // and record the fallback; PFLASH_FAIL_CLOSED=1 keeps the error.
+                const bool fail_closed = http_detail::pflash_fail_closed_from_env();
+                const auto decision = http_detail::pflash_fallback_decision(
+                    prepared.error, fail_closed, prompt_tokens, req.max_output,
+                    config_.max_ctx);
+                const std::string reason = http_detail::pflash_failure_reason(
+                    prepared.error, prepared.pflash_failure_detail);
+                {
+                    std::lock_guard<std::mutex> lk(pflash_failure_mu_);
+                    if (decision.fallback) {
+                        ++pflash_fallback_served_;
+                        ++pflash_fallback_reasons_[reason];
+                    } else {
+                        ++pflash_fallback_refused_;
+                        ++pflash_refused_reasons_[decision.refused];
+                    }
+                }
+                if (!decision.fallback) {
+                    if (!fail_closed) {
+                        std::fprintf(stderr,
+                            "[pflash-fallback] refused=%s reason=%s prompt_tokens=%d "
+                            "max_ctx=%d error=%s\n",
+                            decision.refused.c_str(), reason.c_str(), prompt_tokens,
+                            config_.max_ctx, prepared.error.c_str());
+                        std::fflush(stderr);
+                    }
+                    prepared.error_status = 500;
+                    return prepared;
+                }
+                std::fprintf(stderr,
+                    "[pflash-fallback] serving the raw prompt (%d tokens) reason=%s "
+                    "error=%s detail=%s\n",
+                    prompt_tokens, reason.c_str(), prepared.error.c_str(),
+                    prepared.pflash_failure_detail.c_str());
+                std::fflush(stderr);
+                json record = {
+                    {"reason", reason},
+                    {"error", prepared.error},
+                    {"prompt_tokens", prompt_tokens},
+                };
+                if (!prepared.pflash_failure_detail.empty()) {
+                    record["detail"] = prepared.pflash_failure_detail;
+                }
+                prepared = std::move(uncompressed);
+                prepared.pflash_stats = {{"pflash_fallback", std::move(record)}};
             }
         }
     }
