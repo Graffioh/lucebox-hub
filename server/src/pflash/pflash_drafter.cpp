@@ -162,6 +162,19 @@ std::vector<int32_t> drafter_score_and_compress(
                     }
                     experiment.request_messages.push_back(span);
                 }
+                experiment.request_human_index = request_messages->human_index;
+                for (const auto & span : request_messages->recent) {
+                    if (span.begin < 0 || span.end < span.begin ||
+                        span.end > (int) ids.size()) {
+                        experiment.request_messages.clear();
+                        experiment.request_recent.clear();
+                        experiment.request_messages_error = "recent message span outside the input";
+                        break;
+                    }
+                    experiment.request_recent.push_back(span);
+                }
+                experiment.request_recent_index = request_messages->recent_index;
+                experiment.request_recent_error = request_messages->recent_error;
             }
         }
         if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {

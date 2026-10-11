@@ -30,12 +30,20 @@ inline bool operator!=(
 // messages (role "user" after normalisation; tool results are role "tool"),
 // latest first, at most two; ``error`` says why the server could not map
 // them (the request then falls back to today's windows).
-// PFLASH_SELECT_QUERY_IDENT=heur travels with them: the
+// PFLASH_EVAL_REF_IDENT_QUERY=heur travels with them: the
 // identifier tokens of the last turns (ascending positions), the turns read,
 // and why the server found none it could map (``ident_error``).
+// Candidate-rule inputs (read only by a GGUF with that candidate rule):
+// ``human_index`` = the normalised message indices of ``human``; ``recent`` /
+// ``recent_index`` = the content spans and indices of every non-system
+// message, latest first (``recent_error`` covers their mapping).
 struct PFlashRequestMessages {
     std::vector<PFlashTokenSpan> human;
     std::string error;
+    std::vector<int> human_index;
+    std::vector<PFlashTokenSpan> recent;
+    std::vector<int> recent_index;
+    std::string recent_error;     // why the recent messages could not be mapped
     std::vector<int> ident_tokens;
     int ident_turns = 0;
     std::string ident_error;

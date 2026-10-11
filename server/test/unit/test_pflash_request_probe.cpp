@@ -4,6 +4,7 @@
 #include "pflash/pflash_selection.h"
 #include "scoped_env.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -374,4 +375,74 @@ TEST_CASE(PFlashRequestProbeFixture, policy_json_overrides_validate_and_fail_clo
     REQUIRE(!pflash_request_policy_apply_json(R"([1, 2])", p, error));
     REQUIRE(!pflash_request_policy_apply_json("{", p, error));
     REQUIRE(p.max_runs == before.max_runs && p.recency_pin_tokens == before.recency_pin_tokens);   // unchanged on failure
+}
+
+// V2-A3 candidate rule = the trainer's rule.probe_query_v2. Candidates are
+// built as the server builds them: the latest two human messages and the last
+// non-system messages (all of them, V2-A5), by message index.
+static PFlashRequestQuerySet v2_set(const std::vector<std::string> & roles, const Spans & spans,
+                                    const std::vector<float> & logits) {
+    std::vector<PFlashRequestCandidate> candidates;
+    std::vector<int> humans;
+    for (int i = (int) roles.size() - 1; i >= 0 && humans.size() < 2; --i) {
+        if (roles[(size_t) i] == "user") humans.push_back(i);
+    }
+    for (int i : humans) candidates.push_back({i, true, false, spans[(size_t) i]});
+    for (int i = (int) roles.size() - 1; i >= 0; --i) {
+        if (roles[(size_t) i] == "system") continue;
+        bool merged = false;
+        for (auto & c : candidates) {
+            if (c.message_index == i) { c.recent = true; merged = true; }
+        }
+        if (!merged) candidates.push_back({i, false, true, spans[(size_t) i]});
+    }
+    return pflash_request_query_set_v2(logits, candidates, 0.0f);
+}
+
+TEST_CASE(PFlashRequestProbeFixture, v2_rule_matches_the_trainer_mirror_example) {
+    // luce_box tests/test_request_probe_v2a3.py::test_probe_query_v2_mirror
+    const std::vector<std::string> roles = {"system", "user", "assistant", "tool", "assistant", "tool"};
+    const Spans spans = {{0, 5}, {5, 30}, {30, 40}, {40, 60}, {60, 70}, {70, 90}};
+    const auto logits = logits_with(95, {{10, 14}, {44, 47}, {62, 64}, {32, 36}});
+    const auto set = v2_set(roles, spans, logits);
+    REQUIRE(set.fallback.empty());
+    // V2-A5: every non-system message is a candidate (the assistant at 30-40 too).
+    REQUIRE(set.tokens == std::vector<int>({10, 11, 12, 13, 32, 33, 34, 35, 44, 45, 46, 62, 63}));
+    REQUIRE(set.turn_messages == std::vector<int>({5, 4, 3, 2}));
+    REQUIRE(std::string(kRequestCandidateRule) == "cand_v3_latest_human_prev8_plus_all_nonsystem_turns");
+}
+
+namespace {
+struct V2Fixture {
+    int n;
+    std::vector<std::string> roles;
+    Spans spans;
+    Spans hits;
+    Spans query;
+    std::vector<int> candidates;
+};
+const std::vector<V2Fixture> kV2Fixtures = {
+#include "request_probe_v2_parity.inc"
+};
+} // namespace
+
+TEST_CASE(PFlashRequestProbeFixture, v2_rule_replay_parity_with_the_trainer_rule) {
+    REQUIRE(kV2Fixtures.size() == 80);   // regenerated for cand_v3
+    for (const auto & f : kV2Fixtures) {
+        const auto set = v2_set(f.roles, f.spans, logits_with(f.n, f.hits));
+        std::vector<int> want;
+        for (const auto & q : f.query) for (int t = q.begin; t < q.end; ++t) want.push_back(t);
+        REQUIRE(set.tokens == want);
+        std::vector<int> read;
+        for (const auto & m : set.messages) {
+            for (size_t i = 0; i < f.spans.size(); ++i) {
+                if (f.spans[i] == m.message && f.roles[i] == "user") { read.push_back((int) i); break; }
+            }
+        }
+        read.insert(read.end(), set.turn_messages.begin(), set.turn_messages.end());
+        std::sort(read.begin(), read.end());
+        read.erase(std::unique(read.begin(), read.end()), read.end());
+        REQUIRE(read == f.candidates);
+        REQUIRE(set.tokens.empty() == (set.fallback == "no_request_runs" || set.fallback == "no_human_message"));
+    }
 }

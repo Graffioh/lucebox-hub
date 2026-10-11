@@ -31,6 +31,7 @@
 #include "common/sha1.h"
 #include "pflash/pflash_fold.h"
 #include "pflash/pflash_selection.h"
+#include "pflash/pflash_request_probe.h"
 #include "freeze_history.h"
 
 #ifdef LUCE_HAS_CURL
@@ -491,7 +492,11 @@ std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
 json pflash_view_pieces_json(const std::vector<PflashViewPiece> & pieces) {
     json out = json::array();
     for (const auto & piece : pieces) {
-        out.push_back(json::array({piece.begin, piece.end, piece.recall ? "recall" : "raw"}));
+        if (piece.recall) {
+            out.push_back(json::array({piece.begin, piece.end, "recall", piece.block}));
+        } else {
+            out.push_back(json::array({piece.begin, piece.end, "raw"}));
+        }
     }
     return out;
 }
@@ -4258,6 +4263,9 @@ std::string HttpServer::apply_pflash_compression(
     // by the rendered prompt's own control markers. Feeds the strict tail
     // parser and the legacy window; unused when a benchmark parser
     // (latest_user) or a marker-less prompt needs the sentinel mapping.
+    // PFLASH_SELECT_QUERY_HEAD=1 under the chat parser: the latest human
+    // message's content span (the query head's source).
+    PFlashTokenSpan human_query_content{-1, -1};
     http_detail::PflashChatTurnSpan chat_turn;
     if (!experiment.configured || tail_parser) {
         ChatMarkers chat_markers;
@@ -4622,80 +4630,30 @@ std::string HttpServer::apply_pflash_compression(
                         }
                     }
                 }
-                if (experiment.query_probe) {
-                    // Human means ROLE "user" after normalisation: tool
-                    // results are role "tool" from every API format, also
-                    // when the template renders them inside a user turn.
-                    std::vector<size_t> human;
-                    for (size_t index = messages.size();
-                         index-- > 0 && human.size() < 2;) {
-                        if (messages[index].role == "user") human.push_back(index);
-                    }
-                    std::vector<http_detail::PflashChatTurn> turns = chat_turn.turns;
-                    if (turns.empty()) {
-                        ChatMarkers probe_markers;
-                        if (resolve_chat_markers(tokenizer_, probe_markers)) {
-                            turns = http_detail::pflash_chat_query_turn(
-                                tokenizer_, probe_markers, *drafter_tokenizer_,
-                                drafter_ids).turns;
-                        }
-                    }
-                    const char * mapping = "markers";
-                    if (!http_detail::pflash_human_message_spans(
-                            *drafter_tokenizer_, drafter_ids, turns, messages,
-                            human.size(), request_probe_messages.human)) {
-                        // Content not found verbatim among the rendered
-                        // turns: the sentinel renders of each message.
-                        mapping = "sentinel";
-                        request_probe_messages.human.clear();
-                        for (size_t index : human) {
-                            const std::string & content = messages[index].content;
-                            if (content.find_first_not_of(" \t\n\r") == std::string::npos) {
-                                request_probe_messages.human.push_back({0, 0});
-                                continue;
+                // The last non-system turns before the generation prompt
+                // (latest first), from the rendered prompt's chat markers:
+                // request-probe candidates (V2-A3) and the identifier query.
+                http_detail::PflashChatTurnSpan marker_turns;
+                bool marker_turns_ready = false;
+                const auto recent_turns = [&] (int count) {
+                    if (!marker_turns_ready) {
+                        marker_turns = chat_turn;
+                        if (marker_turns.turns.empty()) {
+                            ChatMarkers recent_markers;
+                            if (resolve_chat_markers(tokenizer_, recent_markers)) {
+                                marker_turns = http_detail::pflash_chat_query_turn(
+                                    tokenizer_, recent_markers, *drafter_tokenizer_, drafter_ids);
                             }
-                            int begin = -1;
-                            int end = -1;
-                            std::string mapping_error;
-                            if (!map_message_content(index, begin, end, mapping_error)) {
-                                request_probe_messages.human.clear();
-                                request_probe_messages.error = mapping_error;
-                                break;
-                            }
-                            request_probe_messages.human.push_back({begin, end});
                         }
-                    }
-                    std::string spans;
-                    for (const auto & span : request_probe_messages.human) {
-                        spans += " [" + std::to_string(span.begin) + "," +
-                            std::to_string(span.end) + ")";
-                    }
-                    std::fprintf(stderr,
-                        "[pflash-request-probe] human messages=%zu mapped by %s:%s%s%s\n",
-                        human.size(), mapping, spans.empty() ? " none" : spans.c_str(),
-                        request_probe_messages.error.empty() ? "" : " error: ",
-                        request_probe_messages.error.c_str());
-                    std::fflush(stderr);
-                }
-                if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {
-                    // Identifier query: the content of the last turns that
-                    // precede the generation prompt (system turns excluded),
-                    // markup tokens blanked (pflash_ident_query.h).
-                    http_detail::PflashChatTurnSpan ident_turns = chat_turn;
-                    if (ident_turns.turns.empty()) {
-                        ChatMarkers ident_markers;
-                        if (resolve_chat_markers(tokenizer_, ident_markers)) {
-                            ident_turns = http_detail::pflash_chat_query_turn(
-                                tokenizer_, ident_markers, *drafter_tokenizer_, drafter_ids);
-                        }
+                        marker_turns_ready = true;
                     }
                     std::vector<PFlashTokenSpan> regions;
-                    for (size_t index = ident_turns.turns.size();
-                         index-- > 0 && (int) regions.size() < luce::pflash::kIdentQueryTurns;) {
-                        const auto & turn = ident_turns.turns[index];
+                    for (size_t index = marker_turns.turns.size();
+                         index-- > 0 && (int) regions.size() < count;) {
+                        const auto & turn = marker_turns.turns[index];
                         if (turn.role == "system") continue;
-                        if (ident_turns.generation_begin > 0 &&
-                            turn.role_begin >= ident_turns.generation_begin) {
+                        if (marker_turns.generation_begin > 0 &&
+                            turn.role_begin >= marker_turns.generation_begin) {
                             continue;
                         }
                         if (turn.content_begin < 0 || turn.content_end <= turn.content_begin ||
@@ -4704,6 +4662,144 @@ std::string HttpServer::apply_pflash_compression(
                         }
                         regions.push_back({turn.content_begin, turn.content_end});
                     }
+                    return regions;
+                };
+                // The content spans of the latest ``count`` human messages
+                // (role "user" after normalisation: tool results are role
+                // "tool" from every API format, also when the template renders
+                // them inside a user turn), latest first: by the rendered
+                // prompt's chat markers, else by sentinel renders.
+                std::vector<size_t> mapped_human;   // indices of the last map_human_messages call
+                const auto map_human_messages = [&] (
+                        size_t count, std::vector<PFlashTokenSpan> & out,
+                        std::string & error) -> const char * {
+                    std::vector<size_t> human;
+                    for (size_t index = messages.size();
+                         index-- > 0 && human.size() < count;) {
+                        if (messages[index].role == "user") human.push_back(index);
+                    }
+                    mapped_human = human;
+                    recent_turns(0);   // resolves marker_turns
+                    if (http_detail::pflash_human_message_spans(
+                            *drafter_tokenizer_, drafter_ids, marker_turns.turns, messages,
+                            human.size(), out)) {
+                        return "markers";
+                    }
+                    out.clear();
+                    for (size_t index : human) {
+                        const std::string & content = messages[index].content;
+                        if (content.find_first_not_of(" \t\n\r") == std::string::npos) {
+                            out.push_back({0, 0});
+                            continue;
+                        }
+                        int begin = -1;
+                        int end = -1;
+                        std::string mapping_error;
+                        if (!map_message_content(index, begin, end, mapping_error)) {
+                            out.clear();
+                            error = mapping_error;
+                            break;
+                        }
+                        out.push_back({begin, end});
+                    }
+                    return "sentinel";
+                };
+                // V2-A3 candidates: the content spans of the last ``count``
+                // non-system messages (latest first), found in render order
+                // from the generation prompt backwards: each message's content
+                // (trimmed) must occur before the previous match.
+                const auto map_recent_messages = [&] (
+                        int count, std::vector<PFlashTokenSpan> & spans,
+                        std::vector<int> & indices, std::string & error) {
+                    recent_turns(0);
+                    const http_detail::DecodedPrompt decoded =
+                        http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
+                    size_t cursor = decoded.text.size();
+                    if (marker_turns.generation_begin > 0 &&
+                        marker_turns.generation_begin < (int) drafter_ids.size()) {
+                        cursor = decoded.token_begin[(size_t) marker_turns.generation_begin];
+                    }
+                    for (size_t index = messages.size();
+                         index-- > 0 && (int) spans.size() < count;) {
+                        if (messages[index].role == "system") continue;
+                        const std::string & raw = messages[index].content;
+                        const size_t lead = raw.find_first_not_of(" \t\n\r");
+                        if (lead == std::string::npos) {
+                            spans.push_back({0, 0});
+                            indices.push_back((int) index);
+                            continue;
+                        }
+                        const size_t tail = raw.find_last_not_of(" \t\n\r");
+                        const std::string content = raw.substr(lead, tail - lead + 1);
+                        if (content.size() > cursor) {
+                            error = "recent message content does not fit before the next one";
+                            spans.clear();
+                            indices.clear();
+                            return;
+                        }
+                        const size_t at = decoded.text.rfind(content, cursor - content.size());
+                        if (at == std::string::npos) {
+                            error = "recent message content not found in render order";
+                            spans.clear();
+                            indices.clear();
+                            return;
+                        }
+                        const int begin = http_detail::token_at_offset(decoded, at);
+                        const int end = (int) (std::lower_bound(
+                            decoded.token_begin.begin(), decoded.token_begin.end(),
+                            at + content.size()) - decoded.token_begin.begin());
+                        spans.push_back({begin, end});
+                        indices.push_back((int) index);
+                        cursor = at;
+                    }
+                };
+                if (experiment.query_probe) {
+                    const char * mapping = map_human_messages(
+                        luce::pflash::kRequestMessages, request_probe_messages.human,
+                        request_probe_messages.error);
+                    for (size_t index : mapped_human) {
+                        request_probe_messages.human_index.push_back((int) index);
+                    }
+                    map_recent_messages(INT_MAX,   // every non-system message (V2-A5)
+                                        request_probe_messages.recent,
+                                        request_probe_messages.recent_index,
+                                        request_probe_messages.recent_error);
+                    std::string spans;
+                    for (const auto & span : request_probe_messages.human) {
+                        spans += " [" + std::to_string(span.begin) + "," +
+                            std::to_string(span.end) + ")";
+                    }
+                    std::string turn_spans;
+                    for (const auto & span : request_probe_messages.recent) {
+                        turn_spans += " [" + std::to_string(span.begin) + "," +
+                            std::to_string(span.end) + ")";
+                    }
+                    std::fprintf(stderr,
+                        "[pflash-request-probe] human messages=%zu mapped by %s:%s%s%s recent:%s\n",
+                        request_probe_messages.human.size(), mapping,
+                        spans.empty() ? " none" : spans.c_str(),
+                        request_probe_messages.error.empty() ? "" : " error: ",
+                        request_probe_messages.error.c_str(),
+                        turn_spans.empty() ? " none" : turn_spans.c_str());
+                    std::fflush(stderr);
+                }
+                // Query head under the chat parser (V2-A3): the latest human
+                // message's prose blocks, wherever it sits (an agent's task
+                // far back, a chat's last turn).
+                if (experiment.query_head && tail_parser) {
+                    std::vector<PFlashTokenSpan> latest;
+                    std::string head_error;
+                    map_human_messages(1, latest, head_error);
+                    if (!latest.empty() && latest[0].end > latest[0].begin) {
+                        human_query_content = latest[0];
+                    }
+                }
+                if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {
+                    // Identifier query: the content of the last turns that
+                    // precede the generation prompt (system turns excluded),
+                    // markup tokens blanked (pflash_ident_query.h).
+                    const std::vector<PFlashTokenSpan> regions =
+                        recent_turns(luce::pflash::kIdentQueryTurns);
                     if (regions.empty()) {
                         request_probe_messages.ident_error = "no turns mapped";
                     } else {
@@ -4845,14 +4941,35 @@ std::string HttpServer::apply_pflash_compression(
     // becomes query windows, kept verbatim. The trailing prose block replaces
     // the fixed-width tail window; without paste structure nothing changes.
     std::vector<PFlashTokenSpan> extra_query_spans;
+    // Under the chat parser the query stays the prompt's end (and the latest
+    // turn's tail); the head plan runs on the latest HUMAN message and its
+    // blocks -- the trailing one included -- become extra query windows,
+    // kept verbatim. Its trailing block replaces the turn-tail window when
+    // that window lies inside the same message (a chat's last turn).
+    const bool chat_query_head = tail_parser && human_query_content.begin >= 0;
+    const int head_begin = chat_query_head ? human_query_content.begin : query_content_begin;
+    const int head_end = chat_query_head ? human_query_content.end : query_content_end;
     if (experiment.selection_active && experiment.query_head &&
         req.pflash_query.empty() && query_window.valid() &&
-        query_content_begin >= 0 && query_content_end > query_content_begin) {
+        (chat_query_head || !tail_parser) &&
+        head_begin >= 0 && head_end > head_begin) {
         const auto plan = http_detail::pflash_query_head_plan(
-            *drafter_tokenizer_, drafter_ids, query_content_begin,
-            query_content_end, experiment.query_head_tokens,
+            *drafter_tokenizer_, drafter_ids, head_begin,
+            head_end, experiment.query_head_tokens,
             experiment.query_tail_tokens);
-        if (plan.tail.begin >= 0 && plan.tail.end > plan.tail.begin) {
+        if (chat_query_head) {
+            auto blocks = plan.extra;
+            if (plan.tail.begin >= 0 && plan.tail.end > plan.tail.begin) {
+                blocks.push_back(plan.tail);
+                if (turn_query_span.begin >= 0 && turn_query_span.begin < head_end &&
+                    turn_query_span.end > head_begin) {
+                    turn_query_span = {-1, -1};
+                }
+            }
+            for (auto & span : blocks) extra_query_spans.push_back(span);
+            extra_query_spans = http_detail::canonicalize_pflash_token_spans(
+                std::move(extra_query_spans));
+        } else if (plan.tail.begin >= 0 && plan.tail.end > plan.tail.begin) {
             query_window.end = plan.tail.end;
             query_window.tokens = plan.tail.end - plan.tail.begin;
             query_window.trailing_trimmed = 0;
@@ -4860,7 +4977,14 @@ std::string HttpServer::apply_pflash_compression(
                                       drafter_ids.begin() + plan.tail.end);
         }
         const int query_begin = query_window.end - query_window.tokens;
-        for (const auto & span : plan.extra) {
+        if (chat_query_head) {
+            std::vector<PFlashTokenSpan> inside;
+            for (const auto & span : extra_query_spans) {
+                if (span.end <= query_begin && span.end > span.begin) inside.push_back(span);
+            }
+            extra_query_spans = std::move(inside);
+        }
+        for (const auto & span : chat_query_head ? std::vector<PFlashTokenSpan>{} : plan.extra) {
             if (span.end <= query_begin && span.end > span.begin) {
                 extra_query_spans.push_back(span);
             }
@@ -5389,11 +5513,11 @@ bool HttpServer::serve_pflash_chat_view(
     }
     std::string recall_block;
     int recalled_tokens = 0;
+    std::vector<std::string> role_markers;
+    std::vector<std::string> end_markers;
+    bool generic_roles = false;
     if (!recalled.empty()) {
         ChatMarkers markers;
-        std::vector<std::string> role_markers;
-        std::vector<std::string> end_markers;
-        bool generic_roles = false;
         if (resolve_chat_markers(tokenizer_, markers)) {
             const auto seq_text = [this] (const std::vector<int32_t> & seq) {
                 std::string text;
@@ -5487,10 +5611,17 @@ bool HttpServer::serve_pflash_chat_view(
     spans.insert(spans.end(), recalled.begin(), recalled.end());
     // Provenance, in served order: the cached view, this turn's tokens
     // before the recall block, the recalled excerpts, the rest.
-    next.pieces = view.pieces;
+    // The cached view is served up to its generation prompt only: cut its
+    // pieces at the raw generation-prompt start.
+    next.pieces.clear();
+    for (auto piece : view.pieces) {
+        if (piece.begin >= view.drafter_gen_begin) continue;
+        piece.end = (std::min)(piece.end, view.drafter_gen_begin);
+        next.pieces.push_back(piece);
+    }
     for (const auto & span : before_split) next.pieces.push_back({span.begin, span.end, false});
     if (!recall_block.empty()) {
-        for (const auto & span : recalled) next.pieces.push_back({span.begin, span.end, true});
+        for (const auto & span : recalled) next.pieces.push_back({span.begin, span.end, true, view.turns + 1});
     }
     for (const auto & span : after_split) next.pieces.push_back({span.begin, span.end, false});
     next.view_tokens = served;
@@ -5512,6 +5643,20 @@ bool HttpServer::serve_pflash_chat_view(
              {"recalled_tokens", recalled_tokens},
              {"pieces", http_detail::pflash_view_pieces_json(next.pieces)}};
     if (compressed) stats["fresh_tokens"] = fresh->size();
+    if (const char * trace = std::getenv("PFLASH_VIEW_TRACE_PATH"); trace && *trace) {
+        // Provenance of a continued view (trace only): the raw drafter ids
+        // after the cached prefix, so a reader rebuilds this request's raw
+        // prompt from the previous one without a selection trace.
+        stats["prefix_drafter_tokens"] = view.drafter_gen_begin;
+        stats["drafter_tokens"] = input;
+        stats["delta_ids"] = std::vector<int32_t>(drafter_ids.begin() + view.drafter_gen_begin, drafter_ids.end());
+        if (!recall_block.empty()) {
+            // The recall transformation's inputs, so a reader reproduces the
+            // block exactly (pflash_recall_excerpt over each recall piece).
+            stats["recall_markers"] = {{"role", role_markers}, {"end", end_markers},
+                                       {"generic_role_lines", generic_roles}};
+        }
+    }
     pflash_views_.remember(std::move(next));
     return true;
 }

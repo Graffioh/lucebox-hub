@@ -162,10 +162,17 @@ struct PFlashSelectionConfig {
     std::vector<luce::common::PFlashTokenSpan> request_messages;
     // Why the server could not map the human messages ("" when it did).
     std::string request_messages_error;
+    // Candidate-rule inputs: the human messages' indices and every
+    // non-system messages (spans and indices), read when the GGUF's candidate
+    // rule includes them.
+    std::vector<int> request_human_index;
+    std::vector<luce::common::PFlashTokenSpan> request_recent;
+    std::vector<int> request_recent_index;
+    std::string request_recent_error;
     // Trace only: what the request probe did on this call (not owned; set
     // by the scorer for the selection it calls).
     const PFlashRequestProbeTrace * request_probe_trace = nullptr;
-    // PFLASH_SELECT_QUERY_IDENT=heur (strict selection, head
+    // PFLASH_EVAL_REF_IDENT_QUERY=heur (strict selection, head
     // scorer, not with the request probe): the scorer query is the
     // identifiers of the last turns (pflash_ident_query.h), scored and not
     // pinned. The tokens come per request (ident_error: why none).
@@ -251,7 +258,7 @@ bool pflash_fold_requested() noexcept;
 bool pflash_query_probe_requested() noexcept;
 bool pflash_query_probe_stub_requested() noexcept;
 
-// PFLASH_SELECT_QUERY_IDENT, read per call: off (default, also when unset),
+// PFLASH_EVAL_REF_IDENT_QUERY, read per call: off (default, also when unset),
 // or heur. Invalid values fail resolve_pflash_selection.
 PFlashIdentQuery pflash_query_ident_requested() noexcept;
 

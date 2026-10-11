@@ -387,6 +387,17 @@ static bool load_qwen35_request_probe(const char * path, bool stub,
                         "is missing or is not ") + luce::pflash::kRequestExtractionVersion +
                         " (the runtime's request-run extraction rule)");
         }
+        // V2-A3 candidate rule: opted in by the GGUF; absent = human messages only.
+        st.request_turns = false;
+        if (gguf_find_key(g, luce::pflash::kRequestCandidateRuleKey) >= 0) {
+            if (!qwen35_metadata_equals(g, luce::pflash::kRequestCandidateRuleKey,
+                                        luce::pflash::kRequestCandidateRule)) {
+                return fail(std::string("request probe metadata ") +
+                            luce::pflash::kRequestCandidateRuleKey + " is not " +
+                            luce::pflash::kRequestCandidateRule + " (the runtime's candidate rule)");
+            }
+            st.request_turns = true;
+        }
         ggml_tensor * fc1 = ggml_get_tensor(data_ctx, "requestprobe.fc1.weight");
         if (!fc1 || fc1->type != GGML_TYPE_F32 || ggml_n_dims(fc1) != 2 ||
             fc1->ne[0] != w.n_embd || fc1->ne[1] < 1) {

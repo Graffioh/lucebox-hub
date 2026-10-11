@@ -1232,9 +1232,37 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         if (!experiment.request_messages_error.empty()) {
             request_trace.fallback = "message_mapping: " + experiment.request_messages_error;
         } else {
-            request_trace.set = luce::pflash::pflash_request_query_set(
-                session->request_raw, experiment.request_messages, st.request_tau);
-            request_trace.fallback = request_trace.set.fallback;
+            if (st.request_turns) {
+                // Candidate rule: the human messages and every
+                // non-system messages, with their message indices.
+                std::vector<luce::pflash::PFlashRequestCandidate> candidates;
+                const auto & hidx = experiment.request_human_index;
+                const auto & ridx = experiment.request_recent_index;
+                if (!experiment.request_recent_error.empty()) {
+                    request_trace.fallback = "message_mapping: " + experiment.request_recent_error;
+                } else if (hidx.size() != experiment.request_messages.size() ||
+                    ridx.size() != experiment.request_recent.size()) {
+                    request_trace.fallback = "message_mapping: candidate indices missing";
+                } else {
+                    for (size_t k = 0; k < hidx.size(); ++k) {
+                        candidates.push_back({hidx[k], true, false, experiment.request_messages[k]});
+                    }
+                    for (size_t k = 0; k < ridx.size(); ++k) {
+                        bool merged = false;
+                        for (auto & c : candidates) {
+                            if (c.message_index == ridx[k]) { c.recent = true; merged = true; }
+                        }
+                        if (!merged) candidates.push_back({ridx[k], false, true, experiment.request_recent[k]});
+                    }
+                    request_trace.set = luce::pflash::pflash_request_query_set_v2(
+                        session->request_raw, candidates, st.request_tau);
+                    request_trace.fallback = request_trace.set.fallback;
+                }
+            } else {
+                request_trace.set = luce::pflash::pflash_request_query_set(
+                    session->request_raw, experiment.request_messages, st.request_tau);
+                request_trace.fallback = request_trace.set.fallback;
+            }
         }
         if (request_trace.fallback.empty()) {
             // v2 calibrated abstention: an unreliable extraction restores today's complete behaviour.
@@ -1253,9 +1281,16 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             request_trace.rows_new = request_trace.rows_stored = 0;
         }
         // Retain each message's turn (previous first, so the latest is the
-        // most recently used), whatever this call decided.
+        // most recently used), whatever this call decided; with the v3 rule
+        // the recent turns' runs too (oldest first).
+        std::vector<luce::pflash::PFlashRequestMessageRuns> retained;
+        for (size_t k = request_trace.set.turns.size(); k-- > 0;) {
+            retained.push_back(request_trace.set.turns[k]);
+        }
         for (size_t k = request_trace.set.messages.size(); k-- > 0;) {
-            const auto & message = request_trace.set.messages[k];
+            retained.push_back(request_trace.set.messages[k]);
+        }
+        for (const auto & message : retained) {
             const std::vector<int> turn = luce::pflash::pflash_request_turn_tokens(message);
             if (turn.empty()) continue;
             std::vector<float> rows;
@@ -1300,7 +1335,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             }
         }
     }
-    // PFLASH_SELECT_QUERY_IDENT: the identifier query's block-14 rows, read
+    // PFLASH_EVAL_REF_IDENT_QUERY: the identifier query's block-14 rows, read
     // while this call's activations exist. Positions before ``resume`` have
     // no rows (only the request probe keeps a row store): the request then
     // falls back to today's windows.

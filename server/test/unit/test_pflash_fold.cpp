@@ -620,7 +620,7 @@ TEST_CASE(PFlashFoldFixture, query_blocks_give_code_only_messages_no_blocks) {
     REQUIRE(json_blocks.tail.end == json_blocks.tail.begin);
 }
 
-TEST_CASE(PFlashFoldFixture, query_head_config_needs_latest_user_and_bounded_caps) {
+TEST_CASE(PFlashFoldFixture, query_head_config_needs_strict_selection_and_bounded_caps) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", nullptr};
     luce_test::ScopedEnvVar head{"PFLASH_SELECT_QUERY_HEAD", "1"};
@@ -628,9 +628,14 @@ TEST_CASE(PFlashFoldFixture, query_head_config_needs_latest_user_and_bounded_cap
     luce_test::ScopedEnvVar tail_tokens{"PFLASH_SELECT_QUERY_TAIL_TOKENS", nullptr};
     PFlashSelectionConfig config;
     std::string error;
-    // The chat tail parser has no user-message boundary to read.
-    REQUIRE(!resolve_pflash_selection(32768, 32, config, error));
-    REQUIRE(error.find("latest_user") != std::string::npos);
+    // V2-A3: the chat parser reads the latest human message's blocks.
+    REQUIRE(resolve_pflash_selection(32768, 32, config, error));
+    REQUIRE(config.query_head);
+    {
+        luce_test::ScopedEnvVar legacy{"PFLASH_SELECT_MODE", nullptr};
+        PFlashSelectionConfig legacy_config;
+        REQUIRE(!resolve_pflash_selection(32768, 32, legacy_config, error));
+    }
     luce_test::ScopedEnvVar latest{"PFLASH_SELECT_QUERY_PARSER", "latest_user"};
     REQUIRE(resolve_pflash_selection(32768, 32, config, error));
     REQUIRE(config.query_head);

@@ -68,6 +68,120 @@ std::vector<int> pflash_request_turn_tokens(const PFlashRequestMessageRuns & mes
     return pflash_request_cap_tail(pflash_request_run_tokens(message.runs), kRequestQueryCap);
 }
 
+namespace {
+
+PFlashRequestMessageRuns request_message_runs(const std::vector<float> & logits,
+                                              PFlashTokenSpan message, float tau) {
+    PFlashRequestMessageRuns runs;
+    runs.message = message;
+    runs.runs = pflash_request_runs(logits, message, tau);
+    for (const auto & run : runs.runs) runs.request_tokens += run.end - run.begin;
+    runs.message_tokens = message.end - message.begin;
+    double sum = 0.0;
+    int finite = 0;
+    runs.logit_min = std::numeric_limits<float>::infinity();
+    runs.logit_max = -std::numeric_limits<float>::infinity();
+    for (int t = message.begin; t < message.end; ++t) {
+        const float value = logits[(size_t) t];
+        if (value >= tau) ++runs.logits_at_or_above_tau;
+        if (!std::isfinite(value)) continue;
+        ++finite;
+        sum += value;
+        runs.logit_min = std::min(runs.logit_min, value);
+        runs.logit_max = std::max(runs.logit_max, value);
+    }
+    if (finite == 0) runs.logit_min = runs.logit_max = 0.0f;
+    runs.logit_mean = finite > 0 ? sum / finite : 0.0;
+    return runs;
+}
+
+} // namespace
+
+PFlashRequestQuerySet pflash_request_query_set_v2(
+        const std::vector<float> & logits,
+        const std::vector<PFlashRequestCandidate> & messages,
+        float tau,
+        int cap) {
+    PFlashRequestQuerySet set;
+    set.turns_read = true;
+    for (const auto & m : messages) {
+        if (m.span.begin < 0 || m.span.end < m.span.begin || m.span.end > (int) logits.size()) {
+            set.fallback = "logits_missing";
+            return set;
+        }
+    }
+    std::vector<const PFlashRequestCandidate *> humans;
+    for (const auto & m : messages) if (m.human) humans.push_back(&m);
+    std::sort(humans.begin(), humans.end(), [](auto a, auto b) { return a->message_index < b->message_index; });
+    // Candidates: the latest human, the previous one below kRequestPreviousBelow, the recent messages.
+    std::vector<const PFlashRequestCandidate *> cands;
+    int latest_index = -1;
+    int previous_index = -1;
+    if (!humans.empty()) {
+        const auto * latest = humans.back();
+        latest_index = latest->message_index;
+        set.messages.push_back(request_message_runs(logits, latest->span, tau));
+        cands.push_back(latest);
+        if (set.messages[0].request_tokens < kRequestPreviousBelow && humans.size() >= 2) {
+            const auto * previous = humans[humans.size() - 2];
+            previous_index = previous->message_index;
+            set.messages.push_back(request_message_runs(logits, previous->span, tau));
+            cands.push_back(previous);
+        }
+    }
+    for (const auto & m : messages) {
+        if (!m.recent) continue;
+        bool seen = false;
+        for (const auto * c : cands) seen = seen || c->message_index == m.message_index;
+        if (!seen) cands.push_back(&m);
+    }
+    if (cands.empty()) {
+        set.fallback = "no_human_message";
+        return set;
+    }
+    // previous_used as the trainer mirror reports it: joined by the < 8 rule, not as a recent message.
+    bool previous_recent = false;
+    for (const auto & m : messages) previous_recent = previous_recent || (m.recent && m.message_index == previous_index);
+    set.previous_used = previous_index >= 0 && !previous_recent;
+    std::sort(cands.begin(), cands.end(), [](auto a, auto b) { return a->message_index > b->message_index; });
+    std::vector<int> taken;
+    int budget = cap;
+    std::vector<int> all;
+    for (const auto * c : cands) {
+        const PFlashRequestMessageRuns * runs = nullptr;
+        PFlashRequestMessageRuns own;
+        if (c->message_index == latest_index) runs = &set.messages[0];
+        else if (c->message_index == previous_index) runs = &set.messages[1];
+        else {
+            own = request_message_runs(logits, c->span, tau);
+            set.turns.push_back(own);
+            set.turn_messages.push_back(c->message_index);
+            runs = &set.turns.back();
+        }
+        std::vector<int> toks;
+        for (const int t : pflash_request_run_tokens(runs->runs)) {
+            all.push_back(t);
+            if (!std::binary_search(taken.begin(), taken.end(), t)) toks.push_back(t);
+        }
+        std::sort(toks.begin(), toks.end());
+        toks.erase(std::unique(toks.begin(), toks.end()), toks.end());
+        const auto take = pflash_request_cap_tail(toks, budget);
+        budget -= (int) take.size();
+        if (c->message_index == latest_index) set.latest_tokens = (int) take.size();
+        else if (c->message_index == previous_index) set.previous_tokens = (int) take.size();
+        else set.turn_tokens += (int) take.size();
+        taken.insert(taken.end(), take.begin(), take.end());
+        std::sort(taken.begin(), taken.end());
+    }
+    std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
+    set.uncapped_tokens = (int) all.size();
+    set.tokens = taken;
+    set.capped = (int) set.tokens.size() < set.uncapped_tokens;
+    if (set.tokens.empty()) set.fallback = "no_request_runs";
+    return set;
+}
+
 PFlashRequestQuerySet pflash_request_query_set(
         const std::vector<float> & logits,
         const std::vector<PFlashTokenSpan> & human_messages,
@@ -87,27 +201,7 @@ PFlashRequestQuerySet pflash_request_query_set(
             set.fallback = "logits_missing";
             return set;
         }
-        PFlashRequestMessageRuns runs;
-        runs.message = message;
-        runs.runs = pflash_request_runs(logits, message, tau);
-        for (const auto & run : runs.runs) runs.request_tokens += run.end - run.begin;
-        runs.message_tokens = message.end - message.begin;
-        double sum = 0.0;
-        int finite = 0;
-        runs.logit_min = std::numeric_limits<float>::infinity();
-        runs.logit_max = -std::numeric_limits<float>::infinity();
-        for (int t = message.begin; t < message.end; ++t) {
-            const float value = logits[(size_t) t];
-            if (value >= tau) ++runs.logits_at_or_above_tau;
-            if (!std::isfinite(value)) continue;
-            ++finite;
-            sum += value;
-            runs.logit_min = std::min(runs.logit_min, value);
-            runs.logit_max = std::max(runs.logit_max, value);
-        }
-        if (finite == 0) runs.logit_min = runs.logit_max = 0.0f;
-        runs.logit_mean = finite > 0 ? sum / finite : 0.0;
-        set.messages.push_back(std::move(runs));
+        set.messages.push_back(request_message_runs(logits, message, tau));
     }
 
     const std::vector<int> latest = pflash_request_run_tokens(set.messages[0].runs);

@@ -35,6 +35,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -236,18 +237,72 @@ int replay_request(int argc, char ** argv) {
     return 0;
 }
 
+// Candidate-rule parity with the trainer (parity_kit v2-rule-compare): rows
+// {id, rule, tau, cap, logits, messages: [{role, span}]} -> {id, rule,
+// candidates, tokens} computed by the runtime's pflash_request_query_set_v2,
+// with candidates built as the server builds them (the latest two human
+// messages and every non-system message).
+int replay_request_rule(int argc, char ** argv) {
+    for (int a = 3; a < argc; ++a) {
+        std::ifstream in(argv[a]);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            const auto row = nlohmann::json::parse(line);
+            if (row.value("rule", "") != kRequestCandidateRule) {
+                std::fprintf(stderr, "%s: rule %s is not the runtime's %s\n",
+                             row.value("id", "").c_str(), row.value("rule", "").c_str(), kRequestCandidateRule);
+                return 3;
+            }
+            const auto logits = row["logits"].get<std::vector<float>>();
+            std::vector<PFlashRequestCandidate> candidates;
+            const auto & messages = row["messages"];
+            int humans = 0;
+            for (int i = (int) messages.size() - 1; i >= 0; --i) {
+                const auto & m = messages[(size_t) i];
+                const std::string role = m.value("role", "");
+                if (role == "system") continue;
+                const PFlashTokenSpan span{m["span"][0].get<int>(), m["span"][1].get<int>()};
+                const bool human = role == "user" && humans < kRequestMessages;
+                if (human) ++humans;
+                candidates.push_back({i, human, true, span});
+            }
+            const auto set = pflash_request_query_set_v2(logits, candidates, row.value("tau", 0.0f),
+                                                         row.value("cap", kRequestQueryCap));
+            std::vector<int> read;
+            for (const auto & c : candidates) {
+                if (c.human) {
+                    for (const auto & m : set.messages) if (m.message == c.span) read.push_back(c.message_index);
+                }
+            }
+            read.insert(read.end(), set.turn_messages.begin(), set.turn_messages.end());
+            std::sort(read.begin(), read.end());
+            read.erase(std::unique(read.begin(), read.end()), read.end());
+            nlohmann::json out;
+            out["id"] = row.value("id", "");
+            out["rule"] = kRequestCandidateRule;
+            out["candidates"] = read;
+            out["tokens"] = set.tokens;
+            std::cout << out.dump() << "\n";
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
             "usage: pflash_fold_replay <drafter.gguf> traces|text|query <file.jsonl>...\n"
-            "       pflash_fold_replay - request <rows.jsonl>...\n");
+            "       pflash_fold_replay - request <rows.jsonl>...\n"
+            "       pflash_fold_replay - request-rule <v2-rule-parity-cases.jsonl>...\n");
         return 2;
     }
     const std::string mode = argv[2];
     if (mode == "text") return replay_text(argc, argv);
     if (mode == "request") return replay_request(argc, argv);
+    if (mode == "request-rule") return replay_request_rule(argc, argv);
     luce::common::Tokenizer vocab;
     if (!vocab.load_from_gguf(argv[1])) return 1;
     if (mode == "query") return replay_query(vocab, argc, argv);

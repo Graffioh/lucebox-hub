@@ -1,24 +1,29 @@
-// Identifier query (PFLASH_SELECT_QUERY_IDENT=heur, strict selection with the
-// head scorer): the scorer query is the identifiers written in the
-// conversation's last turns, alone, instead of today's query windows.
-// It is the runtime form of arm (viii) of the round-10 agent-cue diagnostic
-// (luce_box 99c91fc1, scripts/agent_decay/cues_rows.py, "heur"): every
-// identifier in the LAST 3 non-system turns, pooled as ONE query, scored
-// with today's key mask (identifier tokens are not removed from the keys)
-// and NOT pinned; today's pins are unchanged.
+// EVALUATION REFERENCE ARM ONLY -- not a product path (user rule: no regex or
+// fixed behaviour in the product). PFLASH_EVAL_REF_IDENT_QUERY=heur (strict
+// selection with the head scorer) replaces today's query windows with the
+// identifiers written in the conversation's last 3 non-system turns, pooled
+// as ONE query, scored with today's key mask (identifier tokens are not
+// removed from the keys) and NOT pinned; today's pins are unchanged. It is the
+// runtime form of the agent-cue diagnostic's identifier-heuristic arm (viii),
+// the reference a learned request probe must match or beat on agent turns.
 //
-// Identifiers (the diagnostic's regular expressions, matched left to right
-// with Python ``re`` semantics; ASCII word characters, bytes >= 0x80 count as
-// non-word):
-//   paths / file names      [\w./-]*[A-Za-z_]\w*\.[A-Za-z]{1,6}\b
-//   dotted symbols          \b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\b
-//   snake_case              \b[a-z]\w*_\w+\b
-//   camelCase / CapWords    \b[a-z]+[A-Z]\w*\b | \b[A-Z][a-z]+[A-Z]\w*\b
-//   call names              \b[A-Za-z_]\w{3,}(?=\()
-// kept when >= 4 characters, plus every whole line containing Error,
-// Exception or Traceback (>= 8 characters once stripped). A turn's text is
-// its rendered content with the vocabulary's added (control / user-defined)
-// tokens blanked, so template markup such as <tool_call> never matches.
+// Identifiers = ident_v2 (luce_box lucebox_training/pflash/src/pflash_scorer/
+// request_probe/identifiers.py, IDENTIFIER_VERSION "ident_v2", 06fd8041):
+// the SET of spans (>= 4 characters) of, left to right with Python ``re``
+// semantics (ASCII word characters; bytes >= 0x80 are non-word -- parity is
+// defined on ASCII text):
+//   ident_v1   [\w./-]*[A-Za-z_]\w*\.[A-Za-z]{1,6}\b
+//              | \b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\b
+//              | \b[a-z]\w*_\w+\b | \b[a-z]+[A-Z]\w*\b | \b[A-Z][a-z]+[A-Z]\w*\b
+//              | \b[A-Za-z_]\w{3,}(?=\()
+//   PATH_V2    (?:\.{1,2}/|/)?[\w.-]+(?:/[\w.-]+)+/? | /[\w.-]+/?
+//   UNDERSCORE (?<![\w.])_{1,2}[A-Za-z0-9]\w*
+//   DOTTED_V2  \.?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\.?  plus every [A-Za-z_]\w*
+//              segment of each match
+// plus every whole line containing Error, Exception or Traceback (>= 8
+// characters once stripped). A turn's text is its rendered content with the
+// vocabulary's added (control / user-defined) tokens blanked, so template
+// markup such as <tool_call> never matches.
 
 #pragma once
 
@@ -39,15 +44,18 @@ inline constexpr int kIdentErrorLineMinChars = 8;
 
 enum class PFlashIdentQuery {
     Off,        // today's windows (default)
-    Heur,       // the identifier tokens alone (arm viii)
+    Heur,       // evaluation reference: the identifier tokens alone (arm viii)
 };
+
+enum class PFlashIdentVersion { V1, V2 };      // ident_v1 (pre-registered label), ident_v2 (current)
 
 // "off" | "heur".
 const char * pflash_ident_query_name(PFlashIdentQuery mode) noexcept;
 
 // Character spans [begin, end) of the identifiers and error lines of
-// ``text``, in match order (identifiers first, then error lines).
-std::vector<std::pair<size_t, size_t>> pflash_identifier_char_spans(const std::string & text);
+// ``text``: the sorted, deduplicated set over every rule of ``version``.
+std::vector<std::pair<size_t, size_t>> pflash_identifier_char_spans(
+    const std::string & text, PFlashIdentVersion version = PFlashIdentVersion::V2);
 
 // The identifier tokens of ``turns`` (content spans in token positions of a
 // prompt whose per-token texts are ``token_texts``; ``markup[t]`` blanks

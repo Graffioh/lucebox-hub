@@ -116,6 +116,9 @@ struct Qwen35DrafterState {
     ggml_tensor *         request_fc2_b  = nullptr;  // [1]
     float                 request_norm_eps = 1e-5f;
     float                 request_tau = 0.0f;
+    // Candidate rule of the loaded GGUF: false = human messages only, true =
+    // the V2-A3 rule (requestprobe.candidate_rule == kRequestCandidateRule).
+    bool                  request_turns = false;
     int                   request_width = 0;
     bool                  request_loaded = false;
     bool                  request_stub = false;
