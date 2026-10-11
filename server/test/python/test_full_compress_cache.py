@@ -14,7 +14,7 @@ Correctness: all three replies must be identical.
 Skipped automatically if any prerequisite is missing:
   - target GGUF        (LUCE_TARGET or ~/models/qwen3.6-27b/...)
   - draft safetensors dir or GGUF            (LUCE_DRAFT)
-  - Qwen3-0.6B-BF16 pFlash drafter GGUF      (LUCE_PREFILL_DRAFTER)
+  - Qwen3.5-0.8B-BF16 pFlash drafter GGUF     (LUCE_PREFILL_DRAFTER)
   - luce_server binary (--server-bin / LUCE_SERVER_BIN)
 
 Run:  pytest server/test/python/test_full_compress_cache.py -v -m server
@@ -78,7 +78,7 @@ def compress_server(server_bin, spawn_luce_server):
     draft = Path(os.environ.get(
         "LUCE_DRAFT", Path.home() / "models/qwen3.6-27b-dflash"))
     drafter = Path(os.environ.get(
-        "LUCE_PREFILL_DRAFTER", Path.home() / "models/Qwen3-0.6B-BF16.gguf"))
+        "LUCE_PREFILL_DRAFTER", Path.home() / "models/Qwen3.5-0.8B-BF16.gguf"))
 
     for p, label in [
         (target, "target GGUF"),

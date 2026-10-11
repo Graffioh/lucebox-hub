@@ -194,7 +194,7 @@ server is byte-identical to local-inference mode.
 ```bash
 ./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --prefill-compression auto --prefill-threshold 10000 \
-  --prefill-drafter models/Qwen3-0.6B-BF16.gguf \
+  --prefill-drafter models/Qwen3.5-0.8B-BF16.gguf \
   --prefill-curve 10000:0.5 40000:0.2 100000:0.1 \
   --prefill-upstream-base http://127.0.0.1:8099 \
   --prefill-upstream-model my-upstream-model \
@@ -391,11 +391,50 @@ the whole request's device footprint. `/status/json` reports
 | `--prefill-threshold <N>` | `32000` | Token threshold used by auto mode. |
 | `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
 | `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
-| `--prefill-drafter <path>` | none | PFlash drafter GGUF. |
+| `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
 | `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
+| `PFLASH_SELECT_MODE=top_k` + `PFLASH_SELECT_TOPK <K>` | budget-only fill | Rank rule: keep the K highest-scoring optional segments in score order instead of filling the keep ratio, with the keep-ratio budget still a hard ceiling (min(K segments, the budget)). Use it where the evidence is compact and sits in the first few ranks -- needle retrieval, passage QA, code -- so a small K reaches it for a fraction of the budget's tokens. Do not use it where the answer needs a whole document identified, since the evidence there spans many segments and K cuts it off. |
+
+With a Qwen3.5-0.8B drafter and strict budget selection
+(`PFLASH_SELECT_MODE=budget_only`, `PFLASH_SELECT_CHUNK_SIZE`,
+`PFLASH_SELECT_QUERY_TOKENS`), the drafter runs only its first fifteen
+blocks and scores the context with block 15's NoPE Q/K projections as an
+attention-mass scorer. Its 262K native context covers very long inputs. `PFLASH_SCORING_HEAD_GGUF` accepts a trained block-15 head
+(schema `qwen3_5_0_8b_nope_qk_mass_v1`); `PFLASH_QWEN35_LEGACY_SCORER=1`
+restores the previous all-layer running-max scorer. The Qwen3.5 attention
+runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
+still dispatch head dimension 128 only.
+
+`PFLASH_SEGMENT_PROBE_GGUF` loads a segment probe (schema
+`qwen3_5_0_8b_segment_probe_v1`): a 264K-parameter network on the same block-14
+tap that scores every token for "a new unit of text starts here". With it
+loaded, the context is cut at every boundary above the probe's threshold
+(the query start and instruction-span edges are always cut; minimum and
+maximum segment lengths come from the GGUF metadata) and the strict selector
+ranks the resulting whole functions, classes, files or paragraphs by mass
+density, skipping segments that do not fit the remaining budget, so a kept
+piece is never a definition cut in half. It falls back to fixed chunks when
+the probe finds fewer than four boundaries in a context.
+`PFLASH_SELECT_SEGMENTS=auto|fixed|probe` and
+`PFLASH_SELECT_SCORE=auto|sum|density` override the defaults (auto =
+probe segments and density when a probe is loaded, fixed chunks and mass sum
+otherwise); the compression trace records `segmentation`, `candidate_score`
+and the segment spans.
+
+The per-session adaptive keep ratio applies to this path unchanged: a request
+carrying a `session_id` retains the session's ratio, the strict selector fills
+its token budget from it, and the ratio is updated from the smoothed DFlash
+acceptance rate after every turn where speculative decoding ran (below 75%
+acceptance retain more, above 85% retain less, 0.5-1 point per turn, bounded
+to 2.5-20%; `server/src/server/adaptive_keep_ratio.h`). A new session starts
+from the configured ratio for its prompt length (`--prefill-keep-ratio` or
+`--prefill-curve`), so the controller adapts around the real-use budget
+instead of a fixed 10%. Acceptance is a proxy for compression quality: it
+does not detect a dropped answer document directly, so the ratio curve and
+the retention benchmarks remain the quality reference.
 
 ### Reasoning and MoE controls
 
@@ -540,9 +579,9 @@ drives both arches end-to-end. The only thing the user changes is the model path
 ```bash
 cmake --build build --target test_dflash test_laguna_daemon pflash_daemon -j
 
-# 19 GB Q4_K_M target + 1.2 GB Qwen3-0.6B BF16 drafter + tokenizers
+# 19 GB Q4_K_M target + ~1.6 GB Qwen3.5-0.8B BF16 drafter + tokenizers
 hf download Lucebox/Laguna-XS.2-GGUF laguna-xs2-Q4_K_M.gguf --local-dir models/
-hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-BF16.gguf --local-dir models/
+hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-BF16.gguf --local-dir models/
 hf download poolside/Laguna-XS.2 --local-dir models/Laguna-XS-2 \
     --include 'tokenizer*' '*.json'
 
@@ -564,9 +603,9 @@ LUCE_KV_TYPE=q4_0 ./build/bench_laguna_ttft models/laguna-xs2-Q4_K_M.gguf '4096,
 # standalone test_laguna_daemon binary so it can run without luce_server.
 python3 scripts/laguna_pflash_niah.py \
     --target models/laguna-xs2-Q4_K_M.gguf \
-    --drafter models/Qwen3-0.6B-BF16.gguf \
+    --drafter models/Qwen3.5-0.8B-BF16.gguf \
     --laguna-tok models/Laguna-XS-2 \
-    --drafter-tok Qwen/Qwen3-0.6B \
+    --drafter-tok Qwen/Qwen3.5-0.8B \
     --pflash-bin ./build/pflash_daemon \
     --laguna-bin ./build/test_laguna_daemon \
     --ctx 131072 --depth 0.5 --keep 0.10 --target-kv q4_0
