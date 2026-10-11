@@ -3,6 +3,7 @@
 #include "pflash_compress.h"
 
 #include "pflash_fold.h"
+#include "pflash_request_probe.h"
 #include "pflash_selection.h"
 #include "internal.h"
 
@@ -39,6 +40,96 @@ void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks,
     int hi = std::min(n_chunks - 1, chunk + radius);
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
+
+namespace {
+
+void write_float_or_null(FILE * file, double value) {
+    if (std::isfinite(value)) std::fprintf(file, "%.9g", value);
+    else std::fputs("null", file);
+}
+
+void write_spans(FILE * file, const std::vector<PFlashTokenSpan> & spans) {
+    std::fputc('[', file);
+    for (size_t index = 0; index < spans.size(); ++index) {
+        std::fprintf(file, "%s[%d,%d]", index ? "," : "", spans[index].begin, spans[index].end);
+    }
+    std::fputc(']', file);
+}
+
+// ``"request_probe":{...}``: what the request probe read, chose and charged
+// (PFLASH_SELECT_QUERY_PROBE=1 only; absent otherwise).
+void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestProbeTrace & t) {
+    std::fputs(",\"request_probe\":{\"tau\":", file);
+    write_float_or_null(file, t.tau);
+    std::fprintf(file, ",\"stub\":%s,\"fallback\":", t.stub ? "true" : "false");
+    if (t.fallback.empty()) {
+        std::fputs("null", file);
+    } else {
+        std::fputc('"', file);
+        for (const char c : t.fallback) {
+            if (c == '"' || c == '\\') std::fputc('\\', file);
+            if ((unsigned char) c >= 0x20) std::fputc(c, file);
+        }
+        std::fputc('"', file);
+    }
+    std::fprintf(file,
+        ",\"query_tokens\":%d,\"rows_new\":%d,\"rows_stored\":%d,"
+        "\"previous_used\":%s,\"latest_tokens\":%d,\"previous_tokens\":%d,"
+        "\"uncapped_tokens\":%d,\"capped\":%s,\"pinned_new_tokens\":%d,"
+        "\"mandatory_tokens\":%d,\"mandatory_tokens_base\":%d,\"token_budget\":%d,"
+        "\"query_tiles\":%d,\"store\":{\"turns\":%d,\"tokens\":%d,"
+        "\"evicted_turns\":%d,\"invalidated_turns\":%d}",
+        t.query_tokens, t.rows_new, t.rows_stored,
+        t.set.previous_used ? "true" : "false", t.set.latest_tokens, t.set.previous_tokens,
+        t.set.uncapped_tokens, t.set.capped ? "true" : "false", t.pinned_new_tokens,
+        t.mandatory_tokens, t.mandatory_tokens_base, t.token_budget, t.query_tiles,
+        t.store_turns, t.store_tokens, t.store_evicted_turns, t.store_invalidated_turns);
+    if (t.policy_evaluated) {
+        std::fputs(",\"abstain\":{\"reason\":", file);
+        if (t.abstain.reason.empty()) std::fputs("null", file);
+        else std::fprintf(file, "\"%s\"", t.abstain.reason.c_str());
+        std::fputs(",\"mean_margin\":", file); write_float_or_null(file, t.abstain.mean_margin);
+        std::fputs(",\"max_margin\":", file); write_float_or_null(file, t.abstain.max_margin);
+        std::fputs(",\"latest_share\":", file); write_float_or_null(file, t.abstain.latest_share);
+        std::fprintf(file, ",\"runs\":%d,\"prompt_tokens\":%d}", t.abstain.runs, t.abstain.prompt_tokens);
+    }
+    if (t.recency_pin.begin >= 0) {
+        std::fprintf(file, ",\"recency_pin\":[%d,%d],\"recency_pin_new_tokens\":%d",
+                     t.recency_pin.begin, t.recency_pin.end, t.recency_pin_new_tokens);
+    } else {
+        std::fputs(",\"recency_pin\":null", file);
+    }
+    std::fputs(",\"query_spans\":", file);
+    write_spans(file, luce::pflash::pflash_request_token_spans(t.set.tokens));
+    std::fputs(",\"messages\":[", file);
+    for (size_t index = 0; index < t.set.messages.size(); ++index) {
+        const auto & m = t.set.messages[index];
+        std::fprintf(file, "%s{\"span\":[%d,%d],\"tokens\":%d,\"request_tokens\":%d,"
+                     "\"at_or_above_tau\":%d,\"logit_min\":",
+                     index ? "," : "", m.message.begin, m.message.end, m.message_tokens,
+                     m.request_tokens, m.logits_at_or_above_tau);
+        write_float_or_null(file, m.logit_min);
+        std::fputs(",\"logit_max\":", file);
+        write_float_or_null(file, m.logit_max);
+        std::fputs(",\"logit_mean\":", file);
+        write_float_or_null(file, m.logit_mean);
+        std::fputs(",\"runs\":", file);
+        write_spans(file, m.runs);
+        if (index < t.message_logits.size()) {
+            std::fputs(",\"logits\":[", file);
+            const auto & logits = t.message_logits[index];
+            for (size_t k = 0; k < logits.size(); ++k) {
+                if (k) std::fputc(',', file);
+                write_float_or_null(file, logits[k]);
+            }
+            std::fputc(']', file);
+        }
+        std::fputc('}', file);
+    }
+    std::fputs("]}", file);
+}
+
+} // namespace
 
 void write_compression_trace(
         int input_tokens,
@@ -139,6 +230,9 @@ void write_compression_trace(
                 std::fprintf(file, "%s[%d,%d]", index ? "," : "", span.begin, span.end);
             }
             std::fputc(']', file);
+        }
+        if (trace_fields->request_probe) {
+            write_request_probe_trace(file, *trace_fields->request_probe);
         }
         if (trace_fields->kept_spans) {
             std::fprintf(file,
@@ -385,6 +479,7 @@ std::vector<int32_t> select_pflash_chunks(
             fields.fold_capped = fold.capped;
             fields.fold_contained = fold.contained;
             fields.extra_queries = &config.extra_queries;
+            fields.request_probe = config.request_probe_trace;
             write_compression_trace(
                 input_tokens, keep_ratio, segments ? 0 : config.chunk_size, query_tokens,
                 pool_kernel, (int) fold.anchors.size(), chunk_means, anchor_mask,
@@ -486,6 +581,7 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.top_k =
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
         strict_fields.extra_queries = &config.extra_queries;
+        strict_fields.request_probe = config.request_probe_trace;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

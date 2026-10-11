@@ -1062,6 +1062,98 @@ TEST_CASE(ServerUnitFixture,
                     deepseek.content);
 }
 
+// Request probe: the human user messages' content spans, by message ROLE.
+// Renders ``messages`` (Qwen template) and returns the decoded content of
+// each mapped span, latest first ("<none>" when mapping failed).
+static std::vector<std::string> pflash_human_contents(
+        const std::vector<ChatMessage> & messages, bool drop_last_turn = false) {
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true, false);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", ".", "first", " question", "tool", " output"},
+        rendered);
+    Tokenizer tok;
+    std::vector<std::string> out;
+    if (!tok.load_from_gguf(path.c_str())) {
+        unlink(path.c_str());
+        return {"<tokenizer>"};
+    }
+    unlink(path.c_str());
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    if (!resolve_chat_markers(tok, markers)) return {"<markers>"};
+    auto turns = http_detail::pflash_chat_query_turn(tok, markers, tok, prompt).turns;
+    if (drop_last_turn && !turns.empty()) turns.pop_back();
+    std::vector<PFlashTokenSpan> spans;
+    if (!http_detail::pflash_human_message_spans(tok, prompt, turns, messages, 2, spans)) {
+        return {"<none>"};
+    }
+    for (const auto & span : spans) {
+        out.push_back(tok.decode({prompt.begin() + span.begin, prompt.begin() + span.end}));
+    }
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_request_probe_human_messages_skip_tool_results) {
+    // Qwen renders the tool result inside a user turn; by role it is not
+    // human, so the previous human message is the first question.
+    const auto contents = pflash_human_contents({
+        {"user", "first question", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output", "call-1"},
+        {"user", "What is the answer?", ""},
+    });
+    TEST_ASSERT(contents == std::vector<std::string>({"What is the answer?", "first question"}));
+    // An agent step after the human turn: still the human message.
+    const auto agent = pflash_human_contents({
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output", "call-1"},
+    });
+    TEST_ASSERT(agent == std::vector<std::string>({"What is the answer?"}));
+    // A tool result whose text equals a human message does not count.
+    const auto same_text = pflash_human_contents({
+        {"user", "first question", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "What is the answer?", "call-1"},
+        {"user", "What is the answer?", ""},
+    });
+    TEST_ASSERT(same_text.size() == 2);
+    TEST_ASSERT(same_text[1] == "first question");
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_request_probe_human_messages_repeat_and_fail_closed) {
+    // Equal human contents map in order: the latest to the last turn.
+    const std::vector<ChatMessage> repeated{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    };
+    const auto contents = pflash_human_contents(repeated);
+    TEST_ASSERT(contents == std::vector<std::string>({"What is the answer?", "What is the answer?"}));
+    // A rendered turn missing for a human message: no verbatim mapping
+    // (the server then maps by sentinel renders).
+    TEST_ASSERT(pflash_human_contents(repeated, /*drop_last_turn=*/true) ==
+                std::vector<std::string>({"<none>"}));
+    // An empty human message maps to the empty span.
+    const auto empty = pflash_human_contents({
+        {"user", "first question", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "", ""},
+    });
+    TEST_ASSERT(empty.size() == 2 && empty[0].empty() && empty[1] == "first question");
+    // A message ending in a newline keeps it: the span is the exact content.
+    const auto newline = pflash_human_contents({
+        {"user", "first question\n", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    });
+    TEST_ASSERT(newline.size() == 2 && newline[1] == "first question\n");
+}
+
 TEST_CASE(ServerUnitFixture,
         test_pflash_chat_query_turn_falls_back_without_user_turn) {
     const auto turn = pflash_rendered_query_turn(

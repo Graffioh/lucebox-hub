@@ -683,6 +683,97 @@ PflashChatTurnSpan pflash_chat_query_turn(
     return chosen;
 }
 
+bool pflash_human_message_spans(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & prompt,
+        const std::vector<PflashChatTurn> & turns,
+        const std::vector<ChatMessage> & messages,
+        size_t count,
+        std::vector<PFlashTokenSpan> & out) {
+    out.clear();
+    const auto trim = [] (const std::string & text) {
+        const char * space = " \t\n\r";
+        const size_t begin = text.find_first_not_of(space);
+        if (begin == std::string::npos) return std::string();
+        return text.substr(begin, text.find_last_not_of(space) - begin + 1);
+    };
+    std::vector<size_t> human;
+    std::vector<std::string> human_text;
+    for (size_t index = 0; index < messages.size(); ++index) {
+        if (messages[index].role != "user") continue;
+        human.push_back(index);
+        human_text.push_back(trim(messages[index].content));
+    }
+    const DecodedPrompt decoded = decode_prompt_with_offsets(tokenizer, prompt);
+    const auto char_at = [&](int token) {
+        return token < (int) prompt.size() ? decoded.token_begin[(size_t) token] : decoded.text.size();
+    };
+    std::vector<std::string> turn_text(turns.size());
+    std::vector<uint8_t> turn_usable(turns.size(), 0);
+    for (size_t index = 0; index < turns.size(); ++index) {
+        const auto & turn = turns[index];
+        if (turn.role == "assistant" || turn.role == "model" ||
+            turn.role == "system" || turn.role == "developer" ||
+            turn.content_begin < 0 || turn.content_end < turn.content_begin ||
+            turn.content_end > (int) prompt.size()) {
+            continue;
+        }
+        turn_usable[index] = 1;
+        turn_text[index] = trim(tokenizer.decode(std::vector<int32_t>(
+            prompt.begin() + turn.content_begin, prompt.begin() + turn.content_end)));
+    }
+    const size_t wanted = (std::min)(count, human.size());
+    for (size_t k = 0; k < wanted; ++k) {
+        const size_t h = human.size() - 1 - k;
+        const std::string & content = human_text[h];
+        if (content.empty()) {
+            out.push_back({0, 0});
+            continue;
+        }
+        size_t same = 0;
+        size_t rank_from_end = 0;
+        for (size_t j = 0; j < human.size(); ++j) {
+            if (human_text[j] != content) continue;
+            ++same;
+            if (j > h) ++rank_from_end;
+        }
+        std::vector<size_t> matches;
+        for (size_t index = 0; index < turns.size(); ++index) {
+            if (turn_usable[index] && turn_text[index] == content) matches.push_back(index);
+        }
+        if (matches.size() != same) {
+            out.clear();
+            return false;
+        }
+        const auto & turn = turns[matches[matches.size() - 1 - rank_from_end]];
+        // The span of the message's exact content, its own leading and
+        // trailing whitespace included (the turn bounds trim whatever
+        // whitespace surrounds it): every token overlapping those characters.
+        const std::string & raw = messages[human[h]].content;
+        const size_t lead = raw.find_first_not_of(" \t\n\r");
+        const size_t seg_begin = char_at(turn.content_begin);
+        const size_t seg_end = char_at(turn.content_end);
+        const std::string seg = decoded.text.substr(seg_begin, seg_end - seg_begin);
+        const size_t seg_lead = seg.find_first_not_of(" \t\n\r");
+        if (seg_lead == std::string::npos || seg_begin + seg_lead < lead) {
+            out.clear();
+            return false;
+        }
+        const size_t char_begin = seg_begin + seg_lead - lead;
+        const size_t char_end = char_begin + raw.size();
+        if (char_end > decoded.text.size() ||
+            decoded.text.compare(char_begin, raw.size(), raw) != 0) {
+            out.clear();
+            return false;
+        }
+        const int begin = token_at_offset(decoded, char_begin);
+        const int end = (int) (std::lower_bound(decoded.token_begin.begin(),
+            decoded.token_begin.end(), char_end) - decoded.token_begin.begin());
+        out.push_back({begin, end});
+    }
+    return true;
+}
+
 int pflash_chat_skeleton_tokens() noexcept {
     const char * raw = std::getenv("PFLASH_CHAT_SKELETON_TOKENS");
     if (!raw || !*raw) return 256;
@@ -4136,6 +4227,9 @@ std::string HttpServer::apply_pflash_compression(
     // the current turn's role envelope.
     PFlashTokenSpan query_role_header{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
+    // PFLASH_SELECT_QUERY_PROBE=1: the latest human user messages' content
+    // spans for the request probe (nothing is computed with the flag off).
+    PFlashRequestMessages request_probe_messages;
     // Kept verbatim like the required spans. The system prompt never loses
     // its pin: when it alone does not fit the context the request fails.
     // Developer messages and tool definitions that do not fit are scored
@@ -4510,6 +4604,61 @@ std::string HttpServer::apply_pflash_compression(
                         }
                     }
                 }
+                if (experiment.query_probe) {
+                    // Human means ROLE "user" after normalisation: tool
+                    // results are role "tool" from every API format, also
+                    // when the template renders them inside a user turn.
+                    std::vector<size_t> human;
+                    for (size_t index = messages.size();
+                         index-- > 0 && human.size() < 2;) {
+                        if (messages[index].role == "user") human.push_back(index);
+                    }
+                    std::vector<http_detail::PflashChatTurn> turns = chat_turn.turns;
+                    if (turns.empty()) {
+                        ChatMarkers probe_markers;
+                        if (resolve_chat_markers(tokenizer_, probe_markers)) {
+                            turns = http_detail::pflash_chat_query_turn(
+                                tokenizer_, probe_markers, *drafter_tokenizer_,
+                                drafter_ids).turns;
+                        }
+                    }
+                    const char * mapping = "markers";
+                    if (!http_detail::pflash_human_message_spans(
+                            *drafter_tokenizer_, drafter_ids, turns, messages,
+                            human.size(), request_probe_messages.human)) {
+                        // Content not found verbatim among the rendered
+                        // turns: the sentinel renders of each message.
+                        mapping = "sentinel";
+                        request_probe_messages.human.clear();
+                        for (size_t index : human) {
+                            const std::string & content = messages[index].content;
+                            if (content.find_first_not_of(" \t\n\r") == std::string::npos) {
+                                request_probe_messages.human.push_back({0, 0});
+                                continue;
+                            }
+                            int begin = -1;
+                            int end = -1;
+                            std::string mapping_error;
+                            if (!map_message_content(index, begin, end, mapping_error)) {
+                                request_probe_messages.human.clear();
+                                request_probe_messages.error = mapping_error;
+                                break;
+                            }
+                            request_probe_messages.human.push_back({begin, end});
+                        }
+                    }
+                    std::string spans;
+                    for (const auto & span : request_probe_messages.human) {
+                        spans += " [" + std::to_string(span.begin) + "," +
+                            std::to_string(span.end) + ")";
+                    }
+                    std::fprintf(stderr,
+                        "[pflash-request-probe] human messages=%zu mapped by %s:%s%s%s\n",
+                        human.size(), mapping, spans.empty() ? " none" : spans.c_str(),
+                        request_probe_messages.error.empty() ? "" : " error: ",
+                        request_probe_messages.error.c_str());
+                    std::fflush(stderr);
+                }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
@@ -4747,6 +4896,7 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.history_query_spans = history_query_spans;
     compress_request.turn_query_span = turn_query_span;
     compress_request.extra_query_spans = extra_query_spans;
+    compress_request.request_messages = request_probe_messages;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (experiment.selection_active && query_window.valid()) {

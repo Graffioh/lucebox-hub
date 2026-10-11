@@ -80,6 +80,10 @@ void free_drafter_weights(DrafterContext & ctx);
 //   extra_queries  strict selection only (PFLASH_SELECT_QUERY_HEAD=1): the
 //                    user's prose blocks around pasted material, each mixed
 //                    in at the query's own weight
+//   request_messages  PFLASH_SELECT_QUERY_PROBE=1 only: the human user
+//                    messages' content spans the request probe reads
+//                    (nullptr: none, the request falls back to today's
+//                    windows)
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -95,6 +99,7 @@ std::vector<int32_t> drafter_score_and_compress(
     bool   query_suffix_candidates = false,
     const std::vector<PFlashTokenSpan> & history_queries = {},
     PFlashTokenSpan turn_query = {-1, -1},
-    const std::vector<PFlashTokenSpan> & extra_queries = {});
+    const std::vector<PFlashTokenSpan> & extra_queries = {},
+    const PFlashRequestMessages * request_messages = nullptr);
 
 } // namespace luce::common

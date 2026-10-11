@@ -124,6 +124,8 @@ struct PFlashTraceFields {
     int fold_contained = 0;
     // Query head: the extra query windows scored next to the query.
     const std::vector<PFlashTokenSpan> * extra_queries = nullptr;
+    // PFLASH_SELECT_QUERY_PROBE=1: the request probe's record of this call.
+    const luce::pflash::PFlashRequestProbeTrace * request_probe = nullptr;
 };
 
 void write_compression_trace(
