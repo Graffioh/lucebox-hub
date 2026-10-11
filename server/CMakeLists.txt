@@ -556,6 +556,7 @@ add_library(luce_common STATIC
     src/draft/draft_graph.cpp
     src/pflash/anchor_scan.cpp
     src/pflash/pflash_selection.cpp
+    src/pflash/pflash_fold.cpp
     src/pflash/pflash_drafter.cpp
     src/pflash/pflash_compress.cpp
     src/pflash/qwen35_drafter.cpp
@@ -2187,6 +2188,25 @@ if(LUCE_TESTS)
         endif()
     endif()
 
+    # PFlash fold replay: the runtime's fold selection over recorded traces
+    # (CPU only; the drafter GGUF supplies the vocabulary).
+    add_executable(pflash_fold_replay test/pflash_fold_replay.cpp)
+    target_include_directories(pflash_fold_replay PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
+    if(LUCE_GPU_BACKEND STREQUAL "hip")
+        target_compile_definitions(pflash_fold_replay PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
+    else()
+        target_compile_definitions(pflash_fold_replay PRIVATE
+            LUCE_BACKEND_CUDA=1
+            LUCE_CUDA_MIN_SM=${_luce_cuda_min_sm})
+    endif()
+    target_link_libraries(pflash_fold_replay PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
+    if(LUCE_GPU_BACKEND STREQUAL "cuda")
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(pflash_fold_replay PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(pflash_fold_replay PRIVATE hip::host)
+    endif()
+
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     # Shared image input: request transport and JPEG/PNG decoding.
     add_executable(test_image_input test/unit/test_image_input.cpp src/server/image_input.cpp)
@@ -2358,6 +2378,8 @@ if(LUCE_TESTS)
             test/unit/test_anchor_transitive.cpp
             test/unit/test_pflash_drafter_ipc.cpp
             test/unit/test_pflash_selection.cpp
+            test/unit/test_pflash_fold.cpp
+            test/unit/test_qwen35_causal_mask.cpp
             test/unit/test_model_test_paths.cpp
             test/unit/test_gguf_mmap.cpp
             test/unit/test_kv_quant.cpp

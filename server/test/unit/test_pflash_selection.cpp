@@ -607,6 +607,80 @@ TEST_CASE(PFlashSelectionFixture, probe_segments_split_scores_feed_only_the_inte
     }
 }
 
+TEST_CASE(PFlashSelectionFixture, line_flags_mark_line_starts_and_blank_lines) {
+    // Same cases as the Python port (rules.py line_flags).
+    const std::vector<std::string> texts = {"a", "b\n", "  ", "x", "\n\n", "y", " z.\n", "\n", "w"};
+    const auto flags = pflash_line_flags(texts);
+    const std::vector<uint8_t> starts = {0, 0, 1, 0, 0, 1, 0, 1, 1};
+    const std::vector<uint8_t> blanks = {0, 0, 0, 0, 0, 1, 0, 0, 1};
+    REQUIRE(flags.line_start == starts);
+    REQUIRE(flags.after_blank == blanks);
+    // A line of spaces / tabs / CR is blank; a newline in the last token flags nothing.
+    const auto ws = pflash_line_flags({"x\n", " \t\r", "\n", "y", "\n"});
+    REQUIRE(ws.line_start == std::vector<uint8_t>({0, 1, 0, 1, 0}));
+    REQUIRE(ws.after_blank == std::vector<uint8_t>({0, 0, 0, 1, 0}));
+}
+
+TEST_CASE(PFlashSelectionFixture, line_aligned_split_moves_oversize_cuts_to_line_starts) {
+    std::vector<float> boundary(30, 0.0f);
+    std::vector<float> subunit(30, 0.0f);
+    subunit[11] = 0.9f;   // best score: mid-line
+    subunit[7] = 0.2f;    // a line start
+    subunit[9] = 0.1f;    // a line start after a blank line: preferred
+    PFlashLineFlags lines;
+    lines.line_start.assign(30, 0);
+    lines.after_blank.assign(30, 0);
+    lines.line_start[7] = 1;
+    lines.line_start[9] = 1;
+    lines.after_blank[9] = 1;
+    const auto plain = pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit);
+    REQUIRE(plain[0].end == 11);
+    const auto aligned = pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit, &lines);
+    REQUIRE(aligned[0].begin == 0 && aligned[0].end == 9);
+    // Without a blank-line start: the highest-scoring line start.
+    lines.after_blank[9] = 0;
+    const auto any_line = pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit, &lines);
+    REQUIRE(any_line[0].end == 7);
+    // Ties: the earliest line start.
+    subunit[9] = 0.2f;
+    const auto tie = pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit, &lines);
+    REQUIRE(tie[0].end == 7);
+    // No line start in the window: today's cut.
+    PFlashLineFlags none;
+    none.line_start.assign(30, 0);
+    none.after_blank.assign(30, 0);
+    REQUIRE(pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit, &none) == plain);
+    // Line flags shorter than the input: invalid.
+    PFlashLineFlags short_flags;
+    short_flags.line_start.assign(5, 0);
+    short_flags.after_blank.assign(5, 0);
+    REQUIRE(pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit, &short_flags).empty());
+    // Threshold cuts and the floor are untouched; spans stay contiguous and capped.
+    boundary[20] = 0.95f;
+    const auto cut = pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, subunit, &lines);
+    int prev = 0;
+    bool has20 = false;
+    for (const auto & span : cut) {
+        REQUIRE(span.begin == prev);
+        REQUIRE(span.end - span.begin <= 12);
+        prev = span.end;
+        has20 = has20 || span.begin == 20;
+    }
+    REQUIRE(prev == 30 && has20);
+}
+
+TEST_CASE(PFlashSelectionFixture, null_line_flags_are_todays_rule) {
+    std::vector<float> boundary(200, 0.0f);
+    std::vector<float> subunit(200, 0.0f);
+    for (int t = 0; t < 200; ++t) {
+        boundary[(size_t) t] = (float) ((t * 37) % 101) / 100.0f;
+        subunit[(size_t) t] = (float) ((t * 53) % 97) / 96.0f;
+    }
+    const auto today = pflash_probe_segments(boundary, 200, 0.95f, 3, 16, {50, 120}, subunit);
+    const auto via_null = pflash_probe_segments(boundary, 200, 0.95f, 3, 16, {50, 120}, subunit, nullptr);
+    REQUIRE(today == via_null);
+}
+
 TEST_CASE(PFlashSelectionFixture, skip_oversized_keeps_filling_with_smaller_segments) {
     // Ranked by score: a 600-token segment first, then two 200-token ones. Budget 500.
     const std::vector<PFlashSelectionCandidate> candidates = {

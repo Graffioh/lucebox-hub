@@ -11,6 +11,7 @@
 #include "pflash_selection.h"
 #include "common/pflash_types.h"
 #include "internal.h"
+#include "server/tokenizer.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -86,10 +87,19 @@ struct Qwen35DrafterState {
     float                 probe_threshold = 0.9f;
     int                   probe_min_segment = 1;
     int                   probe_max_segment = 2048;
+    // segmentprobe.oversize_split = "line_aligned": oversize cuts at line
+    // starts (pflash_probe_segments with line flags); absent or "best_score":
+    // today's split. ``probe_vocab`` (the drafter's own vocabulary) gives the
+    // per-token texts the line flags are read from.
+    bool                  probe_line_aligned = false;
+    std::unique_ptr<Tokenizer> probe_vocab;
     int                   probe_width = 0;
     bool                  probe_loaded = false;
     // Strict scorer sessions, least recently used evicted
     // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
+    // PFLASH_SELECT_STRATEGY=fold: the drafter's own vocabulary, to read
+    // the prompt's structure from its token ids.
+    std::unique_ptr<Tokenizer> fold_vocab;
     std::vector<std::unique_ptr<Qwen35ScoringSession>> sessions;
     uint64_t              session_clock = 0;
 };
@@ -101,6 +111,14 @@ void free_qwen35_drafter_state(DrafterContext & ctx);
 
 // Defined in qwen35_drafter.cpp.
 //
+// Causal flash-attention mask of one ubatch of n_tokens queries at kv_start,
+// computed by the graph on the device: [align256(kv_start + n_tokens),
+// align32(n_tokens)] F16, row q < n_tokens zero over keys
+// [0, kv_start + q + 1) and -inf after, rows past n_tokens -inf throughout.
+// Its writes are expanded into gf here, ahead of the attention that reads it.
+ggml_tensor * build_qwen35_causal_mask(ggml_context * ctx, ggml_cgraph * gf,
+                                       int kv_start, int n_tokens);
+
 // The legacy all-layer running-max scorer, on the Qwen3.5 architecture.
 std::vector<int32_t> qwen35_score_and_compress(
     TargetWeights & w,
