@@ -10726,6 +10726,32 @@ TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
     TEST_ASSERT(!pflash_relevance_spread({1, INFINITY}, {1, 0}, {0, 0}).valid);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_spread_decision_region_plan) {
+    using luce::common::http_detail::pflash_spread_decision;
+    using luce::common::http_detail::pflash_spread_fires;
+    // Without a region plan the decision is exactly pflash_spread_fires.
+    std::mt19937 rng(20261011);
+    std::uniform_real_distribution<double> u(0.0, 0.4);
+    const double thresholds[] = {0.0, 0.05, 0.11, 0.3};
+    for (int i = 0; i < 2000; ++i) {
+        const double t = thresholds[i % 4];
+        const double sp = (i % 97 == 0) ? NAN : u(rng);
+        const bool valid = (i % 13) != 0;
+        const auto d = pflash_spread_decision(t, valid, sp, false);
+        TEST_ASSERT(d.fires == pflash_spread_fires(t, valid, sp));
+        TEST_ASSERT(d.skipped == nullptr);
+    }
+    TEST_ASSERT(pflash_spread_decision(0.11, true, 0.11, false).fires);
+    // A region plan takes no decision, whatever the spread.
+    for (double sp : {0.0, 0.05, 0.11, 0.5, 5.0}) {
+        for (bool valid : {true, false}) {
+            const auto d = pflash_spread_decision(0.11, valid, sp, true);
+            TEST_ASSERT(!d.fires);
+            TEST_ASSERT(d.skipped != nullptr && std::string(d.skipped) == "region_plan");
+        }
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_spread_threshold_boundary) {
     using luce::common::http_detail::pflash_spread_fires;
     TEST_ASSERT(pflash_spread_fires(0.11, true, 0.11));           // >= fires

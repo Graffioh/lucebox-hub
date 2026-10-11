@@ -650,6 +650,19 @@ std::string pflash_failure_reason(const std::string & error,
 // PFLASH_FALLBACK_SPREAD decision: fire when the threshold is on (> 0), the
 // spread is valid and spread >= threshold.
 bool pflash_spread_fires(double threshold, bool spread_valid, double spread) noexcept;
+// The spread fallback's decision for one selection. A request compressed by a
+// region plan (arrive: a mid-chat paste on a cached history) takes no
+// decision: the threshold was calibrated on whole-prompt selections, where
+// the prompt-start candidate holds most of the score mass; a region has no
+// such candidate, so the spread there has no calibrated meaning. It is
+// still computed and recorded (fired false, skipped "region_plan").
+// Without a region plan: exactly pflash_spread_fires.
+struct PflashSpreadDecision {
+    bool fires = false;
+    const char * skipped = nullptr;   // "region_plan" when no decision was taken
+};
+PflashSpreadDecision pflash_spread_decision(double threshold, bool spread_valid,
+                                            double spread, bool region_plan) noexcept;
 bool pflash_failure_is_config_error(const std::string & error);
 PflashFallbackDecision pflash_fallback_decision(
     const std::string & error, bool fail_closed, int raw_prompt_tokens,
