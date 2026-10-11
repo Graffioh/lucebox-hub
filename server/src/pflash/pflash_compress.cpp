@@ -129,6 +129,26 @@ void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestPro
     std::fputs("]}", file);
 }
 
+// ``"ident_query":{...}``: the identifier query (PFLASH_SELECT_QUERY_IDENT).
+void write_ident_query_trace(FILE * file, const luce::pflash::PFlashIdentQueryTrace & t) {
+    std::fprintf(file, ",\"ident_query\":{\"mode\":\"%s\",\"fallback\":",
+                 luce::pflash::pflash_ident_query_name(t.mode));
+    if (t.fallback.empty()) {
+        std::fputs("null", file);
+    } else {
+        std::fputc('"', file);
+        for (const char c : t.fallback) {
+            if (c == '"' || c == '\\') std::fputc('\\', file);
+            if ((unsigned char) c >= 0x20) std::fputc(c, file);
+        }
+        std::fputc('"', file);
+    }
+    std::fprintf(file, ",\"turns\":%d,\"ident_tokens\":%d,\"query_tokens\":%d,\"query_tiles\":%d,"
+                 "\"query_spans\":", t.turns, t.ident_tokens, t.query_tokens, t.query_tiles);
+    write_spans(file, luce::pflash::pflash_request_token_spans(t.tokens));
+    std::fputc('}', file);
+}
+
 } // namespace
 
 void write_compression_trace(
@@ -233,6 +253,9 @@ void write_compression_trace(
         }
         if (trace_fields->request_probe) {
             write_request_probe_trace(file, *trace_fields->request_probe);
+        }
+        if (trace_fields->ident_query) {
+            write_ident_query_trace(file, *trace_fields->ident_query);
         }
         if (trace_fields->kept_spans) {
             std::fprintf(file,
@@ -480,6 +503,7 @@ std::vector<int32_t> select_pflash_chunks(
             fields.fold_contained = fold.contained;
             fields.extra_queries = &config.extra_queries;
             fields.request_probe = config.request_probe_trace;
+            fields.ident_query = config.ident_query_trace;
             write_compression_trace(
                 input_tokens, keep_ratio, segments ? 0 : config.chunk_size, query_tokens,
                 pool_kernel, (int) fold.anchors.size(), chunk_means, anchor_mask,
@@ -582,6 +606,7 @@ std::vector<int32_t> select_pflash_chunks(
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
         strict_fields.extra_queries = &config.extra_queries;
         strict_fields.request_probe = config.request_probe_trace;
+        strict_fields.ident_query = config.ident_query_trace;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

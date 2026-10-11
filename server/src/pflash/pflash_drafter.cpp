@@ -164,6 +164,23 @@ std::vector<int32_t> drafter_score_and_compress(
                 }
             }
         }
+        if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {
+            if (!request_messages) {
+                experiment.ident_error = "no identifier tokens from the caller";
+            } else if (!request_messages->ident_error.empty()) {
+                experiment.ident_error = request_messages->ident_error;
+            } else {
+                experiment.ident_turns = request_messages->ident_turns;
+                for (const int t : request_messages->ident_tokens) {
+                    if (t < 0 || t >= (int) ids.size()) {
+                        experiment.ident_tokens.clear();
+                        experiment.ident_error = "identifier token outside the input";
+                        break;
+                    }
+                    experiment.ident_tokens.push_back(t);
+                }
+            }
+        }
     }
     if (!experiment.selection_active && !required_instruction_spans.empty()) {
         set_last_error(

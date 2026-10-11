@@ -180,11 +180,13 @@ TEST_CASE(PFlashSelectionFixture, invalid_instruction_spans_fail_closed) {
             spans, input_tokens, error));
         REQUIRE(!error.empty());
     }
-    std::vector<luce::common::PFlashTokenSpan> too_many(65, {0, 1});
+    // No count cap in process (V2-A3): a 200-turn session pins one role
+    // header per turn; the IPC message keeps kPFlashMaxInstructionSpans.
+    std::vector<luce::common::PFlashTokenSpan> many;
+    for (int k = 0; k < 200; ++k) many.push_back({k * 10, k * 10 + 3});
     std::string error;
-    REQUIRE(!validate_pflash_instruction_spans(
-        too_many, input_tokens, error));
-    REQUIRE(!error.empty());
+    REQUIRE(validate_pflash_instruction_spans(many, 2000, error));
+    REQUIRE(error.empty());
 }
 
 TEST_CASE(PFlashSelectionFixture, cumulative_top_p_is_scale_invariant_and_keeps_crossing_chunk) {

@@ -30,9 +30,15 @@ inline bool operator!=(
 // messages (role "user" after normalisation; tool results are role "tool"),
 // latest first, at most two; ``error`` says why the server could not map
 // them (the request then falls back to today's windows).
+// PFLASH_SELECT_QUERY_IDENT=heur travels with them: the
+// identifier tokens of the last turns (ascending positions), the turns read,
+// and why the server found none it could map (``ident_error``).
 struct PFlashRequestMessages {
     std::vector<PFlashTokenSpan> human;
     std::string error;
+    std::vector<int> ident_tokens;
+    int ident_turns = 0;
+    std::string ident_error;
 };
 
 } // namespace luce::common

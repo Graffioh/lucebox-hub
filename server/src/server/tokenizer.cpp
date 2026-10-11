@@ -836,6 +836,13 @@ const std::string & Tokenizer::raw_token(int32_t id) const {
     return id_to_token_[id];
 }
 
+bool Tokenizer::is_added_token(int32_t id) const {
+    for (const auto & entry : added_tokens_) {
+        if (entry.second == id) return true;
+    }
+    return false;
+}
+
 int32_t Tokenizer::token_to_id(const std::string & token) const {
     auto it = token_to_id_.find(token);
     return it != token_to_id_.end() ? it->second : -1;

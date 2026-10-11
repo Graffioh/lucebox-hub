@@ -1300,6 +1300,39 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             }
         }
     }
+    // PFLASH_SELECT_QUERY_IDENT: the identifier query's block-14 rows, read
+    // while this call's activations exist. Positions before ``resume`` have
+    // no rows (only the request probe keeps a row store): the request then
+    // falls back to today's windows.
+    const luce::pflash::PFlashIdentQuery ident_mode = experiment.query_ident;
+    luce::pflash::PFlashIdentQueryTrace ident_trace;
+    std::vector<float> ident_query_rows;   // [hidden, query tokens]
+    if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
+        ident_trace.mode = ident_mode;
+        ident_trace.turns = experiment.ident_turns;
+        ident_trace.ident_tokens = (int) experiment.ident_tokens.size();
+        std::vector<int> query = experiment.ident_tokens;
+        if (!experiment.ident_error.empty()) {
+            ident_trace.fallback = "mapping: " + experiment.ident_error;
+        } else if (query.empty()) {
+            ident_trace.fallback = "no_identifiers";
+        } else {
+            if (query.front() < resume || query.back() >= S) {
+                ident_trace.fallback = "rows_missing";
+            } else {
+                ident_query_rows.assign((size_t) hidden * query.size(), 0.0f);
+                size_t index = 0;
+                for (const auto & span : luce::pflash::pflash_request_token_spans(query)) {
+                    const int n = span.end - span.begin;
+                    ggml_backend_tensor_get(act_in, ident_query_rows.data() + index * (size_t) hidden,
+                                            (size_t) (span.begin - resume) * act_in->nb[1],
+                                            (size_t) hidden * (size_t) n * sizeof(float));
+                    index += (size_t) n;
+                }
+                ident_trace.tokens = std::move(query);
+            }
+        }
+    }
     cleanup();
     // The session now covers this prompt, resumable at the checkpoint and,
     // while the query stays put, reusing its rows.
@@ -1463,8 +1496,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     // heads and query tokens, as for a window. Queries run in bounded tiles;
     // each tile's probabilities are reduced to one row per key on the
     // device, so only [S] floats per tile come back.
+    // The identifier query uses the same scoring with its tokens left among
+    // the keys (scored, not pinned: arm viii's key mask).
     const auto score_request_set = [&](const std::vector<int> & tokens,
-                                       const std::vector<float> & rows) -> bool {
+                                       const std::vector<float> & rows,
+                                       bool mask_query_tokens, int & tiles) -> bool {
         constexpr int kTile = 32;
         const int nq = (int) tokens.size();
         std::vector<float> mask_row((size_t) S, -INFINITY);
@@ -1472,7 +1508,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         if (experiment.query_suffix_candidates) {
             std::fill(mask_row.begin() + query_end, mask_row.end(), 0.0f);
         }
-        for (const int t : tokens) mask_row[(size_t) t] = -INFINITY;
+        if (mask_query_tokens) {
+            for (const int t : tokens) mask_row[(size_t) t] = -INFINITY;
+        }
         std::vector<double> sum((size_t) S, 0.0);
         std::vector<float> part((size_t) S);
         for (int q0 = 0; q0 < nq; q0 += kTile) {
@@ -1575,7 +1613,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 return false;
             }
             for (int j = 0; j < S; ++j) sum[(size_t) j] += part[(size_t) j];
-            ++request_trace.query_tiles;
+            ++tiles;
         }
         const double denominator = (double) H * (double) nq;
         token_mass.assign((size_t) S, 0.0f);
@@ -1583,10 +1621,26 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         return true;
     };
     bool request_set = request_probe && request_trace.fallback.empty();
-    if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows)
+    const bool ident_set = ident_mode != luce::pflash::PFlashIdentQuery::Off &&
+        ident_trace.fallback.empty();
+    if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows,
+                                         /*mask_query_tokens=*/true, request_trace.query_tiles)
+        : ident_set ? !score_request_set(ident_trace.tokens, ident_query_rows,
+                                         /*mask_query_tokens=*/false, ident_trace.query_tiles)
                     : !score_windows()) {
         session->ids.clear();
         return {};
+    }
+    if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
+        ident_trace.query_tokens = ident_set ? (int) ident_trace.tokens.size() : 0;
+        if (!ident_set) ident_trace.tokens.clear();
+        std::fprintf(stderr,
+            "[pflash-ident-query] mode=%s %s turns=%d ident_tokens=%d query_tokens=%d tiles=%d\n",
+            luce::pflash::pflash_ident_query_name(ident_mode),
+            ident_set ? "scored" : ("fallback=" + ident_trace.fallback).c_str(),
+            ident_trace.turns, ident_trace.ident_tokens, ident_trace.query_tokens,
+            ident_trace.query_tiles);
+        std::fflush(stderr);
     }
     const std::vector<float> & probe_raw = session->probe_raw;
     const std::vector<float> & subunit_raw = session->subunit_raw;
@@ -1597,11 +1651,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
         std::chrono::duration<double>(t2 - t1).count(),
-        request_set ? (size_t) 1 : windows.size(),
+        request_set || ident_set ? (size_t) 1 : windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);
-    pflash_set_scoring_stats({resume, n_new, request_set ? 1 : (int) windows.size(),
+    pflash_set_scoring_stats({resume, n_new, request_set || ident_set ? 1 : (int) windows.size(),
                               std::chrono::duration<double>(t1 - t0).count()});
 
     // Candidates: probe segments cut at the pinned spans' edges, or fixed
@@ -1834,13 +1888,17 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     }
 
     luce::pflash::PFlashSelectionConfig request_config;
-    if (request_probe) {
+    const bool traced_query = request_probe || ident_mode != luce::pflash::PFlashIdentQuery::Off;
+    if (traced_query) {
         request_config = experiment;
-        request_config.request_probe_trace = &request_trace;
+        if (request_probe) request_config.request_probe_trace = &request_trace;
+        if (ident_mode != luce::pflash::PFlashIdentQuery::Off) {
+            request_config.ident_query_trace = &ident_trace;
+        }
     }
     return select_pflash_chunks(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
-        /*pool_kernel=*/1, request_probe ? request_config : experiment, pins,
+        /*pool_kernel=*/1, traced_query ? request_config : experiment, pins,
         /*direct_mass=*/true, /*write_trace=*/true,
         segments.empty() ? nullptr : &segments, density,
         /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,

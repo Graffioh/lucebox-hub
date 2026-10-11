@@ -376,6 +376,16 @@ std::string pflash_recall_excerpt(
 // kept so the next turn can append to it instead of recompressing. The next
 // request continues the view when its raw prompt starts with this one's up
 // to the generation prompt, in target and drafter tokens alike.
+// One piece of a served view, in order: raw drafter tokens [begin, end) of
+// the request it was taken from (the view's prompt prefix, so the current
+// request's coordinates), served verbatim, or (recall) as a recalled excerpt
+// of that range under the [Earlier in this conversation] block.
+struct PflashViewPiece {
+    int begin = 0;
+    int end = 0;
+    bool recall = false;
+};
+
 struct PflashChatView {
     std::vector<int32_t> raw_tokens;       // target tokens, raw prompt
     int raw_gen_begin = -1;                 // its generation prompt
@@ -384,6 +394,7 @@ struct PflashChatView {
     std::vector<int32_t> view_tokens;      // target tokens served
     int view_gen_begin = -1;
     std::vector<PFlashTokenSpan> spans;    // raw drafter spans in the view
+    std::vector<PflashViewPiece> pieces;   // the served view, in order (provenance)
     int turns = 0;
 };
 
@@ -539,6 +550,9 @@ int pflash_query_search_end_from_sentinel(
 int pflash_query_search_begin_from_sentinel(
     const std::vector<int32_t> & original,
     const std::vector<int32_t> & sentinel) noexcept;
+
+// The served view's provenance pieces as [[begin, end, "raw"|"recall"], ...].
+json pflash_view_pieces_json(const std::vector<PflashViewPiece> & pieces);
 
 std::string pflash_token_fingerprint(
     const std::vector<int32_t> & ids);
