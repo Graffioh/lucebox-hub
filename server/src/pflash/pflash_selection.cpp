@@ -25,6 +25,14 @@ constexpr const char * kSegmentsEnv = "PFLASH_SELECT_SEGMENTS";
 constexpr const char * kSelectEnv = "PFLASH_SELECT_SCORE";
 constexpr const char * kScorerEnv = "PFLASH_SELECT_SCORER";
 constexpr const char * kSplitEnv = "PFLASH_SELECT_SPLIT";
+constexpr const char * kStrategyEnv = "PFLASH_SELECT_STRATEGY";
+constexpr const char * kFoldKEnv = "PFLASH_SELECT_FOLD_K";
+constexpr const char * kFoldCapEnv = "PFLASH_SELECT_FOLD_CAP";
+constexpr const char * kFoldHeadEnv = "PFLASH_SELECT_FOLD_HEAD";
+constexpr const char * kFoldParagraphsEnv = "PFLASH_SELECT_FOLD_PARAGRAPHS";
+constexpr const char * kQueryHeadEnv = "PFLASH_SELECT_QUERY_HEAD";
+constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
+constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -76,7 +84,14 @@ bool has_pflash_selection_environment() noexcept {
            std::getenv(kSegmentsEnv) != nullptr ||
            std::getenv(kSelectEnv) != nullptr ||
            std::getenv(kScorerEnv) != nullptr ||
-           std::getenv(kSplitEnv) != nullptr;
+           std::getenv(kSplitEnv) != nullptr ||
+           std::getenv(kStrategyEnv) != nullptr ||
+           std::getenv(kQueryHeadEnv) != nullptr;
+}
+
+bool pflash_fold_requested() noexcept {
+    const char * raw = std::getenv(kStrategyEnv);
+    return raw && std::strcmp(raw, "fold") == 0;
 }
 
 bool pflash_chunk_is_structurally_required(
@@ -321,11 +336,13 @@ bool resolve_pflash_selection(
     const char * select_raw = std::getenv(kSelectEnv);
     const char * scorer_raw = std::getenv(kScorerEnv);
     const char * split_raw = std::getenv(kSplitEnv);
+    const char * strategy_raw = std::getenv(kStrategyEnv);
+    const char * query_head_raw = std::getenv(kQueryHeadEnv);
 
     PFlashSelectionConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
         query_parser_raw || top_p_raw || top_k_raw || segments_raw ||
-        select_raw || scorer_raw || split_raw;
+        select_raw || scorer_raw || split_raw || strategy_raw || query_head_raw;
     if (scorer_raw) {
         if (std::strcmp(scorer_raw, "head") == 0) {
             config.scorer = PFlashScorer::Head;
@@ -430,8 +447,117 @@ bool resolve_pflash_selection(
         return false;
     }
 
+    if (strategy_raw) {
+        if (std::strcmp(strategy_raw, "fold") == 0) {
+            config.strategy = PFlashSelectStrategy::Fold;
+        } else if (std::strcmp(strategy_raw, "segments") != 0) {
+            error = std::string(kStrategyEnv) + " must be segments or fold";
+            return false;
+        }
+    }
+    const struct { const char * name; int * value; int min; } fold_knobs[] = {
+        {kFoldKEnv, &config.fold_k, 1},
+        {kFoldCapEnv, &config.fold_cap, 1},
+        {kFoldHeadEnv, &config.fold_head, 0},
+    };
+    for (const auto & knob : fold_knobs) {
+        const char * raw = std::getenv(knob.name);
+        if (raw && (!parse_int(raw, *knob.value) || *knob.value < knob.min)) {
+            error = std::string(knob.name) + " must be an integer >= " +
+                std::to_string(knob.min);
+            return false;
+        }
+    }
+    if (query_head_raw) {
+        if (std::strcmp(query_head_raw, "0") != 0 && std::strcmp(query_head_raw, "1") != 0) {
+            error = std::string(kQueryHeadEnv) + " must be 0 or 1";
+            return false;
+        }
+        config.query_head = query_head_raw[0] == '1';
+    }
+    const struct { const char * name; int * value; } query_caps[] = {
+        {kQueryHeadTokensEnv, &config.query_head_tokens},
+        {kQueryTailTokensEnv, &config.query_tail_tokens},
+    };
+    for (const auto & cap : query_caps) {
+        const char * raw = std::getenv(cap.name);
+        if (raw && (!parse_int(raw, *cap.value) || *cap.value < 2 || *cap.value > 512)) {
+            error = std::string(cap.name) + " must be an integer in [2, 512]";
+            return false;
+        }
+    }
+    if (config.query_head && (config.query_parser != PFlashQueryParser::SemanticUser ||
+                              config.mode == PFlashSelectionMode::Legacy)) {
+        error = std::string(kQueryHeadEnv) + "=1 needs strict selection with " +
+            std::string(kQueryParserEnv) + "=latest_user";
+        return false;
+    }
+    if (const char * raw = std::getenv(kFoldParagraphsEnv)) {
+        if (std::strcmp(raw, "0") != 0 && std::strcmp(raw, "1") != 0) {
+            error = std::string(kFoldParagraphsEnv) + " must be 0 or 1";
+            return false;
+        }
+        config.fold_paragraphs = raw[0] == '1';
+    }
+    if (config.strategy == PFlashSelectStrategy::Fold) {
+        // Fold spends the budget itself: it needs the budget rule and one
+        // scorer, and a head no longer than the cap.
+        if (config.mode != PFlashSelectionMode::BudgetOnly) {
+            error = std::string(kStrategyEnv) + "=fold needs " +
+                std::string(kModeEnv) + "=budget_only";
+            return false;
+        }
+        if (config.scorer != PFlashScorer::Head) {
+            error = std::string(kStrategyEnv) + "=fold needs the head scorer";
+            return false;
+        }
+        if (config.fold_head > config.fold_cap) {
+            error = std::string(kFoldHeadEnv) + " must not exceed " +
+                std::string(kFoldCapEnv);
+            return false;
+        }
+    }
+
     out = config;
     return true;
+}
+
+PFlashLineFlags pflash_line_flags(const std::vector<std::string> & token_texts) {
+    PFlashLineFlags flags;
+    const size_t n = token_texts.size();
+    flags.line_start.assign(n, 0);
+    flags.after_blank.assign(n, 0);
+    // The text of the current line seen so far: is it only spaces / tabs / CR?
+    bool line_blank = true;
+    for (size_t t = 0; t < n; ++t) {
+        const std::string & text = token_texts[t];
+        const size_t last_nl = text.rfind('\n');
+        if (last_nl != std::string::npos) {
+            // The line ended by text's last '\n': the pending line content plus
+            // this token's text after its previous '\n' (if any) up to last_nl.
+            const size_t prev_nl = last_nl == 0 ? std::string::npos : text.rfind('\n', last_nl - 1);
+            bool blank = prev_nl == std::string::npos ? line_blank : true;
+            const size_t from = prev_nl == std::string::npos ? 0 : prev_nl + 1;
+            for (size_t i = from; i < last_nl && blank; ++i) {
+                const char c = text[i];
+                if (c != ' ' && c != '\t' && c != '\r') blank = false;
+            }
+            if (t + 1 < n) {
+                flags.line_start[t + 1] = 1;
+                flags.after_blank[t + 1] = blank ? 1 : 0;
+            }
+            line_blank = true;
+            for (size_t i = last_nl + 1; i < text.size(); ++i) {
+                const char c = text[i];
+                if (c != ' ' && c != '\t' && c != '\r') { line_blank = false; break; }
+            }
+        } else {
+            for (const char c : text) {
+                if (c != ' ' && c != '\t' && c != '\r') { line_blank = false; break; }
+            }
+        }
+    }
+    return flags;
 }
 
 std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
@@ -442,7 +568,24 @@ std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
         int max_segment,
         const std::vector<int> & forced_cuts,
         const std::vector<float> & split_scores) {
+    return pflash_probe_segments(boundary_scores, input_tokens, threshold, min_segment,
+                                 max_segment, forced_cuts, split_scores, nullptr);
+}
+
+std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
+        const std::vector<float> & boundary_scores,
+        int input_tokens,
+        float threshold,
+        int min_segment,
+        int max_segment,
+        const std::vector<int> & forced_cuts,
+        const std::vector<float> & split_scores,
+        const PFlashLineFlags * lines) {
     using luce::common::PFlashTokenSpan;
+    if (lines && ((int) lines->line_start.size() < input_tokens ||
+                  (int) lines->after_blank.size() < input_tokens)) {
+        return {};
+    }
     std::vector<PFlashTokenSpan> spans;
     if (input_tokens <= 0 || (int) boundary_scores.size() < input_tokens ||
         min_segment < 1 || max_segment < min_segment) {
@@ -487,6 +630,24 @@ std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
                 }
             }
             if (best < 0) best = begin + max_segment;
+            if (lines) {
+                // Line-aligned: blank-line starts first, then any line start;
+                // the highest split score, earliest on ties.
+                for (int pass = 0; pass < 2; ++pass) {
+                    int aligned = -1;
+                    for (int token = lo; token <= hi; ++token) {
+                        if (!lines->line_start[(size_t) token]) continue;
+                        if (pass == 0 && !lines->after_blank[(size_t) token]) continue;
+                        if (aligned < 0 || interior[(size_t) token] > interior[(size_t) aligned]) {
+                            aligned = token;
+                        }
+                    }
+                    if (aligned >= 0) {
+                        best = aligned;
+                        break;
+                    }
+                }
+            }
             spans.push_back({begin, best});
             begin = best;
         }
@@ -570,6 +731,14 @@ const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept 
         case PFlashSegmentation::Auto: return "auto";
         case PFlashSegmentation::Fixed: return "fixed";
         case PFlashSegmentation::Probe: return "probe";
+    }
+    return "unknown";
+}
+
+const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept {
+    switch (strategy) {
+        case PFlashSelectStrategy::Segments: return "segments";
+        case PFlashSelectStrategy::Fold: return "fold";
     }
     return "unknown";
 }

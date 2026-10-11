@@ -57,6 +57,7 @@ static void free_qwen35_segment_probe(Qwen35DrafterState & st) {
     st.probe_conv_w.clear();
     st.probe_sub_conv_w.clear();
     st.probe_loaded = false;
+    st.probe_line_aligned = false;
 }
 
 static bool qwen35_metadata_equals(gguf_context * g, const char * key,
@@ -202,6 +203,22 @@ static bool load_qwen35_segment_probe(const std::string & path,
         st.probe_min_segment < 1 || st.probe_max_segment < st.probe_min_segment) {
         return fail("segment probe parameters are missing or out of range");
     }
+    {
+        // Optional oversize split rule; an unknown value refuses the probe.
+        st.probe_line_aligned = false;
+        const int id = gguf_find_key(g, "segmentprobe.oversize_split");
+        if (id >= 0) {
+            if (gguf_get_kv_type(g, id) != GGUF_TYPE_STRING) {
+                return fail("segmentprobe.oversize_split must be a string");
+            }
+            const std::string rule = gguf_get_val_str(g, id);
+            if (rule == "line_aligned") {
+                st.probe_line_aligned = true;
+            } else if (rule != "best_score") {
+                return fail("unknown segmentprobe.oversize_split: " + rule);
+            }
+        }
+    }
     ggml_tensor * fc1 = data_ctx ? ggml_get_tensor(data_ctx, "segmentprobe.fc1.weight") : nullptr;
     if (!fc1 || fc1->type != GGML_TYPE_F32 || ggml_n_dims(fc1) != 2 ||
         fc1->ne[0] != w.n_embd || fc1->ne[1] < 1) {
@@ -293,10 +310,11 @@ static bool load_qwen35_segment_probe(const std::string & path,
     st.probe_loaded = true;
     std::fprintf(stderr,
         "[qwen35-drafter] loaded segment probe: %s (width %d, threshold %.3f, "
-        "segments %d-%d tokens, %zu conv taps%s)\n",
+        "segments %d-%d tokens, %zu conv taps%s%s)\n",
         path.c_str(), st.probe_width, st.probe_threshold,
         st.probe_min_segment, st.probe_max_segment, st.probe_conv_w.size(),
-        st.probe_sub_fc2_w ? ", sub-unit head" : "");
+        st.probe_sub_fc2_w ? ", sub-unit head" : "",
+        st.probe_line_aligned ? ", line-aligned oversize split" : "");
     std::fflush(stderr);
     return true;
 }
@@ -343,6 +361,36 @@ bool load_qwen35_drafter(const std::string & gguf_path,
                 "[qwen35-drafter] ERROR: scoring head load failed, "
                 "refusing to serve without it\n");
             std::fflush(stderr);
+            free_target_weights(st->weights);
+            delete st;
+            return false;
+        }
+    }
+    if (st->probe_loaded && st->probe_line_aligned) {
+        st->probe_vocab = std::make_unique<Tokenizer>();
+        if (!st->probe_vocab->load_from_gguf(gguf_path.c_str())) {
+            set_last_error("line-aligned segment probe: drafter vocabulary load failed");
+            std::fprintf(stderr,
+                "[qwen35-drafter] ERROR: the line-aligned probe split needs the "
+                "drafter vocabulary, refusing to serve without it\n");
+            std::fflush(stderr);
+            free_qwen35_head(*st);
+            free_qwen35_segment_probe(*st);
+            free_target_weights(st->weights);
+            delete st;
+            return false;
+        }
+    }
+    if (luce::pflash::pflash_fold_requested()) {
+        st->fold_vocab = std::make_unique<Tokenizer>();
+        if (!st->fold_vocab->load_from_gguf(gguf_path.c_str())) {
+            set_last_error("PFLASH_SELECT_STRATEGY=fold: drafter vocabulary load failed");
+            std::fprintf(stderr,
+                "[qwen35-drafter] ERROR: fold selection needs the drafter "
+                "vocabulary, refusing to serve without it\n");
+            std::fflush(stderr);
+            free_qwen35_head(*st);
+            free_qwen35_segment_probe(*st);
             free_target_weights(st->weights);
             delete st;
             return false;

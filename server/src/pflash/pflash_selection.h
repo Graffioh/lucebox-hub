@@ -3,6 +3,7 @@
 #include "common/pflash_types.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -96,6 +97,10 @@ enum class PFlashCandidateScore { Auto, Sum, Density };
 // original all-layer running-max scorer, or both with a split budget (the
 // head fills ``split_fraction`` of the budget first, the other scorer the rest).
 enum class PFlashScorer { Head, Legacy, Split };
+// How the kept spans are formed: whole segments in score order (today), or
+// fold -- anchors completed to their enclosing code or text block
+// (pflash_fold.h), routed by prompt type.
+enum class PFlashSelectStrategy { Segments, Fold };
 
 struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
@@ -110,6 +115,14 @@ struct PFlashSelectionConfig {
     PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
     PFlashScorer scorer = PFlashScorer::Head;
     double split_fraction = 0.5;
+    PFlashSelectStrategy strategy = PFlashSelectStrategy::Segments;
+    // Fold only: completions kept, block size above which a completion keeps
+    // the block's first ``fold_head`` tokens plus the anchor.
+    int fold_k = 20;
+    int fold_cap = 1500;
+    int fold_head = 150;
+    // Fold only: blank-line paragraphs as the last-resort text blocks.
+    bool fold_paragraphs = true;
     bool configured = false;
     bool selection_active = false;
     // Per request, never from the environment: the tokens after the query
@@ -127,6 +140,17 @@ struct PFlashSelectionConfig {
     // strings (an identifier, a function description) the last token does
     // not carry.
     luce::common::PFlashTokenSpan turn_query{-1, -1};
+    // PFLASH_SELECT_QUERY_HEAD=1 (latest_user parser): the question may sit
+    // before pasted material. The server scores the user's leading prose
+    // block (capped at ``query_head_tokens``) and the trailing prose block
+    // (capped at ``query_tail_tokens``) as query windows; a block over its
+    // cap contributes its first and last cap/2 tokens.
+    bool query_head = false;
+    int query_head_tokens = 256;
+    int query_tail_tokens = 256;
+    // Per request: those extra windows, scored at full weight next to the
+    // query window and kept verbatim.
+    std::vector<luce::common::PFlashTokenSpan> extra_queries;
 };
 
 // Segment probe: cut the context before every token whose boundary score is
@@ -147,6 +171,33 @@ std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
     const std::vector<int> & forced_cuts,
     const std::vector<float> & split_scores = {});
 
+// Line-aligned oversize split (probe GGUF ``segmentprobe.oversize_split`` =
+// "line_aligned"). Per token t: ``line_start[t]`` = token t-1's text holds the
+// last '\n' before t; ``after_blank[t]`` = the line that '\n' ends holds only
+// spaces, tabs or '\r' (or nothing). Derived from the per-token texts alone,
+// with no marker strings.
+struct PFlashLineFlags {
+    std::vector<uint8_t> line_start;
+    std::vector<uint8_t> after_blank;
+};
+PFlashLineFlags pflash_line_flags(const std::vector<std::string> & token_texts);
+
+// As above, but when ``lines`` is given (sized >= input_tokens) an oversize
+// cut must fall at a line start inside the same window: among line starts
+// that follow a blank line the highest split score, else among all line
+// starts the highest split score (earliest on ties); with no line start in
+// the window, the cut above. ``lines == nullptr`` is exactly the function
+// above.
+std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
+    const std::vector<float> & boundary_scores,
+    int input_tokens,
+    float threshold,
+    int min_segment,
+    int max_segment,
+    const std::vector<int> & forced_cuts,
+    const std::vector<float> & split_scores,
+    const PFlashLineFlags * lines);
+
 // Two-scorer selection: ``head`` candidates fill ``head_fraction`` of the
 // budget (mandatory candidates first, charged once), then ``other``
 // candidates (same spans and ordinals, scored by the other scorer) fill what
@@ -162,6 +213,11 @@ PFlashSelectionResult select_pflash_split(
 const char * pflash_scorer_name(PFlashScorer scorer) noexcept;
 const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept;
 const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept;
+const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept;
+
+// PFLASH_SELECT_STRATEGY=fold, read once: the drafter loads its vocabulary
+// at load time only when fold may be requested.
+bool pflash_fold_requested() noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an
 // empty or invalid experiment variable cannot silently fall back to legacy.

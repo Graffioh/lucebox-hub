@@ -102,6 +102,45 @@ int main(int argc, char ** argv) {
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
+        if (cmd == "segment") {
+            // segment <lookahead> <score_query_end> <suffix_candidates 0|1> <n_instruction_spans> [<begin> <end>]... <path>
+            // The served drafter path (score + probe segmentation + selection, PFlash trace written as for compress)
+            // with explicit query end, suffix-candidate flag and required instruction spans, so callers can reproduce
+            // a chat layout's forced cuts. Selection runs at keep 0.1875, chunk 256, pool 1 (segments do not depend on it).
+            int lookahead = 0, query_end = -1, suffix = 0, n_spans = 0;
+            iss >> lookahead >> query_end >> suffix >> n_spans;
+            std::vector<luce::common::PFlashTokenSpan> spans;
+            bool ok = (bool) iss && lookahead > 0 && n_spans >= 0 && n_spans < 64;
+            for (int i = 0; ok && i < n_spans; ++i) {
+                int b = 0, e = 0;
+                iss >> b >> e;
+                ok = (bool) iss && 0 <= b && b < e;
+                spans.push_back({b, e});
+            }
+            std::string path;
+            std::getline(iss, path);
+            const size_t first = path.find_first_not_of(" \t");
+            path = first == std::string::npos ? std::string() : path.substr(first);
+            auto ids = ok && !path.empty() ? read_counted_i32_file(path) : std::vector<int32_t>{};
+            if (!ok || ids.empty()) {
+                std::fprintf(stderr, "[pflash-daemon] bad segment command: %s\n", line.c_str());
+                std::printf("[pflash-daemon] segment failed\n");
+                std::fflush(stdout);
+                continue;
+            }
+            auto t0 = std::chrono::steady_clock::now();
+            std::vector<int32_t> out = drafter_score_and_compress(
+                ctx, ids, 0.1875f, 256, lookahead, 1, query_end, spans, suffix != 0);
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (out.empty()) {
+                std::fprintf(stderr, "[pflash-daemon] segment failed: %s\n", luce_last_error());
+                std::printf("[pflash-daemon] segment failed\n");
+            } else {
+                std::printf("[pflash-daemon] segment done %.3fs in=%zu\n", secs, ids.size());
+            }
+            std::fflush(stdout);
+            continue;
+        }
         if (cmd != "compress") {
             std::fprintf(stderr, "[pflash-daemon] unknown command: %s\n", line.c_str());
             stream_emit(stream_fd, -1);
