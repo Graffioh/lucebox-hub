@@ -559,6 +559,7 @@ add_library(luce_common STATIC
     src/pflash/pflash_fold.cpp
     src/pflash/pflash_request_probe.cpp
     src/pflash/pflash_request_stage2.cpp
+    src/pflash/pflash_query_candidates.cpp
     src/pflash/pflash_ident_query.cpp
     src/pflash/pflash_drafter.cpp
     src/pflash/pflash_compress.cpp
@@ -2384,6 +2385,7 @@ if(LUCE_TESTS)
             test/unit/test_pflash_fold.cpp
             test/unit/test_pflash_request_probe.cpp
             test/unit/test_pflash_request_stage2.cpp
+            test/unit/test_pflash_query_candidates.cpp
             test/unit/test_pflash_ident_query.cpp
             test/unit/test_qwen35_causal_mask.cpp
             test/unit/test_model_test_paths.cpp

@@ -607,6 +607,11 @@ int pflash_kept_tokens(
 // (kept + keep_ratio * (input - kept) + 1) / input, capped at 1.
 double pflash_effective_keep_ratio(
     int input_tokens, int kept_tokens, double keep_ratio) noexcept;
+// The selector keep ratio for the next re-encode-overshoot retry: ``tightening`` (cumulative over the retries of
+// one request, starts at 0) grows by overflow + 1 and the ratio is requested * (ceiling - tightening) / ceiling,
+// so the ratios only tighten (defect fix 9 Oct 2026; the first retry is what it always was). <= 0: no retry.
+float pflash_ceiling_retry_keep_ratio(float requested_keep_ratio, int target_ceiling, int overflow,
+                                      int & tightening);
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;
 
@@ -756,6 +761,18 @@ void apply_request_reasoning(const json & body,
 // Sticky tools-boundary pinning is part of PPP and must follow its master
 // toggle. Kept as a small policy helper so the disabled path is testable.
 bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
+
+// The tokens PPP remembers as a recent tool head: what the client sent, never
+// a PFlash view. A view is the server's own rewrite; one that dropped a token
+// of the system/tools head (e.g. the system turn's "<|im_end|>\n") would make
+// the next uncompressed request pin -- and every later one restore -- at the
+// view's divergence point instead of the head boundary, so an uncompressed
+// prompt would prefill split differently than with PFlash off. The remembered
+// head is unchanged when nothing was compressed, or when the view kept the
+// head verbatim.
+const std::vector<int32_t> & ppp_tool_prefix_source(
+    bool compressed, const std::vector<int32_t> & request_tokens,
+    const std::vector<int32_t> & served_tokens);
 
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See

@@ -347,10 +347,15 @@ struct PFlashStage2Trace {
     int64_t pass2_us = 0;
 };
 
+struct PFlashQueryTrace;  // pflash_query_candidates.h
+
 // What the request probe did on one scoring call, for the compression
 // trace ("request_probe" object) and the log line.
 struct PFlashRequestProbeTrace {
     PFlashStage2Trace stage2;
+    // Query step 1 (PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN), not owned; nullptr when both are off (the
+    // trace object request_probe.query is written only then).
+    const PFlashQueryTrace * query = nullptr;
     float tau = 0.0f;
     bool stub = false;                  // zero row, tau = +inf (plumbing test)
     PFlashRequestQuerySet set;          // messages, runs, capped query tokens

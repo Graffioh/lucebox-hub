@@ -4,6 +4,7 @@
 
 #include "pflash_fold.h"
 #include "pflash_request_probe.h"
+#include "pflash_query_candidates.h"
 #include "pflash_selection.h"
 #include "internal.h"
 
@@ -185,6 +186,59 @@ void write_request_probe_trace(FILE * file, const luce::pflash::PFlashRequestPro
             std::fputc('"', file);
         }
         std::fprintf(file, ",\"fallback_count\":%ld}", s2.fallback_count);
+    }
+    // Query step 1 (PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN): only when one of them is on.
+    if (t.query && t.query->evaluated) {
+        const auto & q = *t.query;
+        const auto & c = q.config;
+        std::fprintf(file, ",\"query\":{\"candidates_k\":%d,\"unit_score\":\"%s\",\"aggregate\":\"%s\","
+                     "\"temperature\":", c.candidates, luce::pflash::pflash_unit_score_name(c.unit_score),
+                     luce::pflash::pflash_query_aggregate_name(c.aggregate));
+        write_float_or_null(file, c.temperature);
+        std::fputs(",\"extent_margin\":", file);
+        if (c.extent_gap) std::fputs("\"gap\"", file); else write_float_or_null(file, c.extent_margin);
+        std::fputs(",\"null_margin\":", file);
+        write_float_or_null(file, c.null_margin);
+        std::fprintf(file, ",\"pin_cap\":%d,\"pin_margin\":", c.pin_tokens);
+        if (c.pin_gap) std::fputs("\"gap\"", file); else write_float_or_null(file, c.pin_margin);
+        std::fprintf(file, ",\"units\":%d,\"system_used\":%s,\"latest\":%d,\"latest_units\":%d,\"latest_top\":",
+                     q.units, q.system_used ? "true" : "false", q.set.latest, q.set.latest_units);
+        write_float_or_null(file, q.set.latest_top);
+        std::fputs(",\"latest_z\":", file);
+        write_float_or_null(file, q.set.latest_z);
+        std::fprintf(file, ",\"latest_null\":%s,\"candidates\":[", q.set.latest_null ? "true" : "false");
+        for (size_t i = 0; i < q.set.candidates.size(); ++i) {
+            const auto & cand = q.set.candidates[i];
+            std::fprintf(file, "%s{\"message\":%d,\"units\":%zu,\"query_spans\":", i ? "," : "", cand.message,
+                         cand.units.size());
+            write_spans(file, luce::pflash::pflash_request_token_spans(cand.tokens));
+            std::fputs(",\"score\":", file);
+            write_float_or_null(file, cand.score);
+            std::fputs(",\"weight\":", file);
+            write_float_or_null(file, cand.weight);
+            std::fputc('}', file);
+        }
+        std::fputs("],\"blend\":{\"probe\":[", file);
+        for (size_t i = 0; i < q.blend.probe.size(); ++i) {
+            if (i) std::fputc(',', file);
+            write_float_or_null(file, q.blend.probe[i]);
+        }
+        std::fputs("],\"tw\":", file);
+        write_float_or_null(file, q.blend.tw);
+        std::fputs(",\"tw_score\":", file);
+        write_float_or_null(file, q.tw_score);
+        std::fputs(",\"end\":", file);
+        write_float_or_null(file, q.blend.end);
+        std::fprintf(file, "},\"tw_share\":");
+        if (c.tw_score) std::fputs("\"score\"", file); else write_float_or_null(file, c.tw_share);
+        std::fputs(",\"end_share\":", file);
+        write_float_or_null(file, c.end_share);
+        std::fprintf(file, ",\"query_tokens\":%d,\"tiles\":%d,\"pin\":", q.query_tokens, q.tiles);
+        write_spans(file, q.pin.spans);
+        std::fprintf(file, ",\"pin_tokens\":%d,\"pin_units\":%d,\"pin_skipped\":%d,\"pin_cap_used\":%d,"
+                     "\"rank_us\":%lld,\"score_us\":%lld}",
+                     q.pin.tokens, q.pin.units, q.pin.skipped, q.pin_cap_used, (long long) q.rank_us,
+                     (long long) q.score_us);
     }
     std::fputc('}', file);
 }

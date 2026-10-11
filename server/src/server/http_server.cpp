@@ -1133,6 +1133,14 @@ std::vector<PFlashTokenSpan> pflash_complement_token_spans(
     return out;
 }
 
+float pflash_ceiling_retry_keep_ratio(float requested_keep_ratio, int target_ceiling, int overflow,
+                                      int & tightening) {
+    tightening += overflow + 1;
+    const int tightened = target_ceiling - tightening;
+    if (tightened <= 0) return 0.0f;
+    return requested_keep_ratio * (float) tightened / (float) std::max(1, target_ceiling);
+}
+
 int pflash_target_token_ceiling(
         int original_target_tokens, double keep_ratio) noexcept {
     if (original_target_tokens < 0 || !std::isfinite(keep_ratio) ||
@@ -1534,6 +1542,12 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens) {
 
 bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools) {
     return ppp_enabled && has_tools;
+}
+
+const std::vector<int32_t> & ppp_tool_prefix_source(
+        bool compressed, const std::vector<int32_t> & request_tokens,
+        const std::vector<int32_t> & served_tokens) {
+    return compressed ? request_tokens : served_tokens;
 }
 
 // Sampler parameters. When the request omits a value, fall back to the
@@ -5513,6 +5527,7 @@ std::string HttpServer::apply_pflash_compression(
     std::vector<int32_t> final_tokens;
     const auto compress_started = std::chrono::steady_clock::now();
     int join_overhead = 0;
+    int ceiling_tightening = 0;   // tokens taken off the selector target so far (cumulative over retries)
     for (int attempt = 0; ; ++attempt) {
         result = {};
         if (config_.pflash_remote_drafter) {
@@ -5604,16 +5619,16 @@ std::string HttpServer::apply_pflash_compression(
         }
         const int overflow =
             (int) final_tokens.size() - join_overhead - target_ceiling;
-        const int tightened = target_ceiling - overflow - 1;
-        if (attempt >= 2 || tightened <= 0) {
+        // Each retry tightens the selector target by its own overflow ON TOP OF the earlier retries (defect
+        // fix, 9 Oct: the retry used to restart from the requested ratio each time, so a smaller second
+        // overflow LOOSENED the ratio again and the third attempt repeated the first: 11584 > 11567 with probe
+        // pins). The first retry is unchanged.
+        const float retry_ratio = http_detail::pflash_ceiling_retry_keep_ratio(
+            requested_keep_ratio, target_ceiling, overflow, ceiling_tightening);
+        if (attempt >= 2 || retry_ratio <= 0.0f) {
             break;
         }
-        compress_request.keep_ratio =
-            requested_keep_ratio * (float) tightened /
-            (float) std::max(1, target_ceiling);
-        if (compress_request.keep_ratio <= 0.0f) {
-            break;
-        }
+        compress_request.keep_ratio = retry_ratio;
         std::fprintf(stderr,
             "[pflash-select] final prompt %zu exceeds ceiling %d "
             "(re-encode overshoot); retrying with keep_ratio %.6f\n",
@@ -6394,13 +6409,15 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                     forced_cut, effective_prompt.size());
             }
         }
+        const auto & remember_ids = ppp_tool_prefix_source(
+            prepared.compressed, req.prompt_tokens, effective_prompt);
         const auto remember_bounds = find_all_boundaries(
-            effective_prompt, prefix_cache_.chat_markers());
+            remember_ids, prefix_cache_.chat_markers());
         const int remember_n = !remember_bounds.empty()
             ? remember_bounds.front()
-            : (int)effective_prompt.size();
+            : (int)remember_ids.size();
         PinFriendlyPrompt::remember_tool_prefix(
-            recent_tool_prefixes_, effective_prompt, remember_n,
+            recent_tool_prefixes_, remember_ids, remember_n,
             config_.ppp_lcp_window);
     }
 
