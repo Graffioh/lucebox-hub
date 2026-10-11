@@ -328,9 +328,10 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
 | `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
 | `--decode-kv-offload-mb <auto\|N>` | `auto` | Automatically size the RAM budget for active KV suspension; `N` sets a per-model cap in MiB, `0` disables. Applies to concurrent serving. |
-| `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
-| `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap (hard cap, LRU eviction). |
+| `--kv-cache-dir <path>\|off` | `~/.cache/lucebox/kv-cache` | Disk session cache directory (`$XDG_CACHE_HOME/lucebox/kv-cache` when set); `off` or `--no-kv-cache` disables it. Snapshots are written when they leave RAM and at graceful shutdown; a crash loses what was only in RAM. See [docs/PREFIX_CACHE.md](docs/PREFIX_CACHE.md#disk-session-cache). |
+| `--kv-cache-budget <MB>` | `131072` | Disk KV-cache size cap (hard cap, LRU eviction, clamped to the free space). |
 | `--kv-cache-ttl <hours>` | `72` | Delete disk snapshots unused this long; `0` = never. |
+| `--kv-cache-shutdown-flush <s>` | `120` | Longest a graceful shutdown spends writing RAM snapshots to disk; `-1` = no limit. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
 | `--kv-cache-interval <N>` | `10240` | Continued-checkpoint interval. |
 | `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |
