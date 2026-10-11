@@ -190,6 +190,11 @@ struct PFlashSelectionConfig {
     std::string ident_error;
     // Trace only (not owned), as request_probe_trace.
     const PFlashIdentQueryTrace * ident_query_trace = nullptr;
+    // PFLASH_FALLBACK_SPREAD=T (strict selection; opt-in, unset = off): a
+    // request whose relevance spread (pflash_relevance_spread) is >= T is
+    // served by full prefill of the raw prompt (failure policy D5 path,
+    // reason "spread"). 0 = off.
+    double fallback_spread = 0.0;
 };
 
 // Segment probe: cut the context before every token whose boundary score is

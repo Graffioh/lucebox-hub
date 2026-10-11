@@ -10556,6 +10556,267 @@ TEST_CASE(ServerUnitFixture, test_pflash_fallback_decision_and_reasons) {
                 == "selection_failed");
 }
 
+// PFLASH_FALLBACK_SPREAD (relevance-spread fallback, release2).
+TEST_CASE(ServerUnitFixture, test_pflash_relevance_spread_formula) {
+    using luce::common::pflash_relevance_spread;
+    const auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
+    // Uniform over 4, two selected: exp(ln 4) / 2.
+    auto r = pflash_relevance_spread({1, 1, 1, 1}, {1, 1, 0, 0}, {0, 0, 0, 0});
+    TEST_ASSERT(r.valid && r.k == 2 && r.candidates == 4 && near(r.spread, 2.0));
+    // One-hot: H = 0.
+    r = pflash_relevance_spread({5, 0, 0, 0}, {1, 0, 0, 0}, {0, 0, 0, 0});
+    TEST_ASSERT(r.valid && r.k == 1 && near(r.entropy, 0.0) && near(r.spread, 1.0));
+    // Mixed, one forced selected chunk not counted; reference = sim_tier2.spread_of.
+    r = pflash_relevance_spread({0.2, 0.5, 0.1, 0.0, 0.2}, {0, 1, 1, 0, 1}, {0, 0, 1, 0, 0});
+    TEST_ASSERT(r.valid && r.k == 2);
+    TEST_ASSERT_MSG(std::fabs(r.spread - 1.6946226386695418) < 1e-9, std::to_string(r.spread));
+    // All-zero scores: sum 0 -> H = 0 -> 1 / max(k, 1).
+    r = pflash_relevance_spread({0, 0, 0}, {1, 1, 0}, {0, 0, 0});
+    TEST_ASSERT(r.valid && r.k == 2 && near(r.spread, 0.5));
+    r = pflash_relevance_spread({0, 0, 0}, {0, 0, 0}, {0, 0, 0});
+    TEST_ASSERT(r.valid && r.k == 0 && near(r.spread, 1.0));
+    // k = 0 (nothing selected): exp(H) / 1.
+    r = pflash_relevance_spread({1, 3}, {0, 0}, {0, 0});
+    TEST_ASSERT(r.valid && r.k == 0);
+    TEST_ASSERT(std::fabs(r.spread - 1.7547653506033232) < 1e-12);
+    // Forced-only selection: k = 0 as well.
+    r = pflash_relevance_spread({1, 3, 2}, {1, 1, 0}, {1, 1, 0});
+    TEST_ASSERT(r.valid && r.k == 0);
+    TEST_ASSERT(near(r.spread, std::exp(-(1.0/6*std::log(1.0/6) + 0.5*std::log(0.5) +
+                                          1.0/3*std::log(1.0/3)))));
+    // Invalid inputs: no decision may be taken.
+    TEST_ASSERT(!pflash_relevance_spread({1, 2}, {1}, {0, 0}).valid);
+    TEST_ASSERT(!pflash_relevance_spread({1, 2}, {1, 0}, {0}).valid);
+    TEST_ASSERT(!pflash_relevance_spread({1, NAN}, {1, 0}, {0, 0}).valid);
+    TEST_ASSERT(!pflash_relevance_spread({1, INFINITY}, {1, 0}, {0, 0}).valid);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_spread_threshold_boundary) {
+    using luce::common::http_detail::pflash_spread_fires;
+    TEST_ASSERT(pflash_spread_fires(0.11, true, 0.11));           // >= fires
+    TEST_ASSERT(pflash_spread_fires(0.11, true, 0.5));
+    TEST_ASSERT(!pflash_spread_fires(0.11, true, std::nextafter(0.11, 0.0)));
+    TEST_ASSERT(!pflash_spread_fires(0.0, true, 5.0));             // off
+    TEST_ASSERT(!pflash_spread_fires(0.11, false, 5.0));           // invalid spread
+    TEST_ASSERT(!pflash_spread_fires(0.11, true, NAN));
+    using luce::common::http_detail::pflash_failure_reason;
+    TEST_ASSERT(pflash_failure_reason(
+        "PFlash relevance spread fallback (spread 0.200000 >= 0.110000)", "") == "spread");
+    TEST_ASSERT(pflash_failure_reason("PFlash relevance spread unavailable", "") ==
+                "spread_unavailable");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_fallback_spread_env_parse) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce::pflash::PFlashSelectionConfig config;
+    std::string error;
+    {
+        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", nullptr};
+        TEST_ASSERT(luce::pflash::resolve_pflash_selection(1000, 32, config, error));
+        TEST_ASSERT(config.fallback_spread == 0.0);
+    }
+    for (const char * off : {"0", "off", ""}) {
+        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", off};
+        TEST_ASSERT_MSG(luce::pflash::resolve_pflash_selection(1000, 32, config, error), error);
+        TEST_ASSERT(config.fallback_spread == 0.0);
+    }
+    {
+        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "0.11"};
+        TEST_ASSERT_MSG(luce::pflash::resolve_pflash_selection(1000, 32, config, error), error);
+        TEST_ASSERT(config.fallback_spread == 0.11);
+    }
+    for (const char * bad : {"-0.1", "abc", "0.11x", "nan", "inf"}) {
+        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", bad};
+        TEST_ASSERT_MSG(!luce::pflash::resolve_pflash_selection(1000, 32, config, error), bad);
+        TEST_ASSERT(error.find("PFLASH_FALLBACK_SPREAD") != std::string::npos);
+    }
+    {
+        luce_test::ScopedEnvVar legacy{"PFLASH_SELECT_MODE", nullptr};
+        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "0.11"};
+        TEST_ASSERT(!luce::pflash::resolve_pflash_selection(1000, 32, config, error));
+    }
+}
+
+// The sel-trace carries spread / spread_threshold only with the flag on, and
+// the value is the formula applied to the record's own chunk_scores /
+// selected_chunks / forced_chunks.
+TEST_CASE(ServerUnitFixture, test_pflash_spread_in_selection_trace) {
+    char trace_path[] = "/tmp/pflash_spread_trace_XXXXXX";
+    const int fd = mkstemp(trace_path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    luce_test::ScopedEnvVar trace{"PFLASH_TRACE_PATH", trace_path};
+    std::vector<int32_t> ids(64);
+    for (int i = 0; i < 64; ++i) ids[(size_t) i] = 100 + i;
+    std::vector<float> mass(64, 0.001f);
+    for (int i = 16; i < 24; ++i) mass[(size_t) i] = 0.05f;
+    for (int i = 40; i < 44; ++i) mass[(size_t) i] = 0.03f;
+    luce::pflash::PFlashSelectionConfig config;
+    config.mode = luce::pflash::PFlashSelectionMode::BudgetOnly;
+    config.selection_active = true;
+    config.configured = true;
+    config.chunk_size = 8;
+    const auto run = [&] {
+        return luce::common::select_pflash_chunks(
+            ids, mass, /*keep_ratio=*/0.4f, /*n_lookahead=*/4, /*score_query_end=*/64,
+            /*pool_kernel=*/1, config, {}, /*direct_mass=*/true, /*write_trace=*/true);
+    };
+    TEST_ASSERT(!run().empty());
+    const auto off = luce::common::pflash_last_relevance_spread();
+    config.fallback_spread = 0.11;
+    TEST_ASSERT(!run().empty());
+    const auto on = luce::common::pflash_last_relevance_spread();
+    TEST_ASSERT(off.valid && on.valid && off.spread == on.spread);
+    std::ifstream in(trace_path);
+    std::vector<json> rows;
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty()) rows.push_back(json::parse(line));
+    }
+    unlink(trace_path);
+    TEST_ASSERT(rows.size() == 2);
+    TEST_ASSERT(!rows[0].contains("spread") && !rows[0].contains("spread_threshold"));
+    TEST_ASSERT(rows[1].value("spread_threshold", 0.0) == 0.11);
+    TEST_ASSERT(rows[1].value("spread", -1.0) == on.spread);
+    // Recompute from the record (what the offline simulation reads).
+    std::vector<double> scores = rows[1]["chunk_scores"].get<std::vector<double>>();
+    std::vector<uint8_t> selected(scores.size(), 0), forced(scores.size(), 0);
+    for (int i : rows[1]["selected_chunks"].get<std::vector<int>>()) selected[(size_t) i] = 1;
+    for (int i : rows[1]["forced_chunks"].get<std::vector<int>>()) forced[(size_t) i] = 1;
+    const auto again = luce::common::pflash_relevance_spread(scores, selected, forced);
+    TEST_ASSERT(again.valid && again.spread == on.spread);
+    // Everything else in the record is identical with the flag on and off.
+    json a = rows[0], b = rows[1];
+    b.erase("spread");
+    b.erase("spread_threshold");
+    TEST_ASSERT(a == b);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_chat_view_store_forget) {
+    http_detail::PflashChatViewStore store(4);
+    http_detail::PflashChatView first;
+    first.raw_tokens = {1, 2, 3, 9, 9};
+    first.raw_gen_begin = 3;
+    first.drafter_ids = first.raw_tokens;
+    first.drafter_gen_begin = 3;
+    store.remember(first);
+    http_detail::PflashChatView other = first;
+    other.raw_tokens = {7, 7, 7, 9};
+    other.drafter_ids = other.raw_tokens;
+    store.remember(other);
+    TEST_ASSERT(store.size() == 2);
+    // A prompt continuing the first conversation drops its view only.
+    TEST_ASSERT(store.forget({1, 2, 3, 4, 5, 9}, {1, 2, 3, 4, 5, 9}) == 1);
+    TEST_ASSERT(store.size() == 1);
+    http_detail::PflashChatView found;
+    TEST_ASSERT(!store.find({1, 2, 3, 4, 5, 9}, {1, 2, 3, 4, 5, 9}, found));
+    TEST_ASSERT(store.find({7, 7, 7, 1, 9}, {7, 7, 7, 1, 9}, found));
+    TEST_ASSERT(store.forget({5, 5}, {5, 5}) == 0);
+}
+
+// Budget compression that reports a configurable relevance spread.
+struct MockPflashSpreadBackend : MockPflashBudgetBackend {
+    static inline bool spread_valid = true;
+    static inline double spread = 0.0;
+    CompressResult compress(const CompressRequest & request) override {
+        auto result = MockPflashBudgetBackend::compress(request);
+        result.spread_valid = spread_valid;
+        result.spread = spread;
+        result.spread_k = 3;
+        return result;
+    }
+};
+
+static PflashFallbackRun run_spread_case(const char * flag, double spread, bool valid,
+                                         int max_ctx = 8192) {
+    luce_test::ScopedEnvVar env{"PFLASH_FALLBACK_SPREAD", flag};
+    MockPflashSpreadBackend::spread = spread;
+    MockPflashSpreadBackend::spread_valid = valid;
+    return run_pflash_fallback_case<MockPflashSpreadBackend>(max_ctx, 16);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_spread_flag_off_takes_no_decision) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // A spread far above any threshold: with the flag off nothing changes.
+    const auto run = run_spread_case(nullptr, 5.0, true);
+    const auto base = run_pflash_fallback_case<MockPflashBudgetBackend>(8192, 16);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.prepared.compressed);
+    TEST_ASSERT(run.prepared.tokens == base.prepared.tokens);
+    // compress_ms is a wall-clock field
+    json stats_run = run.prepared.pflash_stats;
+    json stats_base = base.prepared.pflash_stats;
+    stats_run.erase("compress_ms");
+    stats_base.erase("compress_ms");
+    TEST_ASSERT(stats_run == stats_base);
+    TEST_ASSERT(!run.prepared.pflash_stats.contains("spread"));
+    TEST_ASSERT(!run.prepared.pflash_stats.contains("pflash_fallback"));
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+    TEST_ASSERT(run.view_records.size() == 1);
+    TEST_ASSERT(run.view_records[0].value("kind", "") == "compressed");
+    // "0" is off too.
+    const auto zero = run_spread_case("0", 5.0, true);
+    TEST_ASSERT(zero.prepared.compressed && !zero.prepared.pflash_stats.contains("spread"));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_spread_fires_full_prefill_with_flag) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto run = run_spread_case("0.11", 0.11, true);   // boundary: fires
+    TEST_ASSERT(run.compress_calls >= 1);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(!run.prepared.compressed);
+    TEST_ASSERT(run.prepared.tokens == run.ids);
+    TEST_ASSERT(run.prepared.snapshot_cut == -1);
+    const json & flag = run.prepared.pflash_stats["pflash_fallback"];
+    TEST_ASSERT(flag.value("reason", "") == "spread");
+    TEST_ASSERT(flag.value("spread", -1.0) == 0.11);
+    TEST_ASSERT(flag.value("spread_threshold", -1.0) == 0.11);
+    TEST_ASSERT(flag.value("fired", false));
+    TEST_ASSERT(flag.value("prompt_tokens", 0) == (int) run.ids.size());
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 1);
+    TEST_ASSERT(run.counters["fallback_reasons"].value("spread", 0) == 1);
+    TEST_ASSERT(run.view_records.size() == 1);
+    TEST_ASSERT(run.view_records[0].value("kind", "") == "raw");
+    TEST_ASSERT(run.view_records[0]["pflash_fallback"].value("reason", "") == "spread");
+    // Below the threshold: compressed, spread recorded, not fired.
+    const auto low = run_spread_case("0.11", std::nextafter(0.11, 0.0), true);
+    TEST_ASSERT_MSG(low.prepared.error.empty(), low.prepared.error);
+    TEST_ASSERT(low.prepared.compressed);
+    TEST_ASSERT(!low.prepared.pflash_stats.contains("pflash_fallback"));
+    TEST_ASSERT(!low.prepared.pflash_stats["spread"].value("fired", true));
+    TEST_ASSERT(low.counters.value("fallback_served", 0) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_spread_fallback_is_not_refused_by_fail_closed) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
+    const auto run = run_spread_case("0.11", 0.5, true);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.prepared.tokens == run.ids);
+    TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") == "spread");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_spread_raw_prompt_too_long_serves_compressed) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto probe = run_pflash_fallback_case<MockPflashBudgetBackend>(8192, 16);
+    const auto run = run_spread_case("0.11", 0.5, true, (int) probe.ids.size() + 15);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.prepared.compressed);
+    TEST_ASSERT(run.prepared.pflash_stats["spread"].value("refused", "") == "raw_exceeds_max_ctx");
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_spread_unavailable_is_a_failure) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const auto run = run_spread_case("0.11", 0.0, false);
+    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
+    TEST_ASSERT(run.prepared.tokens == run.ids);
+    TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") ==
+                "spread_unavailable");
+    // An invalid setting is a configuration error: never served.
+    const auto bad = run_spread_case("abc", 0.5, true);
+    TEST_ASSERT(bad.prepared.error_status == 500);
+    TEST_ASSERT(bad.prepared.error.find("PFLASH_FALLBACK_SPREAD") != std::string::npos);
+}
+
 // Keeps the required spans, the query window through the end, and whatever
 // ``pick`` adds; reports the kept spans like the in-process drafter does.
 struct MockPflashSpanBackend : MockBackend {

@@ -424,6 +424,11 @@ struct ModelBackend {
         bool                 raw_fits = false;
         int                  stage2_budget = -1;
         int                  stage2_budget_widened = -1;
+        // Relevance spread of the served selection (PFLASH_FALLBACK_SPREAD);
+        // spread_valid is false when the backend did not compute one.
+        bool                 spread_valid = false;
+        double               spread = 0.0;
+        int                  spread_k = 0;
 
         static CompressResult from_compressed_ids(
                 std::vector<int32_t> ids) {
