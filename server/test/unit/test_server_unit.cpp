@@ -12091,6 +12091,57 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_longest_prefix_and_prune_ancestors)
     rm_rf(dir);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_restorable_prefix_counts_disk_only_when_on) {
+    using http_detail::pflash_restorable_prefix;
+    const auto is = [](const http_detail::PflashRestorablePrefix & got,
+                       int tokens, const char * source) {
+        return got.tokens == tokens && std::string(got.source) == source;
+    };
+    // Disk cache off: the RAM prefix, whatever the disk would hold.
+    TEST_ASSERT(is(pflash_restorable_prefix(0, false, 0), 0, "none"));
+    TEST_ASSERT(is(pflash_restorable_prefix(0, false, 40000), 0, "none"));
+    TEST_ASSERT(is(pflash_restorable_prefix(9000, false, 40000), 9000, "ram"));
+    // Disk cache on: the deeper of the two; ties stay in RAM (no file read).
+    TEST_ASSERT(is(pflash_restorable_prefix(0, true, 0), 0, "none"));
+    TEST_ASSERT(is(pflash_restorable_prefix(0, true, 40000), 40000, "disk"));
+    TEST_ASSERT(is(pflash_restorable_prefix(9000, true, 40000), 40000, "disk"));
+    TEST_ASSERT(is(pflash_restorable_prefix(40000, true, 40000), 40000, "ram"));
+    TEST_ASSERT(is(pflash_restorable_prefix(41000, true, 40000), 41000, "ram"));
+    TEST_ASSERT(is(pflash_restorable_prefix(-1, true, -5), 0, "none"));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_admission_keeps_a_disk_session_raw) {
+    // A restarted server: RAM is empty, the session is on disk. Counting the
+    // disk entry turns a would-be compression into a raw restore.
+    MockBackendWithAdopt backend;
+    const std::string dir = test_tmp_path("luce_test_pflash_disk_admission").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+    const auto turn2 = disk_test_key(60);
+    const std::vector<int32_t> turn1(turn2.begin(), turn2.begin() + 40);
+    TEST_ASSERT(cache.save(0, turn1));
+    const int disk = cache.longest_prefix(turn2).cur_pos;
+    TEST_ASSERT(disk == MockBackendWithLayout::kMaxPos);
+
+    using http_detail::PflashAdmission;
+    using http_detail::pflash_cache_admission;
+    // Threshold scaled to the mock's KV rows: droppable 60, threshold 20.
+    const int threshold = 20, droppable = 60;
+    const auto decide = [&](bool disk_on) {
+        const auto r = http_detail::pflash_restorable_prefix(0, disk_on, disk);
+        return pflash_cache_admission(
+            (std::max)(0, droppable - r.tokens), r.tokens, threshold);
+    };
+    TEST_ASSERT(decide(/*disk_on=*/false) == PflashAdmission::Compress);
+    TEST_ASSERT(decide(/*disk_on=*/true) != PflashAdmission::Compress);
+    // A prompt the disk does not hold is unaffected.
+    TEST_ASSERT(cache.longest_prefix(disk_test_key(60, 5000)).cur_pos == 0);
+    rm_rf(dir);
+}
+
 TEST_CASE(ServerUnitFixture, test_disk_cache_write_failure_is_not_fatal) {
     MockBackendWithAdopt backend;
     const std::string dir = test_tmp_path("luce_test_disk_write_fail").string();

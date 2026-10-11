@@ -700,6 +700,17 @@ PFlashTokenSpan pflash_chat_history_region(
 PflashAdmission pflash_cold_history_admission(
     PflashAdmission admission, bool raw_fits, bool tool_activity,
     int history_uncached_droppable, int threshold) noexcept;
+// The restorable prefix the cache-aware admission counts: the RAM prefix
+// snapshot, or the deepest entry of the disk session cache when that cache
+// is on and holds more (a restarted server, or a session written out on
+// eviction). Ties go to RAM. With the disk cache off it is the RAM prefix,
+// and ``source`` is "ram" (or "none" when nothing is cached).
+struct PflashRestorablePrefix {
+    int tokens = 0;
+    const char * source = "none";
+};
+PflashRestorablePrefix pflash_restorable_prefix(
+    int ram_tokens, bool disk_enabled, int disk_tokens) noexcept;
 // Tokens of the canonical ``spans`` inside [begin, end).
 int pflash_span_tokens_within(
     const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept;
@@ -957,10 +968,15 @@ private:
         nlohmann::json & stats);
     // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
     // the served prompt's text, for evidence checks in evaluations.
-    // Target tokens of ``prompt`` the reader can restore from its in-memory
-    // prefix cache right now (a live backend snapshot, its authoritative
-    // position); no cache state changes.
-    int restorable_prefix_tokens(const std::vector<int32_t> & prompt);
+    // Target tokens of ``prompt`` the reader can restore right now: its
+    // in-memory prefix cache (a live backend snapshot, its authoritative
+    // position) or, when the disk session cache is on and the request's disk
+    // policy is Full (the scope the generation path looks up), the deepest
+    // disk entry -- an index lookup, no file read. No cache state changes.
+    http_detail::PflashRestorablePrefix restorable_prefix_tokens(
+        const std::vector<int32_t> & prompt,
+        const DiskPrefixCachePolicy & disk_policy);
+    int ram_restorable_prefix_tokens(const std::vector<int32_t> & prompt);
     // Serve a PflashRegionPlan turn from the selection's kept spans; false
     // when it cannot be served (the caller serves the raw prompt).
     bool serve_pflash_region_view(

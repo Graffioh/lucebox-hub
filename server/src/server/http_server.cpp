@@ -1148,6 +1148,14 @@ PflashAdmission pflash_cold_history_admission(
     return PflashAdmission::ColdHistory;
 }
 
+PflashRestorablePrefix pflash_restorable_prefix(
+        int ram_tokens, bool disk_enabled, int disk_tokens) noexcept {
+    const int ram = (std::max)(0, ram_tokens);
+    const int disk = disk_enabled ? (std::max)(0, disk_tokens) : 0;
+    if (disk > ram) return {disk, "disk"};
+    return {ram, ram > 0 ? "ram" : "none"};
+}
+
 int pflash_span_tokens_within(
         const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept {
     int tokens = 0;
@@ -5462,8 +5470,9 @@ std::string HttpServer::apply_pflash_compression(
                                    existing.view_gen_begin, input_tokens, true, 0};
                 }
             } else {
-                const int cached_target =
-                    restorable_prefix_tokens(req.prompt_tokens);
+                const auto restorable = restorable_prefix_tokens(
+                    req.prompt_tokens, req.disk_cache_policy);
+                const int cached_target = restorable.tokens;
                 const int cached_drafter = prompt_tokens > 0
                     ? (std::min)(input_tokens, (int) std::floor(
                           (double) input_tokens * (double) cached_target /
@@ -5563,12 +5572,17 @@ std::string HttpServer::apply_pflash_compression(
                 if (!cold_history_stats.is_null()) {
                     admission_stats["cold_history"] = cold_history_stats;
                 }
+                // Disk cache off: no source field, the record is unchanged.
+                const bool disk_cache_on = !disk_cache_.disabled();
+                if (disk_cache_on) admission_stats["cached_source"] = restorable.source;
                 std::fprintf(stderr,
                     "[pflash-admission] %s cached=%d cached_droppable~%d "
-                    "uncached_droppable~%d droppable~%d threshold=%d\n",
+                    "uncached_droppable~%d droppable~%d threshold=%d%s%s\n",
                     http_detail::pflash_admission_name(admission),
                     cached_target, cached_droppable, uncached_droppable,
-                    droppable_target, config_.pflash_threshold);
+                    droppable_target, config_.pflash_threshold,
+                    disk_cache_on ? " source=" : "",
+                    disk_cache_on ? restorable.source : "");
                 if (admission != http_detail::PflashAdmission::Compress) {
                     // Arrival on a raw conversation the cache holds: compress
                     // the large uncached chunk only; otherwise it stays raw.
@@ -6055,7 +6069,19 @@ std::string HttpServer::apply_pflash_compression(
     return {};
 }
 
-int HttpServer::restorable_prefix_tokens(
+http_detail::PflashRestorablePrefix HttpServer::restorable_prefix_tokens(
+        const std::vector<int32_t> & prompt,
+        const DiskPrefixCachePolicy & disk_policy) {
+    const int ram = ram_restorable_prefix_tokens(prompt);
+    // The generation path looks the whole prompt up on disk only in Full
+    // scope; its probe is index-only, so is this one.
+    const bool disk_enabled = !disk_cache_.disabled() &&
+        disk_policy.mode == DiskPrefixCacheMode::Full;
+    const int disk = disk_enabled ? disk_cache_.longest_prefix(prompt).cur_pos : 0;
+    return http_detail::pflash_restorable_prefix(ram, disk_enabled, disk);
+}
+
+int HttpServer::ram_restorable_prefix_tokens(
         const std::vector<int32_t> & prompt) {
     if (prefix_cache_.disabled()) return 0;
     int limit = (int) prompt.size();

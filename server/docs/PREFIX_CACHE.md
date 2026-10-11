@@ -183,12 +183,13 @@ skipped, so nothing compressed is ever written. A lookup for a compressed
 prompt can only hit a file whose stored tokens equal that prompt exactly.
 FlowKV keeps its existing clamp to the stable system prefix (raw tokens).
 
-**Follow-up: cache-aware admission.** Compression admission that counts the
-cached prefix as warm (only on the PFlash branches today, not on `main`)
-consults RAM only, so after a restart a session on disk would count as cold.
-`DiskPrefixCache::longest_prefix(prompt)` is the index-only probe for that
-case: it returns the deepest restorable key length and KV position without
-reading a file, so admission can take the max of the RAM and disk prefixes.
+**Cache-aware admission.** PFlash's cache-aware admission
+(`PFLASH_ADMISSION=cache`) counts the deeper of the RAM prefix snapshot and
+the deepest disk entry for the prompt (`DiskPrefixCache::longest_prefix`, an
+index lookup that reads no file), so a session restored after a restart stays
+raw instead of being compressed. The disk counts only with `--kv-cache-dir`
+set and the request's disk scope Full. The admission record carries
+`cached_source` (`ram`, `disk` or `none`) when the disk cache is on.
 
 The cache assumes one server per directory: a second server would delete the
 first one's in-flight temporaries at startup.
