@@ -1429,6 +1429,87 @@ TEST_CASE(ServerUnitFixture, test_pflash_effective_keep_ratio_spends_on_droppabl
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_cache_admission_never_drops_a_threshold_of_cache) {
+    using http_detail::PflashAdmission;
+    using http_detail::pflash_cache_admission;
+    const int t = 16384;
+    // Warm agent step: a small uncached tail stays raw, whatever the length.
+    TEST_ASSERT(pflash_cache_admission(2000, 90000, t) == PflashAdmission::UnderThreshold);
+    TEST_ASSERT(pflash_cache_admission(0, 0, t) == PflashAdmission::UnderThreshold);
+    TEST_ASSERT(pflash_cache_admission(t - 1, 0, t) == PflashAdmission::UnderThreshold);
+    // Cold prompt (nothing or little cached) at or past the threshold compresses.
+    TEST_ASSERT(pflash_cache_admission(t, 0, t) == PflashAdmission::Compress);
+    TEST_ASSERT(pflash_cache_admission(40000, t - 1, t) == PflashAdmission::Compress);
+    // A big new chunk on a warm session stays raw: compressing the whole
+    // prompt would throw away a threshold's worth of reusable cache.
+    TEST_ASSERT(pflash_cache_admission(t, t, t) == PflashAdmission::WarmCache);
+    TEST_ASSERT(pflash_cache_admission(30000, 50000, t) == PflashAdmission::WarmCache);
+    // A raw prompt that does not fit the context always compresses.
+    TEST_ASSERT(pflash_cache_admission(2000, 90000, t, false) == PflashAdmission::Compress);
+    TEST_ASSERT(pflash_cache_admission(30000, 50000, t, false) == PflashAdmission::Compress);
+    TEST_ASSERT(std::string(http_detail::pflash_admission_name(PflashAdmission::Compress)) == "compress");
+    TEST_ASSERT(std::string(http_detail::pflash_admission_name(PflashAdmission::UnderThreshold)) == "under_threshold");
+    TEST_ASSERT(std::string(http_detail::pflash_admission_name(PflashAdmission::WarmCache)) == "warm_cache");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_cache_admission_flag_defaults_off) {
+    luce_unsetenv("PFLASH_ADMISSION");
+    TEST_ASSERT(!http_detail::pflash_cache_admission_enabled());
+    luce_setenv("PFLASH_ADMISSION", "length");
+    TEST_ASSERT(!http_detail::pflash_cache_admission_enabled());
+    luce_setenv("PFLASH_ADMISSION", "cache");
+    TEST_ASSERT(http_detail::pflash_cache_admission_enabled());
+    luce_unsetenv("PFLASH_ADMISSION");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_span_tokens_within_clips) {
+    const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
+    TEST_ASSERT(http_detail::pflash_span_tokens_within(spans, 0, 100) == 30);
+    TEST_ASSERT(http_detail::pflash_span_tokens_within(spans, 5, 25) == 10);
+    TEST_ASSERT(http_detail::pflash_span_tokens_within(spans, 10, 20) == 0);
+    TEST_ASSERT(http_detail::pflash_span_tokens_within(spans, 45, 45) == 0);
+    TEST_ASSERT(http_detail::pflash_span_tokens_within({}, 0, 100) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_complement_token_spans) {
+    using V = std::vector<PFlashTokenSpan>;
+    const auto c = http_detail::pflash_complement_token_spans(V{{10, 20}, {30, 40}}, 50);
+    TEST_ASSERT(c.size() == 3);
+    TEST_ASSERT(c[0].begin == 0 && c[0].end == 10);
+    TEST_ASSERT(c[1].begin == 20 && c[1].end == 30);
+    TEST_ASSERT(c[2].begin == 40 && c[2].end == 50);
+    TEST_ASSERT(http_detail::pflash_complement_token_spans(V{}, 5).size() == 1);
+    TEST_ASSERT(http_detail::pflash_complement_token_spans(V{{0, 5}}, 5).empty());
+    const auto clipped = http_detail::pflash_complement_token_spans(V{{0, 3}, {4, 99}}, 10);
+    TEST_ASSERT(clipped.size() == 1 && clipped[0].begin == 3 && clipped[0].end == 4);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_arrive_and_rebuild_ratio_flags) {
+    luce_unsetenv("PFLASH_ARRIVE");
+    luce_unsetenv("PFLASH_CHAT_REBUILD_RATIO");
+    TEST_ASSERT(!http_detail::pflash_arrive_enabled());
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 2.0);
+    luce_setenv("PFLASH_ARRIVE", "1");
+    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "0");
+    TEST_ASSERT(http_detail::pflash_arrive_enabled());
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 0.0);
+    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "3.5");
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 3.5);
+    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "-1");
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 2.0);
+    luce_setenv("PFLASH_CHAT_REBUILD_RATIO", "x");
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_ratio() == 2.0);
+    luce_unsetenv("PFLASH_ARRIVE");
+    luce_unsetenv("PFLASH_CHAT_REBUILD_RATIO");
+    luce_unsetenv("PFLASH_CHAT_REBUILD_MIN_TOKENS");
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_min_tokens() == 0);
+    luce_setenv("PFLASH_CHAT_REBUILD_MIN_TOKENS", "65536");
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_min_tokens() == 65536);
+    luce_setenv("PFLASH_CHAT_REBUILD_MIN_TOKENS", "-5");
+    TEST_ASSERT(http_detail::pflash_chat_rebuild_min_tokens() == 0);
+    luce_unsetenv("PFLASH_CHAT_REBUILD_MIN_TOKENS");
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
     TEST_ASSERT(http_detail::pflash_target_token_ceiling(7, 0.5) == 3);
     TEST_ASSERT(http_detail::pflash_target_token_ceiling(120000, 16384.0 / 120000.0) == 16384);

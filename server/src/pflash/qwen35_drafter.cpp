@@ -659,11 +659,16 @@ Qwen35ScoringSession * acquire_scoring_session(
         bool need_probe,
         bool need_subunit,
         bool need_request,
+        const std::vector<PFlashTokenSpan> & other_windows,
         int & resume,
         int & shared_prefix,
         std::unique_ptr<Qwen35ScoringSession> & scratch) {
     TargetWeights & w = st.weights;
     const int S = (int) ids.size();
+    // Attention keys padded to 256: a cache shorter than that clamps the
+    // padded K view and moves the tail ubatches off the MMA kernel, which
+    // changes the scores (resident drafter vs a freshly loaded one).
+    const int S_padded = align_up_i(S, 256);
     const int limit = scoring_session_limit();
     const size_t row_floats = (size_t) w.n_embd * (size_t) (query_end - query_start);
     resume = 0;
@@ -674,7 +679,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     int best_shared = 0;
     for (auto & owned : st.sessions) {
         Qwen35ScoringSession * session = owned.get();
-        if (!session || session->capacity < S || session->ids.empty() ||
+        if (!session || session->capacity < S_padded || session->ids.empty() ||
             session->keys_trained != st.head_loaded) {
             continue;
         }
@@ -699,6 +704,30 @@ Qwen35ScoringSession * acquire_scoring_session(
             }
             if (!rows) {
                 r = session->checkpoint > 0 && session->checkpoint <= query_start &&
+                        session->checkpoint <= shared
+                    ? session->checkpoint : 0;
+                restore = r > 0;
+            }
+        }
+        // Every other window this call scores must be reproducible as well:
+        // one that starts before the resume point needs its exact stored
+        // rows, or the resume point drops to a checkpoint before it (else 0),
+        // so a resumed call scores the same windows as a fresh one.
+        if (r > 0) {
+            int floor = r;
+            for (const auto & span : other_windows) {
+                if (span.begin < 0 || span.end <= span.begin || span.begin >= r) continue;
+                const size_t floats = (size_t) w.n_embd * (size_t) (span.end - span.begin);
+                bool stored = false;
+                for (const auto & window : session->query_windows) {
+                    stored = stored || (window.begin == span.begin &&
+                        window.end == span.end && span.end <= shared &&
+                        window.rows.size() == floats);
+                }
+                if (!stored) floor = std::min(floor, span.begin);
+            }
+            if (floor < r) {
+                r = session->checkpoint > 0 && session->checkpoint <= floor &&
                         session->checkpoint <= shared
                     ? session->checkpoint : 0;
                 restore = r > 0;
@@ -740,10 +769,10 @@ Qwen35ScoringSession * acquire_scoring_session(
                 })->get();
         }
     }
-    if (target->capacity < S) {
+    if (target->capacity < S_padded) {
         free_qwen35_scoring_session(*target);
         // Headroom so the next turns append without reallocating.
-        const int capacity = limit == 0 ? S : S + S / 2 + 4096;
+        const int capacity = limit == 0 ? S_padded : S + S / 2 + 4096;
         if (!allocate_scoring_session(w, capacity, *target)) {
             set_last_error("qwen35 scoring session allocation failed");
             return nullptr;
@@ -814,10 +843,21 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     int resume = 0;
     int shared_prefix = 0;
     std::unique_ptr<Qwen35ScoringSession> scratch;
+    std::vector<PFlashTokenSpan> other_windows;
+    if (experiment.turn_query.begin >= 0 && experiment.turn_query.end <= query_start &&
+        experiment.turn_query.end > experiment.turn_query.begin) {
+        other_windows.push_back(experiment.turn_query);
+    }
+    for (const auto & span : experiment.extra_queries) {
+        if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
+    }
+    for (const auto & span : experiment.history_queries) {
+        if (span.end <= query_start && span.end > span.begin) other_windows.push_back(span);
+    }
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
-        use_probe && st.probe_sub_fc2_w != nullptr, request_probe, resume,
-        shared_prefix, scratch);
+        use_probe && st.probe_sub_fc2_w != nullptr, request_probe, other_windows,
+        resume, shared_prefix, scratch);
     if (!session) return {};
     // Retained request rows past the shared prefix belong to a prompt that
     // diverged there (an edit, a truncation, another conversation).

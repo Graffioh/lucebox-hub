@@ -1346,6 +1346,20 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
 
     if (release_after_use) {
         free_drafter();
+    } else if (drafter_loaded_ && drafter_ctx_.backend &&
+               drafter_ctx_.backend != target_backend_ &&
+               drafter_ctx_.backend != draft_backend_) {
+        // A resident drafter owns its backend: on non-VMM devices that
+        // backend's pool keeps every operator temporary of the last scoring
+        // run (GiBs after a long prompt) until it is trimmed, and
+        // release_scratch() trims only the target and draft pools. Scoring
+        // sessions are tensors of their own and are unaffected.
+        const char * keep = std::getenv("PFLASH_DRAFTER_TRIM_POOL");
+        if (!(keep && std::string(keep) == "0")) {
+            const size_t trimmed = ggml_backend_cuda_trim_pool(drafter_ctx_.backend);
+            std::fprintf(stderr, "[compress] trimmed %.1f MiB from the drafter pool\n",
+                         trimmed / (1024.0 * 1024.0));
+        }
     }
 
     // Restore park state

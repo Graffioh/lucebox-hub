@@ -1007,6 +1007,83 @@ double pflash_effective_keep_ratio(
     return (std::min)(1.0, budget / (double) input_tokens);
 }
 
+const char * pflash_admission_name(PflashAdmission admission) noexcept {
+    switch (admission) {
+    case PflashAdmission::Compress:       return "compress";
+    case PflashAdmission::UnderThreshold: return "under_threshold";
+    case PflashAdmission::WarmCache:      return "warm_cache";
+    }
+    return "compress";
+}
+
+bool pflash_cache_admission_enabled() noexcept {
+    const char * raw = std::getenv("PFLASH_ADMISSION");
+    return raw && std::string(raw) == "cache";
+}
+
+PflashAdmission pflash_cache_admission(
+        int uncached_droppable, int cached_droppable, int threshold,
+        bool raw_fits) noexcept {
+    if (!raw_fits) return PflashAdmission::Compress;
+    if (uncached_droppable < threshold) return PflashAdmission::UnderThreshold;
+    if (cached_droppable >= threshold) return PflashAdmission::WarmCache;
+    return PflashAdmission::Compress;
+}
+
+int pflash_span_tokens_within(
+        const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept {
+    int tokens = 0;
+    for (const auto & span : spans) {
+        const int lo = (std::max)(span.begin, begin);
+        const int hi = (std::min)(span.end, end);
+        if (hi > lo) tokens += hi - lo;
+    }
+    return tokens;
+}
+
+namespace {
+int pflash_env_tokens(const char * name, int fallback) noexcept {
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) return fallback;
+    return (int) (std::min)(value, 1L << 30);
+}
+}  // namespace
+
+int pflash_chat_rebuild_min_tokens() noexcept {
+    return pflash_env_tokens("PFLASH_CHAT_REBUILD_MIN_TOKENS", 0);
+}
+
+double pflash_chat_rebuild_ratio() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_REBUILD_RATIO");
+    if (!raw || !*raw) return 2.0;
+    char * end = nullptr;
+    const double value = std::strtod(raw, &end);
+    if (end == raw || *end != '\0' || !std::isfinite(value) || value < 0.0) return 2.0;
+    return value;
+}
+
+bool pflash_arrive_enabled() noexcept {
+    const char * raw = std::getenv("PFLASH_ARRIVE");
+    return raw && std::string(raw) == "1";
+}
+
+std::vector<PFlashTokenSpan> pflash_complement_token_spans(
+        const std::vector<PFlashTokenSpan> & spans, int n) {
+    std::vector<PFlashTokenSpan> out;
+    int at = 0;
+    for (const auto & span : spans) {
+        const int begin = (std::max)(0, (std::min)(span.begin, n));
+        const int end = (std::max)(0, (std::min)(span.end, n));
+        if (begin > at) out.push_back({at, begin});
+        at = (std::max)(at, end);
+    }
+    if (at < n) out.push_back({at, n});
+    return out;
+}
+
 int pflash_target_token_ceiling(
         int original_target_tokens, double keep_ratio) noexcept {
     if (original_target_tokens < 0 || !std::isfinite(keep_ratio) ||
@@ -5018,6 +5095,8 @@ std::string HttpServer::apply_pflash_compression(
     // prefix hits the prefix cache from the second turn on -- and must not
     // exhaust the budget of the history it rides with.
     int kept_tokens = 0;
+    json admission_stats;   // cache-aware admission inputs (null when off)
+    http_detail::PflashRegionPlan region_plan;
     if (experiment.selection_active && query_window.valid()) {
         const int input_tokens = (int) drafter_ids.size();
         const int query_begin = query_window.end - query_window.tokens;
@@ -5075,7 +5154,124 @@ std::string HttpServer::apply_pflash_compression(
         // nothing worth selecting.
         const int droppable_target =
             prompt_tokens - target_estimate(kept_tokens);
+        // Cache-aware admission: a conversation PFlash has not compressed
+        // yet stays raw while the reader's restorable prefix covers all but
+        // a threshold's worth of its droppable tokens, or already holds a
+        // threshold's worth of them. A conversation with a view keeps
+        // today's rule below (the view owns its continuation).
         if (config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
+            http_detail::pflash_cache_admission_enabled()) {
+            http_detail::PflashChatView existing;
+            const bool has_view = messages_input && chat_turn.valid() &&
+                pflash_views_.find(req.prompt_tokens, drafter_ids, existing);
+            if (has_view) {
+                admission_stats = {{"view", true}};
+                // Arrival: a large new chunk on a compressed conversation is
+                // compressed on its own; the cached view is served as it is.
+                const int new_droppable = target_estimate((std::max)(0,
+                    (input_tokens - existing.drafter_gen_begin) -
+                    http_detail::pflash_span_tokens_within(
+                        required_instruction_spans, existing.drafter_gen_begin,
+                        input_tokens)));
+                if (http_detail::pflash_arrive_enabled() &&
+                    new_droppable >= config_.pflash_threshold) {
+                    region_plan = {true, "arrive",
+                                   {{existing.drafter_gen_begin, input_tokens}},
+                                   existing.drafter_gen_begin,
+                                   existing.view_gen_begin, input_tokens, true, 0};
+                }
+            } else {
+                const int cached_target =
+                    restorable_prefix_tokens(req.prompt_tokens);
+                const int cached_drafter = prompt_tokens > 0
+                    ? (std::min)(input_tokens, (int) std::floor(
+                          (double) input_tokens * (double) cached_target /
+                          (double) prompt_tokens))
+                    : 0;
+                const int cached_pinned = http_detail::pflash_span_tokens_within(
+                    required_instruction_spans, 0, cached_drafter);
+                const int cached_droppable = cached_drafter > 0
+                    ? target_estimate((std::max)(0, cached_drafter - cached_pinned))
+                    : 0;
+                const int uncached_droppable =
+                    (std::max)(0, droppable_target - cached_droppable);
+                const bool raw_fits = config_.max_ctx <= 0 ||
+                    prompt_tokens + req.max_output <= config_.max_ctx;
+                const auto admission = http_detail::pflash_cache_admission(
+                    uncached_droppable, cached_droppable,
+                    config_.pflash_threshold, raw_fits);
+                admission_stats = {
+                    {"view", false},
+                    {"decision", http_detail::pflash_admission_name(admission)},
+                    {"cached_tokens", cached_target},
+                    {"cached_droppable", cached_droppable},
+                    {"uncached_droppable", uncached_droppable},
+                    {"droppable", droppable_target},
+                    {"threshold", config_.pflash_threshold},
+                    {"raw_fits", raw_fits},
+                };
+                std::fprintf(stderr,
+                    "[pflash-admission] %s cached=%d cached_droppable~%d "
+                    "uncached_droppable~%d droppable~%d threshold=%d\n",
+                    http_detail::pflash_admission_name(admission),
+                    cached_target, cached_droppable, uncached_droppable,
+                    droppable_target, config_.pflash_threshold);
+                if (admission != http_detail::PflashAdmission::Compress) {
+                    // Arrival on a raw conversation the cache holds: compress
+                    // the large uncached chunk only; otherwise it stays raw.
+                    if (http_detail::pflash_arrive_enabled() &&
+                        admission == http_detail::PflashAdmission::WarmCache) {
+                        region_plan = {true, "arrive", {{cached_drafter, input_tokens}},
+                                       0, 0, input_tokens, false, 0};
+                    } else {
+                        prepared.pflash_stats = {{"admission", admission_stats}};
+                        return {};
+                    }
+                }
+            }
+            if (region_plan.active) {
+                // Everything outside the regions is kept as it is served:
+                // the selector spends the budget inside the regions only.
+                auto mandatory = required_instruction_spans;
+                const auto outside = http_detail::pflash_complement_token_spans(
+                    region_plan.regions, input_tokens);
+                mandatory.insert(mandatory.end(), outside.begin(), outside.end());
+                mandatory = http_detail::canonicalize_pflash_token_spans(
+                    std::move(mandatory));
+                std::string region_error;
+                if (!luce::pflash::validate_pflash_instruction_spans(
+                        mandatory, input_tokens, region_error)) {
+                    return "PFlash region plan mapping failed: " + region_error;
+                }
+                required_instruction_spans = std::move(mandatory);
+                kept_tokens = kept_with(required_instruction_spans);
+                region_plan.region_droppable =
+                    target_estimate((std::max)(0, input_tokens - kept_tokens));
+                admission_stats["region"] = {
+                    {"mode", region_plan.mode},
+                    {"regions", [&] {
+                        json out = json::array();
+                        for (const auto & span : region_plan.regions) {
+                            out.push_back({span.begin, span.end});
+                        }
+                        return out;
+                    }()},
+                    {"cut_raw", region_plan.cut_raw},
+                    {"cut_view", region_plan.cut_view},
+                    {"tail_after", region_plan.tail_after},
+                    {"region_droppable", region_plan.region_droppable},
+                };
+                std::fprintf(stderr,
+                    "[pflash-region] %s regions=%zu cut=%d/%d tail_after=%d "
+                    "region_droppable~%d view=%d\n",
+                    region_plan.mode.c_str(), region_plan.regions.size(),
+                    region_plan.cut_raw, region_plan.cut_view,
+                    region_plan.tail_after, region_plan.region_droppable,
+                    (int) region_plan.has_view);
+            }
+        }
+        if (!region_plan.active &&
+            config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
             droppable_target < config_.pflash_threshold) {
             std::fprintf(stderr,
                 "[pflash] skip-compress (droppable ~%d < threshold %d; "
@@ -5096,7 +5292,9 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.extra_query_spans = extra_query_spans;
     compress_request.request_messages = request_probe_messages;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
-        pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
+        pflash_keep_ratio(config_, region_plan.active
+            ? (std::max)(1, region_plan.region_droppable) : prompt_tokens),
+        req.session_id, sessions_);
     if (experiment.selection_active && query_window.valid()) {
         const double effective = http_detail::pflash_effective_keep_ratio(
             (int) compress_request.input_ids.size(), kept_tokens,
@@ -5195,7 +5393,7 @@ std::string HttpServer::apply_pflash_compression(
     // prompt again, or a small follow-up appended verbatim with recall off
     // -- skips the drafter altogether.
     if (experiment.selection_active && messages_input && chat_turn.valid() &&
-        !config_.pflash_remote_drafter) {
+        !config_.pflash_remote_drafter && !region_plan.active) {
         std::vector<int32_t> served;
         json view_stats;
         if (serve_pflash_chat_view(
@@ -5211,6 +5409,7 @@ std::string HttpServer::apply_pflash_compression(
                 {"drafter_fingerprint_fnv1a64",
                  http_detail::pflash_token_fingerprint(compress_request.input_ids)},
             };
+            if (!admission_stats.is_null()) prepared.pflash_stats["admission"] = admission_stats;
             trace_pflash_served(req, prepared);
             return {};
         }
@@ -5346,7 +5545,27 @@ std::string HttpServer::apply_pflash_compression(
         {"scorer_new_tokens", result.scorer_new_tokens},
         {"scorer_forward_ms", std::round(result.scorer_forward_s * 10000.0) / 10.0},
     };
-    if (experiment.selection_active && messages_input && chat_turn.valid() &&
+    if (region_plan.active) {
+        std::vector<int32_t> served;
+        if (!result.kept_spans.empty() && serve_pflash_region_view(
+                req, compress_request.input_ids, chat_turn, region_plan,
+                result.kept_spans, served, prepared.snapshot_cut,
+                prepared.pflash_stats["view"])) {
+            final_tokens = std::move(served);
+        } else {
+            // Never serve a partly built region view: the raw prompt is what
+            // the conversation would have served without the plan.
+            std::fprintf(stderr,
+                "[pflash-region] %s could not be served; serving the raw prompt\n",
+                region_plan.mode.c_str());
+            prepared.pflash_stats = {{"admission", admission_stats},
+                                     {"region_failed", region_plan.mode}};
+            prepared.compressed = false;
+            prepared.tokens = req.prompt_tokens;
+            prepared.snapshot_cut = -1;
+            return {};
+        }
+    } else if (experiment.selection_active && messages_input && chat_turn.valid() &&
         !result.kept_spans.empty()) {
         std::vector<int32_t> served;
         if (serve_pflash_chat_view(
@@ -5363,6 +5582,7 @@ std::string HttpServer::apply_pflash_compression(
     }
     prepared.pflash_stats["drafter_fingerprint_fnv1a64"] =
         http_detail::pflash_token_fingerprint(compress_request.input_ids);
+    if (!admission_stats.is_null()) prepared.pflash_stats["admission"] = admission_stats;
     prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
     trace_pflash_served(req, prepared);
@@ -5372,6 +5592,25 @@ std::string HttpServer::apply_pflash_compression(
         (int) prepared.tokens.size(),
         100.0 * prepared.tokens.size() / prompt_tokens);
     return {};
+}
+
+int HttpServer::restorable_prefix_tokens(
+        const std::vector<int32_t> & prompt) {
+    if (prefix_cache_.disabled()) return 0;
+    int limit = (int) prompt.size();
+    while (limit > 0) {
+        const auto [slot, length] =
+            prefix_cache_.lookup_candidate(prompt, limit);
+        if (slot < 0 || length <= 0) return 0;
+        if (backend_.snapshot_used(slot)) {
+            const int position = backend_.snapshot_cur_pos(slot);
+            if (position > 0) return (std::min)(length, position);
+        }
+        // A key whose snapshot is gone: try the next shorter one; the
+        // generation path invalidates it when it gets there.
+        limit = length - 1;
+    }
+    return 0;
 }
 
 void HttpServer::trace_pflash_served(
@@ -5601,7 +5840,13 @@ bool HttpServer::serve_pflash_chat_view(
     // context: the fresh prompt starts a new view, prefilled from scratch.
     const bool too_long = config_.max_ctx > 0 &&
         (int) served.size() + req.max_output > config_.max_ctx;
-    const bool outgrown = compressed && served.size() > 2 * fresh->size();
+    // PFLASH_CHAT_REBUILD_RATIO (default 2; 0 = only at the context limit).
+    const double rebuild_ratio = http_detail::pflash_chat_rebuild_ratio();
+    // PFLASH_CHAT_REBUILD_MIN_TOKENS (default 0): a view smaller than this is
+    // never rebuilt, so short chats keep their cache; long ones stay bounded.
+    const bool outgrown = compressed && rebuild_ratio > 0.0 &&
+        (double) served.size() > rebuild_ratio * (double) fresh->size() &&
+        (int) served.size() >= http_detail::pflash_chat_rebuild_min_tokens();
     if (too_long || outgrown) {
         return compressed && serve_fresh("rebuild", view.turns + 1);
     }
@@ -5656,6 +5901,136 @@ bool HttpServer::serve_pflash_chat_view(
             stats["recall_markers"] = {{"role", role_markers}, {"end", end_markers},
                                        {"generic_role_lines", generic_roles}};
         }
+    }
+    pflash_views_.remember(std::move(next));
+    return true;
+}
+
+bool HttpServer::serve_pflash_region_view(
+        const ParsedRequest & req,
+        const std::vector<int32_t> & drafter_ids,
+        const http_detail::PflashChatTurnSpan & turn,
+        const http_detail::PflashRegionPlan & plan,
+        const std::vector<PFlashTokenSpan> & kept_spans,
+        std::vector<int32_t> & served,
+        int & snapshot_cut,
+        json & stats) {
+    snapshot_cut = -1;
+    stats = nullptr;
+    const int input = (int) drafter_ids.size();
+    if (!plan.active || plan.regions.empty() || turn.generation_begin <= 0 ||
+        turn.generation_begin >= input || plan.cut_raw < 0 ||
+        plan.cut_raw > turn.generation_begin) {
+        return false;
+    }
+    const auto generation = tokenizer_.encode(drafter_tokenizer_->decode(
+        std::vector<int32_t>(drafter_ids.begin() + turn.generation_begin,
+                             drafter_ids.end())));
+    const auto ends_with_generation = [&generation] (
+            const std::vector<int32_t> & tokens) {
+        return !generation.empty() && tokens.size() > generation.size() &&
+            std::equal(generation.begin(), generation.end(),
+                       tokens.end() - (long) generation.size());
+    };
+    if (!ends_with_generation(req.prompt_tokens)) return false;
+    http_detail::PflashChatView view;
+    if (plan.has_view) {
+        if (!pflash_views_.find(req.prompt_tokens, drafter_ids, view) ||
+            plan.cut_view < 0 || plan.cut_view > (int) view.view_tokens.size()) {
+            return false;
+        }
+    }
+    // From the cut on: the regions as the selection keeps them, every other
+    // raw token verbatim (mandatory, so the selection kept it as well).
+    const auto outside = http_detail::pflash_complement_token_spans(plan.regions, input);
+    const auto region_kept = http_detail::pflash_subtract_token_spans(
+        http_detail::canonicalize_pflash_token_spans(
+            std::vector<PFlashTokenSpan>(kept_spans)), outside);
+    std::vector<PFlashTokenSpan> delta = region_kept;
+    for (const auto & span : http_detail::pflash_subtract_token_spans(
+             {{plan.cut_raw, input}}, plan.regions)) {
+        delta.push_back(span);
+    }
+    delta = http_detail::pflash_subtract_token_spans(
+        http_detail::canonicalize_pflash_token_spans(std::move(delta)),
+        {{0, plan.cut_raw}});
+    const int tail_after = (std::min)((std::max)(plan.tail_after, plan.cut_raw),
+                                      turn.generation_begin);
+    std::vector<PFlashTokenSpan> block_part;
+    std::vector<PFlashTokenSpan> rest_part;
+    for (const auto & span : delta) {
+        if (span.begin < tail_after) {
+            block_part.push_back({span.begin, (std::min)(span.end, tail_after)});
+        }
+        if (span.end > tail_after) {
+            rest_part.push_back({(std::max)(span.begin, tail_after), span.end});
+        }
+    }
+    const auto join = [&] (const std::vector<PFlashTokenSpan> & spans) {
+        std::string text;
+        for (const auto & span : spans) {
+            if (span.end > span.begin) {
+                text += drafter_tokenizer_->decode(std::vector<int32_t>(
+                    drafter_ids.begin() + span.begin, drafter_ids.begin() + span.end));
+            }
+        }
+        return text;
+    };
+    const auto block_tokens = tokenizer_.encode(join(block_part));
+    const auto rest_tokens = tokenizer_.encode(join(rest_part));
+    served.clear();
+    if (plan.has_view) {
+        served.assign(view.view_tokens.begin(), view.view_tokens.begin() + plan.cut_view);
+    }
+    served.insert(served.end(), block_tokens.begin(), block_tokens.end());
+    const int tail_view = (int) served.size();
+    served.insert(served.end(), rest_tokens.begin(), rest_tokens.end());
+    if (!ends_with_generation(served)) return false;
+    if (config_.max_ctx > 0 && (int) served.size() + req.max_output > config_.max_ctx) {
+        return false;
+    }
+
+    http_detail::PflashChatView next;
+    next.raw_tokens = req.prompt_tokens;
+    next.raw_gen_begin = (int) (req.prompt_tokens.size() - generation.size());
+    next.drafter_ids = drafter_ids;
+    next.drafter_gen_begin = turn.generation_begin;
+    next.view_tokens = served;
+    next.view_gen_begin = (int) (served.size() - generation.size());
+    std::vector<PFlashTokenSpan> spans;
+    if (plan.has_view) {
+        spans = http_detail::pflash_subtract_token_spans(
+            http_detail::canonicalize_pflash_token_spans(
+                std::vector<PFlashTokenSpan>(view.spans)), {{plan.cut_raw, input}});
+        for (auto piece : view.pieces) {
+            if (piece.begin >= plan.cut_raw) continue;
+            piece.end = (std::min)(piece.end, plan.cut_raw);
+            next.pieces.push_back(piece);
+        }
+    }
+    spans.insert(spans.end(), delta.begin(), delta.end());
+    next.spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
+    for (const auto & span : delta) next.pieces.push_back({span.begin, span.end, false});
+    next.turns = (plan.has_view ? view.turns : 0) + 1;
+    snapshot_cut = next.view_gen_begin;
+    int region_tokens = 0;
+    for (const auto & span : plan.regions) region_tokens += span.end - span.begin;
+    int region_kept_tokens = 0;
+    for (const auto & span : region_kept) region_kept_tokens += span.end - span.begin;
+    std::fprintf(stderr,
+        "[pflash-view] %s turn=%d served=%zu reused=%d region=%d kept=%d\n",
+        plan.mode.c_str(), next.turns, served.size(), plan.has_view ? plan.cut_view : 0,
+        region_tokens, region_kept_tokens);
+    std::fflush(stderr);
+    stats = {{"mode", plan.mode}, {"turn", next.turns},
+             {"served_tokens", served.size()},
+             {"reused_tokens", plan.has_view ? plan.cut_view : 0},
+             {"region_drafter_tokens", region_tokens},
+             {"region_kept_drafter_tokens", region_kept_tokens},
+             {"pieces", http_detail::pflash_view_pieces_json(next.pieces)}};
+    if (const char * trace = std::getenv("PFLASH_VIEW_TRACE_PATH"); trace && *trace) {
+        stats["cut_raw"] = plan.cut_raw;
+        stats["drafter_tokens"] = input;
     }
     pflash_views_.remember(std::move(next));
     return true;

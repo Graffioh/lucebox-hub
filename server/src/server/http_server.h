@@ -399,6 +399,21 @@ struct PflashChatView {
     int turns = 0;
 };
 
+// One scored turn that compresses only `regions` of the raw prompt (drafter
+// tokens, canonical) and serves everything else as the view holds it or raw:
+// "arrive" = a large uncached chunk. The served prompt keeps the cached view
+// up to cut_view (raw position cut_raw) and serves the rest anew.
+struct PflashRegionPlan {
+    bool active = false;
+    std::string mode;
+    std::vector<PFlashTokenSpan> regions;
+    int cut_raw = 0;
+    int cut_view = 0;
+    int tail_after = 0;
+    bool has_view = false;
+    int region_droppable = 0;
+};
+
 class PflashChatViewStore {
 public:
     explicit PflashChatViewStore(size_t capacity = 8) : capacity_(capacity) {}
@@ -578,6 +593,31 @@ double pflash_effective_keep_ratio(
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;
 
+// Cache-aware admission (PFLASH_ADMISSION=cache; default "length" = today's
+// rule, droppable tokens >= threshold). A conversation without a PFlash view
+// is compressed only when the reader would have to prefill at least
+// ``threshold`` droppable tokens that its restorable prefix cache does not
+// hold, and that cache holds less than ``threshold`` droppable tokens:
+// compressing never throws away a threshold's worth of reusable cache. A raw
+// prompt that does not fit the context is always compressed.
+enum class PflashAdmission { Compress, UnderThreshold, WarmCache };
+const char * pflash_admission_name(PflashAdmission admission) noexcept;
+bool pflash_cache_admission_enabled() noexcept;
+PflashAdmission pflash_cache_admission(
+    int uncached_droppable, int cached_droppable, int threshold,
+    bool raw_fits = true) noexcept;
+// Tokens of the canonical ``spans`` inside [begin, end).
+int pflash_span_tokens_within(
+    const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept;
+// Large-chunk arrival (PFLASH_ARRIVE=1, cache admission only) and the chat
+// view's rebuild ratio (PFLASH_CHAT_REBUILD_RATIO, default 2; 0 = rebuild only
+// at the context limit).
+double pflash_chat_rebuild_ratio() noexcept;
+int pflash_chat_rebuild_min_tokens() noexcept;
+bool pflash_arrive_enabled() noexcept;
+// [0, n) minus the canonical ``spans``.
+std::vector<PFlashTokenSpan> pflash_complement_token_spans(
+    const std::vector<PFlashTokenSpan> & spans, int n);
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────
@@ -805,6 +845,21 @@ private:
         nlohmann::json & stats);
     // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
     // the served prompt's text, for evidence checks in evaluations.
+    // Target tokens of ``prompt`` the reader can restore from its in-memory
+    // prefix cache right now (a live backend snapshot, its authoritative
+    // position); no cache state changes.
+    int restorable_prefix_tokens(const std::vector<int32_t> & prompt);
+    // Serve a PflashRegionPlan turn from the selection's kept spans; false
+    // when it cannot be served (the caller serves the raw prompt).
+    bool serve_pflash_region_view(
+        const ParsedRequest & req,
+        const std::vector<int32_t> & drafter_ids,
+        const http_detail::PflashChatTurnSpan & turn,
+        const http_detail::PflashRegionPlan & plan,
+        const std::vector<PFlashTokenSpan> & kept_spans,
+        std::vector<int32_t> & served,
+        int & snapshot_cut,
+        json & stats);
     void trace_pflash_served(const ParsedRequest & req,
                              const PreparedPrompt & prepared);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
