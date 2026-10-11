@@ -901,6 +901,7 @@ void PrefixCache::replace_inline_entry(
         if (entries_[(size_t)i].slot == slot) {
             std::fprintf(stderr,
                 "[pc] dropping stale entry for reused slot=%d\n", slot);
+            record_eviction(i);
             erase_inline_entry(i);
         }
     }
@@ -932,7 +933,10 @@ bool PrefixCache::commit_inline_reservation(
     }
     if (reservation.has_victim_) {
         const int victim = find_entry(reservation.victim_);
-        if (victim >= 0) erase_inline_entry(victim);
+        if (victim >= 0) {
+            record_eviction(victim);
+            erase_inline_entry(victim);
+        }
     }
     replace_inline_entry(
         reservation.slot_, committed_cut, prompt_ids,
@@ -1044,6 +1048,7 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     if (previous >= 0 &&
         (max_resident_bytes_ == 0 || resident_bytes_ - others <= max_resident_bytes_)) {
         superseded.erase(std::find(superseded.begin(), superseded.end(), previous));
+        entries_[(size_t)previous].edit_backup = true;
     }
     size_t freed = 0;
     // Erase from the back so earlier indices stay valid.
@@ -1063,7 +1068,8 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     return pruned;
 }
 
-std::vector<int> PrefixCache::enforce_resident_budget(int keep_slot) {
+std::vector<int> PrefixCache::enforce_resident_budget(
+        int keep_slot, std::vector<bool> * persist) {
     std::vector<int> evicted;
     if (disabled_ || max_resident_bytes_ == 0) return evicted;
     const size_t before = resident_bytes_;
@@ -1074,7 +1080,10 @@ std::vector<int> PrefixCache::enforce_resident_budget(int keep_slot) {
         // ancestor; never the new entry or a protected pin.
         const int victim = pick_evict_victim(keep);
         if (victim < 0) break;
-        evicted.push_back(entries_[(size_t)victim].slot);
+        const int slot = entries_[(size_t)victim].slot;
+        evicted.push_back(slot);
+        if (persist) persist->push_back(persist_on_evict(slot));
+        record_eviction(victim);
         erase_inline_entry(victim);
     }
     if (!evicted.empty()) {
@@ -1084,6 +1093,38 @@ std::vector<int> PrefixCache::enforce_resident_budget(int keep_slot) {
             evicted.size(), before, resident_bytes_, max_resident_bytes_);
     }
     return evicted;
+}
+
+bool PrefixCache::persist_on_evict(int slot) const {
+    const int idx = find_slot_entry(slot);
+    if (idx < 0) return false;
+    const auto & entry = entries_[(size_t)idx];
+    if (!entry.edit_backup || entry.protect) return true;
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        if (i != idx && is_strict_prefix(entry.ids, entries_[(size_t)i].ids)) {
+            return false;  // its conversation's deeper snapshot is resident
+        }
+    }
+    return true;
+}
+
+std::vector<int32_t> PrefixCache::entry_tokens(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx < 0 ? std::vector<int32_t>{} : entries_[(size_t)idx].ids;
+}
+
+void PrefixCache::record_eviction(int idx) {
+    if (!record_evictions_ || idx < 0 || idx >= (int)entries_.size()) return;
+    const auto & entry = entries_[(size_t)idx];
+    evicted_log_.push_back({entry.slot, entry.ids, persist_on_evict(entry.slot)});
+}
+
+std::vector<PrefixCache::Evicted> PrefixCache::entries_for_shutdown() const {
+    std::vector<Evicted> out;
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+        out.push_back({it->slot, it->ids, persist_on_evict(it->slot)});
+    }
+    return out;
 }
 
 static void update_atomic_max(std::atomic<uint64_t> & value,

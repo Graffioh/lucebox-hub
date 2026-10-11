@@ -2634,6 +2634,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
     }
     disk_cache_.init();
+    restore_replay_blobs();
     status_html_path_ = resolve_status_html();
 
     // PFLASH_UNIFIED=1 (STAGE1-DESIGN.md): read once here; a bad tool list or a later-stage arm fails startup.
@@ -2936,20 +2937,12 @@ void HttpServer::shutdown() {
         queue_tail_ = nullptr;
     }
 
-    // Shutdown save: persist all tracked snapshot slots to disk.
-    // Safe to access slot_tokens_ without locking — worker is joined.
-    if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
-        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
-                     slot_tokens_.size());
-        backend_.snapshot_flush_deferred();
-        for (auto & [slot, tokens] : slot_tokens_) {
-            if (backend_.snapshot_used(slot)) {
-                disk_cache_.learn_layout(slot);
-                disk_cache_.save(slot, tokens);
-            }
-        }
-        slot_tokens_.clear();
-    }
+    // Graceful shutdown is one last eviction: write each conversation's
+    // newest snapshot and the heads. Safe without locking — the worker is
+    // joined. A crash or kill -9 loses what was only in RAM.
+    flush_sessions_to_disk("shutdown");
+    slot_tokens_.clear();
+    slot_aux_.clear();
 }
 
 bool HttpServer::start_worker() {
@@ -3163,19 +3156,11 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
     }
 
-    // Persist disk cache (worker joined — no race on slot_tokens_).
-    if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
-        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
-                     slot_tokens_.size());
-        backend_.snapshot_flush_deferred();
-        for (auto & [slot, tokens] : slot_tokens_) {
-            if (backend_.snapshot_used(slot)) {
-                disk_cache_.learn_layout(slot);
-                disk_cache_.save(slot, tokens);
-            }
-        }
-        slot_tokens_.clear();
-    }
+    // Graceful shutdown is one last eviction (worker joined — no race on
+    // slot_tokens_).
+    flush_sessions_to_disk("shutdown");
+    slot_tokens_.clear();
+    slot_aux_.clear();
 
 #if defined(_WIN32)
     // Status-event sockets remain owned until shutdown(). Keep Winsock alive
@@ -8156,6 +8141,7 @@ std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> &
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
+    request_session_slots_.clear();
     if (req.images) return {};
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
@@ -8313,6 +8299,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
 
     std::vector<int> lookup_lengths;
+    DiskPrefixCache::PrefixProbe disk_probe;
     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full &&
         !effective_prompt.empty()) {
         // Probes are index lookups; only a hit reads a file. A restart then
@@ -8322,6 +8309,17 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             (int) effective_prompt.size(),
             find_all_boundaries(effective_prompt, prefix_cache_.chat_markers()),
             config_.disk_cache_min_tokens);
+        // Session states (agent turns with their generated text) are keyed
+        // past the prompt's chat boundaries; the index knows their lengths.
+        const auto probe = disk_cache_.longest_prefix(effective_prompt);
+        disk_probe = probe;
+        if (probe.len > 0 &&
+            std::find(lookup_lengths.begin(), lookup_lengths.end(), probe.len) ==
+                lookup_lengths.end()) {
+            lookup_lengths.insert(lookup_lengths.begin(), probe.len);
+            std::sort(lookup_lengths.begin(), lookup_lengths.end(),
+                      std::greater<int>());
+        }
     } else if (selected_boundary > 0) {
         lookup_lengths.push_back(selected_boundary);
     } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
@@ -8334,29 +8332,42 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
 
-    if (!cache.using_restore && !disk_cache_.disabled()) {
+    // A RAM hit does not end the search: a session whose deep snapshot was
+    // evicted to disk often still matches a shallow resident entry (the
+    // shared system/tools head). The deeper disk state wins; the index
+    // answers without a read, and a failed read keeps the RAM hit.
+    bool disk_lookup = !cache.using_restore;
+    const int ram_prefix_len = cache.using_restore ? cache.prefix_len : 0;
+    if (cache.using_restore && !disk_cache_.disabled() &&
+        !prepared.compressed && disk_probe.len > 0 && disk_probe.cur_pos > cache.prefix_len &&
+        disk_probe.len < (int) effective_prompt.size()) {
+        lookup_lengths.assign(1, disk_probe.len);
+        disk_lookup = true;
+    }
+    if (disk_lookup && !disk_cache_.disabled()) {
         for (int lookup_length : lookup_lengths) {
             std::vector<int32_t> prefix_tokens(
                 effective_prompt.begin(),
                 effective_prompt.begin() + lookup_length);
             if (!disk_cache_.lookup(prefix_tokens, kDiskStagingSlot)) continue;
 
-            cache.cache_slot = kDiskStagingSlot;
-            cache.prefix_len = backend_.snapshot_cur_pos(kDiskStagingSlot);
-            if (cache.prefix_len <= 0 ||
-                cache.prefix_len > (int) effective_prompt.size()) {
+            const int hit_pos = backend_.snapshot_cur_pos(kDiskStagingSlot);
+            if (hit_pos <= 0 || hit_pos > (int) effective_prompt.size()) {
                 std::fprintf(stderr,
                     "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
-                    cache.prefix_len, effective_prompt.size());
+                    hit_pos, effective_prompt.size());
                 backend_.snapshot_free(kDiskStagingSlot);
                 continue;
             }
+            cache.cache_slot = kDiskStagingSlot;
+            cache.prefix_len = hit_pos;
             cache.using_restore = true;
             cache.disk_hit = true;
             std::fprintf(stderr,
-                "[disk-cache] hit policy=%s len=%d slot=%d pos=%d\n",
+                "[disk-cache] hit policy=%s len=%d slot=%d pos=%d (RAM had %d)\n",
                 disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
-                lookup_length, kDiskStagingSlot, cache.prefix_len);
+                lookup_length, kDiskStagingSlot, cache.prefix_len,
+                ram_prefix_len);
             break;
         }
     }
@@ -8445,7 +8456,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
 
+    // A compressed prompt is not raw history: never persist a prefix of it.
+    // With RAM prefix slots the inline snapshot holds the head and reaches
+    // disk when it is evicted, so this extra prefill-and-write is only the
+    // fallback without them.
     if (!cache.using_restore && !disk_cache_.disabled() &&
+        prefix_cache_.disabled() && !prepared.compressed &&
         cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
@@ -8569,7 +8585,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
     cache.snap_prepared = cache.snap_slot >= 0;
     if (cache.snap_prepared) {
-        forget_inline_slot_metadata(cache.snap_slot);
+        evict_inline_slot(cache.snap_slot);
         backend_.snapshot_free(cache.snap_slot);
         generate_request.snap_slot = cache.snap_slot;
         generate_request.snap_pos = cache.snap_cut;
@@ -8578,6 +8594,19 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         backend_.snapshot_free(cache.full_snap_slot);
     }
 
+    if (cache.using_restore && disk_cache_digest_enabled()) {
+        backend_.snapshot_flush_deferred();
+        int n_tensors = 0;
+        uint64_t n_bytes = 0;
+        const uint64_t digest = snapshot_state_digest(
+            backend_.snapshot_ref(cache.cache_slot), &n_tensors, &n_bytes);
+        std::fprintf(stderr,
+            "[disk-cache] digest %s source=%s pos=%d tensors=%d bytes=%llu "
+            "xxh64=%016llx\n",
+            req.response_id.c_str(), cache.disk_hit ? "ssd" : "ram",
+            cache.prefix_len, n_tensors, (unsigned long long)n_bytes,
+            (unsigned long long)digest);
+    }
     std::fprintf(stderr,
         "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
         "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
@@ -8664,17 +8693,16 @@ void HttpServer::finalize_generation_cache(
                     effective_prompt,
                     backend_.snapshot_bytes_estimate(saved_position));
                 trim_snapshots_after_commit(cache.snap_slot);
-                // The shutdown/disk key is exact: it must not claim rows the
-                // snapshot lacks.
-                slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
-                    effective_prompt.begin(),
-                    effective_prompt.begin() + saved_position);
-                if (!disk_cache_.disabled()) {
-                    disk_cache_.learn_layout(cache.snap_slot);
-                    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-                        disk_cache_.save(
-                            cache.snap_slot, slot_tokens_[cache.snap_slot]);
-                    }
+                // The disk key is exact: it must not claim rows the snapshot
+                // lacks. A compressed view is never written to disk, so it
+                // gets no key. The write happens only if this snapshot is
+                // evicted from RAM (evict_inline_slot) or at shutdown.
+                if (!prepared.compressed &&
+                    cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+                    slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
+                        effective_prompt.begin(),
+                        effective_prompt.begin() + saved_position);
+                    note_session_slot(cache.snap_slot);
                 }
             } else {
                 backend_.snapshot_free(cache.snap_slot);
@@ -8690,7 +8718,10 @@ void HttpServer::finalize_generation_cache(
 
     // Long conversations get a continued checkpoint after crossing the
     // configured interval so a future turn can restore prompt plus output.
-    if (!disk_cache_.disabled() &&
+    // With RAM prefix slots a session's state is written when it is evicted
+    // from RAM instead; this checkpoint is the fallback without them.
+    if (!disk_cache_.disabled() && prefix_cache_.disabled() &&
+        !prepared.compressed &&
         cache.disk_policy.mode == DiskPrefixCacheMode::Full && result.ok() &&
         generation_produced_output) {
         const int final_position =
@@ -8729,6 +8760,149 @@ void HttpServer::forget_inline_slot_metadata(int slot) {
     if (slot < 0) return;
     agent_turn_cache_slots_.erase(slot);
     slot_tokens_.erase(slot);
+    slot_aux_.erase(slot);
+}
+
+bool HttpServer::persist_evicted_slot(int slot, bool persist, const char * reason) {
+    if (slot < 0 || !persist || disk_cache_.disabled()) return false;
+    const auto key = slot_tokens_.find(slot);
+    // No key: a compressed view, a non-`full` disk scope, or no snapshot.
+    if (key == slot_tokens_.end() || !backend_.snapshot_used(slot)) return false;
+    const auto aux = slot_aux_.find(slot);
+    OwnedSnapshot snap = backend_.snapshot_detach(slot);
+    if (snap.empty()) return false;
+    const int pos = snap.cur_pos();
+    const bool queued = disk_cache_.save_async(
+        std::move(snap), key->second,
+        aux == slot_aux_.end() ? std::string() : aux->second);
+    const int pruned = queued
+        ? disk_cache_.prune_ancestors(key->second, config_.disk_cache_cold_max_tokens)
+        : 0;
+    std::fprintf(stderr,
+        "[disk-cache] %s slot=%d tokens=%zu pos=%d -> %s (pruned %d older)\n",
+        reason, slot, key->second.size(), pos,
+        queued ? "write queued" : "not written", pruned);
+    return queued;
+}
+
+void HttpServer::evict_inline_slot(int slot) {
+    if (slot >= 0) {
+        persist_evicted_slot(slot, prefix_cache_.persist_on_evict(slot), "ram eviction");
+    }
+    forget_inline_slot_metadata(slot);
+}
+
+void HttpServer::note_session_slot(int slot) {
+    if (slot >= 0) request_session_slots_.push_back(slot);
+}
+
+std::string HttpServer::session_replay_blob(const ParsedRequest & req,
+                                           const SseEmitter * emitter) {
+    json entries = json::array();
+    if (tool_memory_.disabled()) return std::string();
+    const auto messages =
+        normalize_chat_messages(req.messages, req.format, tool_memory_, true);
+    for (const auto & m : messages) {
+        if (!m.tool_calls_replayed || m.content.empty()) continue;
+        json ids = json::array();
+        for (const auto & call : m.tool_calls) ids.push_back(call.id);
+        entries.push_back({{"ids", ids}, {"raw", m.content}});
+    }
+    // This response's own calls, remembered by remember_agent_turn().
+    std::vector<std::string> ids;
+    if (emitter) {
+        for (const auto & call : emitter->tool_calls()) ids.push_back(call.id);
+    }
+    if (!ids.empty()) {
+        const std::string raw = tool_memory_.lookup(ids);
+        if (!raw.empty()) entries.push_back({{"ids", ids}, {"raw", raw}});
+    }
+    if (entries.empty()) return std::string();
+    return json{{"tool_memory", entries}}.dump();
+}
+
+void HttpServer::restore_replay_blobs() {
+    size_t restored = 0;
+    disk_cache_.for_each_aux([&](const std::string & blob) {
+        const json doc = json::parse(blob, nullptr, /*allow_exceptions=*/false);
+        if (!doc.is_object() || !doc.contains("tool_memory") ||
+            !doc["tool_memory"].is_array()) {
+            return;
+        }
+        for (const auto & entry : doc["tool_memory"]) {
+            if (!entry.is_object() || !entry.contains("ids") ||
+                !entry["ids"].is_array() || !entry.contains("raw") ||
+                !entry["raw"].is_string()) {
+                continue;
+            }
+            std::vector<std::string> ids;
+            for (const auto & id : entry["ids"]) {
+                if (id.is_string()) ids.push_back(id.get<std::string>());
+            }
+            tool_memory_.remember(ids, entry["raw"].get<std::string>());
+            ++restored;
+        }
+    });
+    if (restored > 0) {
+        std::fprintf(stderr,
+            "[disk-cache] restored %zu tool-call replay entries\n", restored);
+    }
+}
+
+void HttpServer::record_session_aux(const ParsedRequest & req,
+                                    const SseEmitter & emitter) {
+    std::vector<int> slots;
+    slots.swap(request_session_slots_);
+    if (disk_cache_.disabled()) return;
+    std::string blob;
+    bool computed = false;
+    for (const int slot : slots) {
+        if (!slot_tokens_.count(slot)) continue;
+        if (!computed) {
+            blob = session_replay_blob(req, &emitter);
+            computed = true;
+        }
+        slot_aux_[slot] = blob;
+    }
+}
+
+void HttpServer::flush_sessions_to_disk(const char * reason) {
+    if (disk_cache_.disabled()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const double limit = config_.disk_cache_shutdown_flush_s;
+    const auto elapsed = [&] {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+    size_t queued = 0, backups = 0, skipped = 0;
+    const auto before = disk_cache_.stats();
+    // Graceful shutdown evicts everything: each conversation's newest
+    // snapshot and the heads, most recently used first, so the time limit
+    // drops the least valuable ones. Queuing can wait for the writer
+    // (bounded queued bytes), so the limit is checked between snapshots.
+    for (const auto & entry : prefix_cache_.entries_for_shutdown()) {
+        if (!entry.persist) {
+            ++backups;
+            continue;
+        }
+        if (limit >= 0 && elapsed() >= limit) {
+            ++skipped;
+            continue;
+        }
+        if (persist_evicted_slot(entry.slot, true, reason)) ++queued;
+        forget_inline_slot_metadata(entry.slot);
+    }
+    const auto drained = disk_cache_.drain(
+        limit < 0 ? -1.0 : (std::max)(0.0, limit - elapsed()));
+    std::fprintf(stderr,
+        "[disk-cache] %s flush: %zu snapshots queued (%zu edit backups not "
+        "written), %llu files %.1f MB written in %.2fs (limit %.0fs; %llu "
+        "writes and %zu snapshots dropped by it)\n",
+        reason, queued, backups,
+        (unsigned long long)(disk_cache_.stats().writes - before.writes),
+        (double)(disk_cache_.stats().write_bytes - before.write_bytes) / (1024.0 * 1024.0),
+        elapsed(), limit,
+        (unsigned long long)drained.cancelled, skipped);
 }
 
 void HttpServer::trim_snapshots_after_commit(int slot) {
@@ -8739,7 +8913,13 @@ void HttpServer::trim_snapshots_after_commit(int slot) {
         }
     };
     release(prefix_cache_.prune_superseded_ancestors(slot));
-    release(prefix_cache_.enforce_resident_budget(slot));
+    std::vector<bool> persist;
+    const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
+    for (size_t i = 0; i < evicted.size(); ++i) {
+        persist_evicted_slot(evicted[i], persist[i], "ram eviction");
+        forget_inline_slot_metadata(evicted[i]);
+        backend_.snapshot_free(evicted[i]);
+    }
 }
 
 void HttpServer::publish_memory_report() {
@@ -8863,7 +9043,7 @@ bool HttpServer::save_generated_turn(
         return false;
     }
     const int slot = reservation.slot();
-    forget_inline_slot_metadata(slot);
+    evict_inline_slot(slot);
     backend_.snapshot_free(slot);
     // The next request usually continues this state, so the backend may
     // keep it live instead of copying it out.
@@ -8876,12 +9056,16 @@ bool HttpServer::save_generated_turn(
     }
     reservation.commit_at(
         canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
-    for (const int evicted : prefix_cache_.enforce_resident_budget(slot)) {
-        forget_inline_slot_metadata(evicted);
-        backend_.snapshot_free(evicted);
+    std::vector<bool> persist;
+    const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
+    for (size_t i = 0; i < evicted.size(); ++i) {
+        persist_evicted_slot(evicted[i], persist[i], "ram eviction");
+        forget_inline_slot_metadata(evicted[i]);
+        backend_.snapshot_free(evicted[i]);
     }
     slot_tokens_[slot] = std::vector<int32_t>(
         canonical.begin(), canonical.begin() + saved_pos);
+    note_session_slot(slot);
     agent_turn_cache_slots_.insert(slot);
     std::fprintf(stderr,
         "[agent-turn-cache] saved generated turn slot=%d prefix=%d "
@@ -9006,7 +9190,7 @@ void HttpServer::remember_agent_turn(
         reservation.cancel();
         return;
     }
-    forget_inline_slot_metadata(slot);
+    evict_inline_slot(slot);
     backend_.snapshot_free(slot);
 
     GenerateRequest replay;
@@ -9028,6 +9212,7 @@ void HttpServer::remember_agent_turn(
         trim_snapshots_after_commit(slot);
         canonical_tokens.resize((size_t) saved_pos);
         slot_tokens_[slot] = std::move(canonical_tokens);
+        note_session_slot(slot);
         agent_turn_cache_slots_.insert(slot);
         std::fprintf(stderr,
             "[agent-turn-cache] saved slot=%d prefix=%d source=%d:%d "
@@ -9604,6 +9789,7 @@ void HttpServer::process_job(ServerJob * job) {
         req, prepared, cache, result, emitter, completion_tokens,
         visible_output_seen, client_disconnected,
         /*replay_cache=*/true);
+    record_session_aux(req, emitter);
 
     if (client_disconnected) {
         std::fprintf(stderr, "[server] client disconnected — generation aborted "
