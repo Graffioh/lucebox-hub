@@ -232,6 +232,15 @@ struct HttpServerTestAccess {
     static json pflash_failure_counters(const HttpServer & server) {
         return server.pflash_failure_counters_json();
     }
+    static json pflash_keep_history(const HttpServer & server) {
+        return server.pflash_keep_history_json();
+    }
+    // A committed inline prefix-cache entry: ids[0, cut) restorable from
+    // ``slot`` (the backend reports the snapshot).
+    static void seed_prefix_cache(HttpServer & server, int slot, int cut,
+                                  const std::vector<int32_t> & ids) {
+        server.prefix_cache_.confirm_inline_snap(slot, cut, ids);
+    }
 };
 }
 
@@ -14820,4 +14829,606 @@ TEST_CASE(ServerUnitFixture, test_pflash_cold_history_raw_over_max_ctx_still_com
     TEST_ASSERT(!admission.value("raw_fits", true));
     TEST_ASSERT(!admission.contains("cold_history"));
     TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+}
+
+// ─── Agent history (PFLASH_AGENT_HISTORY=keep) ───────────────────────────
+
+TEST_CASE(ServerUnitFixture, test_pflash_agent_history_flag_defaults_off) {
+    luce_unsetenv("PFLASH_AGENT_HISTORY");
+    TEST_ASSERT(!http_detail::pflash_agent_history_enabled());
+    // Only "keep" turns it on; anything else is today's behaviour.
+    for (const char * off : {"", "0", "1", "on", "KEEP", "raw", "keep "}) {
+        luce_setenv("PFLASH_AGENT_HISTORY", off);
+        TEST_ASSERT_MSG(!http_detail::pflash_agent_history_enabled(), off);
+    }
+    luce_setenv("PFLASH_AGENT_HISTORY", "keep");
+    TEST_ASSERT(http_detail::pflash_agent_history_enabled());
+    luce_unsetenv("PFLASH_AGENT_HISTORY");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_decision) {
+    using http_detail::PflashAdmission;
+    using http_detail::pflash_keep_history_admission;
+    const int t = 16384;
+    // Large new user content: only it is compressed, whatever today's
+    // decision for the whole prompt (cold, warm or compress).
+    for (auto admission : {PflashAdmission::Compress, PflashAdmission::WarmCache,
+                           PflashAdmission::ColdHistory}) {
+        TEST_ASSERT(pflash_keep_history_admission(admission, t, t, true) ==
+                    PflashAdmission::NewContent);
+        TEST_ASSERT(pflash_keep_history_admission(admission, t, t, false) ==
+                    PflashAdmission::NewContent);
+    }
+    // Small new content: raw instead of compressing the history.
+    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::Compress, t - 1, t, false) ==
+                PflashAdmission::KeepHistory);
+    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::WarmCache, t - 1, t, true) ==
+                PflashAdmission::KeepHistory);
+    // Already raw: unchanged.
+    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::WarmCache, t - 1, t, false) ==
+                PflashAdmission::WarmCache);
+    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::ColdHistory, t - 1, t, true) ==
+                PflashAdmission::ColdHistory);
+    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::UnderThreshold, 3 * t, t, true) ==
+                PflashAdmission::UnderThreshold);
+    TEST_ASSERT(std::string(http_detail::pflash_admission_name(
+        PflashAdmission::NewContent)) == "new_content");
+    TEST_ASSERT(std::string(http_detail::pflash_admission_name(
+        PflashAdmission::KeepHistory)) == "keep_history");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_scope) {
+    using http_detail::PflashChatTurn;
+    const auto turn = [] (const char * role, int begin) {
+        PflashChatTurn out;
+        out.role = role;
+        out.role_begin = begin;
+        out.content_begin = begin + 2;
+        out.content_end = begin + 8;
+        out.turn_end = begin + 10;
+        return out;
+    };
+    int newest = 7;
+    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope({}, newest)) == "no_turns");
+    TEST_ASSERT(newest == -1);
+    // First turn: the preamble and the user's message, no earlier conversation.
+    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
+        {turn("system", 0), turn("user", 10)}, newest)) == "no_history");
+    // Newest turn a tool output (or an assistant prefill): out of scope.
+    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
+        {turn("system", 0), turn("user", 10), turn("assistant", 20), turn("tool", 30)},
+        newest)) == "newest_not_user");
+    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
+        {turn("user", 0), turn("assistant", 10)}, newest)) == "newest_not_user");
+    // A user turn after the agent's turns: in scope, newest is its index.
+    TEST_ASSERT(http_detail::pflash_keep_history_scope(
+        {turn("system", 0), turn("user", 10), turn("assistant", 20), turn("tool", 30),
+         turn("assistant", 40), turn("user", 50)}, newest) == nullptr);
+    TEST_ASSERT(newest == 5);
+    // An empty user turn has nothing to compress or keep apart.
+    auto empty = turn("user", 50);
+    empty.content_end = empty.content_begin;
+    TEST_ASSERT(std::string(http_detail::pflash_keep_history_scope(
+        {turn("user", 0), turn("assistant", 10), empty}, newest)) == "newest_not_user");
+}
+
+static std::string pflash_keep_filler(const char * line, int count) {
+    std::string out;
+    for (int i = 0; i < count; ++i) out += line;
+    return out;
+}
+
+static int pflash_keep_count(const std::string & text, const std::string & needle) {
+    int count = 0;
+    for (size_t at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + needle.size())) {
+        ++count;
+    }
+    return count;
+}
+
+// system + task + read_file call + tool result (``tool_lines`` lines) +
+// the agent's answer: an earlier conversation with tool activity.
+static json pflash_keep_agent_history(int tool_lines) {
+    const json call = json::array({{{"id", "call-1"}, {"type", "function"},
+        {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"parser.py\"}"}}}}});
+    return json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "Fix the bug in parser.py."}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", call}},
+        {{"role", "tool"}, {"tool_call_id", "call-1"},
+         {"content", pflash_keep_filler("def parse(x): return x.strip()\n", tool_lines)}},
+        {{"role", "assistant"}, {"content", "The parser strips each line."}},
+    });
+}
+
+static const char * const kPflashKeepPasteLine = "The manual says many things.\n";
+
+static std::string pflash_keep_paste(int lines, const char * question) {
+    return pflash_keep_filler(kPflashKeepPasteLine, lines) + question;
+}
+
+static json pflash_keep_with(json messages, const json & message) {
+    messages.push_back(message);
+    return messages;
+}
+
+static json pflash_keep_user(const std::string & content) {
+    return {{"role", "user"}, {"content", content}};
+}
+
+struct MockPflashWarmSpanBackend : MockPflashSpanBackend {
+    int warm_pos = 0;   // slot 0 holds a snapshot at this position
+    bool snapshot_used(int slot) const override { return slot == 0 && warm_pos > 0; }
+    int snapshot_cur_pos(int slot) const override {
+        return snapshot_used(slot) ? warm_pos : 0;
+    }
+};
+
+struct PflashKeepHistoryRun {
+    std::vector<HttpServerTestAccess::PreparedPrompt> prepared;
+    std::vector<std::vector<int32_t>> ids;
+    std::vector<std::string> served_text;
+    // Target tokens before the last "<|im_start|>user" of each prompt.
+    std::vector<int> user_cut;
+    json counters;
+    json keep;
+    int compress_calls = 0;
+    std::vector<json> view_records;
+};
+
+// One server, the given turns in order (cache-aware admission, arrive on,
+// fixture tokenizer as target and drafter). ``warm_history``: before the
+// first turn, the prefix cache holds its prompt up to the newest user turn.
+static PflashKeepHistoryRun run_keep_history_session(
+        const std::vector<json> & turns, const json & tools, const char * flag,
+        const char * cold, int threshold, bool warm_history = false,
+        int max_ctx = 16384, const char * arrive_flag = "1") {
+    const int max_output = 16;
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
+    luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", arrive_flag};
+    luce_test::ScopedEnvVar keep{"PFLASH_AGENT_HISTORY", flag};
+    luce_test::ScopedEnvVar cold_env{"PFLASH_COLD_HISTORY", cold};
+    char trace_path[] = "/tmp/pflash_keep_history_view_XXXXXX";
+    const int trace_fd = mkstemp(trace_path);
+    TEST_ASSERT(trace_fd >= 0);
+    close(trace_fd);
+    luce_test::ScopedEnvVar view_trace{"PFLASH_VIEW_TRACE_PATH", trace_path};
+    std::vector<std::string> rendered;
+    std::string cover;
+    for (const auto & messages : turns) {
+        ToolMemory tool_memory;
+        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+        rendered.push_back(render_chat_template(
+            chat, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+            /*enable_thinking=*/true,
+            tools.is_array() && !tools.empty() ? tools.dump() : ""));
+        cover += rendered.back();
+    }
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"user", "assistant", "system", "\n", "tool"}, cover);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PflashKeepHistoryRun run;
+    for (const auto & text : rendered) {
+        run.ids.push_back(tokenizer.encode(text));
+        const size_t at = text.rfind("<|im_start|>user");
+        run.user_cut.push_back(at == std::string::npos ? -1
+            : (int) tokenizer.encode(text.substr(0, at)).size());
+    }
+    auto backend_owner = std::make_unique<MockPflashWarmSpanBackend>();
+    MockPflashWarmSpanBackend & backend = *backend_owner;
+    // The selector keeps the user's questions (a prompt-end query ranks
+    // them first), nothing else of a paste.
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        std::vector<PFlashTokenSpan> spans;
+        for (const char * text : {"What does the manual say about exit codes?",
+                                  "And what about signals?", "Which page covers traps?"}) {
+            const auto span = http_detail::pflash_decoded_text_span(
+                tokenizer, request.input_ids, 0, (int) request.input_ids.size(), text);
+            if (span.begin >= 0) spans.push_back(span);
+        }
+        return spans;
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = threshold;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = max_ctx;
+    config.prefix_cache_cap = warm_history ? 4 : 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        if (warm_history) {
+            TEST_ASSERT(run.user_cut[0] > 0);
+            backend.warm_pos = run.user_cut[0];
+            HttpServerTestAccess::seed_prefix_cache(server, 0, run.user_cut[0], run.ids[0]);
+        }
+        for (size_t index = 0; index < turns.size(); ++index) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            request.messages = turns[index];
+            if (tools.is_array() && !tools.empty()) request.tools = tools;
+            request.prompt_tokens = run.ids[index];
+            request.max_output = max_output;
+            run.prepared.push_back(HttpServerTestAccess::prepare_prompt(server, request));
+            run.served_text.push_back(tokenizer.decode(run.prepared.back().tokens));
+        }
+        run.counters = HttpServerTestAccess::pflash_failure_counters(server);
+        run.keep = HttpServerTestAccess::pflash_keep_history(server);
+    }
+    run.compress_calls = backend.compress_calls;
+    std::ifstream in(trace_path);
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty()) run.view_records.push_back(json::parse(line));
+    }
+    unlink(trace_path);
+    unlink(path.c_str());
+    return run;
+}
+
+static bool pflash_keep_prefix_is(const std::vector<int32_t> & served,
+                                  const std::vector<int32_t> & ids, int cut) {
+    return cut > 0 && (int) served.size() >= cut && (int) ids.size() >= cut &&
+        std::equal(ids.begin(), ids.begin() + cut, served.begin());
+}
+
+// Stats with the keep_history record and timings removed: what the flag must
+// leave untouched out of scope.
+static json pflash_keep_stats_without_record(json stats) {
+    stats.erase("compress_ms");
+    if (stats.contains("admission")) stats["admission"].erase("keep_history");
+    return stats;
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_history_big_paste) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // Case 4: a small agent history (under the threshold) and a large paste
+    // as the new user turn. Today the whole prompt is compressed; with the
+    // flag the history is served raw and only the paste is compressed.
+    const json turn = pflash_keep_with(pflash_keep_agent_history(6),
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
+    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
+                                              nullptr, 400);
+    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                             nullptr, 400);
+    TEST_ASSERT_MSG(off.prepared[0].error.empty(), off.prepared[0].error);
+    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+    TEST_ASSERT(off.prepared[0].pflash_stats["admission"].value("decision", "") == "compress");
+    TEST_ASSERT(!off.prepared[0].pflash_stats["admission"].contains("keep_history"));
+    // Today: the tool output is compressed away with the paste.
+    TEST_ASSERT(pflash_keep_count(off.served_text[0], "def parse(x)") < 6);
+    // With the flag: one compression, the history token for token, the
+    // paste compressed, the question kept.
+    TEST_ASSERT(on.compress_calls == 1);
+    TEST_ASSERT(on.prepared[0].compressed);
+    const json & admission = on.prepared[0].pflash_stats["admission"];
+    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
+    const json & keep = admission["keep_history"];
+    TEST_ASSERT(keep.value("in_scope", false) && keep.value("fired", false));
+    TEST_ASSERT(keep.value("decision_before", "") == "compress");
+    TEST_ASSERT(keep.value("new_droppable", 0) >= 400);
+    TEST_ASSERT(keep.value("base", "") == "raw");
+    TEST_ASSERT(keep.value("raw_base_tokens", -1) == on.user_cut[0]);
+    TEST_ASSERT(admission["region"].value("mode", "") == "new_content");
+    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
+    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 6);
+    TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
+    TEST_ASSERT(on.served_text[0].find("exit codes?") != std::string::npos);
+    TEST_ASSERT(on.prepared[0].tokens.size() < on.ids[0].size());
+    const json & view = on.prepared[0].pflash_stats["view"];
+    TEST_ASSERT(view.value("mode", "") == "new_content");
+    TEST_ASSERT(view.value("raw_base_tokens", -1) == on.user_cut[0]);
+    TEST_ASSERT(on.view_records.size() == 1);
+    TEST_ASSERT(on.view_records[0]["pflash"]["view"].value("mode", "") == "new_content");
+    TEST_ASSERT(on.keep["decisions"].value("new_content", 0) == 1);
+    TEST_ASSERT(on.counters.value("fallback_served", 0) == 0);
+    TEST_ASSERT(off.keep.is_null());   // /props shows nothing with the flag off
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_cold_history_big_paste) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // Case 3: a cold history over the threshold and a large paste. With
+    // PFLASH_COLD_HISTORY=raw today serves everything raw; with the flag the
+    // history is still raw and only the paste is compressed.
+    const json turn = pflash_keep_with(pflash_keep_agent_history(60),
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
+    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
+                                              "raw", 400);
+    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                             "raw", 400);
+    TEST_ASSERT(off.prepared[0].pflash_stats["admission"].value("decision", "") ==
+                "cold_history");
+    TEST_ASSERT(!off.prepared[0].compressed && off.compress_calls == 0);
+    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+    const json & admission = on.prepared[0].pflash_stats["admission"];
+    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
+    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "cold_history");
+    TEST_ASSERT(admission["cold_history"].value("fired", false));
+    TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
+    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
+    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 60);
+    TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
+    TEST_ASSERT(on.counters.value("fallback_served", 0) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_new_turn_serves_raw) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
+    // A cold history over the threshold and a short new question: the
+    // history is never compressed. With PFLASH_COLD_HISTORY=raw the
+    // cold-history rule serves it (unchanged); without it, today compresses
+    // and the flag serves the raw prompt (keep_history), never refused.
+    const json turn = pflash_keep_with(pflash_keep_agent_history(60),
+        pflash_keep_user("Why does it strip?"));
+    const auto cold = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                               "raw", 400);
+    TEST_ASSERT(cold.prepared[0].pflash_stats["admission"].value("decision", "") ==
+                "cold_history");
+    TEST_ASSERT(!cold.prepared[0].compressed && cold.compress_calls == 0);
+    TEST_ASSERT(cold.prepared[0].tokens == cold.ids[0]);
+    TEST_ASSERT(!cold.prepared[0].pflash_stats["admission"]["keep_history"].value("fired", true));
+    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
+                                              nullptr, 400);
+    TEST_ASSERT(off.prepared[0].compressed && off.compress_calls == 1);
+    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                             nullptr, 400);
+    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+    TEST_ASSERT(!on.prepared[0].compressed && on.compress_calls == 0);
+    TEST_ASSERT(on.prepared[0].tokens == on.ids[0]);
+    const json & admission = on.prepared[0].pflash_stats["admission"];
+    TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", admission.dump());
+    TEST_ASSERT(admission["keep_history"].value("fired", false));
+    TEST_ASSERT(admission["keep_history"].value("new_droppable", 999) < 400);
+    TEST_ASSERT(on.prepared[0].pflash_stats["pflash_fallback"].value("reason", "") ==
+                "keep_history");
+    TEST_ASSERT(on.counters.value("fallback_served", 0) == 1);
+    TEST_ASSERT(on.counters["fallback_reasons"].value("keep_history", 0) == 1);
+    TEST_ASSERT(on.keep["decisions"].value("keep_history", 0) == 1);
+    TEST_ASSERT(on.view_records.size() == 1);
+    TEST_ASSERT(on.view_records[0].value("kind", "") == "raw");
+    TEST_ASSERT(on.view_records[0]["pflash_fallback"].value("reason", "") == "keep_history");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_warm_cache_big_paste) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // Case 2: the prefix cache holds the history; a large paste arrives.
+    // Today (arrive on) the uncached tail from the cache boundary is
+    // compressed and the prompt re-encoded; with the flag the served prompt
+    // starts with the raw history tokens the cache restores.
+    const json turn = pflash_keep_with(pflash_keep_agent_history(60),
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
+    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
+                                              nullptr, 400, /*warm_history=*/true);
+    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                             nullptr, 400, /*warm_history=*/true);
+    TEST_ASSERT_MSG(off.prepared[0].error.empty(), off.prepared[0].error);
+    const json & before = off.prepared[0].pflash_stats["admission"];
+    TEST_ASSERT_MSG(before.value("decision", "") == "warm_cache", before.dump());
+    TEST_ASSERT(before.value("cached_tokens", 0) == off.user_cut[0]);
+    TEST_ASSERT(before["region"].value("mode", "") == "arrive");
+    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+    const json & admission = on.prepared[0].pflash_stats["admission"];
+    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
+    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "warm_cache");
+    TEST_ASSERT(admission.value("cached_tokens", 0) == on.user_cut[0]);
+    TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
+    TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 60);
+    TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
+    // Without arrive today serves warm_cache raw; the flag still compresses
+    // only the paste, on the same raw base.
+    const auto off_raw = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
+                                                  nullptr, 400, true, 16384, nullptr);
+    TEST_ASSERT(off_raw.prepared[0].pflash_stats["admission"].value("decision", "") ==
+                "warm_cache");
+    TEST_ASSERT(!off_raw.prepared[0].compressed && off_raw.compress_calls == 0);
+    const auto on_raw = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                                 nullptr, 400, true, 16384, nullptr);
+    TEST_ASSERT(on_raw.prepared[0].pflash_stats["admission"].value("decision", "") ==
+                "new_content");
+    TEST_ASSERT(on_raw.prepared[0].tokens == on.prepared[0].tokens);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_first_turn_and_tool_output_unchanged) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // Case 1: tools defined, no assistant turn yet: the paste is compressed
+    // with the preamble as today.
+    const json first = json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
+    });
+    // Case 5: the newest turn is a large tool output.
+    json tool_newest = pflash_keep_agent_history(6);
+    tool_newest.erase(tool_newest.size() - 1);
+    tool_newest.push_back({{"role", "assistant"}, {"content", ""},
+        {"tool_calls", json::array({{{"id", "call-2"}, {"type", "function"},
+            {"function", {{"name", "read_file"},
+                          {"arguments", "{\"path\":\"manual.txt\"}"}}}}})}});
+    tool_newest.push_back({{"role", "tool"}, {"tool_call_id", "call-2"},
+                           {"content", pflash_keep_filler(kPflashKeepPasteLine, 30)}});
+    for (const auto & [turn, reason] : std::vector<std::pair<json, std::string>>{
+             {first, "no_history"}, {tool_newest, "newest_not_user"}}) {
+        for (const char * cold : {(const char *) nullptr, "raw"}) {
+            const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(),
+                                                      nullptr, cold, 400);
+            const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(),
+                                                     "keep", cold, 400);
+            TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+            TEST_ASSERT(on.prepared[0].tokens == off.prepared[0].tokens);
+            TEST_ASSERT(on.prepared[0].compressed == off.prepared[0].compressed);
+            TEST_ASSERT(on.compress_calls == off.compress_calls);
+            const json & keep = on.prepared[0].pflash_stats["admission"]["keep_history"];
+            TEST_ASSERT_MSG(!keep.value("in_scope", true), keep.dump());
+            TEST_ASSERT_MSG(keep.value("reason", "") == reason, keep.dump());
+            TEST_ASSERT(pflash_keep_stats_without_record(on.prepared[0].pflash_stats) ==
+                        pflash_keep_stats_without_record(off.prepared[0].pflash_stats));
+            TEST_ASSERT(on.counters == off.counters);
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_chat_without_tools_unchanged) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    // A plain chat (no tools anywhere) with a paste after an answer: out of
+    // scope, served, traced and counted exactly as with the flag off.
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        pflash_keep_user("Hello there."),
+        {{"role", "assistant"}, {"content", "Hi."}},
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
+    });
+    const auto off = run_keep_history_session({turn}, json(), nullptr, "raw", 400);
+    const auto on = run_keep_history_session({turn}, json(), "keep", "raw", 400);
+    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+    TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
+    TEST_ASSERT(on.prepared[0].tokens == off.prepared[0].tokens);
+    json stats_on = on.prepared[0].pflash_stats;
+    json stats_off = off.prepared[0].pflash_stats;
+    stats_on.erase("compress_ms");
+    stats_off.erase("compress_ms");
+    TEST_ASSERT_MSG(stats_on == stats_off, stats_on.dump() + " vs " + stats_off.dump());
+    TEST_ASSERT(!stats_on["admission"].contains("keep_history"));
+    TEST_ASSERT(on.counters == off.counters);
+    TEST_ASSERT(on.keep["decisions"].empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_raw_over_max_ctx_unchanged) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    const json turn = pflash_keep_with(pflash_keep_agent_history(6),
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
+    const auto probe = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                                nullptr, 400);
+    // The raw prompt plus the reply budget no longer fits: today's rule.
+    const int max_ctx = (int) probe.ids[0].size() + 15;
+    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
+                                              nullptr, 400, false, max_ctx);
+    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "keep",
+                                             nullptr, 400, false, max_ctx);
+    TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
+    TEST_ASSERT(on.prepared[0].compressed);
+    TEST_ASSERT(on.prepared[0].tokens == off.prepared[0].tokens);
+    const json & keep = on.prepared[0].pflash_stats["admission"]["keep_history"];
+    TEST_ASSERT(keep.value("reason", "") == "raw_too_long");
+    TEST_ASSERT(on.prepared[0].pflash_stats["admission"].value("decision", "") == "compress");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_follow_up_turns) {
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
+    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", nullptr};       // default: on
+    // Rebuild a view over 1.1x a fresh selection, at any size: today's rule
+    // would rebuild turn 2 (the fixture's fresh selection keeps the short
+    // history; the release ratio 2 bites at real sizes, 60K + 8K vs 24K).
+    luce_test::ScopedEnvVar ratio{"PFLASH_CHAT_REBUILD_RATIO", "1.1"};
+    luce_test::ScopedEnvVar min_tokens{"PFLASH_CHAT_REBUILD_MIN_TOKENS", nullptr};
+    // Turn 1: history + paste (new_content on a raw base). Turn 2: a short
+    // question: the view continues verbatim, no rebuild although it is far
+    // larger than a fresh selection. Turn 3: a second paste: new_content on
+    // the view. Turn 4: a large tool output as the newest turn: today's
+    // rules (arrive on the view) -- the known limitation.
+    const json t1 = pflash_keep_with(pflash_keep_agent_history(6),
+        pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
+    json t2 = pflash_keep_with(t1, {{"role", "assistant"}, {"content", "Exit codes are listed."}});
+    t2 = pflash_keep_with(t2, pflash_keep_user("And what about signals?"));
+    json t3 = pflash_keep_with(t2, {{"role", "assistant"}, {"content", "Signals are covered."}});
+    t3 = pflash_keep_with(t3, pflash_keep_user(
+        pflash_keep_filler("Another page of the manual.\n", 30) + "Which page covers traps?"));
+    json t4 = pflash_keep_with(t3, {{"role", "assistant"}, {"content", ""},
+        {"tool_calls", json::array({{{"id", "call-2"}, {"type", "function"},
+            {"function", {{"name", "read_file"},
+                          {"arguments", "{\"path\":\"traps.txt\"}"}}}}})}});
+    t4 = pflash_keep_with(t4, {{"role", "tool"}, {"tool_call_id", "call-2"},
+        {"content", pflash_keep_filler("trap handlers run on signals.\n", 30)}});
+    const auto run = run_keep_history_session({t1, t2, t3, t4}, pflash_cold_history_tools(),
+                                              "keep", nullptr, 400);
+    for (const auto & prepared : run.prepared) {
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(prepared.compressed);
+    }
+    const auto mode = [&] (size_t turn) {
+        return run.prepared[turn].pflash_stats["view"].value("mode", "");
+    };
+    const auto view_prefix = [&] (size_t turn) {
+        // The served prompt minus its generation prompt (what the next turn
+        // reuses): turn's served up to the start of the next turn's delta.
+        const auto & stats = run.prepared[turn + 1].pflash_stats["view"];
+        return stats.value("reused_tokens", -1);
+    };
+    // Turn 1: raw base, paste compressed.
+    TEST_ASSERT(mode(0) == "new_content");
+    TEST_ASSERT(pflash_keep_prefix_is(run.prepared[0].tokens, run.ids[0], run.user_cut[0]));
+    // Turn 2: the view continues; the history is still the raw tokens.
+    TEST_ASSERT_MSG(mode(1) == "continue", run.prepared[1].pflash_stats.dump());
+    const json & view2 = run.prepared[1].pflash_stats["view"];
+    TEST_ASSERT(view2.value("keep_history", false));
+    TEST_ASSERT(run.prepared[1].pflash_stats["admission"]["keep_history"].value("decision", "") ==
+                "view");
+    // Today's rule would rebuild here: the view is over 1.1x the fresh
+    // selection (no minimum size).
+    TEST_ASSERT_MSG(view2.value("served_tokens", 0) * 10 > 11 * view2.value("fresh_tokens", 0),
+                    view2.dump());
+    TEST_ASSERT(pflash_keep_prefix_is(run.prepared[1].tokens, run.ids[0], run.user_cut[0]));
+    const int reused2 = view_prefix(0);
+    TEST_ASSERT(reused2 > run.user_cut[0]);
+    TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(),
+                           run.prepared[0].tokens.begin() + reused2,
+                           run.prepared[1].tokens.begin()));
+    TEST_ASSERT(run.served_text[1].find("And what about signals?") != std::string::npos);
+    TEST_ASSERT(run.served_text[1].find("Exit codes are listed.") != std::string::npos);
+    // Turn 3: the second paste is compressed on its own after the view.
+    TEST_ASSERT_MSG(mode(2) == "new_content", run.prepared[2].pflash_stats.dump());
+    TEST_ASSERT(run.prepared[2].pflash_stats["admission"]["keep_history"].value("decision", "") ==
+                "new_content");
+    const int reused3 = view_prefix(1);
+    TEST_ASSERT(reused3 > reused2);
+    TEST_ASSERT(std::equal(run.prepared[1].tokens.begin(),
+                           run.prepared[1].tokens.begin() + reused3,
+                           run.prepared[2].tokens.begin()));
+    TEST_ASSERT(pflash_keep_count(run.served_text[2], "Another page of the manual.") < 30);
+    TEST_ASSERT(run.served_text[2].find("Signals are covered.") != std::string::npos);
+    // Turn 4: newest turn a tool output -> out of scope, today's arrive.
+    const json & keep4 = run.prepared[3].pflash_stats["admission"]["keep_history"];
+    TEST_ASSERT(keep4.value("reason", "") == "newest_not_user");
+    TEST_ASSERT_MSG(mode(3) == "arrive", run.prepared[3].pflash_stats.dump());
+    TEST_ASSERT(run.keep["decisions"].value("new_content", 0) == 2);
+    TEST_ASSERT(run.keep["decisions"].value("view", 0) == 1);
+    TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_raw_base_target_fails_closed) {
+    const json messages = pflash_keep_with(pflash_keep_agent_history(2),
+        pflash_keep_user("What now?"));
+    ToolMemory tool_memory;
+    const std::string rendered = render_chat_template(
+        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
+        pflash_cold_history_tools().dump());
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"user", "assistant", "system", "\n", "tool"}, rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tokenizer, markers));
+    const auto ids = tokenizer.encode(rendered);
+    const auto parsed = http_detail::pflash_chat_query_turn(tokenizer, markers, tokenizer, ids);
+    int newest = -1;
+    TEST_ASSERT(http_detail::pflash_keep_history_scope(parsed.turns, newest) == nullptr);
+    const int cut = http_detail::pflash_raw_base_target(
+        tokenizer, markers, ids, tokenizer, ids, parsed.turns, newest);
+    TEST_ASSERT(cut == (int) tokenizer.encode(rendered.substr(0, rendered.rfind("<|im_start|>user"))).size());
+    // Drafter tokens that do not decode to the same history: -1.
+    auto other = ids;
+    other[3] = other[4];
+    TEST_ASSERT(http_detail::pflash_raw_base_target(
+        tokenizer, markers, ids, tokenizer, other, parsed.turns, newest) == -1);
+    // A turn list that does not match the target parse: -1.
+    auto fewer = parsed.turns;
+    fewer.erase(fewer.begin());
+    TEST_ASSERT(http_detail::pflash_raw_base_target(
+        tokenizer, markers, ids, tokenizer, ids, fewer, (int) fewer.size() - 1) == -1);
+    TEST_ASSERT(http_detail::pflash_raw_base_target(
+        tokenizer, markers, ids, tokenizer, ids, parsed.turns, 99) == -1);
+    unlink(path.c_str());
 }
