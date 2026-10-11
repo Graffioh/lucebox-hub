@@ -488,6 +488,14 @@ std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
     return result;
 }
 
+json pflash_view_pieces_json(const std::vector<PflashViewPiece> & pieces) {
+    json out = json::array();
+    for (const auto & piece : pieces) {
+        out.push_back(json::array({piece.begin, piece.end, piece.recall ? "recall" : "raw"}));
+    }
+    return out;
+}
+
 std::string pflash_token_fingerprint(
         const std::vector<int32_t> & ids) {
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -4659,6 +4667,62 @@ std::string HttpServer::apply_pflash_compression(
                         request_probe_messages.error.c_str());
                     std::fflush(stderr);
                 }
+                if (experiment.query_ident != luce::pflash::PFlashIdentQuery::Off) {
+                    // Identifier query: the content of the last turns that
+                    // precede the generation prompt (system turns excluded),
+                    // markup tokens blanked (pflash_ident_query.h).
+                    http_detail::PflashChatTurnSpan ident_turns = chat_turn;
+                    if (ident_turns.turns.empty()) {
+                        ChatMarkers ident_markers;
+                        if (resolve_chat_markers(tokenizer_, ident_markers)) {
+                            ident_turns = http_detail::pflash_chat_query_turn(
+                                tokenizer_, ident_markers, *drafter_tokenizer_, drafter_ids);
+                        }
+                    }
+                    std::vector<PFlashTokenSpan> regions;
+                    for (size_t index = ident_turns.turns.size();
+                         index-- > 0 && (int) regions.size() < luce::pflash::kIdentQueryTurns;) {
+                        const auto & turn = ident_turns.turns[index];
+                        if (turn.role == "system") continue;
+                        if (ident_turns.generation_begin > 0 &&
+                            turn.role_begin >= ident_turns.generation_begin) {
+                            continue;
+                        }
+                        if (turn.content_begin < 0 || turn.content_end <= turn.content_begin ||
+                            turn.content_end > (int) drafter_ids.size()) {
+                            continue;
+                        }
+                        regions.push_back({turn.content_begin, turn.content_end});
+                    }
+                    if (regions.empty()) {
+                        request_probe_messages.ident_error = "no turns mapped";
+                    } else {
+                        std::vector<std::string> texts(drafter_ids.size());
+                        std::vector<unsigned char> markup(drafter_ids.size(), 0);
+                        for (const auto & region : regions) {
+                            for (int t = region.begin; t < region.end; ++t) {
+                                const int32_t id = drafter_ids[(size_t) t];
+                                texts[(size_t) t] = drafter_tokenizer_->token_text(id);
+                                markup[(size_t) t] = drafter_tokenizer_->is_added_token(id) ? 1 : 0;
+                            }
+                        }
+                        request_probe_messages.ident_turns = (int) regions.size();
+                        request_probe_messages.ident_tokens =
+                            luce::pflash::pflash_ident_query_tokens(texts, markup, regions);
+                    }
+                    std::string spans;
+                    for (const auto & region : regions) {
+                        spans += " [" + std::to_string(region.begin) + "," +
+                            std::to_string(region.end) + ")";
+                    }
+                    std::fprintf(stderr,
+                        "[pflash-ident-query] turns:%s identifier tokens=%zu%s%s\n",
+                        spans.empty() ? " none" : spans.c_str(),
+                        request_probe_messages.ident_tokens.size(),
+                        request_probe_messages.ident_error.empty() ? "" : " error: ",
+                        request_probe_messages.ident_error.c_str());
+                    std::fflush(stderr);
+                }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
@@ -5010,6 +5074,8 @@ std::string HttpServer::apply_pflash_compression(
                 {"drafter_input_tokens", compress_request.input_ids.size()},
                 {"query_rule", parser_selection_rule},
                 {"view", view_stats},
+                {"drafter_fingerprint_fnv1a64",
+                 http_detail::pflash_token_fingerprint(compress_request.input_ids)},
             };
             trace_pflash_served(req, prepared);
             return {};
@@ -5156,6 +5222,13 @@ std::string HttpServer::apply_pflash_compression(
             final_tokens = std::move(served);
         }
     }
+    if (prepared.pflash_stats["view"].is_null() && !result.kept_spans.empty()) {
+        std::vector<http_detail::PflashViewPiece> pieces;
+        for (const auto & span : result.kept_spans) pieces.push_back({span.begin, span.end, false});
+        prepared.pflash_stats["pieces"] = http_detail::pflash_view_pieces_json(pieces);
+    }
+    prepared.pflash_stats["drafter_fingerprint_fnv1a64"] =
+        http_detail::pflash_token_fingerprint(compress_request.input_ids);
     prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
     trace_pflash_served(req, prepared);
@@ -5172,7 +5245,9 @@ void HttpServer::trace_pflash_served(
     const char * path = std::getenv("PFLASH_VIEW_TRACE_PATH");
     if (!path || !*path) return;
     const json record = {
-        {"schema_version", 1},
+        {"schema_version", 2},
+        {"kind", prepared.compressed ? "compressed" : "raw"},
+        {"request_id", req.response_id},
         {"prompt_tokens", req.prompt_tokens.size()},
         {"served_tokens", prepared.tokens.size()},
         {"pflash", prepared.pflash_stats},
@@ -5231,13 +5306,16 @@ bool HttpServer::serve_pflash_chat_view(
         next.view_tokens = *fresh;
         next.view_gen_begin = (int) (fresh->size() - generation.size());
         next.spans = *kept_spans;
+        next.pieces.clear();
+        for (const auto & span : *kept_spans) next.pieces.push_back({span.begin, span.end, false});
         next.turns = turns;
         snapshot_cut = next.view_gen_begin;
         std::fprintf(stderr,
             "[pflash-view] %s turn=%d served=%zu\n", why, turns, fresh->size());
         std::fflush(stderr);
         stats = {{"mode", why}, {"turn", turns}, {"served_tokens", fresh->size()},
-                 {"fresh_tokens", fresh->size()}};
+                 {"fresh_tokens", fresh->size()},
+                 {"pieces", http_detail::pflash_view_pieces_json(next.pieces)}};
         served = *fresh;
         pflash_views_.remember(std::move(next));
         return true;
@@ -5248,7 +5326,8 @@ bool HttpServer::serve_pflash_chat_view(
                      view.turns, view.view_tokens.size());
         std::fflush(stderr);
         stats = {{"mode", "repeat"}, {"turn", view.turns},
-                 {"served_tokens", view.view_tokens.size()}};
+                 {"served_tokens", view.view_tokens.size()},
+                 {"pieces", http_detail::pflash_view_pieces_json(view.pieces)}};
         if (compressed) stats["fresh_tokens"] = fresh->size();
         snapshot_cut = view.view_gen_begin;
         served = view.view_tokens;
@@ -5396,6 +5475,14 @@ bool HttpServer::serve_pflash_chat_view(
     auto spans = view.spans;
     spans.insert(spans.end(), delta_spans.begin(), delta_spans.end());
     spans.insert(spans.end(), recalled.begin(), recalled.end());
+    // Provenance, in served order: the cached view, this turn's tokens
+    // before the recall block, the recalled excerpts, the rest.
+    next.pieces = view.pieces;
+    for (const auto & span : before_split) next.pieces.push_back({span.begin, span.end, false});
+    if (!recall_block.empty()) {
+        for (const auto & span : recalled) next.pieces.push_back({span.begin, span.end, true});
+    }
+    for (const auto & span : after_split) next.pieces.push_back({span.begin, span.end, false});
     next.view_tokens = served;
     next.view_gen_begin = (int) (served.size() - generation.size());
     next.spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
@@ -5412,7 +5499,8 @@ bool HttpServer::serve_pflash_chat_view(
     stats = {{"mode", mode}, {"turn", next.turns},
              {"served_tokens", served.size()}, {"reused_tokens", view.view_gen_begin},
              {"new_tokens", new_tokens}, {"delta_tokens", delta_tokens.size()},
-             {"recalled_tokens", recalled_tokens}};
+             {"recalled_tokens", recalled_tokens},
+             {"pieces", http_detail::pflash_view_pieces_json(next.pieces)}};
     if (compressed) stats["fresh_tokens"] = fresh->size();
     pflash_views_.remember(std::move(next));
     return true;
@@ -5497,6 +5585,11 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
             }
         }
     }
+
+    // PFLASH_VIEW_TRACE_PATH: every request leaves one record, the
+    // uncompressed ones too (kind "raw"), so a reader never has to infer
+    // what was served from the absence of a line.
+    if (!prepared.compressed && prepared.error.empty()) trace_pflash_served(req, prepared);
 
     const int prompt_length = prepared.full_cache_served_tokens >= 0
         ? prepared.full_cache_served_tokens

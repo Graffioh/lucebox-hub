@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/pflash_types.h"
+#include "pflash_ident_query.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -164,6 +165,16 @@ struct PFlashSelectionConfig {
     // Trace only: what the request probe did on this call (not owned; set
     // by the scorer for the selection it calls).
     const PFlashRequestProbeTrace * request_probe_trace = nullptr;
+    // PFLASH_SELECT_QUERY_IDENT=heur (strict selection, head
+    // scorer, not with the request probe): the scorer query is the
+    // identifiers of the last turns (pflash_ident_query.h), scored and not
+    // pinned. The tokens come per request (ident_error: why none).
+    PFlashIdentQuery query_ident = PFlashIdentQuery::Off;
+    std::vector<int> ident_tokens;
+    int ident_turns = 0;
+    std::string ident_error;
+    // Trace only (not owned), as request_probe_trace.
+    const PFlashIdentQueryTrace * ident_query_trace = nullptr;
 };
 
 // Segment probe: cut the context before every token whose boundary score is
@@ -239,6 +250,10 @@ bool pflash_fold_requested() noexcept;
 // today's windows through the probe path.
 bool pflash_query_probe_requested() noexcept;
 bool pflash_query_probe_stub_requested() noexcept;
+
+// PFLASH_SELECT_QUERY_IDENT, read per call: off (default, also when unset),
+// or heur. Invalid values fail resolve_pflash_selection.
+PFlashIdentQuery pflash_query_ident_requested() noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an
 // empty or invalid experiment variable cannot silently fall back to legacy.

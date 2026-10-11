@@ -126,6 +126,8 @@ struct PFlashTraceFields {
     const std::vector<PFlashTokenSpan> * extra_queries = nullptr;
     // PFLASH_SELECT_QUERY_PROBE=1: the request probe's record of this call.
     const luce::pflash::PFlashRequestProbeTrace * request_probe = nullptr;
+    // ``"ident_query":{...}`` (PFLASH_SELECT_QUERY_IDENT only; absent otherwise).
+    const luce::pflash::PFlashIdentQueryTrace * ident_query = nullptr;
 };
 
 void write_compression_trace(

@@ -34,6 +34,7 @@ constexpr const char * kQueryHeadEnv = "PFLASH_SELECT_QUERY_HEAD";
 constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
 constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
 constexpr const char * kQueryProbeEnv = "PFLASH_SELECT_QUERY_PROBE";
+constexpr const char * kQueryIdentEnv = "PFLASH_SELECT_QUERY_IDENT";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -100,6 +101,13 @@ bool pflash_query_probe_requested() noexcept {
     return raw && std::strcmp(raw, "1") == 0;
 }
 
+PFlashIdentQuery pflash_query_ident_requested() noexcept {
+    const char * raw = std::getenv(kQueryIdentEnv);
+    if (!raw) return PFlashIdentQuery::Off;
+    if (std::strcmp(raw, "heur") == 0) return PFlashIdentQuery::Heur;
+    return PFlashIdentQuery::Off;
+}
+
 bool pflash_query_probe_stub_requested() noexcept {
     const char * raw = std::getenv("PFLASH_SELECT_QUERY_PROBE_STUB");
     return raw && std::strcmp(raw, "1") == 0;
@@ -138,10 +146,9 @@ bool validate_pflash_instruction_spans(
         error = "PFlash input token count must not be negative";
         return false;
     }
-    if (spans.size() > luce::common::kPFlashMaxInstructionSpans) {
-        error = "PFlash has too many instruction spans";
-        return false;
-    }
+    // No count limit in process (an agent session pins one role header per
+    // turn: hundreds of spans). kPFlashMaxInstructionSpans bounds the IPC
+    // message only (pflash_drafter_ipc.cpp checks it there).
     int previous_end = 0;
     for (const auto & span : spans) {
         if (span.begin < 0 || span.end <= span.begin ||
@@ -521,6 +528,26 @@ bool resolve_pflash_selection(
          config.scorer != PFlashScorer::Head)) {
         error = std::string(kQueryProbeEnv) + "=1 needs strict selection with the "
             "head scorer";
+        return false;
+    }
+    // Identifier query: like the probe, not a selection knob of its own; it
+    // changes where the strict head scorer's query comes from.
+    if (const char * raw = std::getenv(kQueryIdentEnv)) {
+        if (std::strcmp(raw, "off") != 0 && std::strcmp(raw, "heur") != 0) {
+            error = std::string(kQueryIdentEnv) + " must be off or heur";
+            return false;
+        }
+        config.query_ident = pflash_query_ident_requested();
+    }
+    if (config.query_ident != PFlashIdentQuery::Off &&
+        (config.mode == PFlashSelectionMode::Legacy ||
+         config.scorer != PFlashScorer::Head)) {
+        error = std::string(kQueryIdentEnv) + " needs strict selection with the head scorer";
+        return false;
+    }
+    if (config.query_ident != PFlashIdentQuery::Off && config.query_probe) {
+        error = std::string(kQueryIdentEnv) + " and " + std::string(kQueryProbeEnv) +
+            "=1 are exclusive (each replaces the scorer query)";
         return false;
     }
     if (const char * raw = std::getenv(kFoldParagraphsEnv)) {

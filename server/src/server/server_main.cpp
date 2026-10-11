@@ -28,6 +28,7 @@
 #include "common/specla_mode.h"
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
+#include "pflash/pflash_selection.h"
 #include "placement/draft_residency.h"
 #include "placement/device_select.h"
 #include "kvflash_pager.h"
@@ -1479,6 +1480,20 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             for (const auto & p : sconfig.pflash_curve)
                 std::fprintf(stderr, " %d:%.3f", p.first, p.second);
             std::fprintf(stderr, "\n");
+        }
+        // A query-source flag (request probe, identifier query) works only
+        // with strict head selection. Without it every compression call fails
+        // and FlowKV / PFlash silently serve the prompt verbatim: refuse to
+        // start instead.
+        if (luce::pflash::pflash_query_probe_requested() ||
+            std::getenv("PFLASH_SELECT_QUERY_IDENT") != nullptr) {
+            luce::pflash::PFlashSelectionConfig check;
+            std::string check_error;
+            if (!luce::pflash::resolve_pflash_selection(1 << 16, 32, check, check_error)) {
+                std::fprintf(stderr, "[server] invalid PFlash selection config: %s\n",
+                             check_error.c_str());
+                return 1;
+            }
         }
         if (!sconfig.pflash_upstream_base.empty()) {
             std::fprintf(stderr, "[server] pflash upstream: %s  model=%s\n",
