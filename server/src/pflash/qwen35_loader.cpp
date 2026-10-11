@@ -13,7 +13,11 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <limits>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -319,6 +323,183 @@ static bool load_qwen35_segment_probe(const std::string & path,
     return true;
 }
 
+static void free_qwen35_request_probe(Qwen35DrafterState & st) {
+    if (st.request_buf) { ggml_backend_buffer_free(st.request_buf); st.request_buf = nullptr; }
+    if (st.request_ctx) { ggml_free(st.request_ctx); st.request_ctx = nullptr; }
+    st.request_norm_w = st.request_norm_b = st.request_fc1_w = st.request_fc1_b =
+        st.request_fc2_w = st.request_fc2_b = nullptr;
+    st.request_width = 0;
+    st.request_loaded = false;
+    st.request_stub = false;
+    st.request_policy = luce::pflash::PFlashRequestPolicy{};
+}
+
+static constexpr const char * kQwen35RequestProbeSchema = "qwen3_5_0_8b_request_probe_v1";
+
+// Request probe (PFLASH_SELECT_QUERY_PROBE=1): its own LayerNorm -> fc1 ->
+// GELU(erf) -> fc2 trunk on the block-14 tap, from a GGUF of its own
+// (``path``), or -- ``stub`` -- an all-zero trunk of width 256 with
+// tau = +inf, under which every request falls back to today's windows.
+// Fails closed on any contract mismatch, like the segment probe.
+static bool load_qwen35_request_probe(const char * path, bool stub,
+                                      Qwen35DrafterState & st) {
+    const TargetWeights & w = st.weights;
+    ggml_context * data_ctx = nullptr;
+    gguf_context * g = nullptr;
+    auto fail = [&](const std::string & message) {
+        free_qwen35_request_probe(st);
+        if (g) gguf_free(g);
+        if (data_ctx) ggml_free(data_ctx);
+        set_last_error(message);
+        return false;
+    };
+    if (stub) {
+        st.request_width = 256;
+        st.request_norm_eps = 1e-5f;
+        st.request_tau = std::numeric_limits<float>::infinity();
+    } else {
+        if (!path || !*path) {
+            return fail("PFLASH_SELECT_QUERY_PROBE=1 needs PFLASH_REQUEST_PROBE_GGUF");
+        }
+        if (st.gguf_sha256.empty()) {
+            return fail("request probe requires the drafter GGUF identity hash");
+        }
+        gguf_init_params params{ /*no_alloc=*/ false, /*ctx=*/ &data_ctx };
+        g = gguf_init_from_file(path, params);
+        if (!g) return fail(std::string("request probe GGUF could not be opened: ") + path);
+        if (!qwen35_metadata_equals(g, "general.architecture", "requestprobe") ||
+            !qwen35_metadata_equals(g, "requestprobe.schema", kQwen35RequestProbeSchema) ||
+            !qwen35_metadata_equals(g, "requestprobe.base_model", kQwen35HeadBaseModel) ||
+            !qwen35_metadata_equals(g, "requestprobe.runtime_gguf_sha256", st.gguf_sha256) ||
+            !qwen35_metadata_equals(g, "requestprobe.feature_tap", kQwen35HeadFeatureTap)) {
+            return fail("request probe metadata does not match the loaded Qwen3.5-0.8B drafter");
+        }
+        if (!qwen35_metadata_f32(g, "requestprobe.norm_eps", st.request_norm_eps) ||
+            !(st.request_norm_eps > 0.0f) ||
+            !qwen35_metadata_f32(g, "requestprobe.tau", st.request_tau) ||
+            std::isnan(st.request_tau)) {
+            return fail("request probe metadata requestprobe.norm_eps / requestprobe.tau "
+                        "is missing or out of range");
+        }
+        if (!qwen35_metadata_equals(g, "requestprobe.extraction_version",
+                                    luce::pflash::kRequestExtractionVersion)) {
+            return fail(std::string("request probe metadata requestprobe.extraction_version "
+                        "is missing or is not ") + luce::pflash::kRequestExtractionVersion +
+                        " (the runtime's request-run extraction rule)");
+        }
+        ggml_tensor * fc1 = ggml_get_tensor(data_ctx, "requestprobe.fc1.weight");
+        if (!fc1 || fc1->type != GGML_TYPE_F32 || ggml_n_dims(fc1) != 2 ||
+            fc1->ne[0] != w.n_embd || fc1->ne[1] < 1) {
+            return fail("request probe tensor contract mismatch: requestprobe.fc1.weight");
+        }
+        st.request_width = (int) fc1->ne[1];
+    }
+    struct Contract {
+        const char * name;
+        int n_dims;
+        int64_t ne0;
+        int64_t ne1;
+        ggml_tensor ** destination;
+    };
+    const Contract contracts[] = {
+        {"requestprobe.norm.weight", 1, (int64_t) w.n_embd, 1, &st.request_norm_w},
+        {"requestprobe.norm.bias", 1, (int64_t) w.n_embd, 1, &st.request_norm_b},
+        {"requestprobe.fc1.weight", 2, (int64_t) w.n_embd, (int64_t) st.request_width, &st.request_fc1_w},
+        {"requestprobe.fc1.bias", 1, (int64_t) st.request_width, 1, &st.request_fc1_b},
+        {"requestprobe.fc2.weight", 1, (int64_t) st.request_width, 1, &st.request_fc2_w},
+        {"requestprobe.fc2.bias", 1, 1, 1, &st.request_fc2_b},
+    };
+    ggml_init_params ip{};
+    ip.mem_size = 8 * ggml_tensor_overhead();
+    ip.no_alloc = true;
+    st.request_ctx = ggml_init(ip);
+    if (!st.request_ctx) return fail("request probe context allocation failed");
+    for (const auto & contract : contracts) {
+        if (!stub) {
+            ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
+            if (!source || source->type != GGML_TYPE_F32 ||
+                ggml_n_dims(source) != contract.n_dims ||
+                source->ne[0] != contract.ne0 ||
+                (contract.n_dims == 2 && source->ne[1] != contract.ne1)) {
+                return fail(std::string("request probe tensor contract mismatch: ") + contract.name);
+            }
+        }
+        *contract.destination = contract.n_dims == 1
+            ? ggml_new_tensor_1d(st.request_ctx, GGML_TYPE_F32, contract.ne0)
+            : ggml_new_tensor_2d(st.request_ctx, GGML_TYPE_F32, contract.ne0, contract.ne1);
+        ggml_set_name(*contract.destination, contract.name);
+    }
+    st.request_buf = ggml_backend_alloc_ctx_tensors(st.request_ctx, w.backend);
+    if (!st.request_buf) return fail("request probe buffer allocation failed");
+    for (const auto & contract : contracts) {
+        if (stub) {
+            ggml_backend_tensor_memset(*contract.destination, 0, 0, ggml_nbytes(*contract.destination));
+        } else {
+            ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
+            ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
+        }
+    }
+    // v2 policy: GGUF metadata (optional keys), then the JSON file and the pin variable (config).
+    luce::pflash::PFlashRequestPolicy policy;
+    if (g) {
+        const struct { const char * key; int * dst; } ints[] = {
+            {"requestprobe.policy.min_prompt_tokens", &policy.min_prompt_tokens},
+            {"requestprobe.policy.max_prompt_tokens", &policy.max_prompt_tokens},
+            {"requestprobe.policy.max_runs", &policy.max_runs},
+            {"requestprobe.policy.recency_pin_tokens", &policy.recency_pin_tokens},
+        };
+        for (const auto & k : ints) {
+            if (gguf_find_key(g, k.key) >= 0 && !qwen35_metadata_u32(g, k.key, *k.dst)) {
+                return fail(std::string("request probe metadata ") + k.key + " must be a u32");
+            }
+        }
+        const struct { const char * key; float * dst; } floats[] = {
+            {"requestprobe.policy.min_mean_margin", &policy.min_mean_margin},
+            {"requestprobe.policy.min_max_margin", &policy.min_max_margin},
+            {"requestprobe.policy.min_latest_share", &policy.min_latest_share},
+            {"requestprobe.policy.max_latest_share", &policy.max_latest_share},
+        };
+        for (const auto & k : floats) {
+            if (gguf_find_key(g, k.key) >= 0 && !qwen35_metadata_f32(g, k.key, *k.dst)) {
+                return fail(std::string("request probe metadata ") + k.key + " must be an f32");
+            }
+        }
+    }
+    std::string policy_error;
+    if (const char * file = std::getenv("PFLASH_REQUEST_PROBE_POLICY")) {
+        std::ifstream in(file);
+        std::stringstream text;
+        text << in.rdbuf();
+        if (!*file || !in || !luce::pflash::pflash_request_policy_apply_json(text.str(), policy, policy_error)) {
+            return fail(std::string("PFLASH_REQUEST_PROBE_POLICY ") + file + ": " +
+                        (policy_error.empty() ? "cannot read the file" : policy_error));
+        }
+    }
+    if (const char * raw = std::getenv("PFLASH_SELECT_QUERY_PROBE_RECENCY_PIN")) {
+        char * end = nullptr;
+        const long k = std::strtol(raw, &end, 10);
+        if (!*raw || *end || k < 0 || k > 4096) {
+            return fail("PFLASH_SELECT_QUERY_PROBE_RECENCY_PIN must be an integer in [0, 4096]");
+        }
+        policy.recency_pin_tokens = (int) k;
+    }
+    if (!luce::pflash::pflash_request_policy_valid(policy, policy_error)) return fail(policy_error);
+    st.request_policy = policy;
+    if (g) gguf_free(g);
+    if (data_ctx) ggml_free(data_ctx);
+    st.request_stub = stub;
+    st.request_loaded = true;
+    std::fprintf(stderr,
+        "[qwen35-drafter] loaded request probe: %s (width %d, tau %g; policy: prompt [%d,%d], "
+        "min mean/max margin %g/%g, latest share [%g,%g], max runs %d, recency pin %d)\n",
+        stub ? "STUB all-zero trunk, every request falls back" : path,
+        st.request_width, (double) st.request_tau, policy.min_prompt_tokens, policy.max_prompt_tokens,
+        (double) policy.min_mean_margin, (double) policy.min_max_margin, (double) policy.min_latest_share,
+        (double) policy.max_latest_share, policy.max_runs, policy.recency_pin_tokens);
+    std::fflush(stderr);
+    return true;
+}
+
 } // namespace
 
 bool load_qwen35_drafter(const std::string & gguf_path,
@@ -334,7 +515,10 @@ bool load_qwen35_drafter(const std::string & gguf_path,
     }
     const char * head_path = std::getenv("PFLASH_SCORING_HEAD_GGUF");
     const char * probe_path = std::getenv("PFLASH_SEGMENT_PROBE_GGUF");
-    if (head_path || probe_path) {
+    const bool request_wanted = luce::pflash::pflash_query_probe_requested();
+    const bool request_stub = request_wanted && luce::pflash::pflash_query_probe_stub_requested();
+    const char * request_path = std::getenv("PFLASH_REQUEST_PROBE_GGUF");
+    if (head_path || probe_path || (request_wanted && !request_stub)) {
         const auto identity = read_gguf_metadata(gguf_path, /*compute_sha256=*/ true);
         st->gguf_sha256 = identity.ok ? identity.sha256 : std::string();
     }
@@ -352,6 +536,16 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             return false;
         }
     }
+    if (request_wanted && !load_qwen35_request_probe(request_path, request_stub, *st)) {
+        std::fprintf(stderr,
+            "[qwen35-drafter] ERROR: PFLASH_SELECT_QUERY_PROBE=1 and the request probe "
+            "did not load (%s), refusing to serve without it\n", luce_last_error());
+        std::fflush(stderr);
+        free_qwen35_segment_probe(*st);
+        free_target_weights(st->weights);
+        delete st;
+        return false;
+    }
     if (head_path) {
         if (!*head_path || !load_qwen35_scoring_head(head_path, *st)) {
             if (!*head_path) {
@@ -361,6 +555,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
                 "[qwen35-drafter] ERROR: scoring head load failed, "
                 "refusing to serve without it\n");
             std::fflush(stderr);
+            free_qwen35_request_probe(*st);
             free_target_weights(st->weights);
             delete st;
             return false;
@@ -376,6 +571,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             std::fflush(stderr);
             free_qwen35_head(*st);
             free_qwen35_segment_probe(*st);
+            free_qwen35_request_probe(*st);
             free_target_weights(st->weights);
             delete st;
             return false;
@@ -391,6 +587,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             std::fflush(stderr);
             free_qwen35_head(*st);
             free_qwen35_segment_probe(*st);
+            free_qwen35_request_probe(*st);
             free_target_weights(st->weights);
             delete st;
             return false;
@@ -416,6 +613,7 @@ void free_qwen35_drafter_state(DrafterContext & ctx) {
     st->sessions.clear();
     free_qwen35_head(*st);
     free_qwen35_segment_probe(*st);
+    free_qwen35_request_probe(*st);
     free_target_weights(st->weights);
     delete st;
     ctx.state = nullptr;

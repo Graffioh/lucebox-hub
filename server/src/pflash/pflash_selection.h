@@ -102,6 +102,8 @@ enum class PFlashScorer { Head, Legacy, Split };
 // (pflash_fold.h), routed by prompt type.
 enum class PFlashSelectStrategy { Segments, Fold };
 
+struct PFlashRequestProbeTrace;  // pflash_request_probe.h
+
 struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
     // Chat-first default: the scorer query is the tail of the latest user
@@ -151,6 +153,17 @@ struct PFlashSelectionConfig {
     // Per request: those extra windows, scored at full weight next to the
     // query window and kept verbatim.
     std::vector<luce::common::PFlashTokenSpan> extra_queries;
+    // PFLASH_SELECT_QUERY_PROBE=1 (strict selection, head scorer): the
+    // scorer query is the request text of the latest human user messages,
+    // found by the probe's request row (pflash_request_probe.h); the
+    // content spans of those messages, latest first, come per request.
+    bool query_probe = false;
+    std::vector<luce::common::PFlashTokenSpan> request_messages;
+    // Why the server could not map the human messages ("" when it did).
+    std::string request_messages_error;
+    // Trace only: what the request probe did on this call (not owned; set
+    // by the scorer for the selection it calls).
+    const PFlashRequestProbeTrace * request_probe_trace = nullptr;
 };
 
 // Segment probe: cut the context before every token whose boundary score is
@@ -218,6 +231,14 @@ const char * pflash_select_strategy_name(PFlashSelectStrategy strategy) noexcept
 // PFLASH_SELECT_STRATEGY=fold, read once: the drafter loads its vocabulary
 // at load time only when fold may be requested.
 bool pflash_fold_requested() noexcept;
+
+// PFLASH_SELECT_QUERY_PROBE=1, read once at load: the drafter loads the
+// request probe from PFLASH_REQUEST_PROBE_GGUF (or refuses to load).
+// PFLASH_SELECT_QUERY_PROBE_STUB=1 (testing): an all-zero request probe
+// with tau = +inf replaces the GGUF, so every request falls back to
+// today's windows through the probe path.
+bool pflash_query_probe_requested() noexcept;
+bool pflash_query_probe_stub_requested() noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an
 // empty or invalid experiment variable cannot silently fall back to legacy.

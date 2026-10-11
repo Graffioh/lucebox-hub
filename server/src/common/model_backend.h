@@ -395,6 +395,9 @@ struct ModelBackend {
         // PFLASH_SELECT_QUERY_HEAD=1: the user's prose blocks around pasted
         // material, extra query windows at full weight (also kept verbatim).
         std::vector<PFlashTokenSpan> extra_query_spans;
+        // PFLASH_SELECT_QUERY_PROBE=1: the human user messages' content
+        // spans (latest first) the request probe reads.
+        PFlashRequestMessages request_messages;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

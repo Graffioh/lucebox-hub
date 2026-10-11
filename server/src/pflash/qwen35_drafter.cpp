@@ -585,6 +585,8 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.checkpoint = 0;
     session.probe_raw.clear();
     session.subunit_raw.clear();
+    session.request_raw.clear();
+    session.request_rows.clear();
     session.query_windows.clear();
 }
 
@@ -656,6 +658,7 @@ Qwen35ScoringSession * acquire_scoring_session(
         int query_end,
         bool need_probe,
         bool need_subunit,
+        bool need_request,
         int & resume,
         int & shared_prefix,
         std::unique_ptr<Qwen35ScoringSession> & scratch) {
@@ -702,7 +705,8 @@ Qwen35ScoringSession * acquire_scoring_session(
             }
         }
         if ((need_probe && (int) session->probe_raw.size() < r) ||
-            (need_subunit && (int) session->subunit_raw.size() < r)) {
+            (need_subunit && (int) session->subunit_raw.size() < r) ||
+            (need_request && (int) session->request_raw.size() < r)) {
             r = 0;
         }
         if (r > resume) {
@@ -750,6 +754,8 @@ Qwen35ScoringSession * acquire_scoring_session(
     target->checkpoint = 0;
     target->probe_raw.clear();
     target->subunit_raw.clear();
+    target->request_raw.clear();
+    target->request_rows.clear();
     target->query_windows.clear();
     return target;
 }
@@ -796,6 +802,13 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     const TargetLayer & L = w.layers[(size_t)kQwen35HeadBlock];
     const bool use_probe = st.probe_loaded &&
         experiment.segmentation != luce::pflash::PFlashSegmentation::Fixed;
+    // PFLASH_SELECT_QUERY_PROBE=1: the request probe's own trunk runs on
+    // the same tap whatever the segmentation mode.
+    const bool request_probe = experiment.query_probe;
+    if (request_probe && !st.request_loaded) {
+        set_last_error("PFLASH_SELECT_QUERY_PROBE=1: the drafter has no request probe");
+        return {};
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     int resume = 0;
@@ -803,9 +816,13 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     std::unique_ptr<Qwen35ScoringSession> scratch;
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
-        use_probe && st.probe_sub_fc2_w != nullptr, resume, shared_prefix,
-        scratch);
+        use_probe && st.probe_sub_fc2_w != nullptr, request_probe, resume,
+        shared_prefix, scratch);
     if (!session) return {};
+    // Retained request rows past the shared prefix belong to a prompt that
+    // diverged there (an edit, a truncation, another conversation).
+    const int request_rows_invalidated = request_probe
+        ? session->request_rows.invalidate_from(shared_prefix) : 0;
     // A session is released (freed or kept) on every exit below.
     struct SessionExit {
         std::unique_ptr<Qwen35ScoringSession> & scratch;
@@ -1063,6 +1080,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     session->probe_raw.resize(use_probe ? (size_t) resume : 0);
     session->subunit_raw.resize(
         use_probe && st.probe_sub_fc2_w ? (size_t) resume : 0);
+    session->request_raw.resize(request_probe ? (size_t) resume : 0);
 
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
@@ -1076,15 +1094,18 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
         ggml_tensor * subunit_new = use_probe && st.probe_sub_fc2_w
             ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
-        ggml_backend_buffer_t nbuf = use_probe
+        ggml_tensor * request_new = request_probe
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+        ggml_backend_buffer_t nbuf = use_probe || request_probe
             ? ggml_backend_alloc_ctx_tensors(nctx, w.backend) : nullptr;
-        if (use_probe && !nbuf) {
+        if ((use_probe || request_probe) && !nbuf) {
             ggml_free(nctx);
             return fail("qwen35 probe buffer allocation failed");
         }
         const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
         ggml_init_params kip{};
-        kip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
+        kip.mem_size = ggml_tensor_overhead() *
+                           (size_t)(64 + (request_probe ? 40 : 24) * n_key_chunks) +
                        ggml_graph_overhead_custom(4096, false) + 64 * 1024;
         kip.no_alloc = true;
         ggml_context * kctx = ggml_init(kip);
@@ -1121,6 +1142,20 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                         ggml_cpy(kctx, ggml_reshape_1d(kctx, sub, n), s_dst));
                 }
             }
+            if (request_new) {
+                // Request probe: its own LayerNorm -> fc1 -> GELU(erf) -> fc2
+                // trunk on the same tap, one raw logit per token.
+                ggml_tensor * r = ggml_norm(kctx, x_c, st.request_norm_eps);
+                r = ggml_add(kctx, ggml_mul(kctx, r, st.request_norm_w), st.request_norm_b);
+                r = ggml_gelu_erf(kctx, ggml_add(kctx, ggml_mul_mat(kctx, st.request_fc1_w, r),
+                                                 st.request_fc1_b));                // [width, n]
+                ggml_tensor * req = ggml_add(kctx, ggml_mul_mat(kctx, st.request_fc2_w, r),
+                                             st.request_fc2_b);                     // [1, n]
+                ggml_tensor * r_dst = ggml_view_1d(kctx, request_new, n,
+                    (size_t)b * ggml_element_size(request_new));
+                ggml_build_forward_expand(kgf,
+                    ggml_cpy(kctx, ggml_reshape_1d(kctx, req, n), r_dst));
+            }
         }
         ggml_gallocr_t kalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
         const bool key_ok = ggml_gallocr_alloc_graph(kalloc, kgf) &&
@@ -1137,9 +1172,133 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                                         (size_t) n_new * sizeof(float));
             }
         }
+        if (key_ok && request_new) {
+            session->request_raw.resize((size_t) S);
+            ggml_backend_tensor_get(request_new, session->request_raw.data() + resume, 0,
+                                    (size_t) n_new * sizeof(float));
+        }
         if (nbuf) ggml_backend_buffer_free(nbuf);
         ggml_free(nctx);
         if (!key_ok) return fail("qwen35 key graph compute failed");
+    }
+
+    // Request probe (PFLASH_SELECT_QUERY_PROBE=1): the query set from the
+    // request logits of the human messages, its block-14 rows, and the rows
+    // later turns will need -- all read here, while this call's activations
+    // (act_in) still exist. Rows before ``resume`` come from the session's
+    // store; a query row found nowhere falls the whole request back to
+    // today's windows.
+    luce::pflash::PFlashRequestProbeTrace request_trace;
+    std::vector<float> request_query_rows;      // [hidden, query tokens]
+    if (request_probe) {
+        request_trace.tau = st.request_tau;
+        request_trace.stub = st.request_stub;
+        request_trace.store_invalidated_turns = request_rows_invalidated;
+        const auto gather = [&](const std::vector<int> & positions,
+                                std::vector<float> & rows, int & fresh,
+                                int & stored) -> bool {
+            rows.assign((size_t) hidden * positions.size(), 0.0f);
+            fresh = 0;
+            stored = 0;
+            std::vector<int> old;
+            std::vector<size_t> old_index;
+            size_t index = 0;
+            for (const auto & span : luce::pflash::pflash_request_token_spans(positions)) {
+                int begin = span.begin;
+                for (; begin < std::min(span.end, resume); ++begin) {
+                    old.push_back(begin);
+                    old_index.push_back(index++);
+                }
+                if (begin < span.end) {
+                    const int n = span.end - begin;
+                    ggml_backend_tensor_get(act_in, rows.data() + index * (size_t) hidden,
+                                            (size_t) (begin - resume) * act_in->nb[1],
+                                            (size_t) hidden * (size_t) n * sizeof(float));
+                    fresh += n;
+                    index += (size_t) n;
+                }
+            }
+            if (!old.empty()) {
+                std::vector<float> old_rows;
+                if (!session->request_rows.lookup(old, hidden, old_rows)) return false;
+                for (size_t k = 0; k < old.size(); ++k) {
+                    std::copy_n(old_rows.data() + k * (size_t) hidden, (size_t) hidden,
+                                rows.data() + old_index[k] * (size_t) hidden);
+                }
+                stored = (int) old.size();
+            }
+            return true;
+        };
+        if (!experiment.request_messages_error.empty()) {
+            request_trace.fallback = "message_mapping: " + experiment.request_messages_error;
+        } else {
+            request_trace.set = luce::pflash::pflash_request_query_set(
+                session->request_raw, experiment.request_messages, st.request_tau);
+            request_trace.fallback = request_trace.set.fallback;
+        }
+        if (request_trace.fallback.empty()) {
+            // v2 calibrated abstention: an unreliable extraction restores today's complete behaviour.
+            request_trace.policy_evaluated = true;
+            request_trace.abstain = luce::pflash::pflash_request_abstain(
+                request_trace.set, session->request_raw, st.request_tau, S, st.request_policy);
+            if (!request_trace.abstain.reason.empty()) {
+                request_trace.fallback = "abstain:" + request_trace.abstain.reason;
+            }
+        }
+        if (request_trace.fallback.empty() &&
+            !gather(request_trace.set.tokens, request_query_rows,
+                    request_trace.rows_new, request_trace.rows_stored)) {
+            request_trace.fallback = "rows_missing";
+            request_query_rows.clear();
+            request_trace.rows_new = request_trace.rows_stored = 0;
+        }
+        // Retain each message's turn (previous first, so the latest is the
+        // most recently used), whatever this call decided.
+        for (size_t k = request_trace.set.messages.size(); k-- > 0;) {
+            const auto & message = request_trace.set.messages[k];
+            const std::vector<int> turn = luce::pflash::pflash_request_turn_tokens(message);
+            if (turn.empty()) continue;
+            std::vector<float> rows;
+            int fresh = 0;
+            int stored = 0;
+            if (gather(turn, rows, fresh, stored)) {
+                request_trace.store_evicted_turns +=
+                    session->request_rows.put(message.message, turn, rows.data(), hidden);
+            }
+        }
+        request_trace.store_turns = (int) session->request_rows.turns().size();
+        request_trace.store_tokens = session->request_rows.tokens();
+        // Feature capture and parity checks (request probe on only): append
+        // this call's block-14 rows and request logits to
+        // PFLASH_TRACE_REQUEST_FEATURES as one record: char[4] "RPF2",
+        // i32 resume, i32 n_new, i32 hidden, f32 rows[n_new][hidden],
+        // f32 request_logits[n_new] (tokens resume .. resume + n_new).
+        if (const char * features = std::getenv("PFLASH_TRACE_REQUEST_FEATURES")) {
+            if (*features && n_new > 0) {
+                std::vector<float> rows((size_t) hidden * (size_t) n_new);
+                ggml_backend_tensor_get(act_in, rows.data(), 0, rows.size() * sizeof(float));
+                FILE * file = std::fopen(features, "ab");
+                const int32_t header[3] = {resume, n_new, hidden};
+                const bool written = file &&
+                    std::fwrite("RPF2", 1, 4, file) == 4 &&
+                    std::fwrite(header, sizeof(header), 1, file) == 1 &&
+                    std::fwrite(rows.data(), sizeof(float), rows.size(), file) == rows.size() &&
+                    std::fwrite(session->request_raw.data() + resume, sizeof(float),
+                                (size_t) n_new, file) == (size_t) n_new;
+                if (file) std::fclose(file);
+                if (!written) {
+                    return fail("PFLASH_TRACE_REQUEST_FEATURES: feature dump write failed");
+                }
+            }
+        }
+        const char * dump = std::getenv("PFLASH_TRACE_REQUEST_LOGITS");
+        if (dump && std::strcmp(dump, "1") == 0) {
+            for (const auto & message : request_trace.set.messages) {
+                request_trace.message_logits.emplace_back(
+                    session->request_raw.begin() + message.message.begin,
+                    session->request_raw.begin() + message.message.end);
+            }
+        }
     }
     cleanup();
     // The session now covers this prompt, resumable at the checkpoint and,
@@ -1282,20 +1441,153 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         return true;
     };
     std::vector<float> token_mass;
-    double total_weight = 0.0;
-    for (const auto & window : windows) {
-        std::vector<float> mass;
-        if (!score_window(window, mass)) {
-            session->ids.clear();
-            return {};
+    // Today's windows: each scored on its own, mixed at their weights.
+    const auto score_windows = [&]() -> bool {
+        token_mass.clear();
+        double total_weight = 0.0;
+        for (const auto & window : windows) {
+            std::vector<float> mass;
+            if (!score_window(window, mass)) return false;
+            if (token_mass.empty()) token_mass.assign(mass.size(), 0.0f);
+            for (size_t i = 0; i < mass.size(); ++i) {
+                token_mass[i] += (float) window.weight * mass[i];
+            }
+            total_weight += window.weight;
         }
-        if (token_mass.empty()) token_mass.assign(mass.size(), 0.0f);
-        for (size_t i = 0; i < mass.size(); ++i) {
-            token_mass[i] += (float) window.weight * mass[i];
+        for (auto & value : token_mass) value = (float) (value / total_weight);
+        return true;
+    };
+    // Request probe: ONE gathered query set with one common key mask --
+    // today's key range (the context before the query window, and after it
+    // when those tokens are candidates) minus every query token -- mean over
+    // heads and query tokens, as for a window. Queries run in bounded tiles;
+    // each tile's probabilities are reduced to one row per key on the
+    // device, so only [S] floats per tile come back.
+    const auto score_request_set = [&](const std::vector<int> & tokens,
+                                       const std::vector<float> & rows) -> bool {
+        constexpr int kTile = 32;
+        const int nq = (int) tokens.size();
+        std::vector<float> mask_row((size_t) S, -INFINITY);
+        std::fill_n(mask_row.begin(), (size_t) query_start, 0.0f);
+        if (experiment.query_suffix_candidates) {
+            std::fill(mask_row.begin() + query_end, mask_row.end(), 0.0f);
         }
-        total_weight += window.weight;
+        for (const int t : tokens) mask_row[(size_t) t] = -INFINITY;
+        std::vector<double> sum((size_t) S, 0.0);
+        std::vector<float> part((size_t) S);
+        for (int q0 = 0; q0 < nq; q0 += kTile) {
+            const int n = std::min(kTile, nq - q0);
+            ggml_init_params lip{};
+            lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
+            lip.no_alloc = true;
+            ggml_context * lctx = ggml_init(lip);
+            if (!lctx) {
+                set_last_error("qwen35 request score buffer ctx allocation failed");
+                return false;
+            }
+            ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n, H);
+            ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n);
+            ggml_tensor * x_q = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, hidden, n);
+            ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
+            if (!lbuf) {
+                ggml_free(lctx);
+                set_last_error("qwen35 request score buffer allocation failed");
+                return false;
+            }
+            ggml_backend_tensor_set(x_q, rows.data() + (size_t) q0 * hidden, 0,
+                                    (size_t) hidden * n * sizeof(float));
+            for (int t = 0; t < n; ++t) {
+                ggml_backend_tensor_set(mask, mask_row.data(), (size_t) t * mask->nb[1],
+                                        (size_t) S * sizeof(float));
+            }
+            ggml_init_params sip{};
+            sip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
+                           ggml_graph_overhead_custom(4096, false) + 64 * 1024;
+            sip.no_alloc = true;
+            ggml_context * sctx = ggml_init(sip);
+            if (!sctx) {
+                ggml_backend_buffer_free(lbuf); ggml_free(lctx);
+                set_last_error("qwen35 request score graph ctx allocation failed");
+                return false;
+            }
+            ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 4096, false);
+            ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
+            ggml_tensor * Q = nullptr;
+            if (st.head_loaded) {
+                Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, n);
+            } else {
+                ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
+                                                   D * 2, H, n);
+                Q = ggml_view_3d(sctx, QG, D, H, n,
+                                 ggml_element_size(QG) * D * 2,
+                                 ggml_element_size(QG) * D * 2 * H, 0);
+            }
+            Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
+            ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, n, H]
+            for (int b = 0; b < S; b += key_chunk) {
+                const int nk = std::min(key_chunk, S - b);
+                ggml_tensor * K = ggml_view_3d(sctx, session->keys, D, Hk, nk,
+                                               session->keys->nb[1], session->keys->nb[2],
+                                               (size_t)b * session->keys->nb[2]);
+                K = ggml_cont(sctx, ggml_permute(sctx, K, 0, 2, 1, 3));  // [D, nk, Hk]
+                ggml_tensor * K_score = K;
+                if (H != Hk) {
+                    const int gqa = H / Hk;
+                    ggml_tensor * K_4d = ggml_reshape_4d(sctx, K, D, nk, 1, Hk);
+                    ggml_tensor * K_tpl = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, D, nk, gqa, Hk);
+                    K_score = ggml_reshape_3d(sctx, ggml_repeat(sctx, K_4d, K_tpl), D, nk, H);
+                }
+                ggml_tensor * scores = ggml_mul_mat(sctx, K_score, Q_perm);  // [nk, n, H]
+                ggml_tensor * dst = ggml_view_3d(sctx, logits, nk, n, H,
+                                                 logits->nb[1], logits->nb[2],
+                                                 (size_t)b * logits->nb[0]);
+                ggml_build_forward_expand(sgf, ggml_cpy(sctx, scores, dst));
+            }
+            ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
+                                                    1.0f / std::sqrt((float)D), 0.0f);
+            // Sum over (query, head) per key: [S, n*H] -> [n*H, S] -> [1, S].
+            ggml_tensor * per_key = ggml_sum_rows(sctx, ggml_cont(sctx,
+                ggml_transpose(sctx, ggml_reshape_2d(sctx, probs, S, (int64_t) n * H))));
+            ggml_set_output(per_key);
+            ggml_build_forward_expand(sgf, per_key);
+            ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
+            const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
+                ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                ggml_backend_tensor_get(per_key, part.data(), 0, (size_t) S * sizeof(float));
+            }
+            ggml_gallocr_free(salloc);
+            ggml_free(sctx);
+            ggml_backend_buffer_free(lbuf);
+            ggml_free(lctx);
+            if (!ok) {
+                set_last_error("qwen35 request score graph compute failed");
+                return false;
+            }
+            const size_t nonfinite = count_nonfinite_scores(part.data(), part.size());
+            if (nonfinite != 0) {
+                const std::string message =
+                    "non-finite Qwen3.5 scoring-head scores (request probe): " +
+                    std::to_string(nonfinite) + "/" + std::to_string(part.size());
+                std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+                std::fflush(stderr);
+                set_last_error(message);
+                return false;
+            }
+            for (int j = 0; j < S; ++j) sum[(size_t) j] += part[(size_t) j];
+            ++request_trace.query_tiles;
+        }
+        const double denominator = (double) H * (double) nq;
+        token_mass.assign((size_t) S, 0.0f);
+        for (int j = 0; j < S; ++j) token_mass[(size_t) j] = (float) (sum[(size_t) j] / denominator);
+        return true;
+    };
+    bool request_set = request_probe && request_trace.fallback.empty();
+    if (request_set ? !score_request_set(request_trace.set.tokens, request_query_rows)
+                    : !score_windows()) {
+        session->ids.clear();
+        return {};
     }
-    for (auto & value : token_mass) value = (float) (value / total_weight);
     const std::vector<float> & probe_raw = session->probe_raw;
     const std::vector<float> & subunit_raw = session->subunit_raw;
     auto t2 = std::chrono::steady_clock::now();
@@ -1304,16 +1596,21 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         "%d new) score %.2fs (%zu query windows) total %.2fs head=%s\n",
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
-        std::chrono::duration<double>(t2 - t1).count(), windows.size(),
+        std::chrono::duration<double>(t2 - t1).count(),
+        request_set ? (size_t) 1 : windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);
-    pflash_set_scoring_stats({resume, n_new, (int) windows.size(),
+    pflash_set_scoring_stats({resume, n_new, request_set ? 1 : (int) windows.size(),
                               std::chrono::duration<double>(t1 - t0).count()});
 
-    std::vector<PFlashTokenSpan> segments;
-    bool density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
-    if (use_probe) {
+    // Candidates: probe segments cut at the pinned spans' edges, or fixed
+    // chunks when the probe is off or finds too few boundaries.
+    const auto segment = [&](const std::vector<PFlashTokenSpan> & pins,
+                             std::vector<PFlashTokenSpan> & segments, bool & density) {
+        segments.clear();
+        density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
+        if (!use_probe) return;
         // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
         // padding) plus the residual logit, then sigmoid: the boundary score
         // per token.
@@ -1342,7 +1639,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         const int query_end = score_query_end < 0 ? S : score_query_end;
         const int query_begin = query_end - std::min(n_lookahead, query_end);
         std::vector<int> forced{query_begin, query_end};
-        for (const auto & span : required_instruction_spans) {
+        for (const auto & span : pins) {
             forced.push_back(span.begin);
             forced.push_back(span.end);
         }
@@ -1387,6 +1684,144 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 density ? "density" : "sum");
         }
         std::fflush(stderr);
+    };
+
+    std::vector<PFlashTokenSpan> segments;
+    bool density = false;
+    // The pins the selector charges: the caller's, plus the query tokens of
+    // a scored request set.
+    std::vector<PFlashTokenSpan> pins = required_instruction_spans;
+    if (request_set) {
+        for (const auto & span : luce::pflash::pflash_request_token_spans(request_trace.set.tokens)) {
+            pins.push_back(span);
+        }
+        // v2 bounded recency pin: the latest human message's last K tokens, pinned (not scored).
+        if (!request_trace.set.messages.empty()) {
+            request_trace.recency_pin = luce::pflash::pflash_request_recency_pin(
+                request_trace.set.messages[0].message, st.request_policy.recency_pin_tokens);
+            if (request_trace.recency_pin.begin >= 0) pins.push_back(request_trace.recency_pin);
+        }
+        std::sort(pins.begin(), pins.end(), [](const PFlashTokenSpan & a, const PFlashTokenSpan & b) {
+            return a.begin != b.begin ? a.begin < b.begin : a.end < b.end;
+        });
+        std::vector<PFlashTokenSpan> merged;
+        for (const auto & span : pins) {
+            if (!merged.empty() && span.begin <= merged.back().end) {
+                merged.back().end = std::max(merged.back().end, span.end);
+            } else {
+                merged.push_back(span);
+            }
+        }
+        pins.swap(merged);
+    }
+    segment(pins, segments, density);
+
+    if (request_probe) {
+        // Tokens the selector will keep whatever their score, counted the
+        // way it charges them (pflash_chunk_is_structurally_required over
+        // the candidates); the query pins must fit the reader budget, or
+        // the whole request falls back to today's windows and pins.
+        const int sel_query_end = score_query_end < 0 ? S : score_query_end;
+        const int sel_query_begin = sel_query_end - std::min(n_lookahead, sel_query_end);
+        const auto charged = [&](const std::vector<PFlashTokenSpan> & candidates_pins,
+                                 const std::vector<PFlashTokenSpan> & candidate_segments) {
+            int total = 0;
+            const int n_chunks = candidate_segments.empty()
+                ? (S + experiment.chunk_size - 1) / experiment.chunk_size
+                : (int) candidate_segments.size();
+            for (int c = 0; c < n_chunks; ++c) {
+                const int begin = candidate_segments.empty()
+                    ? c * experiment.chunk_size : candidate_segments[(size_t) c].begin;
+                const int end = candidate_segments.empty()
+                    ? std::min(S, begin + experiment.chunk_size)
+                    : candidate_segments[(size_t) c].end;
+                if (luce::pflash::pflash_chunk_is_structurally_required(
+                        begin, end, sel_query_begin, sel_query_end, S, candidates_pins,
+                        !experiment.query_suffix_candidates)) {
+                    total += end - begin;
+                }
+            }
+            return total;
+        };
+        request_trace.token_budget = (int) std::floor((double) S * (double) keep_ratio);
+        if (request_set) {
+            request_trace.query_tokens = (int) request_trace.set.tokens.size();
+            int already = 0;
+            for (const int t : request_trace.set.tokens) {
+                bool pinned = t >= sel_query_begin && t < sel_query_end;
+                for (const auto & span : required_instruction_spans) {
+                    pinned = pinned || (t >= span.begin && t < span.end);
+                }
+                already += pinned ? 1 : 0;
+            }
+            request_trace.pinned_new_tokens = request_trace.query_tokens - already;
+            if (request_trace.recency_pin.begin >= 0) {
+                const auto & q = request_trace.set.tokens;
+                for (int t = request_trace.recency_pin.begin; t < request_trace.recency_pin.end; ++t) {
+                    bool pinned = (t >= sel_query_begin && t < sel_query_end) ||
+                        std::binary_search(q.begin(), q.end(), t);
+                    for (const auto & span : required_instruction_spans) {
+                        pinned = pinned || (t >= span.begin && t < span.end);
+                    }
+                    request_trace.recency_pin_new_tokens += pinned ? 0 : 1;
+                }
+            }
+            request_trace.mandatory_tokens = charged(pins, segments);
+            std::vector<PFlashTokenSpan> base_segments;
+            bool base_density = false;
+            segment(required_instruction_spans, base_segments, base_density);
+            request_trace.mandatory_tokens_base = charged(required_instruction_spans, base_segments);
+            if (request_trace.mandatory_tokens > request_trace.token_budget &&
+                request_trace.mandatory_tokens_base <= request_trace.token_budget) {
+                request_trace.fallback = "pins_exceed_budget";
+                request_trace.query_tokens = 0;
+                request_trace.recency_pin = {-1, -1};
+                request_trace.recency_pin_new_tokens = 0;
+                request_set = false;
+                pins = required_instruction_spans;
+                segments.swap(base_segments);
+                density = base_density;
+                if (!score_windows()) {
+                    session->ids.clear();
+                    return {};
+                }
+            }
+        } else {
+            request_trace.mandatory_tokens = charged(pins, segments);
+            request_trace.mandatory_tokens_base = request_trace.mandatory_tokens;
+        }
+        std::string policy_note;
+        if (request_trace.policy_evaluated) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), " policy: margin mean %.3f max %.3f, latest share %.3f, runs %d",
+                          request_trace.abstain.mean_margin, request_trace.abstain.max_margin,
+                          request_trace.abstain.latest_share, request_trace.abstain.runs);
+            policy_note = buf;
+        }
+        if (request_trace.recency_pin.begin >= 0) {
+            policy_note += " recency_pin=[" + std::to_string(request_trace.recency_pin.begin) + "," +
+                std::to_string(request_trace.recency_pin.end) + ") new " +
+                std::to_string(request_trace.recency_pin_new_tokens);
+        }
+        std::string runs;
+        for (const auto & m : request_trace.set.messages) {
+            runs += " [" + std::to_string(m.message.begin) + "," + std::to_string(m.message.end) +
+                ")x" + std::to_string(m.runs.size()) + "/" + std::to_string(m.request_tokens);
+        }
+        std::fprintf(stderr,
+            "[pflash-request-probe] %s query_tokens=%d (latest %d, previous %d%s) rows new=%d "
+            "stored=%d pins_new=%d mandatory=%d (base %d) budget=%d store=%d turns/%d tokens "
+            "(evicted %d, invalidated %d) messages:%s%s%s\n",
+            request_set ? "scored" : ("fallback=" + request_trace.fallback).c_str(),
+            request_trace.query_tokens, request_trace.set.latest_tokens,
+            request_trace.set.previous_tokens, request_trace.set.capped ? ", capped" : "",
+            request_trace.rows_new, request_trace.rows_stored, request_trace.pinned_new_tokens,
+            request_trace.mandatory_tokens, request_trace.mandatory_tokens_base,
+            request_trace.token_budget, request_trace.store_turns, request_trace.store_tokens,
+            request_trace.store_evicted_turns, request_trace.store_invalidated_turns,
+            runs.empty() ? " none" : runs.c_str(), request_trace.stub ? " (stub row)" : "",
+            policy_note.c_str());
+        std::fflush(stderr);
     }
 
     if (token_mass_out) {
@@ -1398,14 +1833,20 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         return ids;
     }
 
+    luce::pflash::PFlashSelectionConfig request_config;
+    if (request_probe) {
+        request_config = experiment;
+        request_config.request_probe_trace = &request_trace;
+    }
     return select_pflash_chunks(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
-        /*pool_kernel=*/1, experiment, required_instruction_spans,
+        /*pool_kernel=*/1, request_probe ? request_config : experiment, pins,
         /*direct_mass=*/true, /*write_trace=*/true,
         segments.empty() ? nullptr : &segments, density,
         /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
         st.fold_vocab.get());
 }
+
 
 std::vector<int32_t> qwen35_drafter_score_and_compress(
     DrafterContext & ctx,

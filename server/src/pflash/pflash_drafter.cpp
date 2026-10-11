@@ -109,7 +109,8 @@ std::vector<int32_t> drafter_score_and_compress(
     bool query_suffix_candidates,
     const std::vector<PFlashTokenSpan> & history_queries,
     PFlashTokenSpan turn_query,
-    const std::vector<PFlashTokenSpan> & extra_queries) {
+    const std::vector<PFlashTokenSpan> & extra_queries,
+    const PFlashRequestMessages * request_messages) {
     pflash_clear_kept_spans();
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
@@ -144,6 +145,23 @@ std::vector<int32_t> drafter_score_and_compress(
             if (window.begin >= 0 && window.end > window.begin &&
                 window.end <= (int) ids.size()) {
                 experiment.extra_queries.push_back(window);
+            }
+        }
+        if (experiment.query_probe) {
+            if (!request_messages) {
+                experiment.request_messages_error = "no human message spans from the caller";
+            } else if (!request_messages->error.empty()) {
+                experiment.request_messages_error = request_messages->error;
+            } else {
+                for (const auto & span : request_messages->human) {
+                    if (span.begin < 0 || span.end < span.begin ||
+                        span.end > (int) ids.size()) {
+                        experiment.request_messages.clear();
+                        experiment.request_messages_error = "human message span outside the input";
+                        break;
+                    }
+                    experiment.request_messages.push_back(span);
+                }
             }
         }
     }

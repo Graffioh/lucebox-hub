@@ -9,6 +9,7 @@
 
 #include "pflash_drafter.h"
 #include "pflash_selection.h"
+#include "pflash_request_probe.h"
 #include "common/pflash_types.h"
 #include "internal.h"
 #include "server/tokenizer.h"
@@ -45,6 +46,11 @@ struct Qwen35ScoringSession {
     bool                  keys_trained = false;
     std::vector<float>    probe_raw;        // per token, unit logit
     std::vector<float>    subunit_raw;      // per token, when the probe has one
+    // PFLASH_SELECT_QUERY_PROBE=1: the request row's raw logit per token,
+    // and block-14 rows of the human messages' request runs (BF16, keyed by
+    // token position) for later turns, whose activations are gone.
+    std::vector<float>    request_raw;
+    luce::pflash::PFlashRequestRowStore request_rows;
     // Block-14 output of recent query windows (the query and earlier
     // questions), reused while they sit in the shared prefix: an agent step
     // appends tool output after the same user turn, and a new turn's history
@@ -95,6 +101,27 @@ struct Qwen35DrafterState {
     std::unique_ptr<Tokenizer> probe_vocab;
     int                   probe_width = 0;
     bool                  probe_loaded = false;
+    // Request probe (PFLASH_SELECT_QUERY_PROBE=1 only): its own small
+    // trunk on the same block-14 tap, LayerNorm -> fc1 -> GELU(erf) -> fc2,
+    // from PFLASH_REQUEST_PROBE_GGUF (pflash_request_probe.h); the raw
+    // logit is compared with ``request_tau``. Stub
+    // (PFLASH_SELECT_QUERY_PROBE_STUB=1): all zeros and tau = +inf.
+    ggml_context *        request_ctx = nullptr;
+    ggml_backend_buffer_t request_buf = nullptr;
+    ggml_tensor *         request_norm_w = nullptr;  // [hidden]
+    ggml_tensor *         request_norm_b = nullptr;  // [hidden]
+    ggml_tensor *         request_fc1_w  = nullptr;  // [hidden, request_width]
+    ggml_tensor *         request_fc1_b  = nullptr;  // [request_width]
+    ggml_tensor *         request_fc2_w  = nullptr;  // [request_width]
+    ggml_tensor *         request_fc2_b  = nullptr;  // [1]
+    float                 request_norm_eps = 1e-5f;
+    float                 request_tau = 0.0f;
+    int                   request_width = 0;
+    bool                  request_loaded = false;
+    bool                  request_stub = false;
+    // v2 policy (abstention, recency pin): GGUF requestprobe.policy.*, then the PFLASH_REQUEST_PROBE_POLICY JSON
+    // file, then PFLASH_SELECT_QUERY_PROBE_RECENCY_PIN. Defaults never abstain and pin nothing.
+    luce::pflash::PFlashRequestPolicy request_policy;
     // Strict scorer sessions, least recently used evicted
     // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
     // PFLASH_SELECT_STRATEGY=fold: the drafter's own vocabulary, to read

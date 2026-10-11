@@ -33,6 +33,7 @@ constexpr const char * kFoldParagraphsEnv = "PFLASH_SELECT_FOLD_PARAGRAPHS";
 constexpr const char * kQueryHeadEnv = "PFLASH_SELECT_QUERY_HEAD";
 constexpr const char * kQueryHeadTokensEnv = "PFLASH_SELECT_QUERY_HEAD_TOKENS";
 constexpr const char * kQueryTailTokensEnv = "PFLASH_SELECT_QUERY_TAIL_TOKENS";
+constexpr const char * kQueryProbeEnv = "PFLASH_SELECT_QUERY_PROBE";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -92,6 +93,16 @@ bool has_pflash_selection_environment() noexcept {
 bool pflash_fold_requested() noexcept {
     const char * raw = std::getenv(kStrategyEnv);
     return raw && std::strcmp(raw, "fold") == 0;
+}
+
+bool pflash_query_probe_requested() noexcept {
+    const char * raw = std::getenv(kQueryProbeEnv);
+    return raw && std::strcmp(raw, "1") == 0;
+}
+
+bool pflash_query_probe_stub_requested() noexcept {
+    const char * raw = std::getenv("PFLASH_SELECT_QUERY_PROBE_STUB");
+    return raw && std::strcmp(raw, "1") == 0;
 }
 
 bool pflash_chunk_is_structurally_required(
@@ -490,6 +501,26 @@ bool resolve_pflash_selection(
                               config.mode == PFlashSelectionMode::Legacy)) {
         error = std::string(kQueryHeadEnv) + "=1 needs strict selection with " +
             std::string(kQueryParserEnv) + "=latest_user";
+        return false;
+    }
+    // Request probe: off unless exactly "1". It is not a selection knob of
+    // its own (it does not make the config "configured"): it changes where
+    // the strict head scorer's query comes from.
+    if (const char * raw = std::getenv(kQueryProbeEnv)) {
+        if (std::strcmp(raw, "0") != 0 && std::strcmp(raw, "1") != 0) {
+            error = std::string(kQueryProbeEnv) + " must be 0 or 1";
+            return false;
+        }
+        config.query_probe = raw[0] == '1';
+    }
+    // With PFLASH_SELECT_QUERY_HEAD=1 (the served u314 config) the query
+    // head's windows stay today's fallback and its spans stay pinned; a
+    // scored request set replaces the windows, not the pins.
+    if (config.query_probe &&
+        (config.mode == PFlashSelectionMode::Legacy ||
+         config.scorer != PFlashScorer::Head)) {
+        error = std::string(kQueryProbeEnv) + "=1 needs strict selection with the "
+            "head scorer";
         return false;
     }
     if (const char * raw = std::getenv(kFoldParagraphsEnv)) {

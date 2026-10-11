@@ -508,6 +508,24 @@ PflashChatTurnSpan pflash_chat_query_turn(
     const Tokenizer & tokenizer,
     const std::vector<int32_t> & prompt);
 
+// PFLASH_SELECT_QUERY_PROBE=1: the content spans of the last ``count``
+// messages whose ROLE is "user" (latest first), found among the rendered
+// ``turns`` by exact content. A message maps when its trimmed content
+// equals the trimmed decoded content of exactly as many turns (other than
+// assistant/model/system/developer turns) as there are user messages with
+// that content; equal contents map in order. The span covers every token
+// overlapping the message's exact content, its own leading/trailing
+// whitespace included. A message with empty content maps to the empty span
+// {0, 0}. False (``out`` cleared) when any message
+// does not map that way -- the caller then maps by sentinel renders.
+bool pflash_human_message_spans(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & prompt,
+    const std::vector<PflashChatTurn> & turns,
+    const std::vector<ChatMessage> & messages,
+    size_t count,
+    std::vector<PFlashTokenSpan> & out);
+
 // Return the original prompt offset immediately before the stable trailing
 // suffix shared with a version whose latest user message carries a sentinel.
 // Invalid when no such bounded suffix can establish the semantic boundary.

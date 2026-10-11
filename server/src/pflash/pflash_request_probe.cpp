@@ -1,0 +1,349 @@
+#include "pflash_request_probe.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+namespace luce::pflash {
+
+std::vector<PFlashTokenSpan> pflash_request_runs(
+        const std::vector<float> & logits,
+        PFlashTokenSpan message,
+        float tau,
+        int min_run) {
+    std::vector<PFlashTokenSpan> runs;
+    if (message.begin < 0 || message.end <= message.begin ||
+        message.end > (int) logits.size()) {
+        return runs;
+    }
+    int begin = -1;
+    const auto close = [&](int end) {
+        if (begin >= 0 && end - begin >= std::max(1, min_run)) runs.push_back({begin, end});
+        begin = -1;
+    };
+    for (int t = message.begin; t < message.end; ++t) {
+        // NaN compares false: it breaks a run like any logit below tau.
+        if (logits[(size_t) t] >= tau) {
+            if (begin < 0) begin = t;
+        } else {
+            close(t);
+        }
+    }
+    close(message.end);
+    return runs;
+}
+
+std::vector<int> pflash_request_run_tokens(const std::vector<PFlashTokenSpan> & runs) {
+    std::vector<int> tokens;
+    for (const auto & run : runs) {
+        for (int t = run.begin; t < run.end; ++t) tokens.push_back(t);
+    }
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+    return tokens;
+}
+
+std::vector<int> pflash_request_cap_tail(const std::vector<int> & tokens, int n) {
+    if (n <= 0) return {};
+    if ((size_t) n >= tokens.size()) return tokens;
+    return std::vector<int>(tokens.end() - n, tokens.end());
+}
+
+std::vector<PFlashTokenSpan> pflash_request_token_spans(const std::vector<int> & tokens) {
+    std::vector<PFlashTokenSpan> spans;
+    for (const int t : tokens) {
+        if (!spans.empty() && spans.back().end == t) {
+            ++spans.back().end;
+        } else if (spans.empty() || t > spans.back().end) {
+            spans.push_back({t, t + 1});
+        }
+    }
+    return spans;
+}
+
+std::vector<int> pflash_request_turn_tokens(const PFlashRequestMessageRuns & message) {
+    return pflash_request_cap_tail(pflash_request_run_tokens(message.runs), kRequestQueryCap);
+}
+
+PFlashRequestQuerySet pflash_request_query_set(
+        const std::vector<float> & logits,
+        const std::vector<PFlashTokenSpan> & human_messages,
+        float tau) {
+    PFlashRequestQuerySet set;
+    if (human_messages.empty()) {
+        set.fallback = "no_human_message";
+        return set;
+    }
+    const size_t n = std::min<size_t>(human_messages.size(), (size_t) kRequestMessages);
+    for (size_t index = 0; index < n; ++index) {
+        const PFlashTokenSpan message = human_messages[index];
+        // An empty message (begin == end) has no request tokens.
+        if (message.begin < 0 || message.end < message.begin ||
+            message.end > (int) logits.size()) {
+            set.messages.clear();
+            set.fallback = "logits_missing";
+            return set;
+        }
+        PFlashRequestMessageRuns runs;
+        runs.message = message;
+        runs.runs = pflash_request_runs(logits, message, tau);
+        for (const auto & run : runs.runs) runs.request_tokens += run.end - run.begin;
+        runs.message_tokens = message.end - message.begin;
+        double sum = 0.0;
+        int finite = 0;
+        runs.logit_min = std::numeric_limits<float>::infinity();
+        runs.logit_max = -std::numeric_limits<float>::infinity();
+        for (int t = message.begin; t < message.end; ++t) {
+            const float value = logits[(size_t) t];
+            if (value >= tau) ++runs.logits_at_or_above_tau;
+            if (!std::isfinite(value)) continue;
+            ++finite;
+            sum += value;
+            runs.logit_min = std::min(runs.logit_min, value);
+            runs.logit_max = std::max(runs.logit_max, value);
+        }
+        if (finite == 0) runs.logit_min = runs.logit_max = 0.0f;
+        runs.logit_mean = finite > 0 ? sum / finite : 0.0;
+        set.messages.push_back(std::move(runs));
+    }
+
+    const std::vector<int> latest = pflash_request_run_tokens(set.messages[0].runs);
+    set.previous_used = set.messages[0].request_tokens < kRequestPreviousBelow &&
+        set.messages.size() > 1;
+    const std::vector<int> previous = set.previous_used
+        ? pflash_request_run_tokens(set.messages[1].runs) : std::vector<int>{};
+    set.uncapped_tokens = (int) (latest.size() + previous.size());
+    const std::vector<int> latest_capped = pflash_request_cap_tail(latest, kRequestQueryCap);
+    const std::vector<int> previous_capped = pflash_request_cap_tail(
+        previous, kRequestQueryCap - (int) latest_capped.size());
+    set.latest_tokens = (int) latest_capped.size();
+    set.previous_tokens = (int) previous_capped.size();
+    set.tokens = latest_capped;
+    set.tokens.insert(set.tokens.end(), previous_capped.begin(), previous_capped.end());
+    std::sort(set.tokens.begin(), set.tokens.end());
+    set.tokens.erase(std::unique(set.tokens.begin(), set.tokens.end()), set.tokens.end());
+    set.capped = (int) set.tokens.size() < set.uncapped_tokens;
+    if (set.tokens.empty()) set.fallback = "no_request_runs";
+    return set;
+}
+
+bool pflash_request_policy_valid(const PFlashRequestPolicy & p, std::string & error) {
+    if (p.min_prompt_tokens < 0 || p.max_prompt_tokens < 0 || p.max_runs < 0 || p.recency_pin_tokens < 0) {
+        error = "request-probe policy: negative count"; return false;
+    }
+    if (p.max_prompt_tokens > 0 && p.min_prompt_tokens > p.max_prompt_tokens) {
+        error = "request-probe policy: min_prompt_tokens > max_prompt_tokens"; return false;
+    }
+    if (!(p.min_latest_share >= 0.0f && p.max_latest_share <= 1.0f && p.min_latest_share <= p.max_latest_share)) {
+        error = "request-probe policy: latest-share bounds must satisfy 0 <= min <= max <= 1"; return false;
+    }
+    if (std::isnan(p.min_mean_margin) || std::isnan(p.min_max_margin)) {
+        error = "request-probe policy: NaN margin"; return false;
+    }
+    return true;
+}
+
+bool pflash_request_policy_apply_json(const std::string & text, PFlashRequestPolicy & policy, std::string & error) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(text);
+    } catch (const std::exception & e) {
+        error = std::string("request-probe policy: invalid JSON: ") + e.what(); return false;
+    }
+    if (!j.is_object()) { error = "request-probe policy: not a JSON object"; return false; }
+    PFlashRequestPolicy p = policy;
+    for (const auto & [key, value] : j.items()) {
+        const auto as_int = [&](int & dst) {
+            if (!value.is_number_integer()) return false;
+            dst = value.get<int>(); return true;
+        };
+        const auto as_float = [&](float & dst) {
+            if (value.is_number()) { dst = value.get<float>(); return true; }
+            if (value.is_string() && (value == "-inf" || value == "inf")) {
+                dst = value == "-inf" ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();
+                return true;
+            }
+            return false;
+        };
+        bool ok = false;
+        if (key == "min_prompt_tokens") ok = as_int(p.min_prompt_tokens);
+        else if (key == "max_prompt_tokens") ok = as_int(p.max_prompt_tokens);
+        else if (key == "min_mean_margin") ok = as_float(p.min_mean_margin);
+        else if (key == "min_max_margin") ok = as_float(p.min_max_margin);
+        else if (key == "min_latest_share") ok = as_float(p.min_latest_share);
+        else if (key == "max_latest_share") ok = as_float(p.max_latest_share);
+        else if (key == "max_runs") ok = as_int(p.max_runs);
+        else if (key == "recency_pin_tokens") ok = as_int(p.recency_pin_tokens);
+        else { error = "request-probe policy: unknown key " + key; return false; }
+        if (!ok) { error = "request-probe policy: wrong type for " + key; return false; }
+    }
+    if (!pflash_request_policy_valid(p, error)) return false;
+    policy = p;
+    return true;
+}
+
+PFlashRequestAbstainStats pflash_request_abstain(
+        const PFlashRequestQuerySet & set,
+        const std::vector<float> & logits,
+        float tau,
+        int prompt_tokens,
+        const PFlashRequestPolicy & policy) {
+    PFlashRequestAbstainStats s;
+    s.prompt_tokens = prompt_tokens;
+    double sum = 0.0;
+    float mx = -std::numeric_limits<float>::infinity();
+    int n = 0;
+    for (const int t : set.tokens) {
+        if (t < 0 || t >= (int) logits.size()) continue;
+        const float m = logits[(size_t) t] - tau;
+        sum += m; mx = std::max(mx, m); ++n;
+    }
+    s.mean_margin = n > 0 ? (float) (sum / n) : 0.0f;
+    s.max_margin = n > 0 ? mx : 0.0f;
+    if (!set.messages.empty()) {
+        const auto & latest = set.messages[0];
+        s.latest_share = latest.message_tokens > 0 ? (float) latest.request_tokens / (float) latest.message_tokens : 0.0f;
+        s.runs = (int) latest.runs.size();
+        if (set.previous_used && set.messages.size() > 1) s.runs += (int) set.messages[1].runs.size();
+    }
+    if ((policy.min_prompt_tokens > 0 && prompt_tokens < policy.min_prompt_tokens) ||
+        (policy.max_prompt_tokens > 0 && prompt_tokens > policy.max_prompt_tokens)) {
+        s.reason = "length";
+    } else if (s.mean_margin < policy.min_mean_margin) {
+        s.reason = "mean_margin";
+    } else if (s.max_margin < policy.min_max_margin) {
+        s.reason = "max_margin";
+    } else if (s.latest_share < policy.min_latest_share || s.latest_share > policy.max_latest_share) {
+        s.reason = "latest_share";
+    } else if (policy.max_runs > 0 && s.runs > policy.max_runs) {
+        s.reason = "runs";
+    }
+    return s;
+}
+
+PFlashTokenSpan pflash_request_recency_pin(PFlashTokenSpan latest, int k) {
+    if (k <= 0 || latest.begin < 0 || latest.end <= latest.begin) return {-1, -1};
+    return {std::max(latest.begin, latest.end - k), latest.end};
+}
+
+uint16_t pflash_f32_to_bf16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        return (uint16_t) ((bits >> 16) | 0x0040u);   // quiet NaN
+    }
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t) (bits >> 16);
+}
+
+float pflash_bf16_to_f32(uint16_t value) {
+    const uint32_t bits = (uint32_t) value << 16;
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+void PFlashRequestRowStore::clear() {
+    turns_.clear();
+    hidden_ = 0;
+}
+
+int PFlashRequestRowStore::invalidate_from(int valid_end) {
+    const size_t before = turns_.size();
+    turns_.erase(std::remove_if(turns_.begin(), turns_.end(), [valid_end](const Turn & turn) {
+        return turn.positions.empty() || turn.positions.back() >= valid_end ||
+            turn.message.end > valid_end;
+    }), turns_.end());
+    return (int) (before - turns_.size());
+}
+
+const PFlashRequestRowStore::Turn * PFlashRequestRowStore::find_turn(int position) const {
+    for (const auto & turn : turns_) {
+        if (std::binary_search(turn.positions.begin(), turn.positions.end(), position)) {
+            return &turn;
+        }
+    }
+    return nullptr;
+}
+
+bool PFlashRequestRowStore::covers(const std::vector<int> & positions) const {
+    for (const int position : positions) {
+        if (!find_turn(position)) return false;
+    }
+    return true;
+}
+
+bool PFlashRequestRowStore::lookup(const std::vector<int> & positions, int hidden,
+                                   std::vector<float> & out) {
+    out.assign((size_t) hidden * positions.size(), 0.0f);
+    if (positions.empty()) return true;
+    if (hidden != hidden_) return false;
+    std::vector<const Turn *> used;
+    for (size_t index = 0; index < positions.size(); ++index) {
+        const Turn * turn = find_turn(positions[index]);
+        if (!turn) return false;
+        const size_t row = (size_t) (std::lower_bound(turn->positions.begin(),
+            turn->positions.end(), positions[index]) - turn->positions.begin());
+        const uint16_t * src = turn->rows.data() + row * (size_t) hidden;
+        float * dst = out.data() + index * (size_t) hidden;
+        for (int k = 0; k < hidden; ++k) dst[k] = pflash_bf16_to_f32(src[k]);
+        if (std::find(used.begin(), used.end(), turn) == used.end()) used.push_back(turn);
+    }
+    ++clock_;
+    for (auto & turn : turns_) {
+        if (std::find(used.begin(), used.end(), &turn) != used.end()) turn.last_used = clock_;
+    }
+    return true;
+}
+
+int PFlashRequestRowStore::put(PFlashTokenSpan message, const std::vector<int> & positions,
+                               const float * rows, int hidden) {
+    if (positions.empty() || hidden <= 0 || cap_tokens_ <= 0) return 0;
+    if (hidden != hidden_) {
+        turns_.clear();
+        hidden_ = hidden;
+    }
+    // A turn over the cap alone keeps its last cap_tokens rows.
+    const size_t skip = positions.size() > (size_t) cap_tokens_
+        ? positions.size() - (size_t) cap_tokens_ : 0;
+    Turn turn;
+    turn.message = message;
+    turn.positions.assign(positions.begin() + (long) skip, positions.end());
+    turn.rows.resize(turn.positions.size() * (size_t) hidden);
+    for (size_t index = 0; index < turn.positions.size(); ++index) {
+        const float * src = rows + (index + skip) * (size_t) hidden;
+        uint16_t * dst = turn.rows.data() + index * (size_t) hidden;
+        for (int k = 0; k < hidden; ++k) dst[k] = pflash_f32_to_bf16(src[k]);
+    }
+    turn.last_used = ++clock_;
+    // Replace a turn of the same message, or one sharing a position.
+    turns_.erase(std::remove_if(turns_.begin(), turns_.end(), [&](const Turn & old) {
+        if (old.message == message) return true;
+        for (const int position : turn.positions) {
+            if (std::binary_search(old.positions.begin(), old.positions.end(), position)) {
+                return true;
+            }
+        }
+        return false;
+    }), turns_.end());
+    turns_.push_back(std::move(turn));
+    int evicted = 0;
+    while (tokens() > cap_tokens_ && turns_.size() > 1) {
+        auto oldest = std::min_element(turns_.begin(), turns_.end() - 1,
+            [](const Turn & a, const Turn & b) { return a.last_used < b.last_used; });
+        turns_.erase(oldest);
+        ++evicted;
+    }
+    return evicted;
+}
+
+int PFlashRequestRowStore::tokens() const {
+    int total = 0;
+    for (const auto & turn : turns_) total += (int) turn.positions.size();
+    return total;
+}
+
+} // namespace luce::pflash
