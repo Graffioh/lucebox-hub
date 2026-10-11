@@ -12,6 +12,7 @@
 #include "pflash_request_probe.h"
 #include "pflash_request_stage2.h"
 #include "pflash_scoring_resume.h"
+#include "pflash_session_offload.h"
 #include "common/pflash_types.h"
 #include "internal.h"
 #include "server/tokenizer.h"
@@ -76,8 +77,31 @@ struct Qwen35ScoringSession {
 
 void free_qwen35_scoring_session(Qwen35ScoringSession & session);
 
+// A scoring session while the drafter is released (pflash_session_offload.h):
+// the host bookkeeping moved out of the session (its cache / keys fields
+// empty) and a byte copy of every device tensor it owned, in the order
+// qwen35_session_tensors() lists them.
+struct Qwen35HostSession {
+    Qwen35ScoringSession bookkeeping;
+    int cache_max_ctx = 0;
+    int cache_cur_pos = 0;
+    int cache_last_tok = -1;
+    std::vector<luce::pflash::PFlashHostTensor> tensors;
+};
+
+// Sessions copied to host by drafter_offload_sessions(), at most the
+// configured session count, restored before the next scoring call only under
+// the identity they were stored with (qwen35_session_identity()).
+struct DrafterHostSessions {
+    std::string identity;
+    uint64_t clock = 0;     // Qwen35DrafterState::session_clock at offload
+    std::vector<Qwen35HostSession> sessions;
+    size_t host_bytes = 0;
+};
+
 struct Qwen35DrafterState {
     TargetWeights weights;
+    std::string gguf_path;
     std::string gguf_sha256;
     ggml_context *        head_ctx = nullptr;
     ggml_backend_buffer_t head_buf = nullptr;
@@ -194,6 +218,18 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     std::vector<float> * token_mass_out = nullptr,
     std::vector<PFlashTokenSpan> * segments_out = nullptr,
     bool * density_out = nullptr);
+
+// Session offload (DrafterContext::host_sessions). The identity names the
+// drafter file, this build, the loaded head / probes and the session
+// parameters; a stored session resumes only under an equal one.
+std::string qwen35_session_identity(const DrafterContext & ctx, const Qwen35DrafterState & st);
+// Every device tensor a session owns: blocks 0..14 cache (base, then the
+// recurrent-state snapshot), then the block-15 keys.
+std::vector<ggml_tensor *> qwen35_session_tensors(const Qwen35ScoringSession & session);
+void qwen35_offload_sessions(DrafterContext & ctx);
+// Restores the stored sessions into ``st`` (fresh tensors, byte copies), or
+// drops them with a logged reason; the call then scores as usual.
+void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st);
 
 // Arch dispatch target of drafter_score_and_compress.
 std::vector<int32_t> qwen35_drafter_score_and_compress(
