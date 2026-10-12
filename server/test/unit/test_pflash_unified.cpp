@@ -339,16 +339,6 @@ TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_orders_units_across_regions_
     REQUIRE(g.regions[1].admitted == std::vector<char>({1, 1}));
 }
 
-TEST_CASE(PFlashUnifiedFixture, unified_units_in_spans_takes_any_overlap) {
-    const std::vector<int> begin = {0, 10, 20, 30, 40};
-    const std::vector<int> end = {10, 20, 30, 40, 50};
-    // Unit 0 fully kept; unit 1 half; unit 2 one token (a kept span the probe cut across the unit edge); unit 3
-    // touches a span only at its edge (no token inside); unit 4 none.
-    const auto in = units_in_spans(begin, end, {{0, 15}, {29, 30}, {40, 40}});
-    REQUIRE(in == std::vector<char>({1, 1, 1, 0, 0}));
-    REQUIRE(units_in_spans(begin, end, {}) == std::vector<char>({0, 0, 0, 0, 0}));
-}
-
 TEST_CASE(PFlashUnifiedFixture, unified_rank_units_orders_by_score_then_document) {
     REQUIRE(rank_units({0.5, 2.0, 0.5, NAN, 3.0}, {}) == std::vector<int>({4, 1, 0, 2, 3}));
     REQUIRE(rank_units({0.5, 2.0, 0.5}, {0, 1, 0}) == std::vector<int>({0, 2}));

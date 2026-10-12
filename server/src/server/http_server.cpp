@@ -2574,6 +2574,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     status_html_path_ = resolve_status_html();
 
     // PFLASH_UNIFIED=1 (STAGE1-DESIGN.md): read once here; a bad tool list or a later-stage arm fails startup.
+    // Defaults under the flag: every tool's output may be paged (PFLASH_REGION_TOOLS unset = "*"; set it empty for
+    // none) and recall is gated at theta 0.075 (PFLASH_RECALL_GATE; "off" = ungated recall).
     if (const char * unified = std::getenv("PFLASH_UNIFIED"); unified && std::strcmp(unified, "1") == 0) {
         const auto fail = [] (const std::string & message) {
             std::fprintf(stderr, "[pflash-unified] ERROR: %s\n", message.c_str());
@@ -2583,7 +2585,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         pflash_unified_ = true;
         std::string tools_error;
         const char * tools = std::getenv("PFLASH_REGION_TOOLS");
-        if (!pflash_unified::parse_tool_list(tools ? tools : "", pflash_region_tools_, tools_error)) {
+        if (!pflash_unified::parse_tool_list(tools ? tools : "*", pflash_region_tools_, tools_error)) {
             fail(tools_error);
         }
         for (const char * arm : {"PFLASH_UNIFIED_INPLACE", "PFLASH_UNIFIED_DEFRAG"}) {
@@ -2591,21 +2593,31 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                 fail(std::string(arm) + " is a later arm, not built in stage 1");
             }
         }
+        if (!luce::pflash::has_pflash_selection_environment()) {
+            std::fprintf(stderr, "[pflash-unified] no strict-selection environment: every request is served by the "
+                                 "chat view, as without PFLASH_UNIFIED\n");
+        }
         const char * recall = std::getenv("PFLASH_RECALL");
         pflash_unified_recall_ = !(recall && std::strcmp(recall, "0") == 0);
+        // The default theta was frozen from the dev replay (largest theta whose served gold stays within 3 of
+        // ungated recall); see the recall-gate notes in server/README.md.
+        pflash_recall_gate_ = 0.075;
+        bool gate_given = false;
         if (const char * gate = std::getenv("PFLASH_RECALL_GATE"); gate && *gate) {
-            char * end = nullptr;
-            const double theta = std::strtod(gate, &end);
-            if (end == gate || *end != '\0' || !std::isfinite(theta) || theta <= 0.0 || theta >= 1.0) {
-                fail(std::string("PFLASH_RECALL_GATE must be a number in (0, 1), got '") + gate + "'");
+            if (std::strcmp(gate, "off") == 0) {
+                pflash_recall_gate_ = -1.0;
+            } else {
+                gate_given = true;
+                char * end = nullptr;
+                const double theta = std::strtod(gate, &end);
+                if (end == gate || *end != '\0' || !std::isfinite(theta) || theta <= 0.0 || theta >= 1.0) {
+                    fail(std::string("PFLASH_RECALL_GATE must be a number in (0, 1) or 'off', got '") + gate + "'");
+                }
+                pflash_recall_gate_ = theta;
             }
-            pflash_recall_gate_ = theta;
         }
         if (const char * source = std::getenv("PFLASH_RECALL_SOURCE"); source && *source) {
-            if (std::strcmp(source, "fresh") != 0) {
-                fail(std::string("PFLASH_RECALL_SOURCE must be 'fresh' or unset, got '") + source + "'");
-            }
-            pflash_recall_fresh_ = true;
+            fail("PFLASH_RECALL_SOURCE was removed: recall takes the unheld units, gated by PFLASH_RECALL_GATE");
         }
         if (const char * trace = std::getenv("PFLASH_RECALL_TRACE_UNITS"); trace && *trace) {
             if (std::strcmp(trace, "1") != 0 && std::strcmp(trace, "0") != 0) {
@@ -2613,18 +2625,18 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
             }
             pflash_recall_trace_units_ = std::strcmp(trace, "1") == 0;
         }
-        if (pflash_recall_gate_ > 0.0 && pflash_recall_fresh_) {
-            fail("PFLASH_RECALL_GATE and PFLASH_RECALL_SOURCE=fresh are separate arms; set one");
+        if (gate_given && !pflash_unified_recall_) {
+            fail("PFLASH_RECALL_GATE needs recall on (PFLASH_RECALL=0 is set)");
         }
-        if ((pflash_recall_gate_ > 0.0 || pflash_recall_fresh_) && !pflash_unified_recall_) {
-            fail("PFLASH_RECALL_GATE / PFLASH_RECALL_SOURCE need recall on (PFLASH_RECALL=0 is set)");
-        }
-        // Knobs of the legacy chat view and tool-session rules: replaced, named once.
+        if (!pflash_unified_recall_) pflash_recall_gate_ = -1.0;
+        // Knobs of the legacy chat view and tool-session rules: they apply only to the requests the unified view
+        // hands back to that path (apply_unified_view), named once.
         for (const char * legacy : {"PFLASH_AGENT_PASTE", "PFLASH_ARRIVE", "PFLASH_CHAT_RECALL",
                                     "PFLASH_CHAT_COMPRESS_NEW_TOKENS", "PFLASH_CHAT_REBUILD_MIN_TOKENS",
                                     "PFLASH_CHAT_REBUILD_RATIO", "PFLASH_SELECT_PARAGRAPH_JOIN"}) {
             if (std::getenv(legacy)) {
-                std::fprintf(stderr, "[pflash-unified] %s is ignored under PFLASH_UNIFIED=1\n", legacy);
+                std::fprintf(stderr, "[pflash-unified] %s applies only to requests handed back to the chat view\n",
+                             legacy);
             }
         }
         const auto env = [] (const char * name) {
@@ -2634,7 +2646,6 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         pflash_unified_config_ = "unified-v1|tools=" + pflash_region_tools_.identity +
             "|recall=" + (pflash_unified_recall_ ? "1" : "0") +
             (pflash_recall_gate_ > 0.0 ? "|recall_gate=" + std::to_string(pflash_recall_gate_) : std::string()) +
-            (pflash_recall_fresh_ ? "|recall_source=fresh" : "") +
             "|threshold=" + std::to_string(config_.pflash_threshold) +
             "|drafter=" + config_.pflash_drafter_path +
             "|head=" + env("PFLASH_SCORING_HEAD_GGUF") + "|probe=" + env("PFLASH_SEGMENT_PROBE_GGUF") +
@@ -2643,10 +2654,11 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         for (int tokens : {16384, 32768, 65536, 131072}) {
             pflash_unified_config_ += std::to_string(pflash_keep_ratio(config_, tokens)) + ",";
         }
-        std::fprintf(stderr, "[pflash-unified] on: region tools=%s recall=%d recall_gate=%g recall_source=%s\n",
+        char gate_text[32] = "off";
+        if (pflash_recall_gate_ > 0.0) std::snprintf(gate_text, sizeof gate_text, "%g", pflash_recall_gate_);
+        std::fprintf(stderr, "[pflash-unified] on: region tools=%s recall=%d recall_gate=%s\n",
                      pflash_region_tools_.identity.empty() ? "(none)" : pflash_region_tools_.identity.c_str(),
-                     (int) pflash_unified_recall_, pflash_recall_gate_ > 0.0 ? pflash_recall_gate_ : 0.0,
-                     pflash_recall_fresh_ ? "fresh" : "unheld");
+                     (int) pflash_unified_recall_, gate_text);
         std::fflush(stderr);
     }
 
@@ -5478,7 +5490,7 @@ std::string HttpServer::apply_pflash_compression(
             unified_request.score_query_end = query_window.end;
             unified_request.score_query_tokens = query_window.tokens;
         }
-        unified_request.input_ids = std::move(drafter_ids);
+        unified_request.input_ids = drafter_ids;
         std::string not_ready;
         if (!messages_input) not_ready = "not_messages";
         else if (!experiment.selection_active) not_ready = "no_strict_selection";
@@ -5486,8 +5498,13 @@ std::string HttpServer::apply_pflash_compression(
         else if (!chat_turn.valid()) not_ready = "turns_unparsed";
         else if (config_.pflash_remote_drafter) not_ready = "remote_drafter";
         else if (unified_messages.empty()) not_ready = "messages_unreadable";
-        return apply_unified_view(req, prepared, chat_turn, unified_messages, std::move(unified_request),
-                                  experiment.chunk_size, not_ready);
+        std::string handback;
+        auto unified_error = apply_unified_view(req, prepared, chat_turn, unified_messages,
+                                                std::move(unified_request), experiment.chunk_size, not_ready,
+                                                handback);
+        if (handback.empty()) return unified_error;
+        // Handed back: the chat view below serves this request as it would without PFLASH_UNIFIED.
+        prepared.unified_handback = handback;
     }
 
     // Strict selection spends the keep ratio on the droppable tokens only:
@@ -6387,7 +6404,6 @@ json HttpServer::pflash_unified_json() const {
     return {{"region_tools", pflash_region_tools_.identity},
             {"recall", pflash_unified_recall_},
             {"recall_gate", pflash_recall_gate_ > 0.0 ? json(pflash_recall_gate_) : json(nullptr)},
-            {"recall_source", pflash_recall_fresh_ ? "fresh" : "unheld"},
             {"views", pflash_unified_views_.size()},
             {"view_bytes", pflash_unified_views_.bytes()},
             {"counts", pflash_unified_counts_}};
@@ -6416,6 +6432,10 @@ void HttpServer::trace_pflash_served(
         {"pflash", prepared.pflash_stats},
         {"served_text", tokenizer_.decode(prepared.tokens)},
     };
+    if (!prepared.unified_handback.empty()) {
+        if (!record["pflash"].is_object()) record["pflash"] = json::object();
+        record["pflash"]["unified"] = {{"decision", "handback"}, {"reason", prepared.unified_handback}};
+    }
     // Failure policy D5: a raw record served because compression failed says so.
     if (prepared.pflash_stats.is_object() && prepared.pflash_stats.contains("pflash_fallback")) {
         record["pflash_fallback"] = prepared.pflash_stats["pflash_fallback"];
@@ -6873,7 +6893,7 @@ std::string HttpServer::apply_unified_view(
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<ChatMessage> & messages,
         ModelBackend::CompressRequest request, int chunk_size,
-        const std::string & not_ready) {
+        const std::string & not_ready, std::string & handback) {
     namespace pu = pflash_unified;
     const std::vector<int32_t> & raw = req.prompt_tokens;
     const int prompt_tokens = (int) raw.size();
@@ -6892,24 +6912,33 @@ std::string HttpServer::apply_unified_view(
         std::fflush(stderr);
         return std::string();
     };
-    if (!not_ready.empty()) return serve_raw(not_ready);
+    // The chat view (the release path) serves what the unified view does not take; nothing here changed yet.
+    const auto hand_back = [&] (const std::string & reason) {
+        count("handback." + reason);
+        handback = reason;
+        std::fprintf(stderr, "[pflash-unified] handed back to the chat view (%d tokens): %s\n", prompt_tokens,
+                     reason.c_str());
+        std::fflush(stderr);
+        return std::string();
+    };
+    if (!not_ready.empty()) return hand_back(not_ready);
 
     const std::vector<int32_t> & drafter_ids = request.input_ids;
     const int input = (int) drafter_ids.size();
-    if (turn.generation_begin <= 0 || turn.generation_begin >= input) return serve_raw("no_generation_prompt");
+    if (turn.generation_begin <= 0 || turn.generation_begin >= input) return hand_back("no_generation_prompt");
     // The generation prompt, in target tokens: the raw prompt and every served prompt end with it.
     const auto generation = tokenizer_.encode(drafter_tokenizer_->decode(
         std::vector<int32_t>(drafter_ids.begin() + turn.generation_begin, drafter_ids.end())));
     if (generation.empty() || generation.size() >= raw.size() ||
         !std::equal(generation.begin(), generation.end(), raw.end() - (long) generation.size())) {
-        return serve_raw("generation_mismatch");
+        return hand_back("generation_mismatch");
     }
     const int raw_gen_begin = prompt_tokens - (int) generation.size();
 
     // Both tokenisations decode to one text; units are cut where both start a token (A3).
     const auto td = http_detail::decode_prompt_with_offsets(tokenizer_, raw);
     const auto dd = http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
-    if (td.text != dd.text) return serve_raw("text_mismatch");
+    if (td.text != dd.text) return hand_back("text_mismatch");
     const std::string & text = td.text;
     // The first token starting exactly at ``at`` (the text's end maps to the token count), else -1.
     const auto token_at = [] (const http_detail::DecodedPrompt & decoded, size_t at) {
@@ -7106,6 +7135,33 @@ std::string HttpServer::apply_unified_view(
             }
         }
 
+        // A conversation the view would start: when the part it can never page -- the uncached, unpinned history
+        // before the newest turn, and newest content it cannot cut into lines -- is a threshold's worth, the chat
+        // view takes the request (its cache admission compresses such a prompt) instead of a raw prefill of it.
+        // Newest content the view serves verbatim by design (unlisted tool outputs, small messages) does not count.
+        if (!continues) {
+            const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
+                (double) restorable * (double) input / (double) (std::max)(1, prompt_tokens)));
+            const auto unpinned = [&] (int begin, int end) {
+                begin = (std::max)(begin, uncached_from);
+                return end > begin ? (end - begin) - http_detail::pflash_span_tokens_within(pins, begin, end) : 0;
+            };
+            int newest_begin = turn.generation_begin;
+            for (const auto & c : newest) {
+                if (c.located) newest_begin = (std::min)(newest_begin, c.db);
+            }
+            int cannot_page = unpinned(0, newest_begin);
+            for (size_t k = 0; k < newest.size(); ++k) {
+                if (admission[k].value("decision", "") == "no_lines") cannot_page += unpinned(newest[k].db, newest[k].de);
+            }
+            if (target_estimate(cannot_page) >= config_.pflash_threshold) {
+                if (!found_view) return hand_back("uncached");
+                // The chat view serves this turn: no later turn may continue the view it replaced (or an ancestor).
+                pflash_unified_views_.forget_lineage(view.lineage);
+                return hand_back("reset_uncached");
+            }
+        }
+
         // §5 trigger: a new user question on a view with regions.
         bool recall = false;
         int recall_at = -1;
@@ -7114,7 +7170,7 @@ std::string HttpServer::apply_unified_view(
             newest.back().db >= view.drafter_gen_begin) {
             recall_at = token_at(td, newest.back().cb);
             // Gate arms: no drafter pass for a question when every unit of every region is already held.
-            bool unheld = !(pflash_recall_gate_ > 0.0 || pflash_recall_fresh_);
+            bool unheld = !(pflash_recall_gate_ > 0.0);
             for (const auto & region : held_regions) {
                 unheld = unheld || std::find(region.held.begin(), region.held.end(), 0) != region.held.end();
             }
@@ -7429,15 +7485,11 @@ std::string HttpServer::apply_unified_view(
             for (size_t ri = 1; ri < held_regions.size(); ++ri) {
                 if (held_regions[ri].cap > held_regions[largest].cap) largest = ri;
             }
-            // Each region's candidates: unheld units (PFLASH_RECALL_SOURCE=fresh: only those the drafter's
-            // selection for this question keeps), their scores, costs and the region's cap.
+            // Each region's candidates: unheld units, their scores, costs and the region's cap.
             const size_t region_count = held_regions.size();
             std::vector<pu::RecallRegion> candidates(region_count);
             std::vector<std::vector<int>> orders(region_count);
             std::vector<int> region_caps(region_count);
-            std::vector<std::pair<int, int>> fresh_spans;
-            for (const auto & span : result.kept_spans) fresh_spans.push_back({span.begin, span.end});
-            const bool fresh_ok = !pflash_recall_fresh_ || !fresh_spans.empty();
             for (size_t ri = 0; ri < region_count; ++ri) {
                 pu::Region & region = held_regions[ri];
                 pu::RecallRegion & rc = candidates[ri];
@@ -7445,12 +7497,6 @@ std::string HttpServer::apply_unified_view(
                 rc.score.assign((size_t) units, 0.0);
                 rc.unit_cost.assign((size_t) units, 0);
                 rc.held = region.held;
-                if (pflash_recall_fresh_) {
-                    const auto kept = pu::units_in_spans(region.unit_db, region.unit_de, fresh_spans);
-                    for (int u = 0; u < units; ++u) {
-                        if (!kept[(size_t) u]) rc.held[(size_t) u] = 1;
-                    }
-                }
                 for (int u = 0; u < units; ++u) {
                     rc.score[(size_t) u] = unit_score(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
                     if (region.held[(size_t) u]) continue;
@@ -7548,24 +7594,11 @@ std::string HttpServer::apply_unified_view(
                                   {"new_dropped_mass", new_dropped}, {"deficit_before", gated.deficit_before},
                                   {"deficit_planned", gated.deficit_after}};
                 }
-            } else if (!fresh_ok) {
-                count("recall.no_kept_spans");
-                gate_stats = {{"decision", "no_kept_spans"}, {"source", "fresh"}};
-                nothing();
             } else {
                 for (size_t ri = 0; ri < region_count; ++ri) {
                     const int label_cost = candidates[ri].label_cost;
                     planned[ri] = pu::admit_recall(candidates[ri].unit_cost, candidates[ri].held, orders[ri],
                                                    candidates[ri].cap, [&] (int, int) { return label_cost; });
-                }
-                if (pflash_recall_fresh_) {
-                    int fresh_units = 0;
-                    for (size_t ri = 0; ri < region_count; ++ri) {
-                        for (size_t u = 0; u < candidates[ri].held.size(); ++u) {
-                            fresh_units += !candidates[ri].held[u];
-                        }
-                    }
-                    gate_stats = {{"decision", "fresh"}, {"source", "fresh"}, {"fresh_unheld_units", fresh_units}};
                 }
             }
             double final_deficit = 0.0;
@@ -7870,18 +7903,16 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
             }
         }
 
-        // PFLASH_UNIFIED=1 owns every turn: a configuration it cannot serve
-        // is served raw (apply_unified_view counts why), never by FlowKV.
-        const bool flowkv_continuation = should_compress && continuation &&
-            !selection_owns_compression && !pflash_unified_;
-        if (flowkv_continuation && req.messages.is_array()) {
+        if (should_compress && continuation && req.messages.is_array() &&
+            !selection_owns_compression) {
             // FlowKV owns continuation compression automatically. Falling
             // back to whole-prompt compression would destroy the reusable
             // system/tool prefix anchor, and requiring a separate disk-cache
             // flag made --prefill-compression auto silently do nothing.
             apply_flowkv_compression(req, prepared);
             should_compress = false;
-        } else if (flowkv_continuation) {
+        } else if (should_compress && continuation &&
+                   !selection_owns_compression) {
             should_compress = false;
             std::fprintf(stderr,
                 "[pflash] skip-compress (continuation without messages array)\n");
@@ -7950,7 +7981,9 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
                         record[key] = value;
                     }
                 }
+                const std::string unified_handback = prepared.unified_handback;
                 prepared = std::move(uncompressed);
+                prepared.unified_handback = unified_handback;
                 prepared.pflash_stats = {{"pflash_fallback", std::move(record)}};
             }
         }

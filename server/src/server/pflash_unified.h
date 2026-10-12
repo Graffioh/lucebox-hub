@@ -170,12 +170,6 @@ struct GatedRecall {
 // mass still unheld is below theta x S. The caps bound it: the worst case is admit_recall's fill.
 GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta);
 
-// PFLASH_RECALL_SOURCE=fresh (RECONCILE §2.1, "fresh.kept - view.held"): per unit [unit_begin, unit_end), whether
-// any of its tokens lie in ``spans`` (the drafter selection's kept spans for this request). Any overlap, so a kept
-// span that the probe cut differently from the recorded units is never dropped; the recall caps bound the rest.
-std::vector<char> units_in_spans(const std::vector<int> & unit_begin, const std::vector<int> & unit_end,
-                                 const std::vector<std::pair<int, int>> & spans);
-
 // Units best first: higher score first, document order on ties; ``skip`` units are left out.
 std::vector<int> rank_units(const std::vector<double> & score, const std::vector<char> & skip);
 
@@ -261,6 +255,8 @@ public:
     bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
               const std::string & config, View & out);
     void remember(View view);
+    // Drops every view of ``lineage`` (each turn's view is its own entry, so an ancestor would match next).
+    void forget_lineage(uint64_t lineage);
     size_t size() const;
     size_t bytes() const;
 

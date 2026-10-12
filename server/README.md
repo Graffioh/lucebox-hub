@@ -495,6 +495,44 @@ drafter selection (up to 48 s more per follow-up in a 10-turn coding session on
 an R9700; the session took 281 s against 258 s with full prefill). Chats
 without tools are not affected.
 
+`PFLASH_UNIFIED=1` (part of the release configuration, with a strict-selection
+environment and `PFLASH_ADMISSION=cache`) serves chat and agent sessions with
+one mechanism, the unified view. Only the newest turn is ever paged: the user
+messages since the last reply, or the tool results of the last tool call. A
+message there with at least `--prefill-threshold` droppable tokens that can be
+cut into lines becomes a region, and only what the drafter selection keeps of
+it is served, in whole lines, with a note saying the content was shortened.
+Tool outputs are paged for the tools in `PFLASH_REGION_TOOLS` (default `*`,
+every tool; a comma-separated list names tools; empty pages none). Everything
+before the newest turn is the view already served and stays cached: the
+served prompt only grows by appending, and is never compressed again. A new
+user question recalls, as excerpts at the start of its message, the lines of
+earlier regions it needs that the view does not hold. Recall is gated: the
+drafter scores the context for the question, and when the units the view does
+not hold carry less than `PFLASH_RECALL_GATE` of that score mass (default
+0.075, frozen from a development replay as the largest gate whose answers stay
+within 3 of ungated recall; `off` recalls by the regions' caps alone) nothing
+is appended; otherwise the best unheld units are recalled until what stays
+unheld is below the gate. `PFLASH_RECALL=0` turns recall off. A re-read of a
+paged tool output is served verbatim. A view that would no longer fit the
+context starts over from the raw prompt.
+
+Requests the unified view does not take are handed back to the chat view
+described above and served exactly as without the flag: a request without a
+messages array, a remote drafter, a turn structure or generation prompt it
+cannot read, and a conversation it would start (no stored view continues it)
+whose uncached history before the newest turn, with newest content that
+cannot be cut into lines, reaches `--prefill-threshold` (reason `uncached`,
+or `reset_uncached` when a stored view could not continue; that view is then
+dropped). Such a conversation stays with the chat view while its history is
+uncached. The view trace records `pflash.unified = {decision: handback,
+reason}` for these requests. Without a strict-selection environment the
+unified view serves nothing (startup says so) and every request takes the
+chat view.
+`PFLASH_AGENT_PASTE`, `PFLASH_ARRIVE`, `PFLASH_CHAT_RECALL` and the other
+chat-view knobs apply only to handed-back requests. `PFLASH_RECALL_SOURCE`
+was removed.
+
 Every turn of a multi-turn chat keeps its role header, and user turns (the
 latest included) and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS`
 (default 256 drafter tokens; 0 keeps headers only) stay whole: the
