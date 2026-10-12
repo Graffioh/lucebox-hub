@@ -62,9 +62,10 @@ bool load_drafter(const std::string & gguf_path, int gpu_layers,
 
 void free_drafter(DrafterContext & ctx);
 
-// --draft-residency auto (ReleaseAfterUse): copy every live scoring session to
-// host RAM before free_drafter(), so the next turn can still resume after the
-// drafter is loaded again. No-op without live sessions
+// --draft-residency auto (ReleaseAfterUse): before free_drafter(), copy the
+// scoring sessions this load created or extended to host RAM (a restored,
+// untouched session keeps its host copy), so the next turn can still resume
+// after the drafter is loaded again. No-op without sessions
 // (PFLASH_DRAFTER_SESSIONS=0, nothing scored yet).
 void drafter_offload_sessions(DrafterContext & ctx);
 
