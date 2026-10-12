@@ -150,9 +150,28 @@ When a session's state is written, its shallower files on disk are deleted,
 except a head at or below `--kv-cache-cold-max` tokens or, without one, the
 shallowest (a longer head).
 
-Compressed prompts (PFlash, FlowKV) are not raw history and never get a disk
-key; a request whose disk scope is not `full` gives its snapshots no key
-either.
+Compressed prompts (PFlash, FlowKV) are not raw history and get no disk key,
+except a prompt served from a PFlash unified view (`PFLASH_UNIFIED=1`): its
+key is the tokens it served, and the view itself is kept on disk too, so the
+conversation's next request serves the same tokens again and restores them. A
+request whose disk scope is not `full` gives its snapshots no key either.
+
+**Shortened conversations.** With the disk cache on, the unified view keeps its
+views (what each shortened conversation served, and which lines it left out) in
+`<kv-cache-dir>/.pflash-views`: a view is written when it leaves the RAM view
+store and at shutdown, and read when a request finds no view in RAM, so neither
+a restart nor an eviction turns a shortened conversation cold. One file per
+view, a one-line header indexed at startup; at most 256 views, the least
+recently written dropped first, and the cache's TTL applies, counted from a
+view's last write and checked at startup and at every lookup (a view in use
+returns to RAM and is written again when it leaves). Views written for another
+model, template or context (the cache's identity salt) are never read. A view
+file that does not load, or whose offsets and per-line and per-unit data do not
+agree, is deleted and the request proceeds without it. A conversation served
+raw after a PFlash failure, or handed to the chat view, loses its views in RAM
+and on disk, so no later turn continues them.
+The drafter's own scoring state stays in RAM only: after a restart, the first
+question that needs recall scores the earlier messages again.
 
 **How it is written.** Eviction hands the snapshot's buffer to the disk writer
 without a copy (Qwen keeps snapshots in host memory; other backends copy to
@@ -217,11 +236,17 @@ them go through the same asynchronous writer.
 the concurrent `qwen4exp` engine keeps its checkpoints outside the backend's
 snapshot slots: both run without a disk cache (logged at startup).
 
-**Follow-up: cache-aware admission.** Compression admission that counts the
-cached prefix as warm (on the PFlash branches, not on `main`) consults RAM
-only. `DiskPrefixCache::longest_prefix(prompt)` returns the deepest restorable
-key length and KV position without reading a file, so admission can take the
-max of the RAM and disk prefixes.
+**Cache-aware admission.** PFlash's admission counts the deeper of the RAM
+prefix snapshot and the deepest disk entry for the prompt
+(`DiskPrefixCache::longest_prefix`, an index lookup that reads no file; ties
+go to RAM), in the chat view (`PFLASH_ADMISSION=cache`) and in the unified view
+(`PFLASH_UNIFIED=1`). A conversation restored after a restart, or written out
+on eviction, is then cached history: the unified view serves it raw, from disk,
+and pages only new long content, instead of handing a cold history to the chat
+view. The disk counts only with `--kv-cache-dir` set and the request's disk
+scope `full`. With the disk cache on, the chat view's admission record carries
+`cached_source` (`ram`, `disk` or `none`) and the unified view's stats a
+`cached` object with the tokens and source.
 
 ## Snapshot Memory Management
 

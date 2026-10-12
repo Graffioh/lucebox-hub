@@ -17876,22 +17876,26 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_base_target_fails_closed) {
     unlink(path.c_str());
 }
 
-// ── PFLASH_UNIFIED=1 (STAGE1-DESIGN.md) ──────────────────────────────────
+// ── PFLASH_UNIFIED=1 ───────────────────────────────────────────────────
 
 // Scores every candidate (a line, a paragraph ending in a blank line, or ``chunk`` tokens) with
 // ``score(segment text, prompt text)`` and returns the candidate scores the unified path admits units by; the
 // selection itself is ignored there.
-struct MockUnifiedBackend : MockBackend {
+// ``Base`` MockBackend, or DiskPayloadBackend for a server with the disk session cache.
+template <class Base>
+struct MockUnifiedBackendT : Base {
     const Tokenizer * tokenizer = nullptr;
     int chunk = 0;
     bool paragraphs = false;
     bool widen = false;
     bool keep_scored_only = false;   // kept_spans = the candidates scored above 1 (the selection keeps only them)
+    std::string probe_pin_text;      // non-empty: the request probe pins its last occurrence in the input
+    bool fail = false;               // the drafter pass fails
     std::function<double(const std::string &, const std::string &)> score;
     int compress_calls = 0;
-    CompressRequest last_request;
+    ModelBackend::CompressRequest last_request;
 
-    CompressResult compress(const CompressRequest & request) override {
+    ModelBackend::CompressResult compress(const ModelBackend::CompressRequest & request) override {
         ++compress_calls;
         last_request = request;
         const auto & ids = request.input_ids;
@@ -17902,7 +17906,21 @@ struct MockUnifiedBackend : MockBackend {
             pieces[(size_t) i] = tokenizer->decode(std::vector<int32_t>{ids[(size_t) i]});
             whole += pieces[(size_t) i];
         }
-        CompressResult result;
+        ModelBackend::CompressResult result;
+        if (fail) return result;
+        if (!probe_pin_text.empty()) {
+            const size_t at = whole.rfind(probe_pin_text);
+            if (at != std::string::npos) {
+                int b = -1, e = -1;
+                size_t offset = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (b < 0 && offset + pieces[(size_t) i].size() > at) b = i;
+                    offset += pieces[(size_t) i].size();
+                    if (e < 0 && offset >= at + probe_pin_text.size()) e = i + 1;
+                }
+                result.probe_pins.push_back({b, e});
+            }
+        }
         int begin = 0;
         std::string segment;
         for (int i = 0; i < n; ++i) {
@@ -17928,6 +17946,7 @@ struct MockUnifiedBackend : MockBackend {
         return result;
     }
 };
+using MockUnifiedBackend = MockUnifiedBackendT<MockBackend>;
 
 struct UnifiedRun {
     std::vector<HttpServerTestAccess::PreparedPrompt> prepared;
@@ -17956,6 +17975,16 @@ struct UnifiedOptions {
     const char * trace_units = nullptr;         // PFLASH_RECALL_TRACE_UNITS
     bool keep_scored_only = false;              // the drafter selection keeps only candidates scored above 1
     bool unified = true;                        // false: PFLASH_UNIFIED unset (the chat view serves every turn)
+    std::string disk_dir;                       // non-empty: the disk session cache in this directory
+    bool disk_seed_history = false;             // first, a server restart: turn 0 up to its newest user message on disk
+    DiskPrefixCacheMode disk_mode = DiskPrefixCacheMode::Full;   // the disk scope of the requests
+    int restart_at = -1;                        // a server restart (shutdown flush, a new process) before this turn
+    std::string probe_pin_text;                 // the request probe pins this text's last occurrence
+    bool drafter_fails = false;                 // every drafter pass fails
+    const char * scorer = nullptr;              // PFLASH_SELECT_SCORER
+    const char * fail_closed = nullptr;         // PFLASH_FAIL_CLOSED
+    std::vector<std::vector<std::string>> required;   // per turn, pflash_required
+    std::function<void(size_t)> before_turn;    // runs before each turn (after a restart)
 };
 
 // One server with PFLASH_UNIFIED=1 (unset when ``options.unified`` is false), the turns in order. By default one fixture tokenizer is target and drafter, so
@@ -17972,6 +18001,8 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     luce_test::ScopedEnvVar trace_units{"PFLASH_RECALL_TRACE_UNITS", options.trace_units};
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", options.select_mode};
     luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
+    luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", options.scorer};
+    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", options.fail_closed};
     char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
     const int trace_fd = mkstemp(trace_path);
     TEST_ASSERT(trace_fd >= 0);
@@ -18019,14 +18050,25 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
         run.target_starts.push_back(starts(tokenizer, run.ids.back()));
         run.drafter_starts.push_back(starts(drafter, drafter.encode(text)));
     }
-    auto backend_owner = std::make_unique<MockUnifiedBackend>();
-    MockUnifiedBackend & backend = *backend_owner;
-    backend.tokenizer = &drafter;
-    backend.chunk = chunk;
-    backend.paragraphs = options.paragraphs;
-    backend.widen = options.widen;
-    backend.keep_scored_only = options.keep_scored_only;
-    backend.score = score;
+    std::unique_ptr<ModelBackend> backend_owner;
+    std::function<int()> compress_calls;
+    const auto setup = [&] (auto backend) {
+        backend->tokenizer = &drafter;
+        backend->chunk = chunk;
+        backend->paragraphs = options.paragraphs;
+        backend->widen = options.widen;
+        backend->keep_scored_only = options.keep_scored_only;
+        backend->probe_pin_text = options.probe_pin_text;
+        backend->fail = options.drafter_fails;
+        backend->score = score;
+        compress_calls = [mock = backend.get()] { return mock->compress_calls; };
+        backend_owner = std::move(backend);
+    };
+    if (options.disk_dir.empty()) {
+        setup(std::make_unique<MockUnifiedBackend>());
+    } else {
+        setup(std::make_unique<MockUnifiedBackendT<DiskPayloadBackend>>());
+    }
     LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.pflash_mode = ServerConfig::PflashMode::AUTO;
@@ -18035,22 +18077,59 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     config.max_ctx = max_ctx;
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
+    if (!options.disk_dir.empty()) {
+        config.prefix_cache_cap = 8;
+        config.prefix_cache_max_bytes = 0;
+        config.disk_cache_dir = options.disk_dir;
+        config.disk_cache_min_tokens = 1;
+    }
+    if (options.disk_seed_history) {
+        // The previous process: its session (turn 0 before the newest user message) leaves RAM at shutdown.
+        const size_t at = run.raw_text[0].rfind("<|im_start|>user");
+        const auto & starts0 = run.target_starts[0];
+        const auto it = std::find(starts0.begin(), starts0.end(), at);
+        TEST_ASSERT(at != std::string::npos && it != starts0.end());
+        const std::vector<int32_t> history(run.ids[0].begin(), run.ids[0].begin() + (it - starts0.begin()));
+        auto seed_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & seed_backend = *seed_owner;
+        LuceEngine seed_engine(std::move(seed_owner));
+        HttpServer seed(seed_engine, tokenizer, config);
+        seed_backend.put(0, (int) history.size());
+        SchedulerTestHarness::prefix_cache(seed).confirm_inline_snap(0, (int) history.size(), history);
+        SchedulerTestHarness::set_slot_tokens(seed, 0, history);
+        SchedulerTestHarness::flush_sessions(seed);
+        TEST_ASSERT(SchedulerTestHarness::disk_cache(seed).longest_prefix(history).len == (int) history.size());
+    }
+    config.disk_cache_policy.mode = options.disk_mode;
     {
-        HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&drafter);
+        auto start = [&] {
+            auto server = std::make_unique<HttpServer>(engine, tokenizer, config);
+            server->set_drafter_tokenizer(&drafter);
+            return server;
+        };
+        auto owned = start();
         for (size_t index = 0; index < turns.size(); ++index) {
+            if ((int) index == options.restart_at) {
+                SchedulerTestHarness::flush_sessions(*owned);
+                owned.reset();
+                owned = start();
+            }
+            if (options.before_turn) options.before_turn(index);
+            HttpServer & server = *owned;
             ParsedRequest request;
             request.format = ApiFormat::OPENAI_CHAT;
             request.messages = turns[index];
             if (tools.is_array() && !tools.empty()) request.tools = tools;
             request.prompt_tokens = run.ids[index];
             request.max_output = index < options.max_outputs.size() ? options.max_outputs[index] : 16;
+            if (index < options.required.size()) request.pflash_required = options.required[index];
+            request.disk_cache_policy = config.disk_cache_policy;   // as the request parser sets it
             run.prepared.push_back(HttpServerTestAccess::prepare_prompt(server, request));
             if (!options.allow_errors) TEST_ASSERT_MSG(run.prepared.back().error.empty(), run.prepared.back().error);
             run.served_text.push_back(tokenizer.decode(run.prepared.back().tokens));
-            run.calls_after.push_back(backend.compress_calls);
+            run.calls_after.push_back(compress_calls());
         }
-        run.unified = HttpServerTestAccess::pflash_unified(server);
+        run.unified = HttpServerTestAccess::pflash_unified(*owned);
     }
     std::ifstream in(trace_path);
     for (std::string line; std::getline(in, line);) {
@@ -18147,6 +18226,159 @@ TEST_CASE(ServerUnitFixture, test_unified_paste_pages_then_recall_appends_and_re
     TEST_ASSERT(run.unified["counts"].value("recall.fired", 0) == 1);
     TEST_ASSERT(run.view_records.size() == 3);
     for (const auto & record : run.view_records) TEST_ASSERT(record.value("schema_version", 0) == 3);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_paging_keeps_the_request_probes_pins) {
+    // The question sits mid-paste and scores low; only the request probe's pin keeps it.
+    const std::string question = "Line 40: plain filler text here QUESTION-X";
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {40, "QUESTION-X"}});
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    const UnifiedScore score = [] (const std::string & segment, const std::string & prompt) {
+        return segment.find("QUESTION-X") != std::string::npos ? 0.1 : unified_fruit_score(segment, prompt);
+    };
+    const auto unpinned = run_unified_session({turn}, nullptr, nullptr, 64, score);
+    TEST_ASSERT(unpinned.prepared[0].compressed);
+    TEST_ASSERT(unpinned.served_text[0].find(question) == std::string::npos);
+    UnifiedOptions options;
+    options.probe_pin_text = "QUESTION-X";
+    const auto pinned = run_unified_session({turn}, nullptr, nullptr, 64, score, 0, 0.3f, nullptr, 65536, options);
+    TEST_ASSERT(pinned.prepared[0].compressed);
+    TEST_ASSERT_MSG(pinned.served_text[0].find(question + "\n") != std::string::npos, pinned.served_text[0]);
+    TEST_ASSERT(pinned.served_text[0].find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_raw_fallback_drops_the_conversations_views) {
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    json turn3 = turn2;
+    turn3.push_back({{"role", "assistant"}, {"content", "Line 60."}});
+    turn3.push_back({{"role", "user"}, {"content", "Which line mentions KIWI?"}});
+    // Turn 2 fails its PFlash mapping (a pflash_required text it does not hold) and is served raw.
+    UnifiedOptions options;
+    options.required = {{}, {"text that is not in the message"}, {}};
+    const auto run = run_unified_session({turn1, turn2, turn3}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                         nullptr, 65536, options);
+    TEST_ASSERT(run.prepared[0].compressed);
+    TEST_ASSERT(!run.prepared[1].compressed && run.prepared[1].tokens == run.ids[1]);
+    const json & fallback = run.prepared[1].pflash_stats["pflash_fallback"];
+    TEST_ASSERT_MSG(fallback.value("unified_lineages_forgotten", 0) == 1, run.prepared[1].pflash_stats.dump());
+    // Turn 3 does not continue turn 1's view (its history was served raw): the chat view takes it.
+    TEST_ASSERT_MSG(run.prepared[2].unified_handback == "uncached", run.prepared[2].pflash_stats.dump());
+    TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_needs_candidate_scores) {
+    using luce::pflash::PFlashScorer;
+    using luce::pflash::PFlashSelectStrategy;
+    luce::pflash::PFlashSelectionConfig selection;
+    TEST_ASSERT(http_detail::pflash_selection_gives_lifts(selection));
+    selection.scorer = PFlashScorer::Legacy;
+    TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
+    selection.scorer = PFlashScorer::Split;
+    TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
+    selection.scorer = PFlashScorer::Head;
+    selection.strategy = PFlashSelectStrategy::Fold;
+    TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
+    selection.strategy = PFlashSelectStrategy::Segments;
+    {
+        luce_test::ScopedEnvVar legacy{"PFLASH_QWEN35_LEGACY_SCORER", "1"};
+        TEST_ASSERT(!http_detail::pflash_selection_gives_lifts(selection));
+    }
+
+    const std::string doc = unified_doc(80, {{7, "kiwi"}});
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    // A scorer that gives no candidate scores: the chat view serves the request.
+    UnifiedOptions legacy;
+    legacy.scorer = "legacy";
+    const auto handed = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                            65536, legacy);
+    TEST_ASSERT_MSG(handed.prepared[0].unified_handback == "unscored_selection",
+                    handed.prepared[0].pflash_stats.dump());
+    // A failed drafter pass: the newest content is served verbatim, or with PFLASH_FAIL_CLOSED=1 refused.
+    UnifiedOptions failing;
+    failing.drafter_fails = true;
+    const auto verbatim = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                              65536, failing);
+    TEST_ASSERT(verbatim.served_text[0] == verbatim.raw_text[0]);
+    TEST_ASSERT(verbatim.unified["counts"].value("drafter.failed", 0) == 1);
+    failing.fail_closed = "1";
+    failing.allow_errors = true;
+    const auto refused = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                             65536, failing);
+    TEST_ASSERT_MSG(!refused.prepared[0].error.empty(), refused.prepared[0].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_repeat_with_a_new_pin_serves_it) {
+    // A retry of the same messages that now pins (pflash_required) a line the view left out is not answered with
+    // the stored view: it is paged again with that line kept.
+    const std::string pear = "Line 30: plain filler text here pear";
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {30, "pear"}}) + "Which line mentions KIWI?"}},
+    });
+    const UnifiedScore score = [] (const std::string & segment, const std::string & prompt) {
+        return segment.find("pear") != std::string::npos ? 0.1 : unified_fruit_score(segment, prompt);
+    };
+    UnifiedOptions options;
+    options.required = {{}, {pear}};
+    const auto run = run_unified_session({turn, turn}, nullptr, nullptr, 64, score, 0, 0.3f, nullptr, 65536, options);
+    TEST_ASSERT(run.prepared[0].compressed && run.served_text[0].find(pear) == std::string::npos);
+    TEST_ASSERT_MSG(run.served_text[1].find(pear + "\n") != std::string::npos, run.prepared[1].pflash_stats.dump());
+    TEST_ASSERT(run.unified["counts"].value("repeat.pins_unserved", 0) == 1);
+    TEST_ASSERT(run.unified["counts"].value("repeat", 0) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_disk_view_that_does_not_match_the_prompt_is_dropped) {
+    // The restarted server finds turn 1's view on disk, but the file's region digest no longer matches the
+    // conversation's bytes: the view is deleted and the follow-up goes to the chat view as a cold history.
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const std::string dir = test_tmp_path("luce_test_unified_view_mismatch").string();
+    rm_rf(dir);
+    UnifiedOptions disk;
+    disk.disk_dir = dir;
+    disk.restart_at = 1;
+    int edited = 0;
+    disk.before_turn = [&] (size_t index) {
+        if (index != 1) return;
+        for (const auto & entry : std::filesystem::directory_iterator(dir + "/.pflash-views")) {
+            if (entry.path().extension() != ".view") continue;
+            std::ifstream in(entry.path());
+            std::string header, body;
+            std::getline(in, header);
+            std::getline(in, body);
+            in.close();
+            json view = json::parse(body);
+            view["regions"][0]["content_sha"] = "0000";
+            std::ofstream(entry.path(), std::ios::trunc) << header << "\n" << view.dump() << "\n";
+            ++edited;
+        }
+    };
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                         65536, disk);
+    TEST_ASSERT(edited == 1);
+    TEST_ASSERT(run.prepared[0].compressed && run.prepared[0].unified_view);
+    TEST_ASSERT_MSG(run.prepared[1].unified_handback == "uncached", run.prepared[1].pflash_stats.dump());
+    TEST_ASSERT(run.unified["counts"].value("disk_view_rejected", 0) == 1);
+    TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 0);
+    rm_rf(dir);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_tool_output_needs_listing) {
@@ -18322,6 +18554,157 @@ TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_goes_to_the_chat_vie
     TEST_ASSERT(run.calls_after[0] == 1);
     TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 2);
     TEST_ASSERT(run.unified.value("views", 1) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_restorable_prefix_counts_disk_only_when_on) {
+    using http_detail::pflash_restorable_prefix;
+    const auto is = [](const http_detail::PflashRestorablePrefix & got, int tokens, const char * source) {
+        return got.tokens == tokens && std::string(got.source) == source;
+    };
+    // Disk cache off: the RAM prefix, whatever the disk would hold.
+    TEST_ASSERT(is(pflash_restorable_prefix(0, false, 0), 0, "none"));
+    TEST_ASSERT(is(pflash_restorable_prefix(0, false, 40000), 0, "none"));
+    TEST_ASSERT(is(pflash_restorable_prefix(9000, false, 40000), 9000, "ram"));
+    // Disk cache on: the deeper of the two; ties stay in RAM (no file read).
+    TEST_ASSERT(is(pflash_restorable_prefix(0, true, 0), 0, "none"));
+    TEST_ASSERT(is(pflash_restorable_prefix(0, true, 40000), 40000, "disk"));
+    TEST_ASSERT(is(pflash_restorable_prefix(9000, true, 40000), 40000, "disk"));
+    TEST_ASSERT(is(pflash_restorable_prefix(40000, true, 40000), 40000, "ram"));
+    TEST_ASSERT(is(pflash_restorable_prefix(41000, true, 40000), 41000, "ram"));
+    TEST_ASSERT(is(pflash_restorable_prefix(-1, true, -5), 0, "none"));
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_only_the_new_paste) {
+    // A server restart: the chat's history (an earlier paste and its answer) is on disk, RAM is empty. The unified
+    // view counts the disk entry as cached, as the chat view's admission does: it keeps the conversation instead of
+    // handing a cold history to the chat view, serves the history as it is (the generation path restores it from
+    // disk) and pages only the new paste. Without the entry, or outside the Full disk scope, the chat view takes it.
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "mango"}}) + "Summarise this."}},
+        {{"role", "assistant"}, {"content", "A list of lines."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{33, "kiwi"}}, "Row ") + "Which row mentions KIWI?"}},
+    });
+    const std::string dir = test_tmp_path("luce_test_unified_disk_resume").string();
+    rm_rf(dir);
+    UnifiedOptions disk;
+    disk.disk_dir = dir;
+    disk.disk_seed_history = true;
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
+                                         disk);
+    const auto & stats = run.prepared[0].pflash_stats;
+    TEST_ASSERT_MSG(run.prepared[0].unified_handback.empty(), stats.dump());
+    TEST_ASSERT_MSG(stats.contains("unified") && stats["unified"].contains("cached") &&
+                    stats["unified"]["cached"].value("source", "") == "disk" &&
+                    stats["unified"]["cached"].value("tokens", 0) > 0, stats.dump());
+    TEST_ASSERT(run.prepared[0].compressed);
+    TEST_ASSERT(run.calls_after[0] == 1);
+    TEST_ASSERT(run.served_text[0].find(unified_doc(80, {{7, "mango"}}) + "Summarise this.") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].find("Row 33: plain filler text here kiwi") != std::string::npos);
+    TEST_ASSERT(run.served_text[0].size() < run.raw_text[0].size());
+    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 0);
+
+    // The disk is looked up only in the Full scope, so only there does it count. (A fresh directory: the first run's
+    // shutdown wrote its view there, and a view on disk continues the conversation whatever the scope.)
+    rm_rf(dir);
+    UnifiedOptions off = disk;
+    off.disk_mode = DiskPrefixCacheMode::Off;
+    const auto scoped = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                            65536, off);
+    TEST_ASSERT_MSG(scoped.prepared[0].unified_handback == "uncached", scoped.prepared[0].pflash_stats.dump());
+    rm_rf(dir);
+    // No disk entry: the cold history goes to the chat view, as without the disk cache.
+    UnifiedOptions empty;
+    empty.disk_dir = dir;
+    const auto cold = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                          65536, empty);
+    TEST_ASSERT_MSG(cold.prepared[0].unified_handback == "uncached", cold.prepared[0].pflash_stats.dump());
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_restart_serves_a_disk_chat_raw_for_a_short_question) {
+    // The same restart with a short follow-up question: nothing new to page, so the whole prompt is served raw for
+    // the disk restore -- no drafter pass and no compression of the history. Without the disk cache the chat view
+    // compresses the cold history (test_unified_cold_chat_history_goes_to_the_chat_view).
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Summarise this."}},
+        {{"role", "assistant"}, {"content", "A list of lines."}},
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+    });
+    const std::string dir = test_tmp_path("luce_test_unified_disk_short").string();
+    rm_rf(dir);
+    UnifiedOptions disk;
+    disk.disk_dir = dir;
+    disk.disk_seed_history = true;
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
+                                         disk);
+    TEST_ASSERT_MSG(run.prepared[0].unified_handback.empty(), run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(!run.prepared[0].compressed);
+    TEST_ASSERT(run.prepared[0].tokens == run.ids[0]);
+    TEST_ASSERT(run.calls_after[0] == 0);
+
+    // The chat view alone (PFLASH_UNIFIED unset) counts the disk the same way: its cache admission keeps the
+    // history raw instead of compressing it, and records where the cached prefix is.
+    UnifiedOptions chat = disk;
+    chat.unified = false;
+    const auto warm = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
+                                          chat);
+    TEST_ASSERT(warm.calls_after[0] == 0);
+    TEST_ASSERT(!warm.prepared[0].compressed);
+    TEST_ASSERT(warm.prepared[0].tokens == warm.ids[0]);
+    const json warm_admission = warm.prepared[0].pflash_stats.value("admission", json::object());
+    TEST_ASSERT_MSG(warm_admission.value("cached_source", "") == "disk", warm.prepared[0].pflash_stats.dump());
+    rm_rf(dir);
+    // Disk cache off: the admission compresses the cold history, and nothing records a source.
+    UnifiedOptions plain;
+    plain.unified = false;
+    const auto cold = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536,
+                                          plain);
+    TEST_ASSERT(cold.calls_after[0] == 1);
+    TEST_ASSERT_MSG(cold.prepared[0].pflash_stats.dump().find("cached_source") == std::string::npos,
+                    cold.prepared[0].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_through_its_view_on_disk) {
+    // Turn 1 pages a long paste. The server restarts (shutdown flush): its view is written to disk and read back on
+    // the next turn, so the follow-up continues the shortened conversation -- the same served prefix, nothing handed
+    // back to the chat view -- instead of arriving cold. Without the disk cache the restart loses the view, and the
+    // follow-up goes to the chat view as a cold history.
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const std::string dir = test_tmp_path("luce_test_unified_view_restart").string();
+    rm_rf(dir);
+    UnifiedOptions disk;
+    disk.disk_dir = dir;
+    disk.restart_at = 1;
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                         65536, disk);
+    TEST_ASSERT_MSG(run.prepared[0].compressed && run.prepared[0].unified_view, run.prepared[0].pflash_stats.dump());
+    const auto & stats = run.prepared[1].pflash_stats;
+    TEST_ASSERT_MSG(run.prepared[1].unified_handback.empty() && stats.contains("unified") &&
+                    stats["unified"].value("disk_view", false), stats.dump());
+    TEST_ASSERT(run.prepared[1].compressed && run.prepared[1].unified_view);
+    TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 1);
+    // The follow-up's served prompt starts with what turn 1 served, up to its generation prompt.
+    const int cut = stats["unified"].value("reused_tokens", -1);
+    TEST_ASSERT_MSG(cut > 0 && cut == run.prepared[0].snapshot_cut && run.prepared[1].tokens.size() > (size_t) cut &&
+                    std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + cut,
+                               run.prepared[1].tokens.begin()), stats.dump());
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango") != std::string::npos);
+
+    // The same without the disk cache: the view is gone after the restart.
+    rm_rf(dir);
+    UnifiedOptions ram;
+    ram.restart_at = 1;
+    const auto lost = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                          nullptr, 65536, ram);
+    TEST_ASSERT_MSG(lost.prepared[1].unified_handback == "uncached", lost.prepared[1].pflash_stats.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_unsplittable_paste_goes_to_the_chat_view) {
@@ -18977,6 +19360,14 @@ TEST_CASE(ServerUnitFixture, test_unified_reset_hands_back_to_the_chat_view) {
     TEST_ASSERT_MSG(again.prepared[over].unified_handback == "reset_uncached", again.prepared[over].pflash_stats.dump());
     TEST_ASSERT_MSG(again.prepared[over].error == base.prepared[over].error, again.prepared[over].error);
     TEST_ASSERT(again.prepared[over].tokens == base.prepared[over].tokens);
+
+    // The refused turn keeps the conversation's views: a retry with a short allowance continues the view.
+    std::vector<json> retry(session.begin(), session.begin() + (long) over + 1);
+    retry.push_back(session[over]);
+    const auto retried = run_unified_session(retry, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view, tight);
+    TEST_ASSERT(!retried.prepared[over].error.empty());
+    TEST_ASSERT_MSG(retried.prepared[over + 1].unified_handback.empty() && retried.prepared[over + 1].unified_view,
+                    retried.prepared[over + 1].pflash_stats.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_widened_cap_applies_once) {

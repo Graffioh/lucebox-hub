@@ -3024,6 +3024,11 @@ static std::vector<int32_t> strict_score_impl(
             request_trace.mandatory_tokens = charged(pins, segments);
             request_trace.mandatory_tokens_base = request_trace.mandatory_tokens;
         }
+        if (request_set) {
+            auto probe_pins = luce::pflash::pflash_request_token_spans(request_trace.set.tokens);
+            if (request_trace.recency_pin.begin >= 0) probe_pins.push_back(request_trace.recency_pin);
+            pflash_set_probe_pins(std::move(probe_pins));
+        }
         std::string policy_note;
         if (request_trace.policy_evaluated) {
             char buf[256];

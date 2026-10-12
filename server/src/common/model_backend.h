@@ -516,6 +516,8 @@ struct ModelBackend {
         // Strict selection with the head: every candidate's attention lift
         // (mass per token relative to uniform); empty when unknown.
         std::vector<std::pair<PFlashTokenSpan, double>> candidate_lifts;
+        // The request probe's own pins in that selection (pflash_last_probe_pins).
+        std::vector<PFlashTokenSpan> probe_pins;
         int                  scorer_resume = -1;
         int                  scorer_new_tokens = -1;
         double               scorer_forward_s = 0.0;

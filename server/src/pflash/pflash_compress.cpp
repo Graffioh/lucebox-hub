@@ -469,6 +469,7 @@ namespace {
 thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
 thread_local PFlashScoringStats g_last_scoring_stats;
 thread_local std::vector<PFlashCandidateLift> g_last_candidate_lifts;
+thread_local std::vector<PFlashTokenSpan> g_last_probe_pins;
 thread_local PFlashStage2Outcome g_last_stage2_outcome;
 thread_local PFlashRelevanceSpread g_last_relevance_spread;
 } // namespace
@@ -520,6 +521,14 @@ const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts() {
     return g_last_candidate_lifts;
 }
 
+const std::vector<PFlashTokenSpan> & pflash_last_probe_pins() {
+    return g_last_probe_pins;
+}
+
+void pflash_set_probe_pins(std::vector<PFlashTokenSpan> pins) {
+    g_last_probe_pins = std::move(pins);
+}
+
 const PFlashScoringStats & pflash_last_scoring_stats() {
     return g_last_scoring_stats;
 }
@@ -536,6 +545,7 @@ void pflash_clear_kept_spans() {
     g_last_kept_spans.clear();
     g_last_scoring_stats = {};
     g_last_candidate_lifts.clear();
+    g_last_probe_pins.clear();
     g_last_stage2_outcome = {};
     g_last_relevance_spread = {};
 }

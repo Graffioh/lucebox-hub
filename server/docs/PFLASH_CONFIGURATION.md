@@ -25,6 +25,9 @@ allowed below. Valid integer overrides retain their existing upper clamps.
 | `--prefill-keep-ratio` | `0.05` | curve | Flat ratio; `--prefill-curve tokens:ratio ...` overrides it. The release curve is `16384:0.315 32768:0.270 65536:0.270 120000:0.225`; either flag replaces it |
 | `--prefill-skip-park` | off | | Keep the target resident while the drafter scores; see the release profile |
 | `PFLASH_ADMISSION` | `length` | `cache` | `length` or `cache`; cache admission accounts for restorable target KV |
+| `PFLASH_UNIFIED` | `0` | `1` | One view and recall mechanism for chats and agent sessions: only the newest turn's long uncached content is paged, in whole lines. Needs a strict-selection environment; the chat-view settings below apply only to the requests it hands back. See the [server README](../README.md#pflash) |
+| `PFLASH_REGION_TOOLS` | `*` | | Under the unified view: tools whose outputs may be paged; a comma-separated list names tools, empty pages none |
+| `PFLASH_RECALL`, `PFLASH_RECALL_GATE` | `1`, `0.075` | | Under the unified view: recall for a new question, and the share of score mass outside the view below which nothing is recalled (`off` recalls up to the regions' caps) |
 | `PFLASH_AGENT_PASTE` | `0` | | With cache admission in auto mode, `1` permits a large newest user paste in a tool session; earlier history stays raw |
 | `PFLASH_CHAT_VIEW`, `PFLASH_CHAT_RECALL` | `1`, `1` | | Continue the served view; recall omitted material for a new question |
 | `PFLASH_CHAT_COMPRESS_NEW_TOKENS` | `16384` | | Integer >= 1; smaller additions stay verbatim; capped at 2^30 |

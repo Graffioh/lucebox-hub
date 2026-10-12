@@ -1236,6 +1236,14 @@ int pflash_raw_base_target(
     return target_text == drafter_text ? cut : -1;
 }
 
+PflashRestorablePrefix pflash_restorable_prefix(
+        int ram_tokens, bool disk_enabled, int disk_tokens) noexcept {
+    const int ram = (std::max)(0, ram_tokens);
+    const int disk = disk_enabled ? (std::max)(0, disk_tokens) : 0;
+    if (disk > ram) return {disk, "disk"};
+    return {ram, ram > 0 ? "ram" : "none"};
+}
+
 int pflash_span_tokens_within(
         const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept {
     int tokens = 0;
@@ -1315,6 +1323,13 @@ int pflash_target_token_ceiling(
 bool pflash_fail_closed_from_env() noexcept {
     const char * value = std::getenv("PFLASH_FAIL_CLOSED");
     return value != nullptr && *value && std::strcmp(value, "0") != 0;
+}
+
+bool pflash_selection_gives_lifts(const luce::pflash::PFlashSelectionConfig & selection) noexcept {
+    const char * legacy = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
+    return selection.scorer == luce::pflash::PFlashScorer::Head &&
+           selection.strategy == luce::pflash::PFlashSelectStrategy::Segments &&
+           !(legacy && std::strcmp(legacy, "1") == 0);
 }
 
 std::string pflash_failure_reason(const std::string & error,
@@ -2706,7 +2721,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
     restore_replay_blobs();
     status_html_path_ = resolve_status_html();
 
-    // PFLASH_UNIFIED=1 (STAGE1-DESIGN.md): read once here; a bad tool list or a later-stage arm fails startup.
+    // PFLASH_UNIFIED=1: read once here; a bad tool list or an unsupported variant fails startup.
     // Defaults under the flag: every tool's output may be paged (PFLASH_REGION_TOOLS unset = "*"; set it empty for
     // none) and recall is gated at theta 0.075 (PFLASH_RECALL_GATE; "off" = ungated recall).
     if (const char * unified = std::getenv("PFLASH_UNIFIED"); unified && std::strcmp(unified, "1") == 0) {
@@ -2723,12 +2738,22 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         }
         for (const char * arm : {"PFLASH_UNIFIED_INPLACE", "PFLASH_UNIFIED_DEFRAG"}) {
             if (const char * value = std::getenv(arm); value && *value) {
-                fail(std::string(arm) + " is a later arm, not built in stage 1");
+                fail(std::string(arm) + " is not supported");
             }
         }
         if (!luce::pflash::has_pflash_selection_environment()) {
             std::fprintf(stderr, "[pflash-unified] no strict-selection environment: every request is served by the "
                                  "chat view, as without PFLASH_UNIFIED\n");
+        } else {
+            luce::pflash::PFlashSelectionConfig selection;
+            std::string selection_error;
+            if (luce::pflash::resolve_pflash_selection(1 << 16, 32, selection, selection_error) &&
+                !http_detail::pflash_selection_gives_lifts(selection)) {
+                std::fprintf(stderr, "[pflash-unified] scorer %s, strategy %s give no per-candidate scores: every "
+                                     "request is served by the chat view, as without PFLASH_UNIFIED\n",
+                             luce::pflash::pflash_scorer_name(selection.scorer),
+                             luce::pflash::pflash_select_strategy_name(selection.strategy));
+            }
         }
         const char * recall = std::getenv("PFLASH_RECALL");
         pflash_unified_recall_ = !(recall && std::strcmp(recall, "0") == 0);
@@ -2792,6 +2817,22 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         std::fprintf(stderr, "[pflash-unified] on: region tools=%s recall=%d recall_gate=%s\n",
                      pflash_region_tools_.identity.empty() ? "(none)" : pflash_region_tools_.identity.c_str(),
                      (int) pflash_unified_recall_, gate_text);
+        // With the disk session cache on, the views of shortened conversations are kept on disk too: written when
+        // they leave the RAM store and at shutdown, read on a RAM miss, so neither a restart nor an eviction turns a
+        // shortened conversation cold. Their identity is the disk cache's (model, template, context); the directory
+        // starts with a dot, so the KV cache's scan skips it.
+        if (!disk_cache_.disabled()) {
+            std::string identity;
+            for (uint8_t b : compute_disk_cache_salt(config_)) {
+                char hex_byte[3];
+                std::snprintf(hex_byte, sizeof hex_byte, "%02x", b);
+                identity += hex_byte;
+            }
+            pflash_unified_disk_views_.init(config_.disk_cache_dir + "/.pflash-views", identity,
+                                            disk_cache_ttl_seconds(config_.disk_cache_ttl_hours), 256);
+            // A new conversation must not take the lineage of one on disk (forget_lineage would drop that one).
+            pflash_unified_lineage_ = pflash_unified_disk_views_.max_lineage();
+        }
         std::fflush(stderr);
     }
 
@@ -5780,7 +5821,7 @@ std::string HttpServer::apply_pflash_compression(
     }
 
     if (pflash_unified_) {
-        // STAGE1-DESIGN.md A1: the unified mechanism takes over after the shared query and pins.
+        // The unified view takes over after the shared query and pins.
         ModelBackend::CompressRequest unified_request;
         auto pins = required_instruction_spans;
         pins.insert(pins.end(), system_spans.begin(), system_spans.end());
@@ -5803,6 +5844,7 @@ std::string HttpServer::apply_pflash_compression(
         else if (!query_window.valid()) not_ready = "no_query";
         else if (!chat_turn.valid()) not_ready = "turns_unparsed";
         else if (config_.pflash_remote_drafter) not_ready = "remote_drafter";
+        else if (!http_detail::pflash_selection_gives_lifts(experiment)) not_ready = "unscored_selection";
         else if (unified_messages.empty()) not_ready = "messages_unreadable";
         std::string handback;
         auto unified_error = apply_unified_view(req, prepared, chat_turn, unified_messages,
@@ -6075,8 +6117,9 @@ std::string HttpServer::apply_pflash_compression(
                                    existing.view_gen_begin, input_tokens, true, 0};
                 }
             } else {
-                const int cached_target =
-                    restorable_prefix_tokens(req.prompt_tokens);
+                const auto restorable = restorable_prefix_tokens(
+                    req.prompt_tokens, req.disk_cache_policy);
+                const int cached_target = restorable.tokens;
                 const int cached_drafter = prompt_tokens > 0
                     ? (std::min)(input_tokens, (int) std::floor(
                           (double) input_tokens * (double) cached_target /
@@ -6150,12 +6193,17 @@ std::string HttpServer::apply_pflash_compression(
                 if (!keep_history_stats.is_null()) {
                     admission_stats["keep_history"] = keep_history_stats;
                 }
+                // Disk cache off: no source field, the record is unchanged.
+                const bool disk_cache_on = !disk_cache_.disabled();
+                if (disk_cache_on) admission_stats["cached_source"] = restorable.source;
                 std::fprintf(stderr,
                     "[pflash-admission] %s cached=%d cached_droppable~%d "
-                    "uncached_droppable~%d droppable~%d threshold=%d\n",
+                    "uncached_droppable~%d droppable~%d threshold=%d%s%s\n",
                     http_detail::pflash_admission_name(admission),
                     cached_target, cached_droppable, uncached_droppable,
-                    droppable_target, config_.pflash_threshold);
+                    droppable_target, config_.pflash_threshold,
+                    disk_cache_on ? " source=" : "",
+                    disk_cache_on ? restorable.source : "");
                 if (admission != http_detail::PflashAdmission::Compress) {
                     // Arrival on a raw conversation the cache holds: compress
                     // the large uncached chunk only; otherwise it stays raw.
@@ -6673,7 +6721,23 @@ std::string HttpServer::apply_pflash_compression(
     return {};
 }
 
-int HttpServer::restorable_prefix_tokens(
+http_detail::PflashRestorablePrefix HttpServer::restorable_prefix_tokens(
+        const std::vector<int32_t> & prompt,
+        const DiskPrefixCachePolicy & disk_policy) {
+    const int ram = ram_restorable_prefix_tokens(prompt);
+    // The generation path looks the whole prompt up on disk only in Full
+    // scope; its probe is index-only, so is this one.
+    const bool disk_enabled = !disk_cache_.disabled() &&
+        disk_policy.mode == DiskPrefixCacheMode::Full;
+    int disk = 0;
+    if (disk_enabled) {
+        const auto probe = disk_cache_.longest_prefix(prompt);
+        disk = (std::min)(probe.len, probe.cur_pos);
+    }
+    return http_detail::pflash_restorable_prefix(ram, disk_enabled, disk);
+}
+
+int HttpServer::ram_restorable_prefix_tokens(
         const std::vector<int32_t> & prompt) {
     if (prefix_cache_.disabled()) return 0;
     int limit = (int) prompt.size();
@@ -6711,6 +6775,7 @@ json HttpServer::pflash_unified_json() const {
             {"recall_gate", pflash_recall_gate_ > 0.0 ? json(pflash_recall_gate_) : json(nullptr)},
             {"views", pflash_unified_views_.size()},
             {"view_bytes", pflash_unified_views_.bytes()},
+            {"disk_views", pflash_unified_disk_views_.size()},
             {"counts", pflash_unified_counts_}};
 }
 
@@ -7193,6 +7258,20 @@ bool HttpServer::serve_pflash_region_view(
     return true;
 }
 
+size_t HttpServer::forget_unified_views(const std::vector<int32_t> & raw_tokens) {
+    if (!pflash_unified_) return 0;
+    auto lineages = pflash_unified_views_.lineages_continued_by(raw_tokens);
+    const auto on_disk = pflash_unified_disk_views_.lineages_continued_by(raw_tokens);
+    lineages.insert(lineages.end(), on_disk.begin(), on_disk.end());
+    std::sort(lineages.begin(), lineages.end());
+    lineages.erase(std::unique(lineages.begin(), lineages.end()), lineages.end());
+    for (const uint64_t lineage : lineages) {
+        pflash_unified_views_.forget_lineage(lineage);
+        pflash_unified_disk_views_.forget_lineage(lineage);
+    }
+    return lineages.size();
+}
+
 std::string HttpServer::apply_unified_view(
         const ParsedRequest & req, PreparedPrompt & prepared,
         const http_detail::PflashChatTurnSpan & turn,
@@ -7217,7 +7296,8 @@ std::string HttpServer::apply_unified_view(
         std::fflush(stderr);
         return std::string();
     };
-    // The chat view (the release path) serves what the unified view does not take; nothing here changed yet.
+    // The chat view serves what the unified view does not take; nothing here changed yet. Once it accepts the
+    // request, no later turn continues a view of this conversation (prepare_prompt).
     const auto hand_back = [&] (const std::string & reason) {
         count("handback." + reason);
         handback = reason;
@@ -7240,7 +7320,7 @@ std::string HttpServer::apply_unified_view(
     }
     const int raw_gen_begin = prompt_tokens - (int) generation.size();
 
-    // Both tokenisations decode to one text; units are cut where both start a token (A3).
+    // Both tokenisations decode to one text; units are cut where both start a token.
     const auto td = http_detail::decode_prompt_with_offsets(tokenizer_, raw);
     const auto dd = http_detail::decode_prompt_with_offsets(*drafter_tokenizer_, drafter_ids);
     if (td.text != dd.text) return hand_back("text_mismatch");
@@ -7275,7 +7355,7 @@ std::string HttpServer::apply_unified_view(
         return false;
     };
 
-    // §2.2-2.3: the newest turn -- every message since the last reply: the run of user messages (a document sent on
+    // The newest turn -- every message since the last reply: the run of user messages (a document sent on
     // its own, then the question), or the group of tool messages -- holds the candidates.
     struct Candidate {
         size_t message = 0;
@@ -7374,6 +7454,61 @@ std::string HttpServer::apply_unified_view(
 
     pu::View view;
     bool has_view = pflash_unified_views_.find(raw, drafter_ids, pflash_unified_config_, view);
+    // A view the RAM store no longer holds (a restart, or its eviction) may be on disk: a longer one wins.
+    if (pflash_unified_disk_views_.enabled()) {
+        const size_t ram_len = has_view ? (size_t) (std::max)(0, view.raw_gen_begin) : 0;
+        pu::View stored;
+        bool loaded = pflash_unified_disk_views_.find(raw, drafter_ids, pflash_unified_config_, ram_len, stored);
+        // A view read from disk is consistent in itself (view_from_json); its regions must also be this request's
+        // bytes, and its unit cuts the token starts they were taken at, in both tokenisations.
+        const auto matches_text = [&] (const pu::View & v) {
+            for (const auto & region : v.regions) {
+                if (region.ce > text.size() ||
+                    pu::sha1_hex(text.substr(region.cb, region.ce - region.cb)) != region.content_sha) {
+                    return false;
+                }
+                const auto & cuts = region.layout.cuts;
+                for (size_t u = 0; u + 1 < cuts.size(); ++u) {
+                    if (token_at(td, cuts[u]) != region.unit_tb[u] || token_at(td, cuts[u + 1]) != region.unit_te[u] ||
+                        token_at(dd, cuts[u]) != region.unit_db[u] || token_at(dd, cuts[u + 1]) != region.unit_de[u]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        if (loaded && !matches_text(stored)) {
+            std::fprintf(stderr, "[pflash-unified] disk view of lineage %llu does not match the prompt: dropped\n",
+                         (unsigned long long) stored.lineage);
+            std::fflush(stderr);
+            pflash_unified_disk_views_.forget_lineage(stored.lineage);
+            count("disk_view_rejected");
+            loaded = false;
+        }
+        if (loaded) {
+            count("disk_view");
+            stats["disk_view"] = true;
+            view = std::move(stored);
+            has_view = true;
+        }
+    }
+    // A repeat serves what was served only when the view holds every span this request pins (a pflash_required
+    // text added on a retry may name lines the view left out); otherwise the request starts a new view.
+    if (has_view && view.raw_tokens == raw && view.drafter_ids == drafter_ids) {
+        bool served = true;
+        for (const auto & span : pins) {
+            for (const auto & region : view.regions) {
+                for (size_t u = 0; u < region.unit_db.size(); ++u) {
+                    served = served && !(span.begin < region.unit_de[u] && span.end > region.unit_db[u] &&
+                                         !region.held[u] && !region.mandatory[u]);
+                }
+            }
+        }
+        if (!served) {
+            count("repeat.pins_unserved");
+            has_view = false;
+        }
+    }
     const bool found_view = has_view;
     if (has_view && view.raw_tokens == raw && view.drafter_ids == drafter_ids) {
         // The same request again: what was served.
@@ -7383,6 +7518,7 @@ std::string HttpServer::apply_unified_view(
         stats["served_tokens"] = view.view_tokens.size();
         prepared.tokens = view.view_tokens;
         prepared.compressed = view.view_tokens != raw;
+        prepared.unified_view = true;
         prepared.snapshot_cut = view.view_gen_begin;
         prepared.pflash_stats = {{"unified", stats}, {"compress_ms", 0.0},
                                  {"drafter_input_tokens", input}};
@@ -7397,14 +7533,18 @@ std::string HttpServer::apply_unified_view(
         stats["reset"] = "unusable";
         has_view = false;
     }
-    const int restorable = restorable_prefix_tokens(raw);
+    // A conversation the disk session cache holds (a restarted server, or a session written out on eviction) counts
+    // as cached, as in the chat view. Disk cache off: no cached record, the stats are unchanged.
+    const auto restorable_prefix = restorable_prefix_tokens(raw, req.disk_cache_policy);
+    const int restorable = restorable_prefix.tokens;
+    if (!disk_cache_.disabled()) stats["cached"] = {{"tokens", restorable}, {"source", restorable_prefix.source}};
 
     for (int pass = 0; pass < 2; ++pass) {
         const bool continues = has_view && pass == 0;
         const int new_from = continues ? view.drafter_gen_begin : 0;
         std::vector<pu::Region> held_regions = continues ? view.regions : std::vector<pu::Region>{};
 
-        // §2.4 admission: eligible, new, uncached, big, not a re-read.
+        // Admission: eligible, new, uncached, big, not a re-read.
         json admission = json::array();
         std::vector<size_t> region_candidates;
         std::vector<size_t> verbatim;
@@ -7460,14 +7600,12 @@ std::string HttpServer::apply_unified_view(
                 if (admission[k].value("decision", "") == "no_lines") cannot_page += unpinned(newest[k].db, newest[k].de);
             }
             if (target_estimate(cannot_page) >= config_.pflash_threshold) {
-                if (!found_view) return hand_back("uncached");
-                // The chat view serves this turn: no later turn may continue the view it replaced (or an ancestor).
-                pflash_unified_views_.forget_lineage(view.lineage);
-                return hand_back("reset_uncached");
+                // Once the chat view accepts it, the view this turn would have continued goes, with its lineage.
+                return hand_back(found_view ? "reset_uncached" : "uncached");
             }
         }
 
-        // §5 trigger: a new user question on a view with regions.
+        // Recall trigger: a new user question on a view with regions.
         bool recall = false;
         int recall_at = -1;
         if (continues && pflash_unified_recall_ && !held_regions.empty() && !newest.empty() &&
@@ -7489,7 +7627,7 @@ std::string HttpServer::apply_unified_view(
             }
         }
 
-        // One drafter pass scores the regions to page and, at a question, the earlier regions (A2).
+        // One drafter pass scores the regions to page and, at a question, the earlier regions.
         std::vector<std::pair<PFlashTokenSpan, double>> lifts;
         ModelBackend::CompressResult result;
         bool scored = false;
@@ -7532,11 +7670,25 @@ std::string HttpServer::apply_unified_view(
                 const char * detail = result.ok ? "no candidate scores" : luce_last_error();
                 count(result.ok ? "drafter.no_lifts" : "drafter.failed");
                 stats["drafter_error"] = detail ? detail : "";
+                // PFLASH_FAIL_CLOSED=1 refuses the request, as a failed compression on the chat view; otherwise the
+                // newest content is served verbatim and the view continues.
+                if (http_detail::pflash_fail_closed_from_env()) {
+                    prepared.pflash_failure_detail = detail ? detail : "";
+                    return "PFlash unified view: the drafter pass gave no scores";
+                }
                 std::fprintf(stderr, "[pflash-unified] drafter pass gave no scores (%s): nothing paged or recalled\n",
                              detail ? detail : "");
                 std::fflush(stderr);
             }
         }
+        // The request probe's own pins (the question it found, its recency pin) stay whole, as in the chat view's
+        // selection. An earlier region kept its question's units when it was paged.
+        const auto probe_pinned = [&] (int begin, int end) {
+            for (const auto & span : result.probe_pins) {
+                if (begin < span.end && end > span.begin) return true;
+            }
+            return false;
+        };
         // A unit's score: the token-weighted mean lift of the candidates over it.
         const auto unit_score = [&] (int begin, int end) {
             double sum = 0.0;
@@ -7562,7 +7714,7 @@ std::string HttpServer::apply_unified_view(
             return result.budget_widened ? (std::min)(droppable, cap + cap / 2) : cap;
         };
 
-        // §3 paging, per region: units between clean line cuts, admitted by score under the cap.
+        // Paging, per region: units between clean line cuts, admitted by score under the cap.
         struct Splice {
             int begin = 0;                   // raw target tokens [begin, end) replaced by ``tokens``
             int end = 0;
@@ -7628,7 +7780,9 @@ std::string HttpServer::apply_unified_view(
                 region.unit_de.push_back(cut_d[(size_t) u + 1]);
                 cost[(size_t) u] = cut_t[(size_t) u + 1] - cut_t[(size_t) u];
                 score[(size_t) u] = unit_score(cut_d[(size_t) u], cut_d[(size_t) u + 1]);
-                region.mandatory[(size_t) u] = pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ? 1 : 0;
+                region.mandatory[(size_t) u] =
+                    pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ||
+                    probe_pinned(cut_d[(size_t) u], cut_d[(size_t) u + 1]) ? 1 : 0;
                 if (!region.mandatory[(size_t) u]) droppable += cost[(size_t) u];
             }
             if (droppable <= 0) {
@@ -7751,7 +7905,7 @@ std::string HttpServer::apply_unified_view(
             splices.push_back(std::move(splice));
         }
 
-        // §7: a newest message served verbatim (rejected above, or fallen back while paging) that repeats lines of
+        // Re-reads: a newest message served verbatim (rejected above, or fallen back while paging) that repeats lines of
         // an earlier region covers them; a unit whose informative lines are all covered is held (never recalled).
         int covered_units = 0;
         for (size_t k : verbatim) {
@@ -7775,7 +7929,7 @@ std::string HttpServer::apply_unified_view(
             }
         }
 
-        // §5 recall: each earlier region's unheld units, best first, under the region's cap, appended as
+        // Recall: each earlier region's unheld units, best first, under the region's cap, appended as
         // labelled excerpts at the start of the question; nothing served before is touched.
         json recall_stats = nullptr;
         json gate_stats = nullptr;
@@ -8025,7 +8179,7 @@ std::string HttpServer::apply_unified_view(
             }
         }
 
-        // §4: the served prompt = the view's served prefix, then the raw prompt from where the view ended with
+        // The served prompt = the view's served prefix, then the raw prompt from where the view ended with
         // every splice applied (raw target slices between them).
         std::stable_sort(splices.begin(), splices.end(),
                          [] (const Splice & a, const Splice & b) { return a.begin < b.begin; });
@@ -8070,14 +8224,14 @@ std::string HttpServer::apply_unified_view(
         add_raw(raw_gen_begin, prompt_tokens, "generation");
 
         if (continues && config_.max_ctx > 0 && (int) served.size() + req.max_output > config_.max_ctx) {
-            // §6: a view that cannot continue is reset to admission on the raw prompt.
+            // A view that cannot continue is reset to admission on the raw prompt.
             count("reset.context");
             stats["reset"] = "context";
             stats.erase("recall_gate");
             stats.erase("recall_units");
             continue;
         }
-        // §6: a turn served raw instead of continuing a stored view leaves a raw view (no regions), so its
+        // A turn served raw instead of continuing a stored view leaves a raw view (no regions), so its
         // descendants continue what it served rather than the view it replaced. Not when the raw prompt does
         // not fit either: a retry with a smaller output allowance may still continue that view.
         const bool raw_fits = config_.max_ctx <= 0 || prompt_tokens + req.max_output <= config_.max_ctx;
@@ -8130,6 +8284,7 @@ std::string HttpServer::apply_unified_view(
 
         prepared.tokens = served;
         prepared.compressed = served != raw;
+        prepared.unified_view = true;
         prepared.snapshot_cut = next.view_gen_begin;
         prepared.pflash_stats = {
             {"unified", stats},
@@ -8147,12 +8302,17 @@ std::string HttpServer::apply_unified_view(
             if (result.budget_widened) prepared.pflash_stats["stage2"] = {{"widened", true}};
         }
         std::fprintf(stderr,
-            "[pflash-unified] %s turn=%d served=%zu raw=%d reused=%d regions=+%zu/%zu recall=%s\n",
+            "[pflash-unified] %s turn=%d served=%zu raw=%d reused=%d regions=+%zu/%zu recall=%s%s%s\n",
             decision, turn_index, served.size(), prompt_tokens, continues ? view.view_gen_begin : 0,
             new_regions.size(), next.regions.size(),
-            recall_fired ? "fired" : (recall_stats.is_array() ? "empty" : (recall ? "unscored" : "no")));
+            recall_fired ? "fired" : (recall_stats.is_array() ? "empty" : (recall ? "unscored" : "no")),
+            disk_cache_.disabled() ? "" : " cached_source=",
+            disk_cache_.disabled() ? "" : restorable_prefix.source);
         std::fflush(stderr);
-        pflash_unified_views_.remember(std::move(next));
+        // A view the RAM store evicts goes to disk (with the disk session cache on), as an evicted KV snapshot does.
+        for (const auto & evicted : pflash_unified_views_.remember(std::move(next))) {
+            if (pflash_unified_disk_views_.enabled()) pflash_unified_disk_views_.save(evicted);
+        }
         if (prepared.compressed) trace_pflash_served(req, prepared);
         return {};
     }
@@ -8291,6 +8451,8 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
                 // admission and revive dropped history on the next turn.
                 const size_t forgotten = pflash_views_.forget(req.prompt_tokens);
                 if (forgotten > 0) record["views_forgotten"] = forgotten;
+                const size_t unified_forgotten = forget_unified_views(req.prompt_tokens);
+                if (unified_forgotten > 0) record["unified_lineages_forgotten"] = unified_forgotten;
                 const std::string unified_handback = prepared.unified_handback;
                 prepared = std::move(uncompressed);
                 prepared.unified_handback = unified_handback;
@@ -8314,6 +8476,9 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         prepared.error = context_overflow_message(
             config_.max_ctx, prompt_length, req.max_output);
     }
+    // A request the chat view serves after a hand-back ends the conversation's unified views; one refused keeps
+    // them, so a retry can still continue its view.
+    if (prepared.error.empty() && !prepared.unified_handback.empty()) forget_unified_views(req.prompt_tokens);
     return prepared;
 }
 
@@ -8601,7 +8766,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     bool disk_lookup = !cache.using_restore;
     const int ram_prefix_len = cache.using_restore ? cache.prefix_len : 0;
     if (cache.using_restore && !disk_cache_.disabled() &&
-        !prepared.compressed && disk_probe.len > 0 && disk_probe.cur_pos > cache.prefix_len &&
+        (!prepared.compressed || prepared.unified_view) && disk_probe.len > 0 &&
+        disk_probe.cur_pos > cache.prefix_len &&
         disk_probe.len < (int) effective_prompt.size()) {
         lookup_lengths.assign(1, disk_probe.len);
         disk_lookup = true;
@@ -8957,10 +9123,12 @@ void HttpServer::finalize_generation_cache(
                     backend_.snapshot_bytes_estimate(saved_position));
                 trim_snapshots_after_commit(cache.snap_slot);
                 // The disk key is exact: it must not claim rows the snapshot
-                // lacks. A compressed view is never written to disk, so it
-                // gets no key. The write happens only if this snapshot is
-                // evicted from RAM (evict_inline_slot) or at shutdown.
-                if (!prepared.compressed &&
+                // lacks. A compressed prompt gets no key, except one served
+                // from a unified view: that view is kept on disk too, so the
+                // conversation's next request serves the same tokens again.
+                // The write happens only if this snapshot is evicted from RAM
+                // (evict_inline_slot) or at shutdown.
+                if ((!prepared.compressed || prepared.unified_view) &&
                     cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
                     slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
                         effective_prompt.begin(),
@@ -9145,6 +9313,13 @@ void HttpServer::flush_sessions_to_disk(const char * reason) {
         return std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
     };
+    // The views of shortened conversations first: they are small, and a shortened conversation's KV state is only
+    // reused through its view.
+    if (pflash_unified_disk_views_.enabled()) {
+        size_t views = 0;
+        for (const auto & view : pflash_unified_views_.all()) views += pflash_unified_disk_views_.save(view) ? 1 : 0;
+        std::fprintf(stderr, "[pflash-unified] %s flush: %zu views written\n", reason, views);
+    }
     size_t queued = 0, backups = 0, skipped = 0;
     const auto before = disk_cache_.stats();
     // Graceful shutdown evicts everything: each conversation's newest

@@ -33,6 +33,7 @@
 #include "server_status.h"
 #include "sse_emitter.h"
 #include "pflash_unified.h"
+#include "pflash/pflash_selection.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -665,6 +666,9 @@ struct PflashFallbackDecision {
     std::string refused;
 };
 bool pflash_fail_closed_from_env() noexcept;
+// Whether a strict selection scores every candidate (the block-15 head over segments), which the unified view pages
+// by; the legacy and split scorers (or PFLASH_QWEN35_LEGACY_SCORER=1) and the fold strategy do not.
+bool pflash_selection_gives_lifts(const luce::pflash::PFlashSelectionConfig & selection) noexcept;
 // Short machine-readable reason for a PFlash error string (and the backend's
 // last error, when the drafter reported one): "nonfinite_scores",
 // "compress_failed", "ceiling_exceeded", "mapping_failed", "remote_drafter",
@@ -753,6 +757,17 @@ int pflash_raw_base_target(
     const std::vector<int32_t> & prompt, const Tokenizer & drafter,
     const std::vector<int32_t> & drafter_ids,
     const std::vector<PflashChatTurn> & turns, int turn);
+// The restorable prefix PFlash admission counts: the RAM prefix snapshot, or
+// the deepest entry of the disk session cache when that cache is on and holds
+// more (a restarted server, or a session written out on eviction). Ties go to
+// RAM. With the disk cache off it is the RAM prefix, and ``source`` is "ram"
+// (or "none" when nothing is cached).
+struct PflashRestorablePrefix {
+    int tokens = 0;
+    const char * source = "none";
+};
+PflashRestorablePrefix pflash_restorable_prefix(
+    int ram_tokens, bool disk_enabled, int disk_tokens) noexcept;
 // Tokens of the canonical ``spans`` inside [begin, end).
 int pflash_span_tokens_within(
     const std::vector<PFlashTokenSpan> & spans, int begin, int end) noexcept;
@@ -979,6 +994,9 @@ private:
         nlohmann::json pflash_stats;
         // PFLASH_UNIFIED=1: why the unified view handed this request to the chat view ("" = it did not).
         std::string unified_handback;
+        // PFLASH_UNIFIED=1: served from a unified view. A compressed one may still get a disk key (its served tokens):
+        // the view is kept on disk too, so a resumed conversation serves the same tokens again.
+        bool unified_view = false;
         int error_status = 0;
         std::string error;
         // The drafter's own error when compression failed in the backend
@@ -996,7 +1014,7 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
-    // PFLASH_UNIFIED=1, after the shared query and pins (A1): pages the newest turn's large uncached content
+    // PFLASH_UNIFIED=1, after the shared query and pins: pages the newest turn's large uncached content
     // (a user message, or listed tool outputs), continues the conversation's view, and recalls unheld units of
     // earlier regions at a new user question. ``request`` carries the drafter ids, the pinned spans and the
     // learned query; ``messages`` the normalised messages the prompt was rendered from. ``handback`` set (the
@@ -1008,6 +1026,10 @@ private:
                                    const std::vector<ChatMessage> & messages,
                                    ModelBackend::CompressRequest request, int chunk_size,
                                    const std::string & not_ready, std::string & handback);
+    // A conversation that left the unified view (a raw fallback, or a hand-back to the chat view) is not continued
+    // later from one of its views: drops the lineages these raw tokens would continue, in RAM and on disk. Returns
+    // how many.
+    size_t forget_unified_views(const std::vector<int32_t> & raw_tokens);
     // Multi-turn: serve the conversation's previous view plus this turn's
     // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
     // the parts the fresh selection keeps -- with the segments the fresh
@@ -1034,10 +1056,15 @@ private:
         bool keep_history = false);
     // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
     // the served prompt's text, for evidence checks in evaluations.
-    // Target tokens of ``prompt`` the reader can restore from its in-memory
-    // prefix cache right now (a live backend snapshot, its authoritative
-    // position); no cache state changes.
-    int restorable_prefix_tokens(const std::vector<int32_t> & prompt);
+    // Target tokens of ``prompt`` the reader can restore right now: its
+    // in-memory prefix cache (a live backend snapshot, its authoritative
+    // position) or, when the disk session cache is on and the request's disk
+    // policy is Full (the scope the generation path looks up), the deepest
+    // disk entry -- an index lookup, no file read. No cache state changes.
+    http_detail::PflashRestorablePrefix restorable_prefix_tokens(
+        const std::vector<int32_t> & prompt,
+        const DiskPrefixCachePolicy & disk_policy);
+    int ram_restorable_prefix_tokens(const std::vector<int32_t> & prompt);
     // Serve a PflashRegionPlan turn from the selection's kept spans; false
     // when it cannot be served (the caller serves the raw prompt).
     bool serve_pflash_region_view(
@@ -1259,11 +1286,11 @@ private:
     // Multi-turn PFlash views, matched by raw prompt prefix.
     http_detail::PflashChatViewStore pflash_views_;
 
-    // PFLASH_UNIFIED=1, read once at construction (STAGE1-DESIGN.md): one view and recall mechanism for chat
+    // PFLASH_UNIFIED=1, read once at construction: one view and recall mechanism for chat
     // and agent sessions. Unset, none of it runs and nothing below is read.
     bool pflash_unified_ = false;
     bool pflash_unified_recall_ = true;
-    // PFLASH_RECALL_GATE=<theta> (recall/FABLE-RECALL-GATE.md; default 0.075 under PFLASH_UNIFIED=1): recall only
+    // PFLASH_RECALL_GATE=<theta> (default 0.075 under PFLASH_UNIFIED=1): recall only
     // while the head mass on unheld units is at least theta of the context mass; also skips the drafter pass when
     // every unit of every region is held. < 0 = "off" (fill each region's cap).
     double pflash_recall_gate_ = -1.0;
@@ -1273,6 +1300,7 @@ private:
     pflash_unified::ToolList pflash_region_tools_;
     std::string pflash_unified_config_;   // config identity a stored view must match
     pflash_unified::ViewStore pflash_unified_views_;
+    pflash_unified::ViewDiskStore pflash_unified_disk_views_;   // with the disk session cache on
     std::atomic<uint64_t> pflash_unified_lineage_{0};
 
     // Live status tracker (read by /status/json, written by worker thread).

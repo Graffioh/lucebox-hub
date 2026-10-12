@@ -188,6 +188,13 @@ struct PFlashCandidateLift {
 };
 const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts();
 
+// The pins the request probe added to the last strict selection on this
+// thread: the query tokens it picked and its recency pin (not the caller's
+// pins, nor PFLASH_QUERY_PIN's top units). A caller that selects by the
+// candidate lifts itself keeps them. Cleared with the kept spans.
+const std::vector<PFlashTokenSpan> & pflash_last_probe_pins();
+void pflash_set_probe_pins(std::vector<PFlashTokenSpan> pins);
+
 // Relevance spread of one selection (PFLASH_FALLBACK_SPREAD): with
 // p_i = s_i / sum(s) over every candidate's score (the trace's
 // ``chunk_scores``), H = -sum_{p_i > 0} p_i ln p_i and k = the selected

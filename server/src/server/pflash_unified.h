@@ -1,7 +1,7 @@
 #pragma once
 
 // PFLASH_UNIFIED=1: one view/recall mechanism for chat and agent sessions
-// (.benchmark-work/round13-data/agent-pager/STAGE1-DESIGN.md, amendments A1-A4, A6).
+// (server/README.md, PFlash).
 // The pure parts: the tool list, line-structure detection, region layout,
 // marker and label text, greedy admission of units under a cap, re-read
 // matching and the view store. Nothing here knows a harness's output format,
@@ -59,7 +59,7 @@ Lines split_lines(const std::string & text, size_t begin, size_t end, bool escap
 // value, surrounding whitespace allowed; keys are not values. Empty when it is not JSON.
 std::vector<std::pair<size_t, size_t>> json_string_values(const std::string & text, size_t begin, size_t end);
 
-// The structure to page (A6): the plain lines of the content, or the escaped lines of one of its JSON string
+// The structure to page: the plain lines of the content, or the escaped lines of one of its JSON string
 // values, whichever has the most lines; ties go to plain.
 Lines detect_lines(const std::string & text, size_t begin, size_t end);
 
@@ -144,7 +144,7 @@ Admission admit_recall(const std::vector<int> & unit_cost, const std::vector<cha
                        const std::vector<int> & order, int cap,
                        const std::function<int(int, int)> & label_cost);
 
-// PFLASH_RECALL_GATE (recall/FABLE-RECALL-GATE.md §2.1): recall what the question needs. One region's candidates:
+// PFLASH_RECALL_GATE: recall what the question needs. One region's candidates:
 // per unit its token cost, held flag, score (mean lift: the ranking key) and head mass (its share of the head's
 // mass on the whole prompt); the region's cap and the label cost of one excerpt run.
 struct RecallRegion {
@@ -173,7 +173,7 @@ GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double
 // Units best first: higher score first, document order on ties; ``skip`` units are left out.
 std::vector<int> rank_units(const std::vector<double> & score, const std::vector<char> & skip);
 
-// ── Re-reads (A6) ──────────────────────────────────────────────────────
+// ── Re-reads ──────────────────────────────────────────────────────────
 
 // Line fingerprints of a structure (CR stripped; blank lines 0).
 std::vector<uint64_t> line_hashes(const std::string & text, const Lines & lines);
@@ -247,16 +247,22 @@ struct View {
 // Views by raw prefix. ``find``: the longest stored view whose raw tokens up to its generation prompt prefix this
 // request's (target and drafter alike) and whose config identity matches; newest on ties; a copy. ``remember``
 // adds a view and evicts the least recently used views over ``capacity`` or ``byte_cap``, never the newest one;
-// the view it continued stays, so a fork or an edited request continues it (A4).
+// the view it continued stays, so a fork or an edited request continues it.
 class ViewStore {
 public:
     ViewStore(size_t capacity = 16, size_t byte_cap = (size_t) 256 << 20)
         : capacity_(capacity), byte_cap_(byte_cap) {}
     bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
               const std::string & config, View & out);
-    void remember(View view);
+    // Returns the views it evicted (the server writes them to disk when the disk session cache is on).
+    std::vector<View> remember(View view);
+    // Every stored view, most recently used first (the shutdown flush).
+    std::vector<View> all() const;
     // Drops every view of ``lineage`` (each turn's view is its own entry, so an ancestor would match next).
     void forget_lineage(uint64_t lineage);
+    // The lineages of the views a request with these raw tokens could continue (raw prefix up to the generation
+    // prompt, any config).
+    std::vector<uint64_t> lineages_continued_by(const std::vector<int32_t> & raw_tokens) const;
     size_t size() const;
     size_t bytes() const;
 
@@ -270,6 +276,62 @@ private:
     size_t byte_cap_;
     uint64_t clock_ = 0;
     std::vector<Entry> entries_;
+};
+
+// ── Views on disk (the SSD session cache) ─────────────────────────────
+
+// A view as JSON, every field (its disk form), and back. ``view_from_json`` fails closed: false with ``error`` for
+// anything that is not a complete view whose offsets and per-unit and per-line vectors agree.
+nlohmann::json view_to_json(const View & view);
+bool view_from_json(const nlohmann::json & j, View & view, std::string & error);
+
+// Views of shortened conversations kept on disk next to the KV cache, so a conversation survives a restart or the
+// RAM store's eviction: written when a view leaves the RAM store and at shutdown, read on a RAM miss. One file per
+// view: a one-line header (identity, config, prefix lengths and hashes) that ``init`` indexes, then the view. A view
+// written under another ``identity`` (the disk cache's salt: model, template, context) is never read; any file older
+// than ``ttl_seconds`` (0: never) is deleted at ``init``; over ``cap`` views the least recently written go.
+class ViewDiskStore {
+public:
+    bool init(const std::string & dir, const std::string & identity, uint64_t ttl_seconds, size_t cap);
+    bool enabled() const;
+    // Writes ``view`` (a temporary file, then a rename), replacing the file of the same prefixes and config.
+    bool save(const View & view);
+    // ViewStore::find over the views on disk whose raw prefix is longer than ``longer_than`` tokens. The file is read
+    // and both prefixes compared token by token before it is returned; a file that does not load is deleted.
+    bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
+              const std::string & config, size_t longer_than, View & out);
+    void forget_lineage(uint64_t lineage);
+    // ViewStore::lineages_continued_by over the views on disk, from their headers (no file is read).
+    std::vector<uint64_t> lineages_continued_by(const std::vector<int32_t> & raw_tokens) const;
+    size_t size() const;
+    // The largest lineage on disk: a restarted server numbers its new conversations after it.
+    uint64_t max_lineage() const;
+    // Milliseconds since the epoch for write stamps and the TTL (tests inject one).
+    void set_clock(std::function<uint64_t()> clock);
+
+private:
+    struct Meta {
+        std::string path;
+        uint64_t lineage = 0;
+        std::string config;
+        size_t raw_len = 0;
+        size_t drafter_len = 0;
+        uint64_t raw_hash = 0;
+        uint64_t drafter_hash = 0;
+        uint64_t written = 0;   // ms since the epoch
+    };
+    void enforce_cap_locked();
+    void remove_locked(size_t index);
+    mutable std::mutex mutex_;
+    bool enabled_ = false;
+    std::string dir_;
+    std::string identity_;
+    uint64_t ttl_ = 0;
+    size_t cap_ = 0;
+    uint64_t last_written_ = 0;   // writes are strictly ordered, also within one millisecond
+    std::function<uint64_t()> clock_;
+    uint64_t now() const;
+    std::vector<Meta> metas_;
 };
 
 // Hex SHA-1 of ``bytes`` (region identity).

@@ -6,8 +6,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace pflash_unified;
 
@@ -432,6 +436,230 @@ TEST_CASE(PFlashUnifiedFixture, unified_view_store_finds_longest_prefix_and_keep
     REQUIRE(store.size() == 3);
     REQUIRE(!store.find({1, 2, 3, 0}, {1, 2, 3, 0}, "c", out));
     REQUIRE(store.find({8, 8, 1}, {8, 8, 1}, "c", out));
+}
+
+// A small view with one region whose per-unit and per-line vectors agree.
+static View disk_test_view(const std::vector<int32_t> & raw, int gen, const std::string & config, uint64_t lineage) {
+    View v;
+    v.lineage = lineage;
+    v.version = 2;
+    v.config = config;
+    v.raw_tokens = raw;
+    v.raw_gen_begin = gen;
+    v.drafter_ids = raw;
+    v.drafter_gen_begin = gen;
+    v.view_tokens = {raw.front(), 99, raw.back()};
+    v.view_gen_begin = 2;
+    v.turns = 1;
+    Region r;
+    r.kind = RegionKind::ToolOutput;
+    r.brief = "read_file(a.md)";
+    r.tool_call_id = "call_1";
+    r.content_sha = "ab";
+    r.cb = 3;
+    r.ce = 30;
+    r.te = 2;
+    r.de = 2;
+    r.lines.escaped = true;
+    r.lines.begin = 3;
+    r.lines.end = 30;
+    r.lines.starts = {3, 12, 21};
+    r.lines.ends = {10, 19, 30};
+    r.layout.head_end = 12;
+    r.layout.tail_begin = 21;
+    r.layout.cuts = {12, 21};
+    r.layout.cut_line = {1, 2};
+    r.hashes = {0, 18446744073709551615ULL, 7};
+    r.unit_tb = {0};
+    r.unit_te = {1};
+    r.unit_db = {0};
+    r.unit_de = {1};
+    r.mandatory = {0};
+    r.kept = {1};
+    r.held = {1};
+    r.reread = {0, 1, 0};
+    r.cap = 5;
+    r.droppable = 9;
+    r.recalled_tokens = 2;
+    v.regions.push_back(r);
+    v.pieces.push_back({0, 1, "raw", -1, 0});
+    v.pieces.push_back({1, 2, "paged_text", 0, 0});
+    return v;
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_view_json_round_trip_fails_closed) {
+    const View v = disk_test_view({1, 2, 3, 4, 9}, 4, "c", 42);
+    View back;
+    std::string error;
+    REQUIRE(view_from_json(view_to_json(v), back, error));
+    REQUIRE(view_to_json(back) == view_to_json(v));
+    REQUIRE(back.regions[0].hashes[1] == 18446744073709551615ULL);
+    REQUIRE(back.lineage == 42 && back.regions[0].kind == RegionKind::ToolOutput && back.regions[0].lines.escaped);
+    const auto broken = [&] (const std::function<void(nlohmann::json &)> & edit) {
+        auto j = view_to_json(v);
+        edit(j);
+        View out;
+        std::string why;
+        return !view_from_json(j, out, why) && !why.empty();
+    };
+    REQUIRE(broken([] (nlohmann::json & j) { j["format"] = 2; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j.erase("raw_tokens"); }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["view_gen_begin"] = 9; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["kept"] = "11"; }));       // one unit
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["held"] = "x"; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["te"] = 50; }));          // past the raw prompt
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["kind"] = "other"; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["pieces"][0][1] = 50; }));             // past the view
+    REQUIRE(broken([] (nlohmann::json & j) { j["pieces"][1][3] = 3; }));              // no such region
+    REQUIRE(broken([] (nlohmann::json & j) { j["pieces"][1][3] = -2; }));
+    // Vectors serving indexes per line or per unit, and the offsets it walks, must agree.
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["reread"] = ""; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["hashes"] = nlohmann::json::array(); }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["lines"]["starts"] = {3, 2, 21}; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["lines"]["ends"] = {10, 19, 40}; }));   // past the content
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["layout"]["cuts"] = {21, 12}; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["layout"]["cut_line"] = {1, 3}; }));   // no line 3
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["layout"]["head_end"] = 11; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["unit_te"] = {3}; }));     // past the content's tokens
+    REQUIRE(broken([] (nlohmann::json & j) { j["regions"][0]["unit_db"] = {2}; }));
+    REQUIRE(broken([] (nlohmann::json & j) { j["raw_gen_begin"] = 1; }));            // region after the generation
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_view_stores_name_the_lineages_a_prompt_continues) {
+    namespace fs = std::filesystem;
+    ViewStore store;
+    store.remember(disk_test_view({1, 2, 3, 9}, 3, "c", 1));
+    store.remember(disk_test_view({1, 2, 3, 4, 5, 9}, 5, "other", 2));
+    store.remember(disk_test_view({7, 7, 9}, 2, "c", 3));
+    auto lineages = store.lineages_continued_by({1, 2, 3, 4, 5, 6});
+    std::sort(lineages.begin(), lineages.end());
+    REQUIRE(lineages == std::vector<uint64_t>({1, 2}));   // any config: none of them may continue
+    REQUIRE(store.lineages_continued_by({1, 2, 4}).empty());
+
+    const fs::path dir = fs::temp_directory_path() / ("luce_test_view_lineages_" + std::to_string(getpid()));
+    fs::remove_all(dir);
+    ViewDiskStore disk;
+    REQUIRE(disk.lineages_continued_by({1, 2, 3, 4}).empty());   // not initialised
+    REQUIRE(disk.init(dir.string(), "id-a", 0, 8));
+    REQUIRE(disk.save(disk_test_view({1, 2, 3, 9}, 3, "c", 1)));
+    REQUIRE(disk.save(disk_test_view({7, 7, 9}, 2, "c", 3)));
+    REQUIRE(disk.lineages_continued_by({1, 2, 3, 4}) == std::vector<uint64_t>({1}));
+    REQUIRE(disk.lineages_continued_by({1, 2}).empty());
+    fs::remove_all(dir);
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_view_disk_store_applies_the_ttl_at_lookup) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("luce_test_view_ttl_" + std::to_string(getpid()));
+    fs::remove_all(dir);
+    uint64_t now = 1'000'000'000;
+    ViewDiskStore store;
+    store.set_clock([&] { return now; });
+    REQUIRE(store.init(dir.string(), "id-a", 3600, 8));
+    REQUIRE(store.save(disk_test_view({1, 2, 3, 9}, 3, "c", 1)));
+    View out;
+    now += 3600 * 1000;
+    REQUIRE(store.find({1, 2, 3, 7}, {1, 2, 3, 7}, "c", 0, out));   // at the TTL: still there
+    now += 1;
+    REQUIRE(!store.find({1, 2, 3, 7}, {1, 2, 3, 7}, "c", 0, out));  // past it: gone, file and all
+    REQUIRE(store.size() == 0);
+    REQUIRE(fs::is_empty(dir));
+    fs::remove_all(dir);
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_view_disk_store_restart_identity_cap_and_ttl) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("luce_test_view_disk_" + std::to_string(getpid()));
+    fs::remove_all(dir);
+    const auto view_files = [&] {
+        std::vector<fs::path> out;
+        for (const auto & e : fs::directory_iterator(dir)) {
+            if (e.path().extension() == ".view") out.push_back(e.path());
+        }
+        return out;
+    };
+    {
+        ViewDiskStore store;
+        REQUIRE(store.init(dir.string(), "id-a", 0, 3));
+        REQUIRE(store.save(disk_test_view({1, 2, 3, 9}, 3, "c", 1)));
+        REQUIRE(store.save(disk_test_view({1, 2, 3, 4, 5, 9}, 5, "c", 1)));
+        REQUIRE(store.save(disk_test_view({1, 2, 3, 4, 5, 9}, 5, "c", 1)));   // the same prefixes: replaced
+        REQUIRE(store.size() == 2 && view_files().size() == 2);
+    }
+    {
+        // A new process rebuilds the index from the headers and reads a view only when it matches.
+        ViewDiskStore store;
+        REQUIRE(store.init(dir.string(), "id-a", 0, 3));
+        REQUIRE(store.size() == 2);
+        REQUIRE(store.max_lineage() == 1);
+        View out;
+        REQUIRE(store.find({1, 2, 3, 4, 5, 6, 7}, {1, 2, 3, 4, 5, 6, 7}, "c", 0, out));
+        REQUIRE(view_to_json(out) == view_to_json(disk_test_view({1, 2, 3, 4, 5, 9}, 5, "c", 1)));
+        REQUIRE(store.find({1, 2, 3, 7}, {1, 2, 3, 7}, "c", 0, out));   // a fork continues the ancestor
+        REQUIRE(out.raw_gen_begin == 3);
+        REQUIRE(!store.find({1, 2, 3, 4, 5, 6}, {1, 2, 3, 4, 5, 6}, "c", 5, out));   // RAM holds as long a view
+        REQUIRE(!store.find({1, 2, 3, 4, 5, 6}, {1, 2, 3, 4, 5, 6}, "other", 0, out));
+        REQUIRE(!store.find({1, 2, 3, 4, 5, 6}, {1, 2, 9, 4, 5, 6}, "c", 0, out));   // drafter ids must match too
+        // Over the cap the least recently written goes.
+        REQUIRE(store.save(disk_test_view({7, 7, 9}, 2, "c", 2)));
+        REQUIRE(store.save(disk_test_view({8, 8, 9}, 2, "c", 3)));
+        REQUIRE(store.size() == 3 && view_files().size() == 3);
+        REQUIRE(!store.find({1, 2, 3, 7}, {1, 2, 3, 7}, "c", 0, out));
+        REQUIRE(store.find({1, 2, 3, 4, 5, 6, 7}, {1, 2, 3, 4, 5, 6, 7}, "c", 0, out));
+        // A conversation the chat view took over leaves the disk too.
+        store.forget_lineage(1);
+        REQUIRE(store.size() == 2 && view_files().size() == 2);
+        REQUIRE(!store.find({1, 2, 3, 4, 5, 6, 7}, {1, 2, 3, 4, 5, 6, 7}, "c", 0, out));
+    }
+    {
+        // Another identity (model, template, context) never reads these views.
+        ViewDiskStore other;
+        REQUIRE(other.init(dir.string(), "id-b", 0, 3));
+        REQUIRE(other.size() == 0);
+        View out;
+        REQUIRE(!other.find({7, 7, 1}, {7, 7, 1}, "c", 0, out));
+        REQUIRE(view_files().size() == 2);
+    }
+    {
+        // A view whose body does not load is deleted when read; the request then has no view.
+        for (const auto & file : view_files()) {
+            std::ifstream in(file);
+            std::string header;
+            std::getline(in, header);
+            in.close();
+            if (header.find("\"lineage\":2") == std::string::npos) continue;
+            std::ofstream(file, std::ios::trunc) << header << "\n{\"format\":1}\n";
+        }
+        ViewDiskStore store;
+        REQUIRE(store.init(dir.string(), "id-a", 0, 3));
+        View out;
+        REQUIRE(!store.find({7, 7, 1}, {7, 7, 1}, "c", 0, out));
+        REQUIRE(store.size() == 1 && view_files().size() == 1);
+        REQUIRE(store.find({8, 8, 1}, {8, 8, 1}, "c", 0, out));
+    }
+    {
+        // At startup: an unfinished write is removed, and so is a view older than the TTL.
+        std::ofstream(dir / "x.view.tmp") << "partial";
+        std::ofstream(dir / "old.view") << nlohmann::json({{"format", 1}, {"identity", "id-a"}, {"lineage", 9},
+                                                             {"config", "c"}, {"raw_len", 1}, {"raw_hash", 1},
+                                                             {"drafter_len", 1}, {"drafter_hash", 1},
+                                                             {"written", 1000}}).dump() << "\n{}\n";
+        ViewDiskStore store;
+        REQUIRE(store.init(dir.string(), "id-a", 3600, 3));
+        REQUIRE(store.size() == 1);
+        REQUIRE(!fs::exists(dir / "x.view.tmp") && !fs::exists(dir / "old.view"));
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_view_store_reports_evicted_views) {
+    ViewStore store(2, (size_t) 1 << 30);
+    REQUIRE(store.remember(disk_test_view({1, 9}, 1, "c", 1)).empty());
+    REQUIRE(store.remember(disk_test_view({2, 9}, 1, "c", 2)).empty());
+    const auto evicted = store.remember(disk_test_view({3, 9}, 1, "c", 3));
+    REQUIRE(evicted.size() == 1 && evicted[0].lineage == 1);
+    const auto all = store.all();
+    REQUIRE(all.size() == 2 && all[0].lineage == 3 && all[1].lineage == 2);   // most recently used first
 }
 
 TEST_CASE(PFlashUnifiedFixture, unified_text_helpers) {

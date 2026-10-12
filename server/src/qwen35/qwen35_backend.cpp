@@ -1509,6 +1509,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
             for (const auto & candidate : pflash_last_candidate_lifts()) {
                 result.candidate_lifts.push_back({candidate.span, candidate.lift});
             }
+            result.probe_pins = pflash_last_probe_pins();
         }
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",

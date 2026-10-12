@@ -5740,6 +5740,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
             for (const auto & candidate : pflash_last_candidate_lifts()) {
                 result.candidate_lifts.push_back({candidate.span, candidate.lift});
             }
+            result.probe_pins = pflash_last_probe_pins();
         }
     }
 
