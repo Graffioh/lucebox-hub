@@ -967,6 +967,9 @@ private:
         nlohmann::json pflash_stats;
         // PFLASH_UNIFIED=1: why the unified view handed this request to the chat view ("" = it did not).
         std::string unified_handback;
+        // PFLASH_UNIFIED=1: served from a unified view. A compressed one may still get a disk key (its served tokens):
+        // the view is kept on disk too, so a resumed conversation serves the same tokens again.
+        bool unified_view = false;
         int error_status = 0;
         std::string error;
         // The drafter's own error when compression failed in the backend
@@ -1255,6 +1258,7 @@ private:
     pflash_unified::ToolList pflash_region_tools_;
     std::string pflash_unified_config_;   // config identity a stored view must match
     pflash_unified::ViewStore pflash_unified_views_;
+    pflash_unified::ViewDiskStore pflash_unified_disk_views_;   // with the disk session cache on
     std::atomic<uint64_t> pflash_unified_lineage_{0};
 
     // Live status tracker (read by /status/json, written by worker thread).

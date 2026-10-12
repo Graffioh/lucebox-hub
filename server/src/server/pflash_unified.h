@@ -254,7 +254,10 @@ public:
         : capacity_(capacity), byte_cap_(byte_cap) {}
     bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
               const std::string & config, View & out);
-    void remember(View view);
+    // Returns the views it evicted (the server writes them to disk when the disk session cache is on).
+    std::vector<View> remember(View view);
+    // Every stored view, most recently used first (the shutdown flush).
+    std::vector<View> all() const;
     // Drops every view of ``lineage`` (each turn's view is its own entry, so an ancestor would match next).
     void forget_lineage(uint64_t lineage);
     size_t size() const;
@@ -270,6 +273,56 @@ private:
     size_t byte_cap_;
     uint64_t clock_ = 0;
     std::vector<Entry> entries_;
+};
+
+// ── Views on disk (the SSD session cache) ─────────────────────────────
+
+// A view as JSON, every field (its disk form), and back. ``view_from_json`` fails closed: false with ``error`` for
+// anything that is not a complete view whose offsets and per-unit and per-line vectors agree.
+nlohmann::json view_to_json(const View & view);
+bool view_from_json(const nlohmann::json & j, View & view, std::string & error);
+
+// Views of shortened conversations kept on disk next to the KV cache, so a conversation survives a restart or the
+// RAM store's eviction: written when a view leaves the RAM store and at shutdown, read on a RAM miss. One file per
+// view: a one-line header (identity, config, prefix lengths and hashes) that ``init`` indexes, then the view. A view
+// written under another ``identity`` (the disk cache's salt: model, template, context) is never read; any file older
+// than ``ttl_seconds`` (0: never) is deleted at ``init``; over ``cap`` views the least recently written go.
+class ViewDiskStore {
+public:
+    bool init(const std::string & dir, const std::string & identity, uint64_t ttl_seconds, size_t cap);
+    bool enabled() const;
+    // Writes ``view`` (a temporary file, then a rename), replacing the file of the same prefixes and config.
+    bool save(const View & view);
+    // ViewStore::find over the views on disk whose raw prefix is longer than ``longer_than`` tokens. The file is read
+    // and both prefixes compared token by token before it is returned; a file that does not load is deleted.
+    bool find(const std::vector<int32_t> & raw_tokens, const std::vector<int32_t> & drafter_ids,
+              const std::string & config, size_t longer_than, View & out);
+    void forget_lineage(uint64_t lineage);
+    size_t size() const;
+    // The largest lineage on disk: a restarted server numbers its new conversations after it.
+    uint64_t max_lineage() const;
+
+private:
+    struct Meta {
+        std::string path;
+        uint64_t lineage = 0;
+        std::string config;
+        size_t raw_len = 0;
+        size_t drafter_len = 0;
+        uint64_t raw_hash = 0;
+        uint64_t drafter_hash = 0;
+        uint64_t written = 0;   // ms since the epoch
+    };
+    void enforce_cap_locked();
+    void remove_locked(size_t index);
+    mutable std::mutex mutex_;
+    bool enabled_ = false;
+    std::string dir_;
+    std::string identity_;
+    uint64_t ttl_ = 0;
+    size_t cap_ = 0;
+    uint64_t last_written_ = 0;   // writes are strictly ordered, also within one millisecond
+    std::vector<Meta> metas_;
 };
 
 // Hex SHA-1 of ``bytes`` (region identity).

@@ -150,9 +150,23 @@ When a session's state is written, its shallower files on disk are deleted,
 except a head at or below `--kv-cache-cold-max` tokens or, without one, the
 shallowest (a longer head).
 
-Compressed prompts (PFlash, FlowKV) are not raw history and never get a disk
-key; a request whose disk scope is not `full` gives its snapshots no key
-either.
+Compressed prompts (PFlash, FlowKV) are not raw history and get no disk key,
+except a prompt served from a PFlash unified view (`PFLASH_UNIFIED=1`): its
+key is the tokens it served, and the view itself is kept on disk too, so the
+conversation's next request serves the same tokens again and restores them. A
+request whose disk scope is not `full` gives its snapshots no key either.
+
+**Shortened conversations.** With the disk cache on, the unified view keeps its
+views (what each shortened conversation served, and which lines it left out) in
+`<kv-cache-dir>/.pflash-views`: a view is written when it leaves the RAM view
+store and at shutdown, and read when a request finds no view in RAM, so neither
+a restart nor an eviction turns a shortened conversation cold. One file per
+view, a one-line header indexed at startup; at most 256 views, the least
+recently written dropped first, and the cache's TTL applies. Views written for
+another model, template or context (the cache's identity salt) are never read.
+A view file that does not load is deleted and the request proceeds without it.
+The drafter's own scoring state stays in RAM only: after a restart, the first
+question that needs recall scores the earlier messages again.
 
 **How it is written.** Eviction hands the snapshot's buffer to the disk writer
 without a copy (Qwen keeps snapshots in host memory; other backends copy to

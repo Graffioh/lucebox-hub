@@ -2731,6 +2731,22 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         std::fprintf(stderr, "[pflash-unified] on: region tools=%s recall=%d recall_gate=%s\n",
                      pflash_region_tools_.identity.empty() ? "(none)" : pflash_region_tools_.identity.c_str(),
                      (int) pflash_unified_recall_, gate_text);
+        // With the disk session cache on, the views of shortened conversations are kept on disk too: written when
+        // they leave the RAM store and at shutdown, read on a RAM miss, so neither a restart nor an eviction turns a
+        // shortened conversation cold. Their identity is the disk cache's (model, template, context); the directory
+        // starts with a dot, so the KV cache's scan skips it.
+        if (!disk_cache_.disabled()) {
+            std::string identity;
+            for (uint8_t b : compute_disk_cache_salt(config_)) {
+                char hex_byte[3];
+                std::snprintf(hex_byte, sizeof hex_byte, "%02x", b);
+                identity += hex_byte;
+            }
+            pflash_unified_disk_views_.init(config_.disk_cache_dir + "/.pflash-views", identity,
+                                            disk_cache_ttl_seconds(config_.disk_cache_ttl_hours), 256);
+            // A new conversation must not take the lineage of one on disk (forget_lineage would drop that one).
+            pflash_unified_lineage_ = pflash_unified_disk_views_.max_lineage();
+        }
         std::fflush(stderr);
     }
 
@@ -6484,6 +6500,7 @@ json HttpServer::pflash_unified_json() const {
             {"recall_gate", pflash_recall_gate_ > 0.0 ? json(pflash_recall_gate_) : json(nullptr)},
             {"views", pflash_unified_views_.size()},
             {"view_bytes", pflash_unified_views_.bytes()},
+            {"disk_views", pflash_unified_disk_views_.size()},
             {"counts", pflash_unified_counts_}};
 }
 
@@ -7147,6 +7164,17 @@ std::string HttpServer::apply_unified_view(
 
     pu::View view;
     bool has_view = pflash_unified_views_.find(raw, drafter_ids, pflash_unified_config_, view);
+    // A view the RAM store no longer holds (a restart, or its eviction) may be on disk: a longer one wins.
+    if (pflash_unified_disk_views_.enabled()) {
+        const size_t ram_len = has_view ? (size_t) (std::max)(0, view.raw_gen_begin) : 0;
+        pu::View stored;
+        if (pflash_unified_disk_views_.find(raw, drafter_ids, pflash_unified_config_, ram_len, stored)) {
+            count("disk_view");
+            stats["disk_view"] = true;
+            view = std::move(stored);
+            has_view = true;
+        }
+    }
     const bool found_view = has_view;
     if (has_view && view.raw_tokens == raw && view.drafter_ids == drafter_ids) {
         // The same request again: what was served.
@@ -7156,6 +7184,7 @@ std::string HttpServer::apply_unified_view(
         stats["served_tokens"] = view.view_tokens.size();
         prepared.tokens = view.view_tokens;
         prepared.compressed = view.view_tokens != raw;
+        prepared.unified_view = true;
         prepared.snapshot_cut = view.view_gen_begin;
         prepared.pflash_stats = {{"unified", stats}, {"compress_ms", 0.0},
                                  {"drafter_input_tokens", input}};
@@ -7240,6 +7269,7 @@ std::string HttpServer::apply_unified_view(
                 if (!found_view) return hand_back("uncached");
                 // The chat view serves this turn: no later turn may continue the view it replaced (or an ancestor).
                 pflash_unified_views_.forget_lineage(view.lineage);
+                pflash_unified_disk_views_.forget_lineage(view.lineage);
                 return hand_back("reset_uncached");
             }
         }
@@ -7907,6 +7937,7 @@ std::string HttpServer::apply_unified_view(
 
         prepared.tokens = served;
         prepared.compressed = served != raw;
+        prepared.unified_view = true;
         prepared.snapshot_cut = next.view_gen_begin;
         prepared.pflash_stats = {
             {"unified", stats},
@@ -7931,7 +7962,10 @@ std::string HttpServer::apply_unified_view(
             disk_cache_.disabled() ? "" : " cached_source=",
             disk_cache_.disabled() ? "" : restorable_prefix.source);
         std::fflush(stderr);
-        pflash_unified_views_.remember(std::move(next));
+        // A view the RAM store evicts goes to disk (with the disk session cache on), as an evicted KV snapshot does.
+        for (const auto & evicted : pflash_unified_views_.remember(std::move(next))) {
+            if (pflash_unified_disk_views_.enabled()) pflash_unified_disk_views_.save(evicted);
+        }
         if (prepared.compressed) trace_pflash_served(req, prepared);
         return {};
     }
@@ -8375,7 +8409,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     bool disk_lookup = !cache.using_restore;
     const int ram_prefix_len = cache.using_restore ? cache.prefix_len : 0;
     if (cache.using_restore && !disk_cache_.disabled() &&
-        !prepared.compressed && disk_probe.len > 0 && disk_probe.cur_pos > cache.prefix_len &&
+        (!prepared.compressed || prepared.unified_view) && disk_probe.len > 0 &&
+        disk_probe.cur_pos > cache.prefix_len &&
         disk_probe.len < (int) effective_prompt.size()) {
         lookup_lengths.assign(1, disk_probe.len);
         disk_lookup = true;
@@ -8731,10 +8766,12 @@ void HttpServer::finalize_generation_cache(
                     backend_.snapshot_bytes_estimate(saved_position));
                 trim_snapshots_after_commit(cache.snap_slot);
                 // The disk key is exact: it must not claim rows the snapshot
-                // lacks. A compressed view is never written to disk, so it
-                // gets no key. The write happens only if this snapshot is
-                // evicted from RAM (evict_inline_slot) or at shutdown.
-                if (!prepared.compressed &&
+                // lacks. A compressed prompt gets no key, except one served
+                // from a unified view: that view is kept on disk too, so the
+                // conversation's next request serves the same tokens again.
+                // The write happens only if this snapshot is evicted from RAM
+                // (evict_inline_slot) or at shutdown.
+                if ((!prepared.compressed || prepared.unified_view) &&
                     cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
                     slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
                         effective_prompt.begin(),
@@ -8919,6 +8956,13 @@ void HttpServer::flush_sessions_to_disk(const char * reason) {
         return std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
     };
+    // The views of shortened conversations first: they are small, and a shortened conversation's KV state is only
+    // reused through its view.
+    if (pflash_unified_disk_views_.enabled()) {
+        size_t views = 0;
+        for (const auto & view : pflash_unified_views_.all()) views += pflash_unified_disk_views_.save(view) ? 1 : 0;
+        std::fprintf(stderr, "[pflash-unified] %s flush: %zu views written\n", reason, views);
+    }
     size_t queued = 0, backups = 0, skipped = 0;
     const auto before = disk_cache_.stats();
     // Graceful shutdown evicts everything: each conversation's newest

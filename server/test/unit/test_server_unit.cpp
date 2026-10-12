@@ -17498,6 +17498,7 @@ struct UnifiedOptions {
     std::string disk_dir;                       // non-empty: the disk session cache in this directory
     bool disk_seed_history = false;             // first, a server restart: turn 0 up to its newest user message on disk
     DiskPrefixCacheMode disk_mode = DiskPrefixCacheMode::Full;   // the disk scope of the requests
+    int restart_at = -1;                        // a server restart (shutdown flush, a new process) before this turn
 };
 
 // One server with PFLASH_UNIFIED=1 (unset when ``options.unified`` is false), the turns in order. By default one fixture tokenizer is target and drafter, so
@@ -17611,9 +17612,19 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     }
     config.disk_cache_policy.mode = options.disk_mode;
     {
-        HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&drafter);
+        auto start = [&] {
+            auto server = std::make_unique<HttpServer>(engine, tokenizer, config);
+            server->set_drafter_tokenizer(&drafter);
+            return server;
+        };
+        auto owned = start();
         for (size_t index = 0; index < turns.size(); ++index) {
+            if ((int) index == options.restart_at) {
+                SchedulerTestHarness::flush_sessions(*owned);
+                owned.reset();
+                owned = start();
+            }
+            HttpServer & server = *owned;
             ParsedRequest request;
             request.format = ApiFormat::OPENAI_CHAT;
             request.messages = turns[index];
@@ -17626,7 +17637,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
             run.served_text.push_back(tokenizer.decode(run.prepared.back().tokens));
             run.calls_after.push_back(compress_calls());
         }
-        run.unified = HttpServerTestAccess::pflash_unified(server);
+        run.unified = HttpServerTestAccess::pflash_unified(*owned);
     }
     std::ifstream in(trace_path);
     for (std::string line; std::getline(in, line);) {
@@ -17948,7 +17959,9 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_resumes_a_disk_chat_and_pages_
     TEST_ASSERT(run.served_text[0].size() < run.raw_text[0].size());
     TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 0);
 
-    // The disk is looked up only in the Full scope, so only there does it count.
+    // The disk is looked up only in the Full scope, so only there does it count. (A fresh directory: the first run's
+    // shutdown wrote its view there, and a view on disk continues the conversation whatever the scope.)
+    rm_rf(dir);
     UnifiedOptions off = disk;
     off.disk_mode = DiskPrefixCacheMode::Off;
     const auto scoped = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
@@ -18006,6 +18019,47 @@ TEST_CASE(ServerUnitFixture, test_unified_restart_serves_a_disk_chat_raw_for_a_s
     TEST_ASSERT(cold.calls_after[0] == 1);
     TEST_ASSERT_MSG(cold.prepared[0].pflash_stats.dump().find("cached_source") == std::string::npos,
                     cold.prepared[0].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_shortened_chat_survives_a_restart_through_its_view_on_disk) {
+    // Turn 1 pages a long paste. The server restarts (shutdown flush): its view is written to disk and read back on
+    // the next turn, so the follow-up continues the shortened conversation -- the same served prefix, nothing handed
+    // back to the chat view -- instead of arriving cold. Without the disk cache the restart loses the view, and the
+    // follow-up goes to the chat view as a cold history.
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}}) + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const std::string dir = test_tmp_path("luce_test_unified_view_restart").string();
+    rm_rf(dir);
+    UnifiedOptions disk;
+    disk.disk_dir = dir;
+    disk.restart_at = 1;
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr,
+                                         65536, disk);
+    TEST_ASSERT_MSG(run.prepared[0].compressed && run.prepared[0].unified_view, run.prepared[0].pflash_stats.dump());
+    const auto & stats = run.prepared[1].pflash_stats;
+    TEST_ASSERT_MSG(run.prepared[1].unified_handback.empty() && stats.contains("unified") &&
+                    stats["unified"].value("disk_view", false), stats.dump());
+    TEST_ASSERT(run.prepared[1].compressed && run.prepared[1].unified_view);
+    TEST_ASSERT(run.unified["counts"].value("disk_view", 0) == 1);
+    // The follow-up's served prompt starts with what turn 1 served, up to its generation prompt.
+    const int cut = stats["unified"].value("reused_tokens", -1);
+    TEST_ASSERT_MSG(cut > 0 && cut == run.prepared[0].snapshot_cut && run.prepared[1].tokens.size() > (size_t) cut &&
+                    std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + cut,
+                               run.prepared[1].tokens.begin()), stats.dump());
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango") != std::string::npos);
+
+    // The same without the disk cache: the view is gone after the restart.
+    rm_rf(dir);
+    UnifiedOptions ram;
+    ram.restart_at = 1;
+    const auto lost = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                          nullptr, 65536, ram);
+    TEST_ASSERT_MSG(lost.prepared[1].unified_handback == "uncached", lost.prepared[1].pflash_stats.dump());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_unsplittable_paste_goes_to_the_chat_view) {
