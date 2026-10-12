@@ -6003,6 +6003,7 @@ std::string HttpServer::apply_pflash_compression(
                 served, prepared.snapshot_cut, view_stats, keep_history_view)) {
             prepared.tokens = std::move(served);
             prepared.compressed = true;
+            prepared.snapshot_cut_view = keep_history_view;
             prepared.pflash_stats = {
                 {"compress_ms", 0.0},
                 {"drafter_input_tokens", compress_request.input_ids.size()},
@@ -6243,6 +6244,8 @@ std::string HttpServer::apply_pflash_compression(
                 result.kept_spans, served, prepared.snapshot_cut,
                 prepared.pflash_stats["view"])) {
             final_tokens = std::move(served);
+            // new_content regions exist only in a keep tool session.
+            prepared.snapshot_cut_view = region_plan.mode == "new_content";
         } else {
             // Never serve a partly built region view: the raw prompt is what
             // the conversation would have served without the plan.
@@ -6266,7 +6269,10 @@ std::string HttpServer::apply_pflash_compression(
                 &result.kept_spans, served,
                 prepared.snapshot_cut, prepared.pflash_stats["view"],
                 keep_history_view);
-            if (viewed) final_tokens = std::move(served);
+            if (viewed) {
+                final_tokens = std::move(served);
+                prepared.snapshot_cut_view = keep_history_view;
+            }
         }
         if (!viewed && keep_history_view) {
             // Agent history whose view cannot continue: the raw prompt
@@ -7058,6 +7064,13 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         ppp_prefers_tools_boundary(config_.ppp_enabled, prefer_inline_snap);
     int forced_cut = req.pin_end_token;
     if (forced_cut <= 0) forced_cut = prepared.snapshot_cut;
+    // A PFLASH_AGENT_HISTORY=keep view of a tool session is continued by the
+    // next turn: its snapshot goes at the view's cut even when the tools head
+    // is already restored (where a tool request's forced cut is otherwise
+    // dropped), so the next turn restores the whole view.
+    const bool snap_prefer_tools_boundary = prefer_tools_boundary &&
+        !(prepared.snapshot_cut_view && prepared.snapshot_cut > 0 &&
+          forced_cut == prepared.snapshot_cut);
 
     // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
     // pin_end only — never mutate tokens. Token-level DiffPin rewrite
@@ -7401,7 +7414,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.snap_reservation = prefix_cache_.reserve_inline_snap(
             effective_prompt,
             cache.using_restore ? logical_prefix_len : 0,
-            prefer_tools_boundary,
+            snap_prefer_tools_boundary,
             forced_cut,
             restore_source_slot,
             [this](int target_cut) {

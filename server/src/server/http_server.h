@@ -973,6 +973,10 @@ private:
         // else asks for one: a multi-turn PFlash view sets the start of its
         // generation prompt, where the next turn's prompt branches off.
         int snapshot_cut = -1;
+        // A PFLASH_AGENT_HISTORY=keep view or region of a tool session: the
+        // snapshot is taken at ``snapshot_cut`` even when the system/tools
+        // head is already restored (the next turn continues this view).
+        bool snapshot_cut_view = false;
         // PFlash details for usage.timings.pflash (see build_timings_json).
         nlohmann::json pflash_stats;
         int error_status = 0;

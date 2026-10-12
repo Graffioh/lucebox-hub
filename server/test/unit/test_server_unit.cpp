@@ -200,6 +200,26 @@ struct SchedulerTestHarness {
         std::vector<int> restore_points;
     };
 
+    // The inline snapshot cut a compressed (PFlash) prompt plans: -1 none.
+    static int prepare_cache_snapshot_cut(
+            HttpServer & server, const std::vector<int32_t> & prompt,
+            const json & tools, int snapshot_cut, bool snapshot_cut_view) {
+        ParsedRequest req;
+        req.prompt_tokens = prompt;
+        req.response_id = "test";
+        req.tools = tools;
+        HttpServer::PreparedPrompt prepared;
+        prepared.tokens = prompt;
+        prepared.compressed = true;
+        prepared.snapshot_cut = snapshot_cut;
+        prepared.snapshot_cut_view = snapshot_cut_view;
+        GenerateRequest generate_request;
+        generate_request.prompt = prompt;
+        const auto cache = server.prepare_generation_cache(
+            req, prepared, generate_request);
+        return cache.snap_prepared ? cache.snap_cut : -1;
+    }
+
     static PreparedCache prepare_cache(
             HttpServer & server, const std::vector<int32_t> & prompt,
             bool ends_with_tool_result = false) {
@@ -15318,6 +15338,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_first_turn_paste_with_tool
         TEST_ASSERT(on.served_text[0].find("read_file") != std::string::npos);
         TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
         TEST_ASSERT(on.served_text[0].find("exit codes?") != std::string::npos);
+        TEST_ASSERT(on.prepared[0].snapshot_cut_view);
         TEST_ASSERT(on.keep["decisions"].value("new_content", 0) == 1);
     }
     // An earlier user message before the newest (no assistant turn): today
@@ -15501,7 +15522,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_raw_over_max_ctx) {
 // as the newest turn, a second paste. Every turn continues the view: the
 // history and every tool output stay verbatim, recall comes after the
 // cached view and ahead of the newest message, nothing is ever rebuilt
-// (rebuild ratio 1.1 with no minimum: today's rule would rebuild).
+// (rebuild ratio 1.1 with no minimum: today's rule would rebuild), and the
+// prefix-cache snapshot is asked at the view cut.
 TEST_CASE(ServerUnitFixture, test_pflash_keep_history_follow_up_turns) {
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
     luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", nullptr};       // default: on
@@ -15559,6 +15581,9 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_follow_up_turns) {
         TEST_ASSERT_MSG(pflash_keep_prefix_is(prepared.tokens, run.ids[0], run.user_cut[0]),
                         std::to_string(turn));
         TEST_ASSERT(pflash_keep_count(run.served_text[turn], "def parse(x)") == 6);
+        // The snapshot is asked at the view cut (everything but the
+        // generation prompt).
+        TEST_ASSERT(prepared.snapshot_cut_view);
         TEST_ASSERT(prepared.snapshot_cut > 0 &&
                     prepared.snapshot_cut < (int) prepared.tokens.size());
         if (turn > 0) {
@@ -15681,6 +15706,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_plain_chat_turns_unchanged
             TEST_ASSERT(on.prepared[turn].tokens == off.prepared[turn].tokens);
             TEST_ASSERT(on.prepared[turn].compressed == off.prepared[turn].compressed);
             TEST_ASSERT(on.prepared[turn].snapshot_cut == off.prepared[turn].snapshot_cut);
+            TEST_ASSERT(!on.prepared[turn].snapshot_cut_view);
             json a = on.prepared[turn].pflash_stats;
             json b = off.prepared[turn].pflash_stats;
             a.erase("compress_ms");
@@ -15760,6 +15786,54 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_unparsed_tool_session_raw)
     const auto off = serve(nullptr, calls_off);
     TEST_ASSERT_MSG(off.error.empty(), off.error);
     TEST_ASSERT(!off.pflash_stats["admission"].contains("keep_history"));
+    unlink(path.c_str());
+}
+
+// The prefix-cache snapshot of a keep view (tool session) lands at the view
+// cut even when the system/tools head is already restored; without the
+// keep mark the forced cut is dropped as before and the snapshot falls on a
+// message boundary.
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_snapshot_at_view_cut) {
+    const json messages = pflash_keep_with(pflash_keep_agent_history(6),
+        pflash_keep_user("And what about signals?"));
+    ToolMemory tool_memory;
+    const std::string rendered = render_chat_template(
+        normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
+        pflash_cold_history_tools().dump());
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"user", "assistant", "system", "\n", "tool"}, rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const auto ids = tokenizer.encode(rendered);
+    // The view cut: everything before the generation prompt.
+    const int cut = (int) tokenizer.encode(
+        rendered.substr(0, rendered.rfind("<|im_start|>assistant"))).size();
+    for (const bool view_cut : {false, true}) {
+        auto backend_owner = std::make_unique<SlotSetBackend>();
+        SlotSetBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.prefix_cache_cap = 4;
+        HttpServer server(engine, tokenizer, config);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        // The system/tools head (the first chat boundary) is restored from
+        // slot 0.
+        const auto bounds = find_all_boundaries(ids, cache.chat_markers());
+        TEST_ASSERT(bounds.size() >= 3);
+        const int head = bounds.front();
+        TEST_ASSERT(head > 0 && cut > head + 4 && cut < (int) ids.size());
+        TEST_ASSERT(std::find(bounds.begin(), bounds.end(), cut) == bounds.end());
+        cache.confirm_inline_snap(0, head, ids);
+        backend.positions[0] = head;
+        const int snap = SchedulerTestHarness::prepare_cache_snapshot_cut(
+            server, ids, pflash_cold_history_tools(), cut, view_cut);
+        if (view_cut) {
+            TEST_ASSERT_MSG(snap == cut, std::to_string(snap) + " vs " + std::to_string(cut));
+        } else {
+            TEST_ASSERT_MSG(snap != cut, std::to_string(snap));
+        }
+    }
     unlink(path.c_str());
 }
 
