@@ -1081,6 +1081,11 @@ private:
     // Free a RAM snapshot slot for reuse, writing it to disk first when
     // PrefixCache::persist_on_evict() says so (see persist_evicted_slot).
     void evict_inline_slot(int slot);
+    // Just before `reservation` commits: write (when persist_on_evict says
+    // so) and free the further entries its resident-budget plan evicts
+    // (PrefixCache::InlineReservation::extra_victim_slots). The commit then
+    // drops their metadata. A capture that fails never gets here.
+    void evict_extra_victims(const PrefixCache::InlineReservation & reservation);
     // Disk persistence (docs/PREFIX_CACHE.md): a snapshot is written only
     // when it leaves RAM, never after every turn. Hands the payload of
     // `slot` to the disk writer when `persist` is set and the slot has a disk

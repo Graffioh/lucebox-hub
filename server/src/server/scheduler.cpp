@@ -118,7 +118,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             "[disk-cache] off for concurrent serving: this engine keeps no "
             "checkpoints in backend snapshot slots\n");
     }
-    prefix_cache_.set_record_evictions(disk_enabled);
+    // Recorded with the disk off too: a capture whose resident-budget plan
+    // evicts further checkpoints (PrefixCache::reserve_inline_snap) frees
+    // their payloads here.
+    prefix_cache_.set_record_evictions(true);
     struct DiskLoad {
         ServerJob * job = nullptr;
         std::vector<int32_t> key;
@@ -1182,7 +1185,35 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 OwnedSnapshot displaced = disk_enabled
                     ? backend_.snapshot_take_displaced(captured) : OwnedSnapshot{};
                 for (auto & evicted : prefix_cache_.take_evicted()) {
-                    if (evicted.slot != captured || displaced.empty()) continue;
+                    if (evicted.slot != captured) {
+                        // A further checkpoint the capture's resident-budget
+                        // plan evicted as it committed: its payload is still
+                        // in its own slot. Written like the displaced one,
+                        // then freed.
+                        bool queued = false;
+                        if (disk_enabled && evicted.persist) {
+                            const auto aux = slot_aux_.find(evicted.slot);
+                            const std::string blob =
+                                aux == slot_aux_.end() ? std::string() : aux->second;
+                            OwnedSnapshot snap = backend_.snapshot_detach(evicted.slot);
+                            const int pos = snap.empty() ? 0 : snap.cur_pos();
+                            queued = !snap.empty() &&
+                                disk_cache_.save_async(std::move(snap), evicted.ids, blob);
+                            if (queued) {
+                                disk_cache_.prune_ancestors(
+                                    evicted.ids, config_.disk_cache_cold_max_tokens);
+                            }
+                            std::fprintf(stderr,
+                                "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
+                                "pos=%d -> %s\n", evicted.slot + 1, evicted.ids.size(),
+                                pos, queued ? "write queued" : "not written");
+                        }
+                        engine.discard_prefix_store(
+                            {(uint64_t)evicted.slot + 1, (int)evicted.ids.size()});
+                        forget_inline_slot_metadata(evicted.slot);
+                        continue;
+                    }
+                    if (displaced.empty()) continue;
                     if (evicted.persist) {
                         const auto aux = slot_aux_.find(captured);
                         const int pos = displaced.cur_pos();
