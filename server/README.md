@@ -519,9 +519,11 @@ would make; the query step reads its rows from this call or from an exact F32
 store, and a request that cannot resume exactly is scored from token 0 with
 the reason logged (`[qwen35-scorer] redo from token 0`).
 With the default `--draft-residency auto` the drafter is released after each
-compression; the sessions a call used are copied to host RAM first (pinned
-when the device offers it; `PFLASH_SESSION_OFFLOAD_PINNED=0` uses plain
-memory), only the positions a resume reads, and when the drafter loads again
+compression; the sessions a call used are copied to host RAM first (plain
+pageable memory; `PFLASH_SESSION_OFFLOAD_PINNED=1` uses the device's pinned
+host memory instead, which on an R9700 raised peak VRAM by up to 1 GiB near
+the 225,280-token cap, kept about 0.5 GiB of VRAM in use between requests and
+slowed target prefill), only the positions a resume reads, and when the drafter loads again
 only the session the new prompt can resume from comes back to the GPU. A
 stored session is restored only under the drafter, head, probe and session
 settings it was stored with; anything else drops it, and the call scores

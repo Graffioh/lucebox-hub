@@ -863,8 +863,8 @@ void drop_host_store(DrafterContext & ctx, const std::string & reason) {
 }
 
 ggml_backend_buffer_type_t pinned_host_type(ggml_backend_t backend) {
-    const char * off = std::getenv("PFLASH_SESSION_OFFLOAD_PINNED");
-    if (off && std::string(off) == "0") return nullptr;
+    // Plain host memory unless PFLASH_SESSION_OFFLOAD_PINNED=1.
+    if (!luce::pflash::pflash_session_offload_pinned_enabled()) return nullptr;
     ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
     return dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
 }
