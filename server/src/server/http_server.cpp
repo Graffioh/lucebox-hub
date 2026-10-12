@@ -1082,7 +1082,6 @@ const char * pflash_admission_name(PflashAdmission admission) noexcept {
     case PflashAdmission::Compress:       return "compress";
     case PflashAdmission::UnderThreshold: return "under_threshold";
     case PflashAdmission::WarmCache:      return "warm_cache";
-    case PflashAdmission::ColdHistory:    return "cold_history";
     case PflashAdmission::NewContent:     return "new_content";
     case PflashAdmission::KeepHistory:    return "keep_history";
     }
@@ -1103,11 +1102,6 @@ PflashAdmission pflash_cache_admission(
     return PflashAdmission::Compress;
 }
 
-bool pflash_cold_history_enabled() noexcept {
-    const char * raw = std::getenv("PFLASH_COLD_HISTORY");
-    return raw && std::string(raw) == "raw";
-}
-
 bool pflash_has_tool_activity(const json & tools,
                               const std::vector<ChatMessage> & messages) noexcept {
     if ((tools.is_array() || tools.is_object()) && !tools.empty()) return true;
@@ -1116,38 +1110,6 @@ bool pflash_has_tool_activity(const json & tools,
         if (!message.tool_calls.empty()) return true;
     }
     return false;
-}
-
-PFlashTokenSpan pflash_chat_history_region(
-        const std::vector<PflashChatTurn> & turns) noexcept {
-    int last_assistant = -1;
-    for (size_t index = turns.size(); index-- > 0;) {
-        if (turns[index].role == "assistant" || turns[index].role == "model") {
-            last_assistant = (int) index;
-            break;
-        }
-    }
-    if (last_assistant < 0) return {-1, -1};
-    int first = 0;
-    while (first < last_assistant &&
-           (turns[(size_t) first].role == "system" ||
-            turns[(size_t) first].role == "developer")) {
-        ++first;
-    }
-    const int begin = turns[(size_t) first].role_begin;
-    const int end = turns[(size_t) last_assistant].turn_end;
-    if (begin < 0 || end <= begin) return {-1, -1};
-    return {begin, end};
-}
-
-PflashAdmission pflash_cold_history_admission(
-        PflashAdmission admission, bool raw_fits, bool tool_activity,
-        int history_uncached_droppable, int threshold) noexcept {
-    if (admission != PflashAdmission::Compress || !raw_fits || !tool_activity ||
-        history_uncached_droppable < threshold) {
-        return admission;
-    }
-    return PflashAdmission::ColdHistory;
 }
 
 bool pflash_agent_paste_enabled() noexcept {
@@ -1176,8 +1138,7 @@ PflashAdmission pflash_keep_history_admission(
     if (admission == PflashAdmission::UnderThreshold) return admission;
     if (new_droppable >= threshold &&
         (admission == PflashAdmission::Compress ||
-         admission == PflashAdmission::WarmCache ||
-         admission == PflashAdmission::ColdHistory)) {
+         admission == PflashAdmission::WarmCache)) {
         return PflashAdmission::NewContent;
     }
     if (admission == PflashAdmission::Compress ||
@@ -5693,67 +5654,12 @@ std::string HttpServer::apply_pflash_compression(
                 auto admission = http_detail::pflash_cache_admission(
                     uncached_droppable, cached_droppable,
                     config_.pflash_threshold, raw_fits);
-                // Cold agent history (PFLASH_COLD_HISTORY=raw): a conversation
-                // with tool activity whose earlier turns arrive uncached --
-                // at least a threshold of droppable tokens between the
-                // preamble and the last assistant turn that the restorable
-                // prefix does not hold -- is served raw with full prefill
-                // rather than compressed, so the agent keeps its tool calls
-                // and tool results, and no chat view is built from it. New
-                // content after the last assistant turn does not count: a
-                // first-turn paste has no earlier conversation, and a warm
-                // history leaves only its new tail uncached. A raw prompt
-                // that does not fit still compresses (raw_fits). Evaluated
-                // only when the decision is Compress, so it never touches
-                // the warm-cache, under-threshold, view or arrive paths.
-                json cold_history_stats;
-                if (admission == http_detail::PflashAdmission::Compress &&
-                    raw_fits && http_detail::pflash_cold_history_enabled()) {
-                    // Out of scope (no tools anywhere): nothing is computed
-                    // or recorded, so a plain chat is served and traced
-                    // exactly as with the flag off.
-                    if (tool_activity()) {
-                        // No chat markers or no assistant turn: no earlier
-                        // conversation, the rule does not fire.
-                        const PFlashTokenSpan history =
-                            messages_input && chat_turn.valid()
-                                ? http_detail::pflash_chat_history_region(chat_turn.turns)
-                                : PFlashTokenSpan{-1, -1};
-                        const bool history_valid = history.begin >= 0 &&
-                            history.end > history.begin && history.end <= input_tokens;
-                        int history_uncached_droppable = 0;
-                        if (history_valid) {
-                            const int lo = (std::max)(history.begin, cached_drafter);
-                            const int hi = history.end;
-                            const int uncached_drafter = hi > lo
-                                ? (hi - lo) - http_detail::pflash_span_tokens_within(
-                                      required_instruction_spans, lo, hi)
-                                : 0;
-                            history_uncached_droppable = uncached_drafter > 0
-                                ? target_estimate(uncached_drafter) : 0;
-                        }
-                        admission = http_detail::pflash_cold_history_admission(
-                            admission, raw_fits, /*tool_activity=*/true,
-                            history_uncached_droppable, config_.pflash_threshold);
-                        cold_history_stats = {
-                            {"history_begin", history_valid ? history.begin : -1},
-                            {"history_end", history_valid ? history.end : -1},
-                            {"history_uncached_droppable", history_uncached_droppable},
-                            {"fired", admission == http_detail::PflashAdmission::ColdHistory},
-                        };
-                    } else if (!tool_error.empty()) {
-                        std::fprintf(stderr,
-                            "[pflash-cold-history] messages not readable (%s); rule skipped\n",
-                            tool_error.c_str());
-                    }
-                }
                 // Agent history, no view: the history is served raw -- from
                 // the prefix cache, or prefilled -- and only a newest user
                 // message over the threshold is compressed (new_content, a
                 // region plan on a raw base); otherwise the whole prompt is
                 // served raw (keep_history; a newest tool output of any size
-                // included). Cold history and under-threshold stay as they
-                // are (both raw).
+                // included). Under-threshold stays as it is (raw).
                 int keep_new_droppable = 0;
                 int raw_base = -1;
                 if (keep_scope) {
@@ -5803,9 +5709,6 @@ std::string HttpServer::apply_pflash_compression(
                     {"threshold", config_.pflash_threshold},
                     {"raw_fits", raw_fits},
                 };
-                if (!cold_history_stats.is_null()) {
-                    admission_stats["cold_history"] = cold_history_stats;
-                }
                 if (!keep_history_stats.is_null()) {
                     admission_stats["keep_history"] = keep_history_stats;
                 }
@@ -5838,32 +5741,7 @@ std::string HttpServer::apply_pflash_compression(
                                        0, 0, input_tokens, false, 0};
                     } else {
                         prepared.pflash_stats = {{"admission", admission_stats}};
-                        if (admission == http_detail::PflashAdmission::ColdHistory) {
-                            // Served like the other raw fallbacks (reason
-                            // cold_history): the raw prompt, full prefill,
-                            // counted in /props pflash.failures; decided
-                            // before the drafter runs and never refused.
-                            {
-                                std::lock_guard<std::mutex> lk(pflash_failure_mu_);
-                                ++pflash_fallback_served_;
-                                ++pflash_fallback_reasons_["cold_history"];
-                            }
-                            prepared.pflash_stats["pflash_fallback"] = {
-                                {"reason", "cold_history"},
-                                {"prompt_tokens", prompt_tokens},
-                                {"history_uncached_droppable",
-                                 cold_history_stats.value("history_uncached_droppable", 0)},
-                            };
-                            std::fprintf(stderr,
-                                "[pflash-cold-history] serving the raw prompt (%d tokens): "
-                                "history [%d,%d) uncached_droppable~%d >= threshold %d\n",
-                                prompt_tokens,
-                                cold_history_stats.value("history_begin", -1),
-                                cold_history_stats.value("history_end", -1),
-                                cold_history_stats.value("history_uncached_droppable", 0),
-                                config_.pflash_threshold);
-                            std::fflush(stderr);
-                        } else if (admission == http_detail::PflashAdmission::KeepHistory) {
+                        if (admission == http_detail::PflashAdmission::KeepHistory) {
                             // Nothing to compress in a tool session but its
                             // history: the raw prompt, full prefill.
                             serve_keep_raw(keep_new_droppable,

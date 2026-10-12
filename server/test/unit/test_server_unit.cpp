@@ -1496,58 +1496,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_cache_admission_flag_defaults_off) {
     luce_unsetenv("PFLASH_ADMISSION");
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_cold_history_decision) {
-    using http_detail::PflashAdmission;
-    using http_detail::pflash_cache_admission;
-    using http_detail::pflash_cold_history_admission;
-    const int t = 16384;
-    // Cold agent history: the cache holds nothing, the earlier turns carry
-    // a threshold of droppable tokens -> raw, full prefill.
-    TEST_ASSERT(pflash_cold_history_admission(
-        pflash_cache_admission(40000, 0, t), true, true, 38000, t) ==
-        PflashAdmission::ColdHistory);
-    TEST_ASSERT(pflash_cold_history_admission(
-        PflashAdmission::Compress, true, true, t, t) == PflashAdmission::ColdHistory);
-    TEST_ASSERT(pflash_cold_history_admission(
-        PflashAdmission::Compress, true, true, t - 1, t) == PflashAdmission::Compress);
-    // First-turn paste with tools defined: no earlier conversation -> today's
-    // decision (compress).
-    TEST_ASSERT(pflash_cold_history_admission(
-        pflash_cache_admission(30000, 0, t), true, true, 0, t) ==
-        PflashAdmission::Compress);
-    // Warm cache stays warm, under-threshold stays under (never Compress, so
-    // never touched).
-    TEST_ASSERT(pflash_cold_history_admission(
-        pflash_cache_admission(30000, 50000, t), true, true, 60000, t) ==
-        PflashAdmission::WarmCache);
-    TEST_ASSERT(pflash_cold_history_admission(
-        pflash_cache_admission(2000, 90000, t), true, true, 60000, t) ==
-        PflashAdmission::UnderThreshold);
-    // A chat without tools keeps today's decision.
-    TEST_ASSERT(pflash_cold_history_admission(
-        PflashAdmission::Compress, true, false, 60000, t) == PflashAdmission::Compress);
-    // A raw prompt over the context limit still compresses.
-    TEST_ASSERT(pflash_cold_history_admission(
-        pflash_cache_admission(150000, 0, t, false), false, true, 140000, t) ==
-        PflashAdmission::Compress);
-    TEST_ASSERT(std::string(http_detail::pflash_admission_name(
-        PflashAdmission::ColdHistory)) == "cold_history");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_cold_history_flag_defaults_off) {
-    luce_unsetenv("PFLASH_COLD_HISTORY");
-    TEST_ASSERT(!http_detail::pflash_cold_history_enabled());
-    // Only "raw" turns it on; anything else is today's behaviour (the chat
-    // and admission flags fall back to their defaults).
-    for (const char * off : {"", "0", "1", "on", "RAW", "compress", "raw "}) {
-        luce_setenv("PFLASH_COLD_HISTORY", off);
-        TEST_ASSERT_MSG(!http_detail::pflash_cold_history_enabled(), off);
-    }
-    luce_setenv("PFLASH_COLD_HISTORY", "raw");
-    TEST_ASSERT(http_detail::pflash_cold_history_enabled());
-    luce_unsetenv("PFLASH_COLD_HISTORY");
-}
-
 TEST_CASE(ServerUnitFixture, test_pflash_has_tool_activity) {
     const json tools = json::array({{{"type", "function"},
         {"function", {{"name", "read_file"}}}}});
@@ -1563,63 +1511,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_has_tool_activity) {
     auto with_call = plain;
     with_call[2].tool_calls.push_back({"call-1", "read_file", json::object()});
     TEST_ASSERT(http_detail::pflash_has_tool_activity(json(), with_call));
-}
-
-// The earlier conversation of a rendered Qwen prompt, decoded.
-static std::string pflash_history_region_text(const std::vector<ChatMessage> & messages) {
-    const std::string rendered = render_chat_template(
-        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true, false);
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"user", "assistant", "system", "\n"}, rendered);
-    Tokenizer tok;
-    if (!tok.load_from_gguf(path.c_str())) {
-        unlink(path.c_str());
-        return "<tokenizer>";
-    }
-    unlink(path.c_str());
-    const auto prompt = tok.encode(rendered);
-    ChatMarkers markers;
-    if (!resolve_chat_markers(tok, markers)) return "<markers>";
-    const auto turns = http_detail::pflash_chat_query_turn(tok, markers, tok, prompt).turns;
-    const auto region = http_detail::pflash_chat_history_region(turns);
-    if (region.begin < 0) return "<none>";
-    return tok.decode({prompt.begin() + region.begin, prompt.begin() + region.end});
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_chat_history_region) {
-    // Agent loop: from the first turn after the system preamble up to and
-    // including the last assistant turn; the trailing tool result and the
-    // generation prompt are new content.
-    const std::string agent = pflash_history_region_text({
-        {"system", "You are a coding agent.", ""},
-        {"user", "Fix the parser.", ""},
-        {"assistant", "Reading it.", ""},
-        {"tool", "old tool output", "call-1"},
-        {"assistant", "Running the tests.", ""},
-        {"tool", "new tool output", "call-2"},
-    });
-    TEST_ASSERT_MSG(agent.rfind("<|im_start|>user\nFix the parser.", 0) == 0, agent);
-    TEST_ASSERT_MSG(agent.find("old tool output") != std::string::npos, agent);
-    TEST_ASSERT_MSG(agent.size() >= std::string("Running the tests.<|im_end|>").size() &&
-                    agent.substr(agent.size() - std::string("Running the tests.<|im_end|>").size()) ==
-                        "Running the tests.<|im_end|>", agent);
-    TEST_ASSERT_MSG(agent.find("new tool output") == std::string::npos, agent);
-    TEST_ASSERT_MSG(agent.find("You are a coding agent") == std::string::npos, agent);
-    // A new user message after the last assistant turn is new content too.
-    const std::string chat = pflash_history_region_text({
-        {"user", "first question", ""},
-        {"assistant", "first answer", ""},
-        {"user", "second question", ""},
-    });
-    TEST_ASSERT_MSG(chat.find("first question") != std::string::npos, chat);
-    TEST_ASSERT_MSG(chat.find("first answer") != std::string::npos, chat);
-    TEST_ASSERT_MSG(chat.find("second question") == std::string::npos, chat);
-    // First turn (no assistant turn yet): no earlier conversation.
-    TEST_ASSERT(pflash_history_region_text({
-        {"system", "You are a coding agent.", ""},
-        {"user", "a long pasted document", ""},
-    }) == "<none>");
-    TEST_ASSERT(http_detail::pflash_chat_history_region({}).begin == -1);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_span_tokens_within_clips) {
@@ -15089,23 +14980,14 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_head_plan_windows_and_caps) {
     TEST_ASSERT(!plan.structured && plan.extra.empty() && plan.tail.begin < 0);
 }
 
-// Cold agent history (PFLASH_COLD_HISTORY=raw) through prepare_prompt with
-// cache-aware admission and no prefix cache (every request arrives cold).
-struct PflashColdHistoryRun {
-    HttpServerTestAccess::PreparedPrompt prepared;
-    json counters;
-    std::vector<int32_t> ids;
-    int compress_calls = 0;
-    std::vector<json> view_records;
-};
-
-static std::string pflash_cold_history_filler(const char * line, int count) {
+// A tool session: its tool definitions and filler text.
+static std::string pflash_tool_session_filler(const char * line, int count) {
     std::string out;
     for (int i = 0; i < count; ++i) out += line;
     return out;
 }
 
-static json pflash_cold_history_tools() {
+static json pflash_tool_session_tools() {
     return json::array({
         {{"type", "function"},
          {"function", {{"name", "read_file"}, {"description", "Read a file"},
@@ -15116,222 +14998,6 @@ static json pflash_cold_history_tools() {
 
 // system + task + (assistant tool call + long tool result) + assistant tool
 // call + a short new tool result.
-static json pflash_cold_agent_messages() {
-    const json call1 = json::array({{{"id", "call-1"}, {"type", "function"},
-        {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"parser.py\"}"}}}}});
-    const json call2 = json::array({{{"id", "call-2"}, {"type", "function"},
-        {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"test_parser.py\"}"}}}}});
-    return json::array({
-        {{"role", "system"}, {"content", "You are a coding agent."}},
-        {{"role", "user"}, {"content", "Fix the bug in parser.py."}},
-        {{"role", "assistant"}, {"content", ""}, {"tool_calls", call1}},
-        {{"role", "tool"}, {"tool_call_id", "call-1"},
-         {"content", pflash_cold_history_filler("def parse(x): return x.strip()\n", 60)}},
-        {{"role", "assistant"}, {"content", ""}, {"tool_calls", call2}},
-        {{"role", "tool"}, {"tool_call_id", "call-2"}, {"content", "def test(): pass"}},
-    });
-}
-
-// ``paste``: PFLASH_AGENT_PASTE (nullptr = unset, the default: a tool
-// session is served raw before any other rule).
-static PflashColdHistoryRun run_cold_history_case(
-        const json & messages, const json & tools, const char * flag,
-        int threshold, int max_ctx = 8192, int max_output = 16,
-        const char * paste = "1") {
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
-    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
-    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
-    luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", "1"};
-    luce_test::ScopedEnvVar cold{"PFLASH_COLD_HISTORY", flag};
-    luce_test::ScopedEnvVar paste_env{"PFLASH_AGENT_PASTE", paste};
-    char trace_path[] = "/tmp/pflash_cold_history_view_XXXXXX";
-    const int trace_fd = mkstemp(trace_path);
-    TEST_ASSERT(trace_fd >= 0);
-    close(trace_fd);
-    luce_test::ScopedEnvVar view_trace{"PFLASH_VIEW_TRACE_PATH", trace_path};
-    ToolMemory tool_memory;
-    const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
-    const std::string rendered = render_chat_template(
-        chat, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
-        /*enable_thinking=*/true, tools.is_array() && !tools.empty() ? tools.dump() : "");
-    const std::string path = write_pflash_bpe_tokenizer_fixture(
-        {"user", "assistant", "system", "\n", "tool"}, rendered);
-    Tokenizer tokenizer;
-    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
-    PflashColdHistoryRun run;
-    run.ids = tokenizer.encode(rendered);
-
-    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
-    MockPflashBudgetBackend & backend = *backend_owner;
-    LuceEngine engine(std::move(backend_owner));
-    ServerConfig config;
-    config.pflash_mode = ServerConfig::PflashMode::AUTO;
-    config.pflash_threshold = threshold;
-    config.pflash_keep_ratio = 0.3f;
-    config.max_ctx = max_ctx;
-    config.prefix_cache_cap = 0;
-    config.prefill_cache_cap = 0;
-    {
-        HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&tokenizer);
-        ParsedRequest request;
-        request.format = ApiFormat::OPENAI_CHAT;
-        request.messages = messages;
-        if (tools.is_array() && !tools.empty()) request.tools = tools;
-        request.prompt_tokens = run.ids;
-        request.max_output = max_output;
-        run.prepared = HttpServerTestAccess::prepare_prompt(server, request);
-        run.counters = HttpServerTestAccess::pflash_failure_counters(server);
-    }
-    run.compress_calls = backend.compress_calls;
-    std::ifstream in(trace_path);
-    for (std::string line; std::getline(in, line);) {
-        if (!line.empty()) run.view_records.push_back(json::parse(line));
-    }
-    unlink(trace_path);
-    unlink(path.c_str());
-    return run;
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_cold_agent_history_serves_raw) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const auto run = run_cold_history_case(
-        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400);
-    TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-    TEST_ASSERT(run.compress_calls == 0);          // decided before the drafter
-    TEST_ASSERT(!run.prepared.compressed);
-    TEST_ASSERT(run.prepared.tokens == run.ids);   // the raw prompt
-    const json & admission = run.prepared.pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "cold_history", admission.dump());
-    TEST_ASSERT(admission["cold_history"].value("fired", false));
-    TEST_ASSERT(admission["cold_history"].value("history_uncached_droppable", 0) >= 400);
-    TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") == "cold_history");
-    TEST_ASSERT(run.counters.value("fallback_served", 0) == 1);
-    TEST_ASSERT(run.counters["fallback_reasons"].value("cold_history", 0) == 1);
-    TEST_ASSERT(run.view_records.size() == 1);
-    TEST_ASSERT(run.view_records[0].value("kind", "") == "raw");
-    TEST_ASSERT(run.view_records[0]["pflash"]["admission"].value("decision", "") == "cold_history");
-    TEST_ASSERT(run.view_records[0]["pflash_fallback"].value("reason", "") == "cold_history");
-    // Tool activity from the history alone (no tools field) is in scope too.
-    const auto no_field = run_cold_history_case(
-        pflash_cold_agent_messages(), json(), "raw", 400);
-    TEST_ASSERT(no_field.compress_calls == 0 && !no_field.prepared.compressed);
-    // Fail-closed never turns it into an error.
-    luce_test::ScopedEnvVar closed{"PFLASH_FAIL_CLOSED", "1"};
-    const auto strict = run_cold_history_case(
-        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400);
-    TEST_ASSERT_MSG(strict.prepared.error.empty(), strict.prepared.error);
-    TEST_ASSERT(strict.prepared.tokens == strict.ids);
-    // PFLASH_AGENT_PASTE off (the default): the tool session is served raw
-    // before the cold-history rule is reached (keep_history).
-    const auto off = run_cold_history_case(
-        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400, 8192, 16,
-        nullptr);
-    TEST_ASSERT_MSG(off.prepared.error.empty(), off.prepared.error);
-    TEST_ASSERT(off.compress_calls == 0 && off.prepared.tokens == off.ids);
-    TEST_ASSERT(off.prepared.pflash_stats["admission"].value("decision", "") == "keep_history");
-    TEST_ASSERT(!off.prepared.pflash_stats["admission"].contains("cold_history"));
-}
-
-// Without PFLASH_COLD_HISTORY=raw a cold tool session is still served raw:
-// nothing in a tool session but a big newest user message is compressed
-// (keep_history instead of cold_history), with the paste switch on or off.
-TEST_CASE(ServerUnitFixture, test_pflash_cold_history_flag_off_tool_session_still_raw) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    for (const char * paste : {(const char *) nullptr, "1"}) {
-        for (const char * off : {(const char *) nullptr, "0", "compress"}) {
-            const auto run = run_cold_history_case(
-                pflash_cold_agent_messages(), pflash_cold_history_tools(), off, 400, 8192,
-                16, paste);
-            TEST_ASSERT_MSG(run.prepared.error.empty(), run.prepared.error);
-            TEST_ASSERT(run.compress_calls == 0);
-            TEST_ASSERT(!run.prepared.compressed && run.prepared.tokens == run.ids);
-            const json & admission = run.prepared.pflash_stats["admission"];
-            TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", admission.dump());
-            TEST_ASSERT(!admission.contains("cold_history"));
-            TEST_ASSERT(admission["keep_history"].value("paste", !paste) == (paste != nullptr));
-            TEST_ASSERT(run.prepared.pflash_stats["pflash_fallback"].value("reason", "") ==
-                        "keep_history");
-            TEST_ASSERT(run.counters["fallback_reasons"].value("keep_history", 0) == 1);
-        }
-    }
-}
-
-// Tools defined, no assistant turn yet: the paste is the newest user message.
-// With PFLASH_AGENT_PASTE=1 the decision is a new_content region over it
-// alone, whatever PFLASH_COLD_HISTORY says (the region served on the raw
-// system prompt and tools is checked with a span-returning drafter in
-// test_pflash_keep_history_first_turn_paste_with_tools); with the switch off
-// the request is served raw.
-TEST_CASE(ServerUnitFixture, test_pflash_cold_history_first_turn_paste) {
-    const json messages = json::array({
-        {{"role", "system"}, {"content", "You are a coding agent."}},
-        {{"role", "user"}, {"content",
-            pflash_cold_history_filler("The parser strips every line.\n", 60) +
-            "What does the parser do?"}},
-    });
-    const auto on = run_cold_history_case(messages, pflash_cold_history_tools(), "raw", 400);
-    const auto off = run_cold_history_case(messages, pflash_cold_history_tools(), nullptr, 400);
-    TEST_ASSERT_MSG(on.prepared.error.empty(), on.prepared.error);
-    TEST_ASSERT(on.compress_calls == 1 && off.compress_calls == 1);
-    TEST_ASSERT(on.prepared.tokens == off.prepared.tokens);
-    const json & admission = on.prepared.pflash_stats["admission"];
-    TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "compress");
-    TEST_ASSERT(!admission["cold_history"].value("fired", true));
-    TEST_ASSERT(admission["cold_history"].value("history_begin", 0) == -1);
-    TEST_ASSERT(admission["region"].value("mode", "") == "new_content");
-    TEST_ASSERT(off.prepared.pflash_stats["admission"].value("decision", "") == "new_content");
-    const auto paste_off = run_cold_history_case(messages, pflash_cold_history_tools(), "raw",
-                                                 400, 8192, 16, nullptr);
-    TEST_ASSERT_MSG(paste_off.prepared.error.empty(), paste_off.prepared.error);
-    TEST_ASSERT(paste_off.compress_calls == 0 && paste_off.prepared.tokens == paste_off.ids);
-    TEST_ASSERT(paste_off.prepared.pflash_stats["admission"].value("decision", "") ==
-                "keep_history");
-}
-
-TEST_CASE(ServerUnitFixture, test_pflash_cold_history_chat_without_tools_unchanged) {
-    // A plain multi-turn chat with a long earlier turn: out of scope, served
-    // and traced exactly as with the flag off.
-    const json messages = json::array({
-        {{"role", "system"}, {"content", "You are helpful."}},
-        {{"role", "user"}, {"content",
-            pflash_cold_history_filler("The parser strips every line.\n", 60)}},
-        {{"role", "assistant"}, {"content", "Noted."}},
-        {{"role", "user"}, {"content", "What does the parser do?"}},
-    });
-    const auto on = run_cold_history_case(messages, json(), "raw", 400);
-    const auto off = run_cold_history_case(messages, json(), nullptr, 400);
-    TEST_ASSERT_MSG(on.prepared.error.empty(), on.prepared.error);
-    TEST_ASSERT(on.compress_calls == 1 && off.compress_calls == 1);
-    TEST_ASSERT(on.prepared.compressed);
-    TEST_ASSERT(on.prepared.tokens == off.prepared.tokens);
-    json stats_on = on.prepared.pflash_stats;
-    json stats_off = off.prepared.pflash_stats;
-    stats_on.erase("compress_ms");
-    stats_off.erase("compress_ms");
-    TEST_ASSERT_MSG(stats_on == stats_off, stats_on.dump() + " vs " + stats_off.dump());
-    TEST_ASSERT(!stats_on["admission"].contains("cold_history"));
-}
-
-// A tool session whose raw prompt does not fit the context is not compressed
-// as a whole (the history would be): with no big newest user message the
-// request gets the context-overflow error full prefill gets, switch on or off.
-TEST_CASE(ServerUnitFixture, test_pflash_cold_history_raw_over_max_ctx_overflows) {
-    luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    const auto probe = run_cold_history_case(
-        pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400);
-    const int max_ctx = (int) probe.ids.size() + 15;   // raw + 16 output > max_ctx
-    for (const char * paste : {(const char *) nullptr, "1"}) {
-        const auto run = run_cold_history_case(
-            pflash_cold_agent_messages(), pflash_cold_history_tools(), "raw", 400, max_ctx,
-            16, paste);
-        TEST_ASSERT(run.compress_calls == 0 && !run.prepared.compressed);
-        TEST_ASSERT_MSG(run.prepared.error_status == 400, run.prepared.error);
-        TEST_ASSERT(run.prepared.error.find("maximum context length") != std::string::npos);
-    }
-}
-
 // ─── Tool sessions (PFLASH_AGENT_PASTE) ───────────────────────────────────
 
 TEST_CASE(ServerUnitFixture, test_pflash_agent_paste_flag_defaults_off) {
@@ -15352,9 +15018,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_decision) {
     using http_detail::pflash_keep_history_admission;
     const int t = 16384;
     // Large new user content: only it is compressed, whatever today's
-    // decision for the whole prompt (cold, warm or compress).
-    for (auto admission : {PflashAdmission::Compress, PflashAdmission::WarmCache,
-                           PflashAdmission::ColdHistory}) {
+    // decision for the whole prompt (warm or compress).
+    for (auto admission : {PflashAdmission::Compress, PflashAdmission::WarmCache}) {
         TEST_ASSERT(pflash_keep_history_admission(admission, t, t, true) ==
                     PflashAdmission::NewContent);
         TEST_ASSERT(pflash_keep_history_admission(admission, t, t, false) ==
@@ -15368,8 +15033,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_decision) {
     // Already raw: unchanged.
     TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::WarmCache, t - 1, t, false) ==
                 PflashAdmission::WarmCache);
-    TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::ColdHistory, t - 1, t, true) ==
-                PflashAdmission::ColdHistory);
     TEST_ASSERT(pflash_keep_history_admission(PflashAdmission::UnderThreshold, 3 * t, t, true) ==
                 PflashAdmission::UnderThreshold);
     TEST_ASSERT(std::string(http_detail::pflash_admission_name(
@@ -15493,7 +15156,7 @@ using PflashKeepRecallPairs = std::vector<std::pair<std::string, std::string>>;
 // first turn, the prefix cache holds its prompt up to the newest user turn.
 static PflashKeepHistoryRun run_keep_history_session(
         const std::vector<json> & turns, const json & tools, const char * flag,
-        const char * cold, int threshold, bool warm_history = false,
+        int threshold, bool warm_history = false,
         int max_ctx = 16384, const char * arrive_flag = "1",
         const PflashKeepRecallPairs & recall_pairs = {}) {
     const int max_output = 16;
@@ -15502,7 +15165,6 @@ static PflashKeepHistoryRun run_keep_history_session(
     luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
     luce_test::ScopedEnvVar arrive{"PFLASH_ARRIVE", arrive_flag};
     luce_test::ScopedEnvVar paste{"PFLASH_AGENT_PASTE", flag};
-    luce_test::ScopedEnvVar cold_env{"PFLASH_COLD_HISTORY", cold};
     char trace_path[] = "/tmp/pflash_keep_history_view_XXXXXX";
     const int trace_fd = mkstemp(trace_path);
     TEST_ASSERT(trace_fd >= 0);
@@ -15640,10 +15302,10 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_history_big_paste) {
     // compressed.
     const json turn = pflash_keep_with(pflash_keep_agent_history(6),
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
-                                              nullptr, 400);
-    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "1",
-                                             nullptr, 400);
+    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
+                                              400);
+    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
+                                             400);
     pflash_keep_assert_paste_off_raw(off);
     TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
     // With the switch: one compression, the history token for token, the
@@ -15674,23 +15336,23 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_history_big_paste) {
     TEST_ASSERT(on.keep.value("paste", false));
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_keep_history_cold_history_big_paste) {
+TEST_CASE(ServerUnitFixture, test_pflash_keep_history_big_history_big_paste) {
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
-    // Case 3: a cold history over the threshold and a large paste. By
+    // Case 3: an uncached history over the threshold and a large paste. By
     // default everything is served raw; with PFLASH_AGENT_PASTE=1 the
     // history is still raw and only the paste is compressed.
     const json turn = pflash_keep_with(pflash_keep_agent_history(60),
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
-                                              "raw", 400);
-    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "1",
-                                             "raw", 400);
+    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
+                                              400);
+    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
+                                             400);
     pflash_keep_assert_paste_off_raw(off);
     TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
     const json & admission = on.prepared[0].pflash_stats["admission"];
     TEST_ASSERT_MSG(admission.value("decision", "") == "new_content", admission.dump());
-    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "cold_history");
-    TEST_ASSERT(admission["cold_history"].value("fired", false));
+    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "compress");
+    TEST_ASSERT(!admission.contains("cold_history"));
     TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
     TEST_ASSERT(pflash_keep_prefix_is(on.prepared[0].tokens, on.ids[0], on.user_cut[0]));
     TEST_ASSERT(pflash_keep_count(on.served_text[0], "def parse(x)") == 60);
@@ -15700,31 +15362,23 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_cold_history_big_paste) {
 
 TEST_CASE(ServerUnitFixture, test_pflash_keep_history_small_new_turn_serves_raw) {
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", "1"};
-    // A cold history over the threshold and a short new question: the
-    // history is never compressed. With PFLASH_AGENT_PASTE=1 and
-    // PFLASH_COLD_HISTORY=raw the cold-history rule serves it raw; without
-    // the cold-history rule the raw prompt is served as keep_history; with
-    // the switch off as keep_history too. Never refused.
+    // An uncached history over the threshold and a short new question: the
+    // history is never compressed. The raw prompt is served (keep_history),
+    // with the switch on or off. Never refused.
     const json turn = pflash_keep_with(pflash_keep_agent_history(60),
         pflash_keep_user("Why does it strip?"));
-    const auto cold = run_keep_history_session({turn}, pflash_cold_history_tools(), "1",
-                                               "raw", 400);
-    TEST_ASSERT(cold.prepared[0].pflash_stats["admission"].value("decision", "") ==
-                "cold_history");
-    TEST_ASSERT(!cold.prepared[0].compressed && cold.compress_calls == 0);
-    TEST_ASSERT(cold.prepared[0].tokens == cold.ids[0]);
-    TEST_ASSERT(!cold.prepared[0].pflash_stats["admission"]["keep_history"].value("fired", true));
-    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
-                                              nullptr, 400);
+    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
+                                              400);
     pflash_keep_assert_paste_off_raw(off);
-    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "1",
-                                             nullptr, 400);
+    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
+                                             400);
     TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
     TEST_ASSERT(!on.prepared[0].compressed && on.compress_calls == 0);
     TEST_ASSERT(on.prepared[0].tokens == on.ids[0]);
     const json & admission = on.prepared[0].pflash_stats["admission"];
     TEST_ASSERT_MSG(admission.value("decision", "") == "keep_history", admission.dump());
     TEST_ASSERT(admission["keep_history"].value("fired", false));
+    TEST_ASSERT(admission["keep_history"].value("decision_before", "") == "compress");
     TEST_ASSERT(admission["keep_history"].value("new_droppable", 999) < 400);
     TEST_ASSERT(on.prepared[0].pflash_stats["pflash_fallback"].value("reason", "") ==
                 "keep_history");
@@ -15744,10 +15398,10 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_warm_cache_big_paste) {
     // the paste is compressed (never arrive's re-encoded uncached tail).
     const json turn = pflash_keep_with(pflash_keep_agent_history(60),
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto off = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
-                                              nullptr, 400, /*warm_history=*/true);
-    const auto on = run_keep_history_session({turn}, pflash_cold_history_tools(), "1",
-                                             nullptr, 400, /*warm_history=*/true);
+    const auto off = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
+                                              400, /*warm_history=*/true);
+    const auto on = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
+                                             400, /*warm_history=*/true);
     pflash_keep_assert_paste_off_raw(off);
     TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
     const json & admission = on.prepared[0].pflash_stats["admission"];
@@ -15759,11 +15413,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_warm_cache_big_paste) {
     TEST_ASSERT(pflash_keep_count(on.served_text[0], "The manual says many things.") < 30);
     // Without arrive: the switch off serves it raw, the switch on still
     // compresses only the paste, on the same raw base.
-    const auto off_raw = run_keep_history_session({turn}, pflash_cold_history_tools(), nullptr,
-                                                  nullptr, 400, true, 16384, nullptr);
+    const auto off_raw = run_keep_history_session({turn}, pflash_tool_session_tools(), nullptr,
+                                                  400, true, 16384, nullptr);
     pflash_keep_assert_paste_off_raw(off_raw);
-    const auto on_raw = run_keep_history_session({turn}, pflash_cold_history_tools(), "1",
-                                                 nullptr, 400, true, 16384, nullptr);
+    const auto on_raw = run_keep_history_session({turn}, pflash_tool_session_tools(), "1",
+                                                 400, true, 16384, nullptr);
     TEST_ASSERT(on_raw.prepared[0].pflash_stats["admission"].value("decision", "") ==
                 "new_content");
     TEST_ASSERT(on_raw.prepared[0].tokens == on.prepared[0].tokens);
@@ -15785,11 +15439,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_first_turn_paste_with_tool
         {{"role", "system"}, {"content", "You are a coding agent."}},
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
     });
-    for (const char * cold : {(const char *) nullptr, "raw"}) {
-        const auto off = run_keep_history_session({first}, pflash_cold_history_tools(), nullptr,
-                                                  cold, 400);
-        const auto on = run_keep_history_session({first}, pflash_cold_history_tools(), "1",
-                                                 cold, 400);
+    {
+        const auto off = run_keep_history_session({first}, pflash_tool_session_tools(), nullptr,
+                                                  400);
+        const auto on = run_keep_history_session({first}, pflash_tool_session_tools(), "1",
+                                                 400);
         pflash_keep_assert_paste_off_raw(off);
         TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
         TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
@@ -15812,11 +15466,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_first_turn_paste_with_tool
         pflash_keep_user(pflash_keep_filler("Earlier note line.\n", 30)),
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
     });
-    const auto off2 = run_keep_history_session({two_users}, pflash_cold_history_tools(), nullptr,
-                                               nullptr, 400);
+    const auto off2 = run_keep_history_session({two_users}, pflash_tool_session_tools(), nullptr,
+                                               400);
     pflash_keep_assert_paste_off_raw(off2);
-    const auto on2 = run_keep_history_session({two_users}, pflash_cold_history_tools(), "1",
-                                              nullptr, 400);
+    const auto on2 = run_keep_history_session({two_users}, pflash_tool_session_tools(), "1",
+                                              400);
     TEST_ASSERT(on2.prepared[0].pflash_stats["admission"].value("decision", "") == "new_content");
     TEST_ASSERT(pflash_keep_count(on2.served_text[0], "Earlier note line.") == 30);
     TEST_ASSERT(pflash_keep_prefix_is(on2.prepared[0].tokens, on2.ids[0], on2.user_cut[0]));
@@ -15828,11 +15482,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_first_turn_paste_with_tool
         pflash_keep_user(pflash_keep_filler("Earlier note line.\n", 30)),
         pflash_keep_user("Fix the bug in parser.py."),
     });
-    const auto off3 = run_keep_history_session({small_newest}, pflash_cold_history_tools(),
-                                               nullptr, nullptr, 400);
+    const auto off3 = run_keep_history_session({small_newest}, pflash_tool_session_tools(),
+                                               nullptr, 400);
     pflash_keep_assert_paste_off_raw(off3);
-    const auto on3 = run_keep_history_session({small_newest}, pflash_cold_history_tools(),
-                                              "1", nullptr, 400);
+    const auto on3 = run_keep_history_session({small_newest}, pflash_tool_session_tools(),
+                                              "1", 400);
     TEST_ASSERT_MSG(on3.prepared[0].error.empty(), on3.prepared[0].error);
     TEST_ASSERT(pflash_keep_all_raw(on3, 0) && on3.compress_calls == 0);
     TEST_ASSERT(on3.prepared[0].pflash_stats["admission"].value("decision", "") == "keep_history");
@@ -15858,15 +15512,14 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_tool_output_no_view_served
         return messages;
     };
     const json small_history = with_tool_output(6);
-    for (const char * cold : {(const char *) nullptr, "raw"}) {
-        // Small cold history: the admission would compress the whole prompt
-        // (history and tool output); cold_history does not fire (history
-        // small).
-        const auto off = run_keep_history_session({small_history}, pflash_cold_history_tools(),
-                                                  nullptr, cold, 400);
+    {
+        // Small uncached history: the admission would compress the whole
+        // prompt (history and tool output).
+        const auto off = run_keep_history_session({small_history}, pflash_tool_session_tools(),
+                                                  nullptr, 400);
         pflash_keep_assert_paste_off_raw(off);
-        const auto on = run_keep_history_session({small_history}, pflash_cold_history_tools(),
-                                                 "1", cold, 400);
+        const auto on = run_keep_history_session({small_history}, pflash_tool_session_tools(),
+                                                 "1", 400);
         TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
         TEST_ASSERT(pflash_keep_all_raw(on, 0) && on.compress_calls == 0);
         const json & admission = on.prepared[0].pflash_stats["admission"];
@@ -15882,22 +15535,24 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_tool_output_no_view_served
     // Warm history (cached up to the tool output): arrive would compress the
     // uncached tool output; it is served raw.
     const json big_history = with_tool_output(60);
-    const auto off_warm = run_keep_history_session({big_history}, pflash_cold_history_tools(),
-                                                   nullptr, "raw", 400, /*warm_history=*/true);
+    const auto off_warm = run_keep_history_session({big_history}, pflash_tool_session_tools(),
+                                                   nullptr, 400, /*warm_history=*/true);
     pflash_keep_assert_paste_off_raw(off_warm);
-    const auto on_warm = run_keep_history_session({big_history}, pflash_cold_history_tools(),
-                                                  "1", "raw", 400, /*warm_history=*/true);
+    const auto on_warm = run_keep_history_session({big_history}, pflash_tool_session_tools(),
+                                                  "1", 400, /*warm_history=*/true);
     TEST_ASSERT(pflash_keep_all_raw(on_warm, 0) && on_warm.compress_calls == 0);
     TEST_ASSERT(on_warm.prepared[0].pflash_stats["admission"].value("decision", "") ==
                 "keep_history");
     TEST_ASSERT(on_warm.prepared[0].pflash_stats["admission"]["keep_history"]
                     .value("decision_before", "") == "warm_cache");
-    // Cold big history: cold_history serves it raw, as before.
-    const auto on_cold = run_keep_history_session({big_history}, pflash_cold_history_tools(),
-                                                  "1", "raw", 400);
+    // Uncached big history: served raw as well (keep_history).
+    const auto on_cold = run_keep_history_session({big_history}, pflash_tool_session_tools(),
+                                                  "1", 400);
     TEST_ASSERT(pflash_keep_all_raw(on_cold, 0) && on_cold.compress_calls == 0);
     TEST_ASSERT(on_cold.prepared[0].pflash_stats["admission"].value("decision", "") ==
-                "cold_history");
+                "keep_history");
+    TEST_ASSERT(on_cold.prepared[0].pflash_stats["admission"]["keep_history"]
+                    .value("decision_before", "") == "compress");
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_keep_history_chat_without_tools_unchanged) {
@@ -15910,8 +15565,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_chat_without_tools_unchang
         {{"role", "assistant"}, {"content", "Hi."}},
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")),
     });
-    const auto off = run_keep_history_session({turn}, json(), nullptr, "raw", 400);
-    const auto on = run_keep_history_session({turn}, json(), "1", "raw", 400);
+    const auto off = run_keep_history_session({turn}, json(), nullptr, 400);
+    const auto on = run_keep_history_session({turn}, json(), "1", 400);
     TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
     TEST_ASSERT(on.prepared[0].compressed && on.compress_calls == 1);
     TEST_ASSERT(on.prepared[0].tokens == off.prepared[0].tokens);
@@ -15933,16 +15588,16 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_raw_over_max_ctx) {
     luce_test::ScopedEnvVar fail_closed{"PFLASH_FAIL_CLOSED", nullptr};
     const json paste = pflash_keep_with(pflash_keep_agent_history(6),
         pflash_keep_user(pflash_keep_paste(30, "What does the manual say about exit codes?")));
-    const auto probe = run_keep_history_session({paste}, pflash_cold_history_tools(), "1",
-                                                nullptr, 400);
+    const auto probe = run_keep_history_session({paste}, pflash_tool_session_tools(), "1",
+                                                400);
     const int max_ctx = (int) probe.ids[0].size() + 15;   // raw + 16 output > max_ctx
-    const auto off = run_keep_history_session({paste}, pflash_cold_history_tools(), nullptr,
-                                              nullptr, 400, false, max_ctx);
+    const auto off = run_keep_history_session({paste}, pflash_tool_session_tools(), nullptr,
+                                              400, false, max_ctx);
     TEST_ASSERT(off.compress_calls == 0 && !off.prepared[0].compressed);
     TEST_ASSERT_MSG(off.prepared[0].error_status == 400, off.prepared[0].error);
     TEST_ASSERT(off.prepared[0].error.find("maximum context length") != std::string::npos);
-    const auto on = run_keep_history_session({paste}, pflash_cold_history_tools(), "1",
-                                             nullptr, 400, false, max_ctx);
+    const auto on = run_keep_history_session({paste}, pflash_tool_session_tools(), "1",
+                                             400, false, max_ctx);
     TEST_ASSERT_MSG(on.prepared[0].error.empty(), on.prepared[0].error);
     TEST_ASSERT(on.prepared[0].compressed);
     const json & admission = on.prepared[0].pflash_stats["admission"];
@@ -15954,15 +15609,15 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_raw_over_max_ctx) {
     // compressed, so the request gets the overflow error (as full prefill).
     json history = pflash_keep_agent_history(60);
     const json small = pflash_keep_with(history, pflash_keep_user("Why does it strip?"));
-    const auto probe2 = run_keep_history_session({small}, pflash_cold_history_tools(), "1",
-                                                 nullptr, 400);
+    const auto probe2 = run_keep_history_session({small}, pflash_tool_session_tools(), "1",
+                                                 400);
     const int max_ctx2 = (int) probe2.ids[0].size() + 15;
-    const auto off2 = run_keep_history_session({small}, pflash_cold_history_tools(), nullptr,
-                                               nullptr, 400, false, max_ctx2);
+    const auto off2 = run_keep_history_session({small}, pflash_tool_session_tools(), nullptr,
+                                               400, false, max_ctx2);
     TEST_ASSERT(off2.compress_calls == 0 && !off2.prepared[0].compressed);
     TEST_ASSERT_MSG(off2.prepared[0].error_status == 400, off2.prepared[0].error);
-    const auto on2 = run_keep_history_session({small}, pflash_cold_history_tools(), "1",
-                                              nullptr, 400, false, max_ctx2);
+    const auto on2 = run_keep_history_session({small}, pflash_tool_session_tools(), "1",
+                                              400, false, max_ctx2);
     TEST_ASSERT(on2.compress_calls == 0 && !on2.prepared[0].compressed);
     TEST_ASSERT_MSG(on2.prepared[0].error_status == 400, on2.prepared[0].error);
     TEST_ASSERT(on2.prepared[0].error.find("maximum context length") != std::string::npos);
@@ -15973,11 +15628,11 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_raw_over_max_ctx) {
             {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"a.txt\"}"}}}}})}});
     history.push_back({{"role", "tool"}, {"tool_call_id", "call-2"},
                        {"content", pflash_keep_filler(kPflashKeepPasteLine, 30)}});
-    const auto probe3 = run_keep_history_session({history}, pflash_cold_history_tools(), "1",
-                                                 nullptr, 400);
+    const auto probe3 = run_keep_history_session({history}, pflash_tool_session_tools(), "1",
+                                                 400);
     const int max_ctx3 = (int) probe3.ids[0].size() + 15;
-    const auto on3 = run_keep_history_session({history}, pflash_cold_history_tools(), "1",
-                                              nullptr, 400, false, max_ctx3);
+    const auto on3 = run_keep_history_session({history}, pflash_tool_session_tools(), "1",
+                                              400, false, max_ctx3);
     TEST_ASSERT(on3.compress_calls == 0 && !on3.prepared[0].compressed);
     TEST_ASSERT_MSG(on3.prepared[0].error_status == 400, on3.prepared[0].error);
 }
@@ -16027,8 +15682,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_follow_up_turns) {
         {"content", pflash_keep_filler("more trap notes here.\n", 30)}}));    // 7 big tool
     m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Done reading."}});
     turns.push_back(m = pflash_keep_with(m, pflash_keep_user("Summarize the traps.")));      // 8
-    const auto run = run_keep_history_session(turns, pflash_cold_history_tools(), "1",
-                                              nullptr, 400, false, 16384, "1",
+    const auto run = run_keep_history_session(turns, pflash_tool_session_tools(), "1",
+                                              400, false, 16384, "1",
                                               {{sig_q, sigint}});
     const auto mode = [&] (size_t turn) {
         return run.prepared[turn].pflash_stats["view"].value("mode", "");
@@ -16109,8 +15764,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_follow_up_turns) {
     TEST_ASSERT(run.counters.value("fallback_served", 0) == 0);
     // PFLASH_AGENT_PASTE off: both pastes, both big tool outputs and every
     // follow-up served raw, without a drafter pass.
-    const auto off = run_keep_history_session(turns, pflash_cold_history_tools(), nullptr,
-                                              nullptr, 400, false, 16384, "1",
+    const auto off = run_keep_history_session(turns, pflash_tool_session_tools(), nullptr,
+                                              400, false, 16384, "1",
                                               {{sig_q, sigint}});
     pflash_keep_assert_paste_off_raw(off);
     TEST_ASSERT(pflash_keep_count(off.served_text[0], "The manual says many things.") == 30);
@@ -16137,15 +15792,15 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_view_over_context_not_rebu
             {"function", {{"name", "read_file"}, {"arguments", "{\"path\":\"a.txt\"}"}}}}})}});
     t2 = pflash_keep_with(t2, {{"role", "tool"}, {"tool_call_id", "call-2"},
         {"content", pflash_keep_filler("trap handlers run on signals.\n", 30)}});
-    const auto probe = run_keep_history_session({t1, t2}, pflash_cold_history_tools(), "1",
-                                                nullptr, 400);
+    const auto probe = run_keep_history_session({t1, t2}, pflash_tool_session_tools(), "1",
+                                                400);
     TEST_ASSERT(probe.prepared[1].compressed);
     // The context holds turn 1's view but not turn 2's continuation.
     const int max_ctx = (int) probe.prepared[1].tokens.size() + 15;
     // Switch off: never compressed; each raw prompt is served, or gets the
     // overflow error when it does not fit.
-    const auto off = run_keep_history_session({t1, t2}, pflash_cold_history_tools(), nullptr,
-                                              nullptr, 400, false, max_ctx);
+    const auto off = run_keep_history_session({t1, t2}, pflash_tool_session_tools(), nullptr,
+                                              400, false, max_ctx);
     TEST_ASSERT(off.compress_calls == 0);
     for (size_t turn = 0; turn < 2; ++turn) {
         TEST_ASSERT(!off.prepared[turn].compressed);
@@ -16156,8 +15811,8 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_view_over_context_not_rebu
             TEST_ASSERT(off.prepared[turn].tokens == off.ids[turn]);
         }
     }
-    const auto on = run_keep_history_session({t1, t2}, pflash_cold_history_tools(), "1",
-                                             nullptr, 400, false, max_ctx);
+    const auto on = run_keep_history_session({t1, t2}, pflash_tool_session_tools(), "1",
+                                             400, false, max_ctx);
     TEST_ASSERT(on.prepared[0].compressed);
     TEST_ASSERT(!on.prepared[1].compressed);
     TEST_ASSERT_MSG(on.prepared[1].error_status == 400, on.prepared[1].error);
@@ -16183,10 +15838,10 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_plain_chat_turns_unchanged
     m = pflash_keep_with(m, {{"role", "assistant"}, {"content", "Two."}});
     turns.push_back(m = pflash_keep_with(m, pflash_keep_user(
         pflash_keep_filler("Another page of the manual.\n", 30) + "Which page covers traps?")));
-    for (const char * cold : {(const char *) nullptr, "raw"}) {
-        const auto off = run_keep_history_session(turns, json(), nullptr, cold, 400, false,
+    {
+        const auto off = run_keep_history_session(turns, json(), nullptr, 400, false,
                                                   16384, "1", {{sig_q, sigint}});
-        const auto on = run_keep_history_session(turns, json(), "1", cold, 400, false,
+        const auto on = run_keep_history_session(turns, json(), "1", 400, false,
                                                  16384, "1", {{sig_q, sigint}});
         TEST_ASSERT(off.prepared[1].pflash_stats["view"].value("recalled_tokens", 0) > 0);
         for (size_t turn = 0; turn < turns.size(); ++turn) {
@@ -16229,7 +15884,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_unparsed_tool_session_raw)
     const std::string rendered = render_chat_template(
         normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
         ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
-        pflash_cold_history_tools().dump());
+        pflash_tool_session_tools().dump());
     const std::string path = write_pflash_bpe_tokenizer_fixture(
         {"user", "assistant", "system", "\n", "tool"}, rendered);
     Tokenizer tokenizer;
@@ -16252,7 +15907,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_keep_history_unparsed_tool_session_raw)
         ParsedRequest request;
         request.format = ApiFormat::OPENAI_CHAT;
         request.messages = rendered;   // raw text: no messages array
-        request.tools = pflash_cold_history_tools();
+        request.tools = pflash_tool_session_tools();
         request.prompt_tokens = ids;
         request.max_output = 16;
         auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
@@ -16291,7 +15946,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_tool_view_snapshot_at_last_message_end)
     const std::string rendered = render_chat_template(
         normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
         ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
-        pflash_cold_history_tools().dump());
+        pflash_tool_session_tools().dump());
     const std::string path = write_pflash_bpe_tokenizer_fixture(
         {"user", "assistant", "system", "\n", "tool"}, rendered);
     Tokenizer tokenizer;
@@ -16317,7 +15972,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_tool_view_snapshot_at_last_message_end)
     cache.confirm_inline_snap(0, head, ids);
     backend.positions[0] = head;
     const int snap = SchedulerTestHarness::prepare_cache_snapshot_cut(
-        server, ids, pflash_cold_history_tools(), cut);
+        server, ids, pflash_tool_session_tools(), cut);
     TEST_ASSERT_MSG(snap == cut + 1 && snap == bounds.back(),
                     std::to_string(snap) + " vs cut " + std::to_string(cut));
     unlink(path.c_str());
@@ -16330,7 +15985,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_base_target_fails_closed) {
     const std::string rendered = render_chat_template(
         normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory),
         ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
-        pflash_cold_history_tools().dump());
+        pflash_tool_session_tools().dump());
     const std::string path = write_pflash_bpe_tokenizer_fixture(
         {"user", "assistant", "system", "\n", "tool"}, rendered);
     Tokenizer tokenizer;
