@@ -403,7 +403,7 @@ struct PflashChatView {
 // One scored turn that compresses only `regions` of the raw prompt (drafter
 // tokens, canonical) and serves everything else as the view holds it or raw:
 // "arrive" = a large uncached chunk; "new_content" = the newest user turn's
-// content of an agent conversation (PFLASH_AGENT_HISTORY=keep). The served
+// content of a tool session (PFLASH_AGENT_PASTE=1). The served
 // prompt keeps the cached view up to cut_view (raw position cut_raw) and
 // serves the rest anew. ``raw_base`` (no view): the raw prompt's own target
 // tokens [0, cut_view) stand in for the view, so the earlier conversation is
@@ -714,21 +714,23 @@ PFlashTokenSpan pflash_chat_history_region(
 PflashAdmission pflash_cold_history_admission(
     PflashAdmission admission, bool raw_fits, bool tool_activity,
     int history_uncached_droppable, int threshold) noexcept;
-// Agent history (PFLASH_AGENT_HISTORY=keep, cache admission only; unset or
-// any other value = off, today's decisions). In a conversation with tool
-// activity (a "tool session") the agent's history and tool output are never
-// compressed: the only content PFlash may compress is the newest turn when it
-// is a user message whose droppable tokens reach the threshold (decision
-// ``NewContent``: a region plan over that content alone, served on a raw base
-// -- the raw prompt's own tokens before it, so a first turn's system prompt
-// and tools as well -- or on the conversation's view). Everything else is
-// served raw (``KeepHistory``, or the raw decision that already applies), and
-// a view is only continued: new turns appended verbatim (a tool output of any
-// size included), recall at the newest user message, never rebuilt and never
-// compressed again as a whole. A raw prompt over the context is not
-// compressed either: unless a big newest paste brings it under, the request
-// gets the context-overflow error full prefill gets.
-bool pflash_agent_history_enabled() noexcept;
+// Tool sessions (cache admission, --prefill-compression auto). In a
+// conversation with tool activity (a "tool session") the agent's history and
+// tool output are never compressed. By default nothing in a tool session is:
+// it is served raw, full prefill (``KeepHistory``). PFLASH_AGENT_PASTE=1
+// (exactly "1"; anything else = off) lets PFlash compress one thing, the
+// newest turn when it is a user message whose droppable tokens reach the
+// threshold (decision ``NewContent``: a region plan over that content alone,
+// served on a raw base -- the raw prompt's own tokens before it, so a first
+// turn's system prompt and tools as well -- or on the conversation's view).
+// Everything else is served raw (``KeepHistory``, or the raw decision that
+// already applies), and a view is only continued: new turns appended
+// verbatim (a tool output of any size included), recall at the newest user
+// message, never rebuilt and never compressed again as a whole. A raw prompt
+// over the context is not compressed either: unless a big newest paste
+// brings it under (switch on), the request gets the context-overflow error
+// full prefill gets.
+bool pflash_agent_paste_enabled() noexcept;
 // The newest turn of ``turns`` when it is a user turn with content: returns
 // nullptr and sets ``newest``; otherwise what the newest turn is
 // ("no_turns", "newest_not_user": a tool output, an assistant prefill or an
@@ -1000,7 +1002,7 @@ private:
     // no scoring: a repeated prompt, or a small follow-up with recall off;
     // it returns false for the caller to compress. With one it always
     // serves: a continued view, or the fresh prompt as a new view.
-    // ``keep_history`` (PFLASH_AGENT_HISTORY=keep, a tool session): the view
+    // ``keep_history`` (a tool session, PFLASH_AGENT_PASTE=1): the view
     // only continues -- new tokens are appended verbatim (no compress-new),
     // recalled passages are clipped to the message content that holds them,
     // the view is never rebuilt (neither when it outgrows a fresh selection
@@ -1285,7 +1287,7 @@ private:
     uint64_t                        pflash_fallback_refused_ = 0;
     std::map<std::string, uint64_t> pflash_fallback_reasons_;   // served, by reason
     std::map<std::string, uint64_t> pflash_refused_reasons_;    // refused, by why
-    // PFLASH_AGENT_HISTORY=keep decisions, by name (/props pflash.keep_history).
+    // Tool-session decisions, by name (/props pflash.keep_history).
     std::map<std::string, uint64_t> pflash_keep_history_counts_;
     nlohmann::json pflash_failure_counters_json() const;
     nlohmann::json pflash_keep_history_json() const;

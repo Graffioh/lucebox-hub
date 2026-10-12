@@ -1150,9 +1150,9 @@ PflashAdmission pflash_cold_history_admission(
     return PflashAdmission::ColdHistory;
 }
 
-bool pflash_agent_history_enabled() noexcept {
-    const char * raw = std::getenv("PFLASH_AGENT_HISTORY");
-    return raw && std::string(raw) == "keep";
+bool pflash_agent_paste_enabled() noexcept {
+    const char * raw = std::getenv("PFLASH_AGENT_PASTE");
+    return raw && std::string(raw) == "1";
 }
 
 const char * pflash_keep_history_scope(
@@ -5422,9 +5422,96 @@ std::string HttpServer::apply_pflash_compression(
     int kept_tokens = 0;
     json admission_stats;   // cache-aware admission inputs (null when off)
     http_detail::PflashRegionPlan region_plan;
-    // PFLASH_AGENT_HISTORY=keep, in scope, on a conversation with a view:
-    // the view only continues (serve_pflash_chat_view keep_history).
+    // A tool session's view (PFLASH_AGENT_PASTE=1): it only continues
+    // (serve_pflash_chat_view keep_history).
     bool keep_history_view = false;
+    // Tool sessions under cache admission: PFlash never compresses the
+    // agent's history or tool output. Tool activity (tools defined, or an
+    // assistant tool call / tool result in the history) is read once and
+    // only when a rule asks for it.
+    const bool tool_session_rules =
+        config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
+        http_detail::pflash_cache_admission_enabled();
+    const bool raw_fits = config_.max_ctx <= 0 ||
+        prompt_tokens + req.max_output <= config_.max_ctx;
+    int tool_activity_state = -1;   // -1 not read, 0 none, 1 tools
+    std::string tool_error;
+    const auto tool_activity = [&] {
+        if (tool_activity_state < 0) {
+            tool_activity_state = 0;
+            // Tools defined: a tool session whatever the messages.
+            if (http_detail::pflash_has_tool_activity(req.tools, {})) {
+                tool_activity_state = 1;
+                return true;
+            }
+            try {
+                tool_activity_state = http_detail::pflash_has_tool_activity(
+                    req.tools,
+                    // No tool-memory replay: only roles and tool calls are
+                    // read, and the lookup must not touch the memory a
+                    // second time.
+                    normalize_chat_messages(
+                        req.messages, req.format, tool_memory_,
+                        /*replay_tool_memory=*/false)) ? 1 : 0;
+            } catch (const std::exception & e) {
+                // Unreadable messages: the rules do not apply.
+                tool_error = e.what();
+            }
+        }
+        return tool_activity_state == 1;
+    };
+    const auto count_keep_history = [this] (const char * decision) {
+        std::lock_guard<std::mutex> lk(pflash_failure_mu_);
+        ++pflash_keep_history_counts_[decision];
+    };
+    // The raw prompt, full prefill, for a tool session nothing may be
+    // compressed in: counted with the raw fallbacks (reason keep_history) and
+    // never refused. A raw prompt over the context then gets the
+    // context-overflow error, as with full prefill. ``new_droppable`` < 0:
+    // not measured.
+    const auto serve_keep_raw = [&] (int new_droppable, const char * why) {
+        count_keep_history("keep_history");
+        {
+            std::lock_guard<std::mutex> lk(pflash_failure_mu_);
+            ++pflash_fallback_served_;
+            ++pflash_fallback_reasons_["keep_history"];
+        }
+        prepared.pflash_stats = {{"admission", admission_stats}};
+        prepared.pflash_stats["pflash_fallback"] = {
+            {"reason", "keep_history"},
+            {"prompt_tokens", prompt_tokens},
+        };
+        if (new_droppable >= 0) {
+            prepared.pflash_stats["pflash_fallback"]["new_droppable"] = new_droppable;
+        }
+        std::fprintf(stderr,
+            "[pflash-keep-history] serving the raw prompt (%d tokens): %s, "
+            "newest user content droppable~%d, threshold %d%s\n",
+            prompt_tokens, why, new_droppable, config_.pflash_threshold,
+            raw_fits ? "" : "; the raw prompt does not fit the context");
+        std::fflush(stderr);
+    };
+    // By default a tool session is served raw: nothing in it is compressed.
+    // PFLASH_AGENT_PASTE=1 lets PFlash compress one thing, the newest turn
+    // when it is a user message with a threshold's worth of droppable tokens
+    // (a pasted document), below; that needs strict selection and a located
+    // query, so without them the session is served raw as well.
+    if (tool_session_rules && tool_activity() &&
+        !(http_detail::pflash_agent_paste_enabled() &&
+          experiment.selection_active && query_window.valid())) {
+        const bool paste = http_detail::pflash_agent_paste_enabled();
+        int newest = -1;
+        const char * newest_kind = messages_input && chat_turn.valid()
+            ? http_detail::pflash_keep_history_scope(chat_turn.turns, newest)
+            : "unparsed";
+        admission_stats = {{"decision", "keep_history"}, {"raw_fits", raw_fits},
+                           {"keep_history", {{"in_scope", true},
+                                             {"newest", newest_kind ? newest_kind : "user"},
+                                             {"paste", paste}}}};
+        serve_keep_raw(-1, paste ? "tool session without strict selection or a query"
+                                 : "tool session (PFLASH_AGENT_PASTE off)");
+        return {};
+    }
     if (experiment.selection_active && query_window.valid()) {
         const int input_tokens = (int) drafter_ids.size();
         const int query_begin = query_window.end - query_window.tokens;
@@ -5492,59 +5579,29 @@ std::string HttpServer::apply_pflash_compression(
             http_detail::PflashChatView existing;
             const bool has_view = messages_input && chat_turn.valid() &&
                 pflash_views_.find(req.prompt_tokens, drafter_ids, existing);
-            const bool raw_fits = config_.max_ctx <= 0 ||
-                prompt_tokens + req.max_output <= config_.max_ctx;
-            // Tool activity, read once and only when a rule asks for it.
-            int tool_activity_state = -1;   // -1 not read, 0 none, 1 tools
-            std::string tool_error;
-            const auto tool_activity = [&] {
-                if (tool_activity_state < 0) {
-                    tool_activity_state = 0;
-                    // Tools defined: a tool session whatever the messages.
-                    if (http_detail::pflash_has_tool_activity(req.tools, {})) {
-                        tool_activity_state = 1;
-                        return true;
-                    }
-                    try {
-                        tool_activity_state = http_detail::pflash_has_tool_activity(
-                            req.tools,
-                            // No tool-memory replay: only roles and tool
-                            // calls are read, and the lookup must not touch
-                            // the memory a second time.
-                            normalize_chat_messages(
-                                req.messages, req.format, tool_memory_,
-                                /*replay_tool_memory=*/false)) ? 1 : 0;
-                    } catch (const std::exception & e) {
-                        // Unreadable messages: the rules do not apply.
-                        tool_error = e.what();
-                    }
-                }
-                return tool_activity_state == 1;
-            };
-            // Agent history (PFLASH_AGENT_HISTORY=keep): in a tool session
-            // (tool activity) the history and tool output are never
+            // A tool session here has PFLASH_AGENT_PASTE=1 (otherwise it was
+            // served raw above): its history and tool output are still never
             // compressed. Only the newest turn, when it is a user message,
             // may be: its content alone, on its own budget, when its
             // droppable tokens reach the threshold. Everything else is served
             // raw, and a view is only continued. Chats without tools:
-            // nothing is computed or recorded, as with the flag off.
+            // nothing is computed or recorded.
             json keep_history_stats;
             int keep_newest = -1;
             bool keep_scope = false;
-            if (http_detail::pflash_agent_history_enabled()) {
-                if (tool_activity()) {
-                    keep_scope = true;
-                    const bool parsed = messages_input && chat_turn.valid();
-                    const char * newest_kind = parsed
-                        ? http_detail::pflash_keep_history_scope(chat_turn.turns, keep_newest)
-                        : "unparsed";
-                    keep_history_stats = {{"in_scope", true},
-                                          {"newest", newest_kind ? newest_kind : "user"}};
-                } else if (!tool_error.empty()) {
-                    std::fprintf(stderr,
-                        "[pflash-keep-history] messages not readable (%s); rule skipped\n",
-                        tool_error.c_str());
-                }
+            if (tool_activity()) {
+                keep_scope = true;
+                const bool parsed = messages_input && chat_turn.valid();
+                const char * newest_kind = parsed
+                    ? http_detail::pflash_keep_history_scope(chat_turn.turns, keep_newest)
+                    : "unparsed";
+                keep_history_stats = {{"in_scope", true},
+                                      {"newest", newest_kind ? newest_kind : "user"},
+                                      {"paste", true}};
+            } else if (!tool_error.empty()) {
+                std::fprintf(stderr,
+                    "[pflash-keep-history] messages not readable (%s); rule skipped\n",
+                    tool_error.c_str());
             }
             // Droppable target tokens of a turn's content (the pinned query
             // and instruction spans inside it excluded).
@@ -5554,34 +5611,6 @@ std::string HttpServer::apply_pflash_compression(
                     http_detail::pflash_span_tokens_within(
                         required_instruction_spans, turn.content_begin,
                         turn.content_end)));
-            };
-            const auto count_keep_history = [this] (const char * decision) {
-                std::lock_guard<std::mutex> lk(pflash_failure_mu_);
-                ++pflash_keep_history_counts_[decision];
-            };
-            // The raw prompt, full prefill, for a tool session nothing may be
-            // compressed in: counted with the raw fallbacks (reason
-            // keep_history) and never refused. A raw prompt over the context
-            // then gets the context-overflow error, as with full prefill.
-            const auto serve_keep_raw = [&] (int new_droppable, const char * why) {
-                count_keep_history("keep_history");
-                {
-                    std::lock_guard<std::mutex> lk(pflash_failure_mu_);
-                    ++pflash_fallback_served_;
-                    ++pflash_fallback_reasons_["keep_history"];
-                }
-                prepared.pflash_stats = {{"admission", admission_stats}};
-                prepared.pflash_stats["pflash_fallback"] = {
-                    {"reason", "keep_history"},
-                    {"prompt_tokens", prompt_tokens},
-                    {"new_droppable", new_droppable},
-                };
-                std::fprintf(stderr,
-                    "[pflash-keep-history] serving the raw prompt (%d tokens): %s, "
-                    "newest user content droppable~%d, threshold %d%s\n",
-                    prompt_tokens, why, new_droppable, config_.pflash_threshold,
-                    raw_fits ? "" : "; the raw prompt does not fit the context");
-                std::fflush(stderr);
             };
             if (keep_scope && !(messages_input && chat_turn.valid())) {
                 // A tool session whose turns cannot be located: nothing can
@@ -6360,9 +6389,13 @@ json HttpServer::pflash_failure_counters_json() const {
 }
 
 json HttpServer::pflash_keep_history_json() const {
-    if (!http_detail::pflash_agent_history_enabled()) return nullptr;
+    if (config_.pflash_mode != ServerConfig::PflashMode::AUTO ||
+        !http_detail::pflash_cache_admission_enabled()) {
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lk(pflash_failure_mu_);
-    return {{"enabled", true}, {"decisions", pflash_keep_history_counts_}};
+    return {{"paste", http_detail::pflash_agent_paste_enabled()},
+            {"decisions", pflash_keep_history_counts_}};
 }
 
 void HttpServer::trace_pflash_served(

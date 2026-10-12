@@ -470,26 +470,30 @@ turns it off; the breaks do not count against the token ceiling).
 appends each compressed request's served prompt as JSONL, for evidence
 checks in evaluations.
 
-Coding-agent sessions (`PFLASH_AGENT_HISTORY=keep`, with
-`PFLASH_ADMISSION=cache`): in a conversation with tool activity (the request
-defines `tools`, or its history has an assistant tool call or a tool result)
-PFlash never compresses the agent's history or any tool output. The only
-thing it compresses is the newest turn when it is a user message with at
-least `--prefill-threshold` droppable tokens (a pasted document, on the
-first turn too): that content alone, on its own keep budget, after the raw
-history (restored from the prefix cache or prefilled) or after the
-conversation's view. Every other request is served raw with full prefill
-(`pflash_fallback.reason = keep_history`; a newest tool output of any size
-included), and a view is only continued: later turns and tool outputs are
-appended verbatim, a new big paste is compressed as a region of its own,
-and recall adds the passages of earlier pastes that the new question needs
-in the excerpt block at the start of the newest user message, after the
-cached view. The view is never rebuilt and never compressed again as a
-whole; when it cannot continue (or no longer fits the context) the raw
-prompt is served, and a raw prompt over the context gets the
-context-overflow error full prefill gets. The prefix-cache snapshot of such
-a view is taken at the view's end, so the next turn restores the whole view.
-Chats without tools are not affected.
+Coding-agent sessions (with `PFLASH_ADMISSION=cache` and
+`--prefill-compression auto`): in a conversation with tool activity (the
+request defines `tools`, or its history has an assistant tool call or a tool
+result) PFlash never compresses the agent's history or any tool output. By
+default it compresses nothing in such a session: every request is served raw
+with full prefill (`pflash_fallback.reason = keep_history`), and a raw prompt
+over the context gets the context-overflow error full prefill gets.
+`PFLASH_AGENT_PASTE=1` (default off) lets PFlash compress one thing: the
+newest turn when it is a user message with at least `--prefill-threshold`
+droppable tokens (a pasted document, on the first turn too). That content
+alone is compressed, on its own keep budget, after the raw history (restored
+from the prefix cache or prefilled) or after the conversation's view. A view
+is then only continued: later turns and tool outputs are appended verbatim, a
+new big paste is compressed as a region of its own, and recall adds the
+passages of earlier pastes that the new question needs in the excerpt block
+at the start of the newest user message, after the cached view. The view is
+never rebuilt and never compressed again as a whole; when it cannot continue
+(or no longer fits the context) the raw prompt is served. The switch is off
+by default because follow-up questions after a compressed paste cost more
+than full prefill, which keeps the whole raw prompt cached: a follow-up that
+needs recall prefills the recalled passages again, and every user turn runs a
+drafter selection (up to 48 s more per follow-up in a 10-turn coding session on
+an R9700; the session took 281 s against 258 s with full prefill). Chats
+without tools are not affected.
 
 Every turn of a multi-turn chat keeps its role header, and user turns (the
 latest included) and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS`
