@@ -217,11 +217,17 @@ them go through the same asynchronous writer.
 the concurrent `qwen4exp` engine keeps its checkpoints outside the backend's
 snapshot slots: both run without a disk cache (logged at startup).
 
-**Follow-up: cache-aware admission.** Compression admission that counts the
-cached prefix as warm (on the PFlash branches, not on `main`) consults RAM
-only. `DiskPrefixCache::longest_prefix(prompt)` returns the deepest restorable
-key length and KV position without reading a file, so admission can take the
-max of the RAM and disk prefixes.
+**Cache-aware admission.** PFlash's admission counts the deeper of the RAM
+prefix snapshot and the deepest disk entry for the prompt
+(`DiskPrefixCache::longest_prefix`, an index lookup that reads no file; ties
+go to RAM), in the chat view (`PFLASH_ADMISSION=cache`) and in the unified view
+(`PFLASH_UNIFIED=1`). A conversation restored after a restart, or written out
+on eviction, is then cached history: the unified view serves it raw, from disk,
+and pages only new long content, instead of handing a cold history to the chat
+view. The disk counts only with `--kv-cache-dir` set and the request's disk
+scope `full`. With the disk cache on, the chat view's admission record carries
+`cached_source` (`ram`, `disk` or `none`) and the unified view's stats a
+`cached` object with the tokens and source.
 
 ## Snapshot Memory Management
 
