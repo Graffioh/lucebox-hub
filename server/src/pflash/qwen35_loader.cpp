@@ -625,6 +625,7 @@ static bool load_qwen35_stage2(const char * path, const std::string & drafter_pa
 bool load_qwen35_drafter(const std::string & gguf_path,
                          DrafterContext & out) {
     auto * st = new Qwen35DrafterState();
+    st->gguf_path = gguf_path;
     // The scorer never needs logits, and tied-embedding Qwen3.5-0.8B
     // exports omit output.weight, so skip the lm_head entirely.
     TargetLoadPlan plan;

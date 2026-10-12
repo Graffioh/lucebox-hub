@@ -1354,6 +1354,9 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     }
 
     if (release_after_use) {
+        // Scoring sessions outlive the release in host RAM; the next scoring
+        // call restores them once the drafter is loaded again.
+        if (drafter_loaded_) luce::common::drafter_offload_sessions(drafter_ctx_);
         free_drafter();
     } else if (drafter_loaded_ && drafter_ctx_.backend &&
                drafter_ctx_.backend != target_backend_ &&
