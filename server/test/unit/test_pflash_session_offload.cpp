@@ -181,6 +181,47 @@ TEST_CASE(PFlashSessionOffloadFixture, token_prefix_round_trip_copies_only_the_p
     CHECK(host.bytes == ggml_nbytes(src[2]) + ggml_nbytes(src[3]));
 }
 
+// A session restored for a request longer than its stored capacity is allocated with more positions; the stored prefix
+// lands at the same token positions of the longer tensors, byte for byte. A whole-tensor copy never goes into a longer
+// tensor.
+TEST_CASE(PFlashSessionOffloadFixture, token_prefix_restores_into_a_longer_session) {
+    const int n = 300;
+    Layout a(512);
+    Layout b(1280);
+    const auto src = pflash_owned_tensors(a.ctx);
+    const auto dst = pflash_owned_tensors(b.ctx);
+    fill_random(src, 21);
+    fill_random(dst, 22);
+    PFlashHostCopy host;
+    std::string error;
+    REQUIRE(pflash_copy_to_host(src, kTokens, n, nullptr, host, error));
+    REQUIRE(pflash_copy_from_host(host, dst, error));
+    // attn_k / attn_v [64, T, 2]: rows < n of each head equal; keys [32, 2, T]: positions < n equal.
+    for (int i : {0, 1}) {
+        const auto s_b = bytes_of(src[(size_t) i]);
+        const auto d_b = bytes_of(dst[(size_t) i]);
+        for (int h = 0; h < 2; ++h) {
+            const size_t row = src[(size_t) i]->nb[1];
+            CHECK(std::memcmp(s_b.data() + h * src[(size_t) i]->nb[2], d_b.data() + h * dst[(size_t) i]->nb[2],
+                              row * n) == 0);
+        }
+    }
+    CHECK(bytes_of(src[2]) == bytes_of(dst[2]));
+    CHECK(bytes_of(src[3]) == bytes_of(dst[3]));
+    const auto ks = bytes_of(src[4]);
+    const auto kd = bytes_of(dst[4]);
+    CHECK(std::memcmp(ks.data(), kd.data(), src[4]->nb[2] * n) == 0);
+    // Whole copies keep requiring the exact shape.
+    PFlashHostCopy whole;
+    REQUIRE(pflash_copy_to_host(src, kWhole, 0, nullptr, whole, error));
+    std::string why;
+    CHECK(!pflash_copy_from_host(whole, dst, why));
+    CHECK(why.find("shape differs") != std::string::npos);
+    // A shorter target is refused.
+    Layout c(256);
+    CHECK(!pflash_copy_from_host(host, pflash_owned_tensors(c.ctx), why));
+}
+
 TEST_CASE(PFlashSessionOffloadFixture, mismatched_layouts_are_refused_and_nothing_is_written) {
     Layout a(512);
     REQUIRE(a.buf != nullptr);
@@ -199,8 +240,8 @@ TEST_CASE(PFlashSessionOffloadFixture, mismatched_layouts_are_refused_and_nothin
         size_t i = 0;
         for (ggml_tensor * t : pflash_owned_tensors(other.ctx)) CHECK(bytes_of(t) == before[i++]);
     };
-    Layout longer(768);
-    refused(longer, pflash_owned_tensors(longer.ctx), "shape differs");
+    Layout shorter(256);          // fewer positions than the stored layout
+    refused(shorter, pflash_owned_tensors(shorter.ctx), "shape differs");
     Layout other_type(512, GGML_TYPE_F16);
     refused(other_type, pflash_owned_tensors(other_type.ctx), "type differs");
     Layout fewer(512);
@@ -216,7 +257,7 @@ TEST_CASE(PFlashSessionOffloadFixture, mismatched_layouts_are_refused_and_nothin
     Layout same(512);
     PFlashHostCopy bad;
     REQUIRE(pflash_copy_to_host(pflash_owned_tensors(a.ctx), kTokens, 200, nullptr, bad, error));
-    bad.tensors[0].chunks.back().first = ggml_nbytes(pflash_owned_tensors(a.ctx)[0]);
+    bad.tensors[2].chunks.back().first = ggml_nbytes(pflash_owned_tensors(a.ctx)[2]);   // a whole-tensor copy
     std::string why;
     CHECK(!pflash_copy_from_host(bad, pflash_owned_tensors(same.ctx), why));
     CHECK(why.find("out of bounds") != std::string::npos);

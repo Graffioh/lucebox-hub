@@ -1038,15 +1038,20 @@ void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st, cons
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    // A request longer than the stored capacity gets the headroom acquire would give it, as a resident session that
+    // grew would have; the stored prefix goes into the longer tensors unchanged.
+    const int S = (int) ids.size();
+    int capacity = host.bookkeeping.capacity;
+    if (capacity < align_up_i(S, 256)) capacity = S + S / 2 + 4096;
     auto session = std::make_unique<Qwen35ScoringSession>();
     if (host.bookkeeping.capacity <= 0 ||
-        !allocate_scoring_session(st.weights, host.bookkeeping.capacity, *session)) {
+        !allocate_scoring_session(st.weights, capacity, *session)) {
         free_qwen35_scoring_session(*session);
         drop(std::string("allocation failed: ") + luce_last_error());
         return;
     }
     std::string error;
-    if (session->cache.max_ctx != host.cache_max_ctx) {
+    if (session->cache.max_ctx < host.cache_max_ctx) {
         error = "cache size differs";
     } else if (!luce::pflash::pflash_copy_from_host(host.copy, qwen35_session_tensors(*session), error)) {
         // error set

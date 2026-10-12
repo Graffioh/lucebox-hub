@@ -51,6 +51,8 @@ struct PFlashTensorCopy {
     int64_t ne[GGML_MAX_DIMS] = {0, 0, 0, 0};
     size_t nb[GGML_MAX_DIMS] = {0, 0, 0, 0};
     std::vector<std::pair<size_t, size_t>> chunks;   // {offset in tensor, bytes}
+    int token_dim = -1;          // -1: whole tensor
+    int64_t n_tokens = 0;        // positions copied along token_dim
 };
 
 struct PFlashHostCopy {
@@ -74,8 +76,10 @@ bool pflash_copy_to_host(const std::vector<ggml_tensor *> & tensors, const std::
                          std::string & error);
 
 // Writes a host copy back into ``tensors``. Every pair is checked first (count, type, shape, strides, chunk bounds,
-// allocated); on any mismatch nothing is written and the reason is in ``error``. Bytes outside the copied chunks are
-// left as they are (a resume never reads them before writing them).
+// allocated); on any mismatch nothing is written and the reason is in ``error``. A token-prefix copy may go into a
+// tensor that is longer along its token axis (a session reallocated with more capacity); every other axis must match
+// and the chunks are recomputed for the target layout. Bytes outside the copied chunks are left as they are (a resume
+// never reads them before writing them).
 bool pflash_copy_from_host(const PFlashHostCopy & host, const std::vector<ggml_tensor *> & tensors,
                            std::string & error);
 

@@ -125,6 +125,8 @@ bool pflash_copy_to_host(const std::vector<ggml_tensor *> & tensors, const std::
             c.ne[d] = t->ne[d];
             c.nb[d] = t->nb[d];
         }
+        c.token_dim = token_dims[i];
+        c.n_tokens = token_dims[i] < 0 ? 0 : std::min<int64_t>(std::max<int64_t>(n_tokens, 0), t->ne[token_dims[i]]);
         std::string why;
         if (!pflash_token_chunks(t, token_dims[i], n_tokens, c.chunks, why)) {
             error = "tensor " + std::to_string(i) + ": " + why;
@@ -154,6 +156,7 @@ bool pflash_copy_from_host(const PFlashHostCopy & host, const std::vector<ggml_t
         error = "tensor count " + std::to_string(tensors.size()) + " != stored " + std::to_string(host.tensors.size());
         return false;
     }
+    std::vector<std::vector<std::pair<size_t, size_t>>> targets(tensors.size());
     size_t total = 0;
     for (size_t i = 0; i < tensors.size(); ++i) {
         const ggml_tensor * t = tensors[i];
@@ -167,13 +170,35 @@ bool pflash_copy_from_host(const PFlashHostCopy & host, const std::vector<ggml_t
             error = where + " type differs";
             return false;
         }
+        const bool grow = h.token_dim >= 0 && h.token_dim < GGML_MAX_DIMS;
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            if (h.ne[d] != t->ne[d] || h.nb[d] != t->nb[d]) {
+            const bool same = grow && d == h.token_dim ? t->ne[d] >= h.ne[d] : t->ne[d] == h.ne[d];
+            const bool same_nb = grow && d > h.token_dim ? true : t->nb[d] == h.nb[d];
+            if (!same || !same_nb) {
                 error = where + " shape differs";
                 return false;
             }
         }
-        for (const auto & ch : h.chunks) {
+        if (grow) {
+            std::string why;
+            if (!pflash_token_chunks(t, h.token_dim, h.n_tokens, targets[i], why)) {
+                error = where + ": " + why;
+                return false;
+            }
+            if (targets[i].size() != h.chunks.size()) {
+                error = where + " chunk layout differs";
+                return false;
+            }
+            for (size_t k = 0; k < h.chunks.size(); ++k) {
+                if (targets[i][k].second != h.chunks[k].second) {
+                    error = where + " chunk size differs";
+                    return false;
+                }
+            }
+        } else {
+            targets[i] = h.chunks;
+        }
+        for (const auto & ch : targets[i]) {
             if (ch.first > ggml_nbytes(t) || ch.second > ggml_nbytes(t) - ch.first) {
                 error = where + " chunk out of bounds";
                 return false;
@@ -188,7 +213,7 @@ bool pflash_copy_from_host(const PFlashHostCopy & host, const std::vector<ggml_t
     }
     size_t pos = 0;
     for (size_t i = 0; i < tensors.size(); ++i) {
-        for (const auto & ch : host.tensors[i].chunks) {
+        for (const auto & ch : targets[i]) {
             ggml_backend_tensor_set(tensors[i], host.blob.data() + pos, ch.first, ch.second);
             pos += ch.second;
         }
