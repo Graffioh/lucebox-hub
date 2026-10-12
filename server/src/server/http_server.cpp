@@ -6941,7 +6941,8 @@ std::string HttpServer::apply_unified_view(
         return false;
     };
 
-    // §2.2-2.3: the newest turn -- one user message, or the group of tool messages -- holds the candidates.
+    // §2.2-2.3: the newest turn -- every message since the last reply: the run of user messages (a document sent on
+    // its own, then the question), or the group of tool messages -- holds the candidates.
     struct Candidate {
         size_t message = 0;
         pu::RegionKind kind = pu::RegionKind::UserContent;
@@ -6957,9 +6958,13 @@ std::string HttpServer::apply_unified_view(
     std::vector<Candidate> newest;
     const size_t last = messages.size() - 1;
     if (messages[last].role == "user") {
-        Candidate c;
-        c.message = last;
-        newest.push_back(std::move(c));
+        size_t first = last;
+        while (first > 0 && messages[first - 1].role == "user") --first;
+        for (size_t index = first; index <= last; ++index) {
+            Candidate c;
+            c.message = index;
+            newest.push_back(std::move(c));
+        }
     } else if (messages[last].role == "tool") {
         size_t first = last;
         while (first > 0 && messages[first - 1].role == "tool") --first;

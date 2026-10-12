@@ -16523,6 +16523,49 @@ static std::vector<json> unified_fruit_turns(const char * second_question) {
     return {turn1, turn2};
 }
 
+TEST_CASE(ServerUnitFixture, test_unified_pages_a_document_sent_before_its_question) {
+    // The documents arrive as their own user message and the question as the next one: both are the newest turn,
+    // so the documents are paged exactly as when they share one message with the question.
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc}},
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_sharp_fruit_score);
+    const json & u0 = run.prepared[0].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u0.value("decision", "") == "region", u0.dump());
+    const json & adm = u0["admission"];
+    TEST_ASSERT_MSG(adm.size() == 2, adm.dump());
+    TEST_ASSERT(adm[0].value("message", 0) == 1 && adm[0].value("decision", "") == "region");
+    TEST_ASSERT(adm[1].value("message", 0) == 2 && adm[1].value("decision", "") != "region");
+    TEST_ASSERT(run.prepared[0].tokens.size() < run.ids[0].size());
+    // The question is served verbatim, after the paged documents.
+    const std::string & s0 = run.served_text[0];
+    TEST_ASSERT(s0.find("Which line mentions KIWI?") != std::string::npos);
+    TEST_ASSERT(s0.find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(s0.find("Line 60: plain filler text here mango\n") == std::string::npos);
+    // The next question continues the view and recalls the dropped mango line; the served prefix is untouched (I1).
+    const json & u1 = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u1.value("decision", "") == "recall", u1.dump());
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango\n") != std::string::npos);
+    const int vg1 = run.prepared[0].snapshot_cut;
+    TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + vg1,
+                           run.prepared[1].tokens.begin()));
+    // Same paging as the one-message layout (where the question line is one more unit of the region): the same
+    // document lines are kept.
+    const auto one = run_unified_session(unified_fruit_turns("Which line mentions MANGO?"), nullptr, nullptr, 64,
+                                         unified_sharp_fruit_score);
+    const json & k_split = adm[0];
+    const json & k_one = one.prepared[0].pflash_stats["unified"]["admission"][0];
+    TEST_ASSERT_MSG(k_split.value("units", -1) + 1 == k_one.value("units", -2) &&
+                    k_split.value("kept_units", -1) == k_one.value("kept_units", -2) &&
+                    k_split.value("kept_tokens", -1) == k_one.value("kept_tokens", -2), k_split.dump() + k_one.dump());
+}
+
 TEST_CASE(ServerUnitFixture, test_unified_recall_gate_takes_only_what_the_question_needs) {
     UnifiedOptions gate;
     gate.recall_gate = "0.05";
