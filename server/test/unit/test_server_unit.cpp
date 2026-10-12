@@ -16019,11 +16019,14 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_base_target_fails_closed) {
 
 // ── PFLASH_UNIFIED=1 (STAGE1-DESIGN.md) ──────────────────────────────────
 
-// Scores every candidate (a line, or ``chunk`` tokens) with ``score(segment text, prompt text)`` and returns the
-// candidate scores the unified path admits units by; the selection itself is ignored there.
+// Scores every candidate (a line, a paragraph ending in a blank line, or ``chunk`` tokens) with
+// ``score(segment text, prompt text)`` and returns the candidate scores the unified path admits units by; the
+// selection itself is ignored there.
 struct MockUnifiedBackend : MockBackend {
     const Tokenizer * tokenizer = nullptr;
     int chunk = 0;
+    bool paragraphs = false;
+    bool widen = false;
     std::function<double(const std::string &, const std::string &)> score;
     int compress_calls = 0;
     CompressRequest last_request;
@@ -16041,17 +16044,20 @@ struct MockUnifiedBackend : MockBackend {
         }
         CompressResult result;
         int begin = 0;
+        std::string segment;
         for (int i = 0; i < n; ++i) {
+            segment += pieces[(size_t) i];
             const bool cut = chunk > 0 ? i + 1 - begin >= chunk
-                                       : pieces[(size_t) i].find('\n') != std::string::npos;
+                           : paragraphs ? segment.size() >= 2 && segment.compare(segment.size() - 2, 2, "\n\n") == 0
+                                        : pieces[(size_t) i].find('\n') != std::string::npos;
             if (!cut && i + 1 < n) continue;
-            std::string segment;
-            for (int k = begin; k <= i; ++k) segment += pieces[(size_t) k];
             result.candidate_lifts.push_back({{begin, i + 1}, score ? score(segment, whole) : 1.0});
+            segment.clear();
             begin = i + 1;
         }
         result.compressed_ids = ids;
         result.kept_spans = {{0, n}};
+        result.budget_widened = widen;
         result.ok = true;
         return result;
     }
@@ -16065,20 +16071,33 @@ struct UnifiedRun {
     std::vector<int> calls_after;
     std::vector<json> view_records;
     json unified;
+    std::vector<std::vector<size_t>> target_starts;     // per turn, byte offsets where a raw target token starts
+    std::vector<std::vector<size_t>> drafter_starts;
 };
 
 using UnifiedScore = std::function<double(const std::string &, const std::string &)>;
 
-// One server with PFLASH_UNIFIED=1, the turns in order (fixture tokenizer as target and drafter, which share every
-// token boundary).
+struct UnifiedOptions {
+    std::vector<int> max_outputs;               // per turn; 16 when absent
+    const char * select_mode = "budget_only";   // nullptr: no strict-selection environment
+    std::vector<std::string> target_words;      // whole pre-tokeniser pieces the target has as one token
+    bool distinct_drafter = false;              // a drafter tokenizer of its own, with ``drafter_words``
+    std::vector<std::string> drafter_words;
+    bool paragraphs = false;                    // drafter candidates end at blank lines
+    bool widen = false;                         // the drafter pass reports a stage-2 widened budget
+    bool allow_errors = false;                  // a turn may be refused (context overflow)
+};
+
+// One server with PFLASH_UNIFIED=1, the turns in order. By default one fixture tokenizer is target and drafter, so
+// every token boundary is shared; ``distinct_drafter`` gives the drafter its own merges.
 static UnifiedRun run_unified_session(const std::vector<json> & turns, const json & tools, const char * region_tools,
                                       int threshold, const UnifiedScore & score, int chunk = 0,
                                       float keep_ratio = 0.3f, const char * recall = nullptr,
-                                      int max_ctx = 65536) {
+                                      int max_ctx = 65536, const UnifiedOptions & options = UnifiedOptions()) {
     luce_test::ScopedEnvVar unified{"PFLASH_UNIFIED", "1"};
     luce_test::ScopedEnvVar region{"PFLASH_REGION_TOOLS", region_tools};
     luce_test::ScopedEnvVar recall_env{"PFLASH_RECALL", recall};
-    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", options.select_mode};
     luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
     char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
     const int trace_fd = mkstemp(trace_path);
@@ -16096,18 +16115,43 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
         cover += rendered.back();
     }
     cover += "[]\xE2\x80\xA6" "0123456789:;,.-|\\\"" "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ";
-    const std::string path = write_pflash_bpe_tokenizer_fixture({"user", "assistant", "system", "\n", "tool"}, cover);
+    const auto vocabulary = [] (const std::vector<std::string> & words) {
+        std::vector<std::string> out{"user", "assistant", "system", "\n", "tool"};
+        out.insert(out.end(), words.begin(), words.end());
+        return out;
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(vocabulary(options.target_words), cover);
     Tokenizer tokenizer;
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    std::string drafter_path;
+    Tokenizer drafter_tokenizer;
+    if (options.distinct_drafter) {
+        drafter_path = write_pflash_bpe_tokenizer_fixture(vocabulary(options.drafter_words), cover);
+        TEST_ASSERT(drafter_tokenizer.load_from_gguf(drafter_path.c_str()));
+    }
+    Tokenizer & drafter = options.distinct_drafter ? drafter_tokenizer : tokenizer;
     UnifiedRun run;
+    const auto starts = [] (const Tokenizer & tok, const std::vector<int32_t> & ids) {
+        std::vector<size_t> out;
+        size_t at = 0;
+        for (int32_t id : ids) {
+            out.push_back(at);
+            at += tok.decode(std::vector<int32_t>{id}).size();
+        }
+        return out;
+    };
     for (const auto & text : rendered) {
         run.ids.push_back(tokenizer.encode(text));
         run.raw_text.push_back(text);
+        run.target_starts.push_back(starts(tokenizer, run.ids.back()));
+        run.drafter_starts.push_back(starts(drafter, drafter.encode(text)));
     }
     auto backend_owner = std::make_unique<MockUnifiedBackend>();
     MockUnifiedBackend & backend = *backend_owner;
-    backend.tokenizer = &tokenizer;
+    backend.tokenizer = &drafter;
     backend.chunk = chunk;
+    backend.paragraphs = options.paragraphs;
+    backend.widen = options.widen;
     backend.score = score;
     LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
@@ -16119,16 +16163,16 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     config.prefill_cache_cap = 0;
     {
         HttpServer server(engine, tokenizer, config);
-        server.set_drafter_tokenizer(&tokenizer);
+        server.set_drafter_tokenizer(&drafter);
         for (size_t index = 0; index < turns.size(); ++index) {
             ParsedRequest request;
             request.format = ApiFormat::OPENAI_CHAT;
             request.messages = turns[index];
             if (tools.is_array() && !tools.empty()) request.tools = tools;
             request.prompt_tokens = run.ids[index];
-            request.max_output = 16;
+            request.max_output = index < options.max_outputs.size() ? options.max_outputs[index] : 16;
             run.prepared.push_back(HttpServerTestAccess::prepare_prompt(server, request));
-            TEST_ASSERT_MSG(run.prepared.back().error.empty(), run.prepared.back().error);
+            if (!options.allow_errors) TEST_ASSERT_MSG(run.prepared.back().error.empty(), run.prepared.back().error);
             run.served_text.push_back(tokenizer.decode(run.prepared.back().tokens));
             run.calls_after.push_back(backend.compress_calls);
         }
@@ -16140,6 +16184,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     }
     unlink(trace_path);
     unlink(path.c_str());
+    if (!drafter_path.empty()) unlink(drafter_path.c_str());
     return run;
 }
 
@@ -16474,4 +16519,343 @@ TEST_CASE(ServerUnitFixture, test_unified_experimental_flags_fail_startup) {
         TEST_ASSERT(threw);
     }
     unlink(path.c_str());
+}
+
+// The four lines of paragraph ``p`` of unified_paragraph_doc().
+static std::string unified_paragraph_lines(int p, const std::map<int, std::string> & marks) {
+    std::string out;
+    for (int i = 1; i <= 4; ++i) {
+        out += "P" + std::to_string(p) + " line " + std::to_string(i) + ": filler text";
+        const auto it = marks.find(p);
+        if (i == 3 && it != marks.end()) out += " " + it->second;
+        out += "\n";
+    }
+    return out;
+}
+
+// Paragraphs of four lines "P<p> line <i>: filler text[ mark]\n", each followed by a blank line; a mark goes on line
+// 3 of its paragraph, and paragraph ``gap`` gets a second blank line.
+static std::string unified_paragraph_doc(int paragraphs, const std::map<int, std::string> & marks, int gap = -1) {
+    std::string out;
+    for (int p = 1; p <= paragraphs; ++p) {
+        out += unified_paragraph_lines(p, marks);
+        out += p == gap ? "\n\n" : "\n";
+    }
+    return out;
+}
+
+// ``served`` is a paged form of ``raw``: every served line is the next raw line, a marker for the raw lines it
+// hides, or the one preamble, whose counts agree. "" when it holds, else what broke.
+static std::string unified_check_paged(const std::string & served, const std::string & raw) {
+    const auto split = [] (const std::string & text) {
+        std::vector<std::string> out;
+        size_t at = 0;
+        for (;;) {
+            const size_t nl = text.find('\n', at);
+            out.push_back(text.substr(at, nl == std::string::npos ? std::string::npos : nl - at));
+            if (nl == std::string::npos) break;
+            at = nl + 1;
+        }
+        if (!text.empty() && text.back() == '\n') out.pop_back();
+        return out;
+    };
+    const auto raw_lines = split(raw);
+    const std::string open = "[\xE2\x80\xA6 ";
+    const std::string close = " not shown \xE2\x80\xA6]";
+    size_t next = 0;
+    int shown = 0;
+    int preambles = 0;
+    int said_shown = -1;
+    int said_total = -1;
+    for (const auto & line : split(served)) {
+        if (line.rfind("[Server note: this ", 0) == 0) {
+            ++preambles;
+            const size_t counts = line.find("shortened: ");
+            if (counts == std::string::npos ||
+                std::sscanf(line.c_str() + counts + 11, "%d of %d", &said_shown, &said_total) != 2) {
+                return "preamble: " + line;
+            }
+            continue;
+        }
+        if (line.rfind(open, 0) == 0 && line.size() > close.size() &&
+            line.compare(line.size() - close.size(), close.size(), close) == 0) {
+            next += (size_t) std::atoi(line.c_str() + open.size());
+            continue;
+        }
+        if (next >= raw_lines.size() || line != raw_lines[next]) {
+            return "served line '" + line + "' at raw line " + std::to_string(next);
+        }
+        ++next;
+        ++shown;
+    }
+    if (next != raw_lines.size()) return "ended at raw line " + std::to_string(next) + " of " +
+                                          std::to_string(raw_lines.size());
+    if (preambles != 1 || said_shown != shown || said_total != (int) raw_lines.size()) {
+        return "preamble says " + std::to_string(said_shown) + " of " + std::to_string(said_total) + ", served " +
+               std::to_string(shown) + " of " + std::to_string(raw_lines.size());
+    }
+    return "";
+}
+
+// The content of the ``nth`` (0-based) message of ``role`` in a rendered Qwen prompt.
+static std::string unified_rendered_content(const std::string & text, const std::string & role, int nth) {
+    const std::string open = "<|im_start|>" + role + "\n";
+    size_t at = 0;
+    for (int k = 0; k <= nth; ++k) {
+        at = text.find(open, k == 0 ? 0 : at + 1);
+        if (at == std::string::npos) return "";
+    }
+    const size_t begin = at + open.size();
+    const size_t end = text.find("<|im_end|>", begin);
+    return end == std::string::npos ? "" : text.substr(begin, end - begin);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_owns_continuations_without_selection_env) {
+    // PFLASH_UNIFIED=1 without a strict-selection environment: every turn is served raw, and a continuation never
+    // reaches the legacy FlowKV path (which would compress the aged paste).
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    UnifiedOptions options;
+    options.select_mode = nullptr;
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                         nullptr, 65536, options);
+    for (size_t turn = 0; turn < 2; ++turn) {
+        TEST_ASSERT_MSG(run.prepared[turn].tokens == run.ids[turn], run.prepared[turn].pflash_stats.dump());
+        TEST_ASSERT(!run.prepared[turn].compressed);
+    }
+    TEST_ASSERT(run.calls_after == std::vector<int>({0, 0}));
+    TEST_ASSERT_MSG(run.unified["counts"].value("raw.no_strict_selection", 0) == 2, run.unified.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_reread_holds_unit_ending_in_blank_line) {
+    // Units are paragraphs ending in a blank line. A short user message that pastes paragraph 10 again covers its
+    // four lines; the blank line after it, next to an uncovered line, does not keep the unit from being held, so
+    // the question recalls other paragraphs, not that one again.
+    const std::map<int, std::string> marks{{3, "kiwi"}, {10, "mango"}};
+    const std::string doc = unified_paragraph_doc(16, marks);
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "P3 line 3."}});
+    turn2.push_back({{"role", "user"}, {"content", "Here it is again:\n" + unified_paragraph_lines(10, marks) +
+                                                   "\nWhich line mentions MANGO?"}});
+    UnifiedOptions options;
+    options.paragraphs = true;
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 400, unified_fruit_score, 0, 0.3f,
+                                         nullptr, 65536, options);
+    TEST_ASSERT_MSG(run.prepared[0].pflash_stats["unified"].value("decision", "") == "region",
+                    run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(run.served_text[0].find("mango") == std::string::npos);
+    const json & u2 = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u2["admission"][0].value("decision", "") == "small", u2.dump());
+    TEST_ASSERT_MSG(u2.value("reread_held_units", 0) == 1, u2.dump());
+    TEST_ASSERT_MSG(u2.value("decision", "") == "recall", u2.dump());
+    TEST_ASSERT_MSG(unified_occurrences(run.served_text[1], "mango") == 1, run.served_text[1]);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_reread_coverage_counts_fallen_back_messages) {
+    // A big user message is a region candidate, but its cap does not cover the preamble and marker, so it falls
+    // back to verbatim while paging. It still repeats paragraph 10: that unit is held, never recalled again.
+    const std::map<int, std::string> marks{{10, "mango"}};
+    const std::string doc = unified_paragraph_doc(16, marks);
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Summarise this."}},
+    });
+    std::string message = "Here it is again:\n" + unified_paragraph_lines(10, marks);
+    for (int i = 1; i <= 20; ++i) message += "Extra note " + std::to_string(i) + " about the plan\n";
+    message += "Which line mentions MANGO?";
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "A list of paragraphs."}});
+    turn2.push_back({{"role", "user"}, {"content", message}});
+    UnifiedOptions options;
+    options.paragraphs = true;
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 400, unified_fruit_score, 0, 0.15f,
+                                         nullptr, 65536, options);
+    TEST_ASSERT_MSG(run.prepared[0].pflash_stats["unified"].value("decision", "") == "region",
+                    run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(run.served_text[0].find("mango") == std::string::npos);
+    const json & u2 = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u2["admission"][0].value("decision", "") == "cap_below_overhead", u2.dump());
+    TEST_ASSERT_MSG(u2.value("decision", "") == "recall", u2.dump());
+    TEST_ASSERT_MSG(u2.value("reread_held_units", 0) == 1, u2.dump());
+    TEST_ASSERT_MSG(unified_occurrences(run.served_text[1], "mango") == 1, run.served_text[1]);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_reset_leaves_a_raw_view) {
+    // Recall overheads can grow a view past the raw prompt. A turn whose view no longer fits but whose raw prompt
+    // does is served raw, and the next turn continues that raw prompt, not the older compressed view.
+    const std::string doc = unified_doc(80, {});
+    json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Question 0?"}},
+    });
+    std::vector<json> turns{turn};
+    for (int q = 1; q <= 8; ++q) {
+        turn.push_back({{"role", "assistant"}, {"content", "Ok."}});
+        turn.push_back({{"role", "user"}, {"content", "Question " + std::to_string(q) + "?"}});
+        turns.push_back(turn);
+    }
+    const auto probe = run_unified_session(turns, nullptr, nullptr, 64, nullptr);
+    size_t over = 0;
+    for (size_t t = 1; t < probe.prepared.size() && over == 0; ++t) {
+        if (probe.prepared[t].tokens.size() > probe.ids[t].size()) over = t;
+    }
+    TEST_ASSERT_MSG(over > 0 && over + 1 < turns.size(), "no turn whose view is larger than its raw prompt");
+    const std::vector<json> session(turns.begin(), turns.begin() + (long) over + 2);
+
+    // The view of turn ``over`` does not fit with a long output allowance; its raw prompt does.
+    UnifiedOptions options;
+    options.max_outputs.assign(session.size(), 16);
+    options.max_outputs[over] = 4096;
+    const int fits_raw = (int) probe.ids[over].size() + 4096;
+    const auto run = run_unified_session(session, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_raw, options);
+    const json & reset = run.prepared[over].pflash_stats["unified"];
+    TEST_ASSERT_MSG(reset.value("decision", "") == "raw" && reset.value("reason", "") == "reset" &&
+                    reset.value("reset", "") == "context", reset.dump());
+    TEST_ASSERT(run.prepared[over].tokens == run.ids[over]);
+    const json & after = run.prepared[over + 1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(after.value("decision", "") == "continue", after.dump());
+    TEST_ASSERT(run.prepared[over + 1].tokens == run.ids[over + 1]);
+    TEST_ASSERT(run.unified["counts"].value("raw.reset", 0) == 1);
+
+    // When the raw prompt does not fit either, nothing is remembered: a retry with a short allowance continues the
+    // compressed view and is served what the unconstrained session served.
+    std::vector<json> retry(turns.begin(), turns.begin() + (long) over + 1);
+    retry.push_back(turns[over]);
+    const int fits_view = (int) probe.prepared[over].tokens.size() + 16;
+    UnifiedOptions tight;
+    tight.max_outputs.assign(retry.size(), 16);
+    tight.max_outputs[over] = fits_view;
+    tight.allow_errors = true;
+    const auto again = run_unified_session(retry, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, fits_view, tight);
+    TEST_ASSERT(!again.prepared[over].error.empty());           // the raw prompt does not fit: refused
+    TEST_ASSERT(again.prepared[over + 1].error.empty());
+    TEST_ASSERT(again.unified["counts"].value("raw.reset", 0) == 0);
+    TEST_ASSERT_MSG(again.prepared[over + 1].tokens == probe.prepared[over].tokens,
+                    again.prepared[over + 1].pflash_stats.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_widened_cap_applies_once) {
+    // A stage-2 widened pass widens a region's cap by half, once: at paging and again at a later recall, never
+    // compounded.
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    UnifiedOptions options;
+    options.widen = true;
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                         nullptr, 65536, options);
+    const json & paged = run.prepared[0].pflash_stats["unified"]["admission"][0];
+    const int unwidened = paged.value("unwidened_cap", 0);
+    TEST_ASSERT_MSG(unwidened > 0 && paged.value("cap", 0) == unwidened + unwidened / 2, paged.dump());
+    const json & recall = run.prepared[1].pflash_stats["unified"]["recall"];
+    TEST_ASSERT_MSG(recall.is_array() && recall.size() == 1, run.prepared[1].pflash_stats.dump());
+    TEST_ASSERT(recall[0].value("cap", 0) == paged.value("cap", 0));
+    TEST_ASSERT(recall[0].value("wrapper", 0) > 0);
+    TEST_ASSERT(recall[0].value("tokens", 0) <= paged.value("cap", 0) - recall[0].value("wrapper", 0));
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_distinct_tokenizers_keep_lines_whole) {
+    // Target and drafter merge differently: the target has "\n\n" and "\n\n\n" as one token (a blank line then
+    // starts inside a token, so it can be cut only at its separator, and the second of two blank lines not at all),
+    // and the escaped piece backslash + "nitem" (an escaped line "item ..." starts inside it); the drafter has its
+    // own words. Lines stay whole, markers count what they hide, and turn 2 reuses turn 1's served prompt token for
+    // token.
+    UnifiedOptions options;
+    options.distinct_drafter = true;
+    options.target_words = {"\n\n", "\n\n\n", "\\nitem", " filler", " mentions"};
+    options.drafter_words = {" text", " line", "Which"};
+
+    const std::map<int, std::string> marks{{3, "kiwi"}, {10, "mango"}};
+    const std::string doc = unified_paragraph_doc(16, marks, /*gap=*/6);
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "P3 line 3."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f,
+                                         nullptr, 65536, options);
+    // The scenario holds: a blank line starts inside a target token, at a drafter token start.
+    const std::string & raw1 = run.raw_text[0];
+    const size_t blank = raw1.find("text\n\nP2");
+    const size_t gap = raw1.find("text\n\n\nP7");
+    TEST_ASSERT(blank != std::string::npos && gap != std::string::npos);
+    const auto starts_at = [] (const std::vector<size_t> & starts, size_t at) {
+        return std::binary_search(starts.begin(), starts.end(), at);
+    };
+    TEST_ASSERT(starts_at(run.target_starts[0], blank + 4) && !starts_at(run.target_starts[0], blank + 5));
+    TEST_ASSERT(starts_at(run.drafter_starts[0], blank + 5));
+    TEST_ASSERT(!starts_at(run.target_starts[0], gap + 5) && !starts_at(run.target_starts[0], gap + 6));
+    TEST_ASSERT(run.ids[0].size() != run.drafter_starts[0].size());
+
+    TEST_ASSERT_MSG(run.prepared[0].pflash_stats["unified"].value("decision", "") == "region",
+                    run.prepared[0].pflash_stats.dump());
+    const std::string broke = unified_check_paged(unified_rendered_content(run.served_text[0], "user", 0),
+                                                  doc + "Which line mentions KIWI?");
+    TEST_ASSERT_MSG(broke.empty(), broke + "\n" + run.served_text[0]);
+    TEST_ASSERT(run.served_text[0].find("P3 line 3: filler text kiwi\n") != std::string::npos);
+    const int cut = run.prepared[0].snapshot_cut;
+    TEST_ASSERT(cut > 0 && std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + cut,
+                                      run.prepared[1].tokens.begin()));
+    TEST_ASSERT_MSG(run.prepared[1].pflash_stats["unified"].value("decision", "") == "recall",
+                    run.prepared[1].pflash_stats.dump());
+    const std::string & s2 = run.served_text[1];
+    const size_t block = s2.find("[Earlier in this conversation]\n[From an earlier user message]\n");
+    TEST_ASSERT(block != std::string::npos);
+    TEST_ASSERT(s2.find("P10 line 3: filler text mango\n", block) != std::string::npos);
+    TEST_ASSERT(unified_occurrences(s2, "mango") == 1);
+
+    // An escaped (JSON-string) tool output with the same two tokenizers: the result stays valid JSON and its lines
+    // whole, and the line the scores favour is kept (the mark is long enough to lie whole in some 7-token chunk;
+    // the cap leaves room for it next to the long tool preamble).
+    std::string body;
+    for (int i = 1; i <= 80; ++i) {
+        body += "item " + std::to_string(i) + " value" + (i == 33 ? " kiwikiwikiwikiwi" : "") + "\n";
+    }
+    const std::string wrapped = json({{"content", body}, {"total_lines", 80}}).dump();
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const json tool_turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Which item mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "items.txt"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", wrapped}},
+    });
+    const auto tool_run = run_unified_session({tool_turn}, tools, "read_file", 64, unified_fruit_score,
+                                              /*chunk=*/7, 0.5f, nullptr, 65536, options);
+    const size_t escaped = tool_run.raw_text[0].find("value\\nitem 40 ");
+    TEST_ASSERT(escaped != std::string::npos);
+    TEST_ASSERT(starts_at(tool_run.target_starts[0], escaped + 5) &&
+                !starts_at(tool_run.target_starts[0], escaped + 7));
+    TEST_ASSERT(starts_at(tool_run.drafter_starts[0], escaped + 7));
+    const auto & prepared = tool_run.prepared[0];
+    TEST_ASSERT_MSG(prepared.compressed, prepared.pflash_stats.dump());
+    TEST_ASSERT(prepared.pflash_stats["unified"]["admission"][0].value("escaped_lines", false));
+    const std::string & served = tool_run.served_text[0];
+    const size_t open = served.rfind("<tool_response>\n");
+    const size_t close = served.find("\n</tool_response>", open);
+    TEST_ASSERT(open != std::string::npos && close != std::string::npos);
+    const json result = json::parse(served.substr(open + 16, close - open - 16), nullptr, false);
+    TEST_ASSERT_MSG(!result.is_discarded(), served.substr(open, 400));
+    TEST_ASSERT(result.value("total_lines", 0) == 80);
+    const std::string content = result.value("content", "");
+    const std::string content_broke = unified_check_paged(content, body);
+    TEST_ASSERT_MSG(content_broke.empty(), content_broke + "\n" + content);
+    TEST_ASSERT(content.find("item 33 value kiwikiwikiwikiwi\n") != std::string::npos);
 }

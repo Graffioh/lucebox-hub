@@ -7004,6 +7004,7 @@ std::string HttpServer::apply_unified_view(
 
     pu::View view;
     bool has_view = pflash_unified_views_.find(raw, drafter_ids, pflash_unified_config_, view);
+    const bool found_view = has_view;
     if (has_view && view.raw_tokens == raw && view.drafter_ids == drafter_ids) {
         // The same request again: what was served.
         count("repeat");
@@ -7066,37 +7067,6 @@ std::string HttpServer::apply_unified_view(
                 region_candidates.push_back(k);
             } else {
                 verbatim.push_back(k);
-            }
-        }
-
-        // §7: a verbatim newest message that repeats lines of a region covers them; a unit whose lines are all
-        // covered is held (never recalled again).
-        int covered_units = 0;
-        for (size_t k : verbatim) {
-            Candidate & c = newest[k];
-            if (!c.located || c.ce <= c.cb || held_regions.empty()) continue;
-            const auto hashes = pu::line_hashes(text, candidate_lines(c));
-            for (auto & region : held_regions) {
-                const auto match = pu::match_reread(hashes, region.hashes);
-                if (match.matched_candidate == 0) continue;
-                for (size_t line = 0; line < region.reread.size(); ++line) {
-                    if (match.region_covered[line]) region.reread[line] = 1;
-                }
-                for (int u = 0; u < region.layout.units(); ++u) {
-                    if (region.held[(size_t) u]) continue;
-                    bool all = true;
-                    for (int line = region.layout.first_line(u); line < region.layout.cut_line[(size_t) u + 1];
-                         ++line) {
-                        if (!region.reread[(size_t) line]) {
-                            all = false;
-                            break;
-                        }
-                    }
-                    if (all) {
-                        region.held[(size_t) u] = 1;
-                        ++covered_units;
-                    }
-                }
             }
         }
 
@@ -7176,13 +7146,15 @@ std::string HttpServer::apply_unified_view(
             }
             return weight > 0.0 ? sum / weight : std::nan("");
         };
-        // A region's cap: the release curve on its droppable tokens; stage 2 widens it as it widens the budget.
-        const auto cap_for = [&] (int droppable) {
+        // A region's cap: the release curve on its droppable tokens (kept in the region); a pass whose stage 2
+        // widened the budget widens it once, paging and recall alike.
+        const auto base_cap = [&] (int droppable) {
             const float ratio = http_detail::resolve_pflash_keep_ratio(
                 pflash_keep_ratio(config_, (std::max)(1, droppable)), req.session_id, sessions_);
-            int cap = (int) std::floor((double) ratio * (double) droppable);
-            if (result.budget_widened) cap = (std::min)(droppable, cap + cap / 2);
-            return cap;
+            return (int) std::floor((double) ratio * (double) droppable);
+        };
+        const auto widened_cap = [&] (int cap, int droppable) {
+            return result.budget_widened ? (std::min)(droppable, cap + cap / 2) : cap;
         };
 
         // §3 paging, per region: units between clean line cuts, admitted by score under the cap.
@@ -7201,6 +7173,7 @@ std::string HttpServer::apply_unified_view(
             const auto verbatim_because = [&] (const std::string & why) {
                 admission[k]["decision"] = why;
                 count("verbatim." + why);
+                verbatim.push_back(k);
             };
             if (!scored) {
                 verbatim_because("unscored");
@@ -7257,7 +7230,8 @@ std::string HttpServer::apply_unified_view(
                 verbatim_because("all_pinned");
                 continue;
             }
-            const int cap = cap_for(droppable);
+            const int unwidened = base_cap(droppable);
+            const int cap = widened_cap(unwidened, droppable);
             std::map<std::pair<int, int>, int> marker_costs;
             const auto marker_line = [&] (int first, int last_unit) {
                 return pu::inserted_line(text, lines, region.layout.cuts[(size_t) first],
@@ -7346,13 +7320,14 @@ std::string HttpServer::apply_unified_view(
             region.kept = admitted.admitted;
             region.held = admitted.admitted;
             region.reread.assign(lines.count(), 0);
-            region.cap = cap;
+            region.cap = unwidened;
             region.droppable = droppable;
             admission[k]["units"] = units;
             admission[k]["kept_units"] = (int) std::count(admitted.admitted.begin(), admitted.admitted.end(), 1);
             admission[k]["mandatory_units"] =
                 (int) std::count(region.mandatory.begin(), region.mandatory.end(), 1);
             admission[k]["cap"] = cap;
+            admission[k]["unwidened_cap"] = unwidened;
             admission[k]["optional_served"] = admitted.cost;
             admission[k]["region_tokens"] = splice.end - splice.begin;
             admission[k]["served_tokens"] = splice.tokens.size();
@@ -7363,6 +7338,30 @@ std::string HttpServer::apply_unified_view(
             count(c.kind == pu::RegionKind::ToolOutput ? "region.tool_output" : "region.user_content");
             new_regions.push_back(std::move(region));
             splices.push_back(std::move(splice));
+        }
+
+        // §7: a newest message served verbatim (rejected above, or fallen back while paging) that repeats lines of
+        // an earlier region covers them; a unit whose informative lines are all covered is held (never recalled).
+        int covered_units = 0;
+        for (size_t k : verbatim) {
+            Candidate & c = newest[k];
+            if (!c.located || c.ce <= c.cb || held_regions.empty()) continue;
+            const auto hashes = pu::line_hashes(text, candidate_lines(c));
+            for (auto & region : held_regions) {
+                const auto match = pu::match_reread(hashes, region.hashes);
+                if (match.matched_candidate == 0) continue;
+                for (size_t line = 0; line < region.reread.size(); ++line) {
+                    if (match.region_covered[line]) region.reread[line] = 1;
+                }
+                for (int u = 0; u < region.layout.units(); ++u) {
+                    if (region.held[(size_t) u]) continue;
+                    if (pu::lines_covered(region.reread, match.region_informative, region.layout.first_line(u),
+                                          region.layout.cut_line[(size_t) u + 1])) {
+                        region.held[(size_t) u] = 1;
+                        ++covered_units;
+                    }
+                }
+            }
         }
 
         // §5 recall: each earlier region's unheld units, best first, under the region's cap, appended as
@@ -7402,8 +7401,8 @@ std::string HttpServer::apply_unified_view(
                 }
                 const std::string label = pu::recall_label_text(region.kind, region.brief);
                 const int label_cost = encode_len(label + "\n") + encode_len("\n");
-                int cap = result.budget_widened ? (std::min)(region.droppable, region.cap + region.cap / 2)
-                                                : region.cap;
+                const int region_cap = widened_cap(region.cap, region.droppable);
+                int cap = region_cap;
                 if (ri == largest) cap -= wrapper;
                 const auto order = pu::rank_units(score, region.held);
                 auto admitted = pu::admit_recall(cost, region.held, order, cap,
@@ -7470,7 +7469,8 @@ std::string HttpServer::apply_unified_view(
                 }
                 excerpts.insert(excerpts.end(), tokens.begin(), tokens.end());
                 recall_stats.push_back({{"region", region_index}, {"units", appended_units},
-                                        {"tokens", tokens.size()}, {"cap", cap},
+                                        {"tokens", tokens.size()}, {"cap", region_cap},
+                                        {"wrapper", ri == largest ? wrapper : 0},
                                         {"cumulative_tokens", region.recalled_tokens}});
             }
             if (excerpts.empty()) {
@@ -7545,7 +7545,11 @@ std::string HttpServer::apply_unified_view(
             stats["reset"] = "context";
             continue;
         }
-        if (!continues && new_regions.empty()) {
+        // §6: a turn served raw instead of continuing a stored view leaves a raw view (no regions), so its
+        // descendants continue what it served rather than the view it replaced. Not when the raw prompt does
+        // not fit either: a retry with a smaller output allowance may still continue that view.
+        const bool raw_fits = config_.max_ctx <= 0 || prompt_tokens + req.max_output <= config_.max_ctx;
+        if (!continues && new_regions.empty() && !(found_view && raw_fits)) {
             stats["admission"] = admission;
             return serve_raw(region_candidates.empty() ? "no_region" : "no_region_paged");
         }
@@ -7566,8 +7570,13 @@ std::string HttpServer::apply_unified_view(
         next.turns = turn_index;
 
         const char * decision = !new_regions.empty() ? (recall_fired ? "region_recall" : "region")
-                                                     : (recall_fired ? "recall" : "continue");
-        count(std::string("serve.") + decision);
+                              : recall_fired ? "recall" : continues ? "continue" : "raw";
+        if (std::strcmp(decision, "raw") == 0) {
+            count("raw.reset");
+            stats["reason"] = "reset";
+        } else {
+            count(std::string("serve.") + decision);
+        }
         stats["decision"] = decision;
         stats["turn"] = turn_index;
         stats["lineage"] = next.lineage;
@@ -7666,16 +7675,18 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
             }
         }
 
-        if (should_compress && continuation && req.messages.is_array() &&
-            !selection_owns_compression) {
+        // PFLASH_UNIFIED=1 owns every turn: a configuration it cannot serve
+        // is served raw (apply_unified_view counts why), never by FlowKV.
+        const bool flowkv_continuation = should_compress && continuation &&
+            !selection_owns_compression && !pflash_unified_;
+        if (flowkv_continuation && req.messages.is_array()) {
             // FlowKV owns continuation compression automatically. Falling
             // back to whole-prompt compression would destroy the reusable
             // system/tool prefix anchor, and requiring a separate disk-cache
             // flag made --prefill-compression auto silently do nothing.
             apply_flowkv_compression(req, prepared);
             should_compress = false;
-        } else if (should_compress && continuation &&
-                   !selection_owns_compression) {
+        } else if (flowkv_continuation) {
             should_compress = false;
             std::fprintf(stderr,
                 "[pflash] skip-compress (continuation without messages array)\n");

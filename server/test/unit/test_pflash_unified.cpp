@@ -281,6 +281,16 @@ TEST_CASE(PFlashUnifiedFixture, test_unified_reread_by_content) {
     REQUIRE(!m.region_covered[(size_t) (59 * 4 + 2)]);      // the "}" after the last block: next line unmatched
     REQUIRE(m.region_covered[(size_t) (39 * 4)]);           // "def f40():"
     REQUIRE(!m.region_covered[(size_t) (38 * 4)]);          // "def f39():"
+    REQUIRE(m.region_informative[(size_t) (39 * 4)]);
+    REQUIRE(!m.region_informative[(size_t) (39 * 4 + 2)]);  // "}"
+    REQUIRE(!m.region_informative[(size_t) (39 * 4 + 3)]);  // blank
+    // A unit ending in the last block's "}" and blank line is covered: its informative lines are; one reaching
+    // into f61 is not.
+    REQUIRE(lines_covered(m.region_covered, m.region_informative, 59 * 4, 60 * 4));
+    REQUIRE(!lines_covered(m.region_covered, m.region_informative, 59 * 4, 60 * 4 + 1));
+    // Lines with nothing informative count only when covered themselves (between two covered blocks).
+    REQUIRE(lines_covered(m.region_covered, m.region_informative, 39 * 4 + 2, 40 * 4));
+    REQUIRE(!lines_covered(m.region_covered, m.region_informative, 59 * 4 + 2, 60 * 4));
 
     // A changed file matches only where it is unchanged; "}" lines (more than 32 copies) never match alone.
     std::string changed = part;

@@ -516,7 +516,12 @@ RereadMatch match_reread(const std::vector<uint64_t> & candidate, const std::vec
         return it == freq.end() || it->second <= max_repeat;
     };
     std::vector<int> reg;     // informative region lines
-    for (int i = 0; i < (int) region.size(); ++i) if (informative(region[(size_t) i])) reg.push_back(i);
+    out.region_informative.assign(region.size(), 0);
+    for (int i = 0; i < (int) region.size(); ++i) {
+        if (!informative(region[(size_t) i])) continue;
+        reg.push_back(i);
+        out.region_informative[(size_t) i] = 1;
+    }
     std::vector<int> cand;    // informative candidate lines
     for (int j = 0; j < (int) candidate.size(); ++j) if (informative(candidate[(size_t) j])) cand.push_back(j);
     out.candidate_informative = (int) cand.size();
@@ -549,6 +554,21 @@ RereadMatch match_reread(const std::vector<uint64_t> & candidate, const std::vec
         for (int i = reg[k] + 1; i < reg[k + 1]; ++i) out.region_covered[(size_t) i] = 1;
     }
     return out;
+}
+
+bool lines_covered(const std::vector<char> & covered, const std::vector<char> & informative, int begin, int end) {
+    bool any_informative = false;
+    bool informative_covered = true;
+    bool all_covered = true;
+    for (int line = begin; line < end; ++line) {
+        const bool is_covered = covered[(size_t) line] != 0;
+        all_covered = all_covered && is_covered;
+        if (informative[(size_t) line]) {
+            any_informative = true;
+            informative_covered = informative_covered && is_covered;
+        }
+    }
+    return any_informative ? informative_covered : all_covered;
 }
 
 // ── View ───────────────────────────────────────────────────────────────

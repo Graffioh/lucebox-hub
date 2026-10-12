@@ -158,12 +158,17 @@ std::vector<uint64_t> line_hashes(const std::string & text, const Lines & lines)
 // region lines. A skipped region line counts as covered when the informative lines on both sides of it are.
 struct RereadMatch {
     std::vector<char> region_covered;    // per region line
+    std::vector<char> region_informative;  // per region line
     int matched_candidate = 0;           // informative candidate lines inside a match
     int candidate_informative = 0;
     bool is_reread() const { return candidate_informative > 0 && 2 * matched_candidate >= candidate_informative; }
 };
 RereadMatch match_reread(const std::vector<uint64_t> & candidate, const std::vector<uint64_t> & region,
                          int min_run = 3, int max_repeat = 32);
+
+// Whether lines [begin, end) are covered as a whole: every informative line is (blank and over-frequent lines at
+// the edges do not count), or, when none is informative, every line is.
+bool lines_covered(const std::vector<char> & covered, const std::vector<char> & informative, int begin, int end);
 
 // ── View ───────────────────────────────────────────────────────────────
 
@@ -184,7 +189,7 @@ struct Region {
     std::vector<char> kept;              // served when paged
     std::vector<char> held;              // kept, recalled or re-read
     std::vector<char> reread;            // per line, covered by a re-read
-    int cap = 0;                         // optional served tokens at paging (target)
+    int cap = 0;                         // optional served tokens at paging, before stage-2 widening (target)
     int droppable = 0;                   // target tokens of the optional units
     int recalled_tokens = 0;             // cumulative appended by recall (target)
 };
