@@ -4281,6 +4281,7 @@ void HttpServer::finalize_generation_cache(
                 // decision sees the requested cut as covered. Keying at the
                 // saved position re-targets the same cut on every request
                 // and the restore point never moves past it.
+                evict_extra_victims(cache.snap_reservation);
                 cache.snap_reservation.commit(
                     effective_prompt,
                     backend_.snapshot_bytes_estimate(saved_position));
@@ -4382,6 +4383,14 @@ void HttpServer::evict_inline_slot(int slot) {
         persist_evicted_slot(slot, prefix_cache_.persist_on_evict(slot), "ram eviction");
     }
     forget_inline_slot_metadata(slot);
+}
+
+void HttpServer::evict_extra_victims(
+        const PrefixCache::InlineReservation & reservation) {
+    for (const int slot : reservation.extra_victim_slots()) {
+        evict_inline_slot(slot);
+        backend_.snapshot_free(slot);
+    }
 }
 
 void HttpServer::note_session_slot(int slot) {
@@ -4646,6 +4655,7 @@ bool HttpServer::save_generated_turn(
         reservation.abort();
         return false;
     }
+    evict_extra_victims(reservation);
     reservation.commit_at(
         canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
     std::vector<bool> persist;
@@ -4798,6 +4808,7 @@ void HttpServer::remember_agent_turn(
     const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
         ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
+        evict_extra_victims(reservation);
         reservation.commit_at(
             canonical_tokens, saved_pos,
             backend_.snapshot_bytes_estimate(saved_pos));

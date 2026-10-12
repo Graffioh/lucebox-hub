@@ -116,7 +116,9 @@ suffix. It is on by default.
 turn:
 
 - a RAM eviction: a new snapshot takes the slot of an older one (its
-  reservation's victim) or the resident budget evicts one after a commit;
+  reservation's victim), the resident budget evicts several to make room for
+  a large one (see *Several evictions for one capture*), or it evicts one
+  after a commit;
 - a graceful shutdown (SIGTERM/SIGINT): one last eviction of everything still
   in RAM, most recently used first, for at most `--kv-cache-shutdown-flush`
   seconds. The log line `[disk-cache] shutdown flush:` gives the sessions,
@@ -366,7 +368,9 @@ shared system/tools head) and protected tool pins. A conversation therefore
 holds about two snapshots instead of one per turn. Chains that are abandoned,
 for example after a client compacts its context, are bounded by
 `--prefix-cache-max-mib`: when a new snapshot would not fit, the cache replaces
-the oldest leaf first and skips the capture if nothing can make room. Snapshots
+the oldest leaf first. When no single entry makes enough room, it evicts several,
+least recently used first (see below), and skips the capture only if nothing
+can make room or the snapshot is larger than the whole limit. Snapshots
 the new one supersedes (including the one it restored from) count as freed,
 because they are pruned as soon as it is committed; a failed capture keeps them.
 After each commit the cache also evicts, oldest leaf first, until the committed
@@ -379,11 +383,27 @@ request runs, process memory can exceed the limit by up to one snapshot.
 Concurrent paged serving measures the exact backend allocation required for
 each checkpoint before copying it. The cache keeps committed checkpoints under
 `--concurrent-prefix-cache-max-mib`: when necessary it replaces one eligible least-recently-used
-entry, and if no single eligible entry can make enough room it skips the new
-checkpoint without disturbing the committed cache. The configured limit covers
-resident committed checkpoint buffers. During an atomic replacement, the new
-buffer and the selected victim can coexist briefly, so transient process memory
-can exceed the limit by up to one checkpoint.
+entry, and when no single eligible entry can make enough room it evicts several
+(below). The configured limit covers resident committed checkpoint buffers.
+During an atomic replacement, the new buffer and the entries it replaces can
+coexist briefly, so transient process memory can exceed the limit by up to one
+checkpoint.
+
+**Several evictions for one capture.** Both paths use the same rule. A capture
+that fits the limit at all, but that no single entry can make room for, plans
+several evictions, least recently used first: edit backups (not written to
+disk while their deeper snapshot is resident), then leaves. The plan never
+takes a protected pin, a head that other resident entries extend, the
+capture's own ancestors or restore source, or an entry another capture in
+flight writes, evicts or counts as freed. It is all or nothing: it exists only
+if the capture fits once those entries are gone, otherwise the capture is
+skipped and nothing is touched. The entries leave RAM only when the capture
+commits (the single-sequence path writes and frees them just before the
+commit), so a capture that fails or is cancelled evicts none of them; each one
+goes to the disk cache like any other eviction. Without this a long session
+that arrives after many short ones (subagent threads) was never captured, so
+it never reached the disk either. A checkpoint larger than the whole limit is
+still skipped (`budget_skips`).
 
 By default the limit is sized when the scheduler starts, from the batch
 engine's own estimate of one checkpoint at `--max-ctx`: every slot keeps its

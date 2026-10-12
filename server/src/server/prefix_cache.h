@@ -179,6 +179,12 @@ public:
         bool active() const;
         int slot() const { return slot_; }
         int target_cut() const { return target_cut_; }
+        // Committed entries besides the slot's own victim that this capture
+        // evicts when it commits (see reserve_inline_snap), in eviction
+        // order. Only those still resident are listed. A caller that owns
+        // their payloads (the single-sequence path) writes and frees them
+        // just before the commit; the commit drops their metadata.
+        std::vector<int> extra_victim_slots() const;
 
         // Commit after the engine saved the payload, cancel before the target
         // slot was touched, or abort after a failed write invalidated it.
@@ -234,6 +240,13 @@ public:
     // With a `restore_point_spacing` (ModelBackend::restore_point_spacing), a
     // cut other than the end of the last message moves down to the deepest
     // spaced restore point, and nothing is reserved when that adds no prefix.
+    // Resident budget: when no single entry makes room for a capture that
+    // fits the budget at all, the reservation plans several, least recently
+    // used first (edit backups, then leaves); see the definition for what is
+    // never planned. All or nothing: a plan exists only when the capture
+    // fits once they are gone, else the capture is skipped and nothing is
+    // touched. They are evicted when it commits, never when it fails or is
+    // cancelled.
     InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
@@ -392,6 +405,12 @@ private:
         PrefixHash victim;
         bool       has_victim;
         size_t     bytes;
+        // Further entries this capture evicts when it commits, in order.
+        std::vector<PrefixHash> extra_victims;
+        std::vector<int> extra_slots;
+        // Slots of every entry it counts as freed (its superseded ancestors
+        // and its victims): no other capture counts them again.
+        std::vector<int> credited_slots;
     };
     std::vector<ActiveReservation> active_reservations_;
     uint64_t next_inline_reservation_ = 1;
@@ -459,8 +478,11 @@ private:
         bool record_hit);
     bool inline_reservation_active(uint64_t id) const;
     void release_inline_reservation(uint64_t id);
-    // A capture in flight writes this slot.
+    // A capture in flight writes this slot or evicts its entry.
     bool slot_reserved(int slot) const;
+    // A capture in flight counts this slot's entry as freed.
+    bool slot_credited(int slot) const;
+    const ActiveReservation * find_active_reservation(uint64_t id) const;
     bool commit_inline_reservation(InlineReservation & reservation,
                                    const std::vector<int32_t> & prompt_ids,
                                    int committed_cut, size_t resident_bytes,

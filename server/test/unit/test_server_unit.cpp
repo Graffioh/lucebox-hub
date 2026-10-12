@@ -3786,6 +3786,196 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_resident_budget_and_stall_stats) 
     unlink(path.c_str());
 }
 
+// Resident budget: a capture that fits the budget but that no single entry
+// makes room for evicts several, least recently used first, when it commits.
+TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_evicts_several_for_large_capture) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const auto bytes = [](size_t n) {
+        return [n](int) { return n; };
+    };
+    const std::vector<std::vector<int32_t>> small = {
+        {1, 100, 3, 101}, {1, 200, 3, 201}, {1, 300, 3, 301}, {1, 400, 3, 401}};
+    const std::vector<int32_t> big = {1, 900, 3, 901};
+    const auto fill = [&](PrefixCache & cache, std::vector<int> & slots) {
+        for (const auto & ids : small) {
+            auto r = cache.reserve_inline_snap(ids, 0, false, (int)ids.size(), -1, bytes(200));
+            TEST_ASSERT(r.active());
+            slots.push_back(r.slot());
+            TEST_ASSERT(r.commit(ids, 200));
+        }
+        TEST_ASSERT(cache.stats().resident_bytes == 800);
+    };
+
+    {
+        PrefixCache cache(8, tokenizer, /*max_resident_bytes=*/1000);
+        cache.set_prunes_superseded(true);
+        cache.set_record_evictions(true);
+        std::vector<int> slots;
+        fill(cache, slots);
+        TEST_ASSERT(cache.take_evicted().empty());
+        // 700 bytes: 500 must go, and every entry holds 200.
+        auto r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(700));
+        TEST_ASSERT(r.active());
+        TEST_ASSERT(r.extra_victim_slots() ==
+                    std::vector<int>({slots[0], slots[1], slots[2]}));
+        // Nothing leaves RAM before the capture lands.
+        TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
+        TEST_ASSERT(cache.take_evicted().empty());
+        TEST_ASSERT(r.commit(big, 700));
+        const auto evicted = cache.take_evicted();
+        TEST_ASSERT(evicted.size() == 3);
+        for (size_t i = 0; i < evicted.size(); ++i) {
+            TEST_ASSERT(evicted[i].slot == slots[i]);
+            TEST_ASSERT(evicted[i].ids == small[i]);
+            TEST_ASSERT(evicted[i].persist);  // each one goes to disk
+        }
+        const auto stats = cache.stats();
+        TEST_ASSERT(stats.in_use == 2 && stats.resident_bytes == 900);
+        TEST_ASSERT(stats.budget_skips == 0);
+        TEST_ASSERT(cache.lookup_candidate(small[3], 4).second == 4);
+        std::vector<int32_t> next = big;
+        next.insert(next.end(), {4, 902});
+        TEST_ASSERT(cache.lookup_candidate(next, (int)next.size()).second == (int)big.size());
+    }
+    {
+        // A capture that fails or is cancelled evicts none of them.
+        PrefixCache cache(8, tokenizer, 1000);
+        cache.set_record_evictions(true);
+        std::vector<int> slots;
+        fill(cache, slots);
+        auto r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(700));
+        TEST_ASSERT(r.active() && r.extra_victim_slots().size() == 3);
+        r.cancel();
+        TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
+        r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(700));
+        TEST_ASSERT(r.active());
+        r.abort();
+        TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
+        TEST_ASSERT(cache.take_evicted().empty());
+    }
+    {
+        // Larger than the whole budget: skipped, nothing evicted.
+        PrefixCache cache(8, tokenizer, 1000);
+        cache.set_record_evictions(true);
+        std::vector<int> slots;
+        fill(cache, slots);
+        auto r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(1001));
+        TEST_ASSERT(!r.active());
+        TEST_ASSERT(cache.stats().budget_skips == 1);
+        TEST_ASSERT(cache.stats().in_use == 4 && cache.stats().resident_bytes == 800);
+        TEST_ASSERT(cache.take_evicted().empty());
+        // Exactly the budget: everything else goes.
+        r = cache.reserve_inline_snap(big, 0, false, (int)big.size(), -1, bytes(1000));
+        TEST_ASSERT(r.active() && r.extra_victim_slots() == slots);
+        TEST_ASSERT(r.commit(big, 1000));
+        TEST_ASSERT(cache.take_evicted().size() == 4);
+        TEST_ASSERT(cache.stats().in_use == 1 && cache.stats().resident_bytes == 1000);
+    }
+    unlink(path.c_str());
+}
+
+// What a several-entry plan never takes: protected pins, heads that other
+// entries extend, the capture's own ancestors and restore source, and the
+// entries another capture in flight evicts.
+TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_plan_keeps_protected_and_in_use) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(16, tokenizer, /*max_resident_bytes=*/1200);
+    cache.set_record_evictions(true);
+    const std::vector<int32_t> s1 = {1, 110, 3, 111};
+    const std::vector<int32_t> s2 = {1, 120, 3, 121};
+    const std::vector<int32_t> pin = {1, 130};
+    const std::vector<int32_t> head = {1, 140};
+    const std::vector<int32_t> leaf = {1, 140, 3, 141};
+    const std::vector<int32_t> ancestor = {1, 150};
+    const std::vector<int32_t> source = {1, 150, 3, 151};
+    const std::vector<int32_t> t1 = {1, 160, 3, 161};
+    const std::vector<int32_t> t2 = {1, 170, 3, 171};
+    // Oldest first. Every entry holds 100 bytes.
+    int slot = 0;
+    for (const auto * ids : {&s1, &s2, &pin, &head, &leaf, &ancestor, &source, &t1, &t2}) {
+        cache.confirm_inline_snap(slot++, (int)ids->size(), *ids,
+                                  /*protect=*/ids == &pin, /*resident_bytes=*/100);
+    }
+    TEST_ASSERT(cache.stats().resident_bytes == 900);
+
+    // In flight: a 500-byte capture that needs two of them gone (s1, s2).
+    const std::vector<int32_t> other = {1, 180, 3, 181};
+    auto first = cache.reserve_inline_snap(
+        other, 0, false, (int)other.size(), -1, [](int) { return (size_t)500; });
+    TEST_ASSERT(first.active());
+    TEST_ASSERT(first.extra_victim_slots() == std::vector<int>({0, 1}));
+
+    // The next turn of `source`, restored from it: 300 bytes must go. The
+    // oldest entries are s1/s2 (the first capture's), then the pin, the head
+    // and the ancestor; only leaf, t1 and t2 are eligible.
+    std::vector<int32_t> turn = source;
+    turn.insert(turn.end(), {4, 152});
+    auto second = cache.reserve_inline_snap(
+        turn, (int)source.size(), false, (int)turn.size(),
+        /*restore_source_slot=*/6, [](int) { return (size_t)100; });
+    TEST_ASSERT(second.active());
+    TEST_ASSERT(second.extra_victim_slots() == std::vector<int>({4, 7, 8}));
+    // A third capture needs 401 bytes gone: only `source` (100, not its
+    // ancestor here) is left to plan, so it is skipped. No protected pin,
+    // head or ancestor is taken instead.
+    auto third = cache.reserve_inline_snap(
+        {1, 190, 3, 191}, 0, false, 4, -1, [](int) { return (size_t)101; });
+    TEST_ASSERT(!third.active());
+
+    TEST_ASSERT(second.commit(turn, 100));
+    auto evicted = cache.take_evicted();
+    TEST_ASSERT(evicted.size() == 3 && evicted[0].ids == leaf &&
+                evicted[1].ids == t1 && evicted[2].ids == t2);
+    TEST_ASSERT(first.commit(other, 500));
+    evicted = cache.take_evicted();
+    TEST_ASSERT(evicted.size() == 2 && evicted[0].ids == s1 && evicted[1].ids == s2);
+    for (const auto * kept : {&pin, &head, &ancestor, &source}) {
+        TEST_ASSERT(cache.lookup_candidate(*kept, (int)kept->size()).second ==
+                    (int)kept->size());
+    }
+    TEST_ASSERT(cache.stats().resident_bytes == 1000);
+    unlink(path.c_str());
+}
+
+// An edit backup goes before an older leaf, and is not written to disk while
+// its conversation's deeper snapshot is resident.
+TEST_CASE(ServerUnitFixture, test_prefix_cache_budget_plan_evicts_edit_backups_first) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    PrefixCache cache(16, tokenizer, /*max_resident_bytes=*/1000);
+    cache.set_prunes_superseded(true);
+    cache.set_record_evictions(true);
+    const std::vector<int32_t> y = {1, 200, 3, 201};
+    const std::vector<int32_t> z = {1, 300, 3, 301};
+    const std::vector<int32_t> head = {1, 100};
+    const std::vector<int32_t> turn1 = {1, 100, 3, 101};
+    const std::vector<int32_t> turn2 = {1, 100, 3, 101, 4, 102};
+    cache.confirm_inline_snap(0, 4, y, false, 100);
+    cache.confirm_inline_snap(1, 4, z, false, 100);
+    cache.confirm_inline_snap(2, 2, head, false, 100);
+    cache.confirm_inline_snap(3, 4, turn1, false, 100);
+    cache.confirm_inline_snap(4, 6, turn2, false, 100);
+    TEST_ASSERT(cache.prune_superseded_ancestors(4).empty());  // turn1 kept
+    TEST_ASSERT(!cache.persist_on_evict(3));                   // as an edit backup
+
+    const std::vector<int32_t> big = {1, 400, 3, 401};
+    auto r = cache.reserve_inline_snap(
+        big, 0, false, 4, -1, [](int) { return (size_t)700; });
+    TEST_ASSERT(r.active());
+    TEST_ASSERT(r.extra_victim_slots() == std::vector<int>({3, 0}));
+    TEST_ASSERT(r.commit(big, 700));
+    const auto evicted = cache.take_evicted();
+    TEST_ASSERT(evicted.size() == 2);
+    TEST_ASSERT(evicted[0].ids == turn1 && !evicted[0].persist);
+    TEST_ASSERT(evicted[1].ids == y && evicted[1].persist);
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_canonical_turn_matches_replay_checkpoint) {
     TEST_ASSERT(http_detail::canonical_turn_matches_checkpoint(
         {1, 2, 3}, {1, 2, 9, 4}, 2));
@@ -10151,6 +10341,62 @@ TEST_CASE(ServerUnitFixture, test_disk_session_ram_eviction_writes_and_restores)
     unlink(path.c_str());
 }
 
+// Single-sequence path: a long session that arrives after several short
+// ones is captured; the short ones it pushes out of RAM go to disk first.
+TEST_CASE(ServerUnitFixture, test_disk_session_large_capture_evicts_several_to_disk) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_several").string();
+    rm_rf(dir);
+    const std::vector<std::vector<int32_t>> small = {
+        {1, 100, 3, 101}, {1, 200, 3, 201}, {1, 300, 3, 301}, {1, 400, 3, 401}};
+    std::vector<int32_t> big = {1, 900, 3};
+    big.insert(big.end(), 40, 901);  // 43 tokens: 5300 bytes, 1400 per short one
+    {
+        auto backend_owner = std::make_unique<DiskPayloadBackend>();
+        DiskPayloadBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config = disk_session_config(dir);
+        config.prefix_cache_max_bytes = 7000;
+        HttpServer server(engine, tokenizer, config);
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        std::vector<int> slots;
+        for (const auto & ids : small) {
+            slots.push_back(commit_turn(server, backend, ids));
+            TEST_ASSERT(slots.back() >= 0);
+        }
+        TEST_ASSERT(disk.entry_count() == 0);
+        const int big_slot = commit_turn(server, backend, big);
+        TEST_ASSERT(big_slot >= 0);
+        TEST_ASSERT(cache.stats().budget_skips == 0);
+        TEST_ASSERT(cache.stats().resident_bytes == 1400 + 5300);
+        // The three oldest left RAM, written then freed; the newest stays.
+        for (int i = 0; i < 3; ++i) {
+            TEST_ASSERT(std::count(backend.freed.begin(), backend.freed.end(), slots[i]) >= 1);
+            TEST_ASSERT(!backend.snapshot_used(slots[i]));
+            TEST_ASSERT(cache.lookup_candidate(small[i], 4).first < 0);
+            TEST_ASSERT(disk.longest_prefix(small[i]).len == 4);
+        }
+        TEST_ASSERT(cache.lookup_candidate(small[3], 4).first == slots[3]);
+        TEST_ASSERT(disk.longest_prefix(small[3]).len == 0);
+        std::vector<int32_t> next = big;
+        next.insert(next.end(), {4, 902});
+        TEST_ASSERT(cache.lookup_candidate(next, (int)next.size()).second == (int)big.size());
+        disk.drain();
+        TEST_ASSERT(disk.stats().writes == 3 && disk.stats().pending_files == 0);
+        // A short session restores from disk afterwards.
+        std::vector<int32_t> again = small[0];
+        again.insert(again.end(), {4, 102});
+        const auto prepared = SchedulerTestHarness::prepare_cache(server, again);
+        TEST_ASSERT(prepared.restore_slot == ModelBackend::kMaxSlots - 1);
+        TEST_ASSERT(prepared.prefix_len == 4);
+    }
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
 // Tool path: an agent turn saved with its generated text (the live state
 // after generation) is written when the resident budget evicts it, keyed
 // by the tokens the next request renders.
@@ -10413,7 +10659,10 @@ public:
     int max_context() const override { return 64; }
     bool supports_prefix_store() const override { return true; }
     bool prefix_store_in_backend_snapshots() const override { return true; }
-    size_t estimate_prefix_store_bytes(int) const override { return 256; }
+    size_t estimate_prefix_store_bytes(int tokens) const override {
+        return bytes_per_token ? (size_t)tokens * bytes_per_token : 256;
+    }
+    size_t bytes_per_token = 0;  // 0: every checkpoint is 256 bytes
     bool token_is_eos(int32_t token) const override { return token == 2; }
     StepPlanLimits step_plan_limits(int) const override {
         return {2, 64, 128, 64};
@@ -10478,7 +10727,8 @@ public:
                     DiskPayloadBackend::make(slot.capture.checkpoint.tokens);
                 output.prefix_store.status = PrefixStoreEvent::Status::saved;
                 output.prefix_store.ticket = slot.capture;
-                output.prefix_store.bytes = 256;
+                output.prefix_store.bytes =
+                    estimate_prefix_store_bytes(slot.capture.checkpoint.tokens);
                 slot.capture = {};
             }
             result.prefills.push_back(std::move(output));
@@ -10585,6 +10835,98 @@ TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_eviction_and_restore) 
     SchedulerTestHarness::flush_sessions(server);
     TEST_ASSERT(disk.stats().pending_files == 0);
     TEST_ASSERT(disk.longest_prefix({1, 300, 3, 301, 4, 9}).len == 3);
+    rm_rf(dir);
+    unlink(path.c_str());
+}
+
+// Concurrent (paged) serving does the same: a long session's checkpoint
+// that no single resident one makes room for evicts several when it lands,
+// writes them to disk (with the disk on) and frees their payloads.
+TEST_CASE(ServerUnitFixture, test_disk_session_concurrent_large_capture_evicts_several) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::string dir = test_tmp_path("luce_test_session_paged_several").string();
+    for (const bool disk_on : {true, false}) {
+        rm_rf(dir);
+        auto backend_owner = std::make_unique<DiskCheckpointBackend>();
+        DiskCheckpointBackend & backend = *backend_owner;
+        backend.engine.bytes_per_token = 100;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config = disk_session_config(disk_on ? dir : std::string());
+        config.arch = "qwen35";
+        config.max_ctx = 64;
+        config.prefix_cache_cap = 8;
+        config.concurrent_prefix_cache_max_bytes = 4500;
+        config.concurrent_prefix_cache = true;
+        config.admission_coalesce_ms = 0;
+        HttpServer server(engine, tokenizer, config);
+        DiskPrefixCache & disk = SchedulerTestHarness::disk_cache(server);
+        TEST_ASSERT(disk.disabled() == !disk_on);
+
+        std::vector<std::unique_ptr<ServerJob>> jobs;
+        std::vector<int> fds;
+        const auto run_one = [&](std::vector<int32_t> prompt, const char * id) {
+            int sockets[2] = {-1, -1};
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+            fds.push_back(sockets[0]);
+            fds.push_back(sockets[1]);
+            auto job = std::make_unique<ServerJob>();
+            job->fd = sockets[0];
+            job->req.format = ApiFormat::OPENAI_CHAT;
+            job->req.prompt_tokens = std::move(prompt);
+            job->req.max_output = 1;
+            job->req.stream = false;
+            job->req.model = "scheduler-test";
+            job->req.response_id = id;
+            jobs.push_back(std::move(job));
+            ServerJob * raw = jobs.back().get();
+            SchedulerTestHarness::enqueue(server, raw);
+            std::unique_lock<std::mutex> lock(raw->mu);
+            return raw->cv.wait_for(lock, std::chrono::seconds(5), [&] { return raw->done; });
+        };
+        std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+        // Four short conversations save their 3-token heads (300 bytes each),
+        // then a long one saves its 42-token head (4200 bytes): 900 must go.
+        const std::vector<std::vector<int32_t>> small = {
+            {1, 100, 3, 101, 4}, {1, 200, 3, 201, 4},
+            {1, 300, 3, 301, 4}, {1, 400, 3, 401, 4}};
+        std::vector<int32_t> big = {1};
+        big.insert(big.end(), 40, 900);
+        big.insert(big.end(), {3, 901, 4});
+        bool ok = true;
+        for (size_t i = 0; i < small.size(); ++i) {
+            ok = ok && run_one(small[i], "s");
+        }
+        const auto before = SchedulerTestHarness::prefix_cache(server).stats();
+        ok = ok && run_one(big, "big");
+        disk.drain();
+        SchedulerTestHarness::stop(server);
+        scheduler.join();
+        for (const int fd : fds) close(fd);
+
+        TEST_ASSERT(ok);
+        TEST_ASSERT(before.in_use == 4 && before.resident_bytes == 1200);
+        PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+        const auto after = cache.stats();
+        TEST_ASSERT(after.budget_skips == 0);
+        TEST_ASSERT(after.in_use == 2 && after.resident_bytes == 300 + 4200);
+        std::vector<int32_t> next = big;
+        next.push_back(9);
+        TEST_ASSERT(cache.lookup_candidate(next, (int)next.size()).second == 42);
+        TEST_ASSERT(cache.lookup_candidate(small[3], 5).second == 3);
+        // Only the newest short head and the long one keep a payload.
+        TEST_ASSERT(backend.slots.size() == 2);
+        TEST_ASSERT(backend.displaced.empty());
+        if (disk_on) {
+            TEST_ASSERT(disk.stats().writes == 3);
+            for (int i = 0; i < 4; ++i) {
+                std::vector<int32_t> probe = small[(size_t)i];
+                probe.push_back(9);
+                TEST_ASSERT(disk.longest_prefix(probe).len == (i < 3 ? 3 : 0));
+            }
+        }
+    }
     rm_rf(dir);
     unlink(path.c_str());
 }
