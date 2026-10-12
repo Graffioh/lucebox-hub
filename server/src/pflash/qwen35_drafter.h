@@ -73,30 +73,34 @@ struct Qwen35ScoringSession {
     // prompts that share them (never the BF16 request_rows).
     luce::pflash::PFlashExactRowSets query_sets;
     uint64_t              last_used = 0;
+    // Session offload: the host entry this session was restored from, valid while no scoring call has acquired the
+    // session since (a call that acquires it extends or rewrites it, so that copy is stale from then on).
+    uint64_t              host_id = 0;
+    bool                  host_valid = false;
 };
 
 void free_qwen35_scoring_session(Qwen35ScoringSession & session);
 
-// A scoring session while the drafter is released (pflash_session_offload.h):
-// the host bookkeeping moved out of the session (its cache / keys fields
-// empty) and a byte copy of every device tensor it owned, in the order
-// qwen35_session_tensors() lists them.
+// A scoring session while the drafter is released (pflash_session_offload.h): a copy of its host bookkeeping (cache /
+// keys fields empty) and of the device bytes a resume reads, in qwen35_session_tensors() order.
 struct Qwen35HostSession {
+    uint64_t id = 0;
+    bool on_device = false;           // restored into a device session during the current load
     Qwen35ScoringSession bookkeeping;
     int cache_max_ctx = 0;
     int cache_cur_pos = 0;
     int cache_last_tok = -1;
-    std::vector<luce::pflash::PFlashHostTensor> tensors;
+    luce::pflash::PFlashHostCopy copy;
 };
 
-// Sessions copied to host by drafter_offload_sessions(), at most the
-// configured session count, restored before the next scoring call only under
-// the identity they were stored with (qwen35_session_identity()).
+// Sessions kept on the host by drafter_offload_sessions(), at most the configured session count (most recently
+// used), restored one at a time before a scoring call that can resume from it, and only under the identity they
+// were stored with (qwen35_session_identity()).
 struct DrafterHostSessions {
     std::string identity;
-    uint64_t clock = 0;     // Qwen35DrafterState::session_clock at offload
+    uint64_t clock = 0;     // Qwen35DrafterState::session_clock at the last offload
+    uint64_t next_id = 0;
     std::vector<Qwen35HostSession> sessions;
-    size_t host_bytes = 0;
 };
 
 struct Qwen35DrafterState {
@@ -227,9 +231,11 @@ std::string qwen35_session_identity(const DrafterContext & ctx, const Qwen35Draf
 // recurrent-state snapshot), then the block-15 keys.
 std::vector<ggml_tensor *> qwen35_session_tensors(const Qwen35ScoringSession & session);
 void qwen35_offload_sessions(DrafterContext & ctx);
-// Restores the stored sessions into ``st`` (fresh tensors, byte copies), or
-// drops them with a logged reason; the call then scores as usual.
-void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st);
+// Restores the one stored session a request over ``ids`` can resume from (if
+// no device session already can) into fresh tensors, or drops it with a
+// logged reason; the call then scores as usual. Other stored sessions stay on
+// the host untouched.
+void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st, const std::vector<int32_t> & ids);
 
 // Arch dispatch target of drafter_score_and_compress.
 std::vector<int32_t> qwen35_drafter_score_and_compress(
