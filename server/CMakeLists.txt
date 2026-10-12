@@ -747,6 +747,7 @@ add_library(luce_common STATIC
     src/server/json_schema_grammar.cpp
     src/server/tool_hint.cpp
     src/server/tool_memory.cpp
+    src/server/pflash_unified.cpp
     src/server/response_error.cpp
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
@@ -2482,6 +2483,7 @@ if(LUCE_TESTS)
             test/pflash/test_pflash_drafter_ipc.cpp
             test/pflash/test_pflash_selection.cpp
             test/pflash/test_pflash_fold.cpp
+            test/pflash/test_pflash_unified.cpp
             test/pflash/test_pflash_request_probe.cpp
             test/pflash/test_pflash_request_stage2.cpp
             test/pflash/test_pflash_query_candidates.cpp
