@@ -144,6 +144,37 @@ Admission admit_recall(const std::vector<int> & unit_cost, const std::vector<cha
                        const std::vector<int> & order, int cap,
                        const std::function<int(int, int)> & label_cost);
 
+// PFLASH_RECALL_GATE (recall/FABLE-RECALL-GATE.md §2.1): recall what the question needs. One region's candidates:
+// per unit its token cost, held flag, score (mean lift: the ranking key) and head mass (its share of the head's
+// mass on the whole prompt); the region's cap and the label cost of one excerpt run.
+struct RecallRegion {
+    std::vector<int> unit_cost;
+    std::vector<char> held;
+    std::vector<double> score;
+    std::vector<double> mass;
+    int cap = 0;
+    int label_cost = 0;
+};
+
+struct GatedRecall {
+    std::vector<Admission> regions;      // per region, as admit_recall's
+    double deficit_before = 0.0;         // D / S before any unit: the head mass on unheld units over S
+    double deficit_after = 0.0;          // D / S after the admitted units
+    bool gated = false;                  // deficit_before < theta: nothing taken, the present context suffices
+};
+
+// ``context_mass`` = S (> 0): the head mass on every candidate that is not pinned (history, held and unheld units).
+// D = the mass of the unheld units. When D / S < ``theta`` nothing is taken. Else unheld units are taken best first
+// ACROSS regions (one order by score; region then document order on ties), each under its own region's cap with
+// admit_recall's run and label accounting (a unit that does not fit is skipped), and the taking stops as soon as the
+// mass still unheld is below theta x S. The caps bound it: the worst case is admit_recall's fill.
+GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta);
+
+// PFLASH_RECALL_SOURCE=fresh (RECONCILE §2.1, "fresh.kept - view.held"): per unit [unit_begin, unit_end), whether
+// more than half of its tokens lie in ``spans`` (the drafter selection's kept spans for this request).
+std::vector<char> units_in_spans(const std::vector<int> & unit_begin, const std::vector<int> & unit_end,
+                                 const std::vector<std::pair<int, int>> & spans);
+
 // Units best first: higher score first, document order on ties; ``skip`` units are left out.
 std::vector<int> rank_units(const std::vector<double> & score, const std::vector<char> & skip);
 

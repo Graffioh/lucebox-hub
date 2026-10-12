@@ -254,6 +254,100 @@ TEST_CASE(PFlashUnifiedFixture, unified_admit_recall_skips_held_and_charges_labe
     REQUIRE(a.admitted == std::vector<char>({0, 1, 0, 1, 1}));
 }
 
+TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_appends_nothing_when_the_present_context_suffices) {
+    RecallRegion r;
+    r.unit_cost = {10, 10, 10, 10};
+    r.held = {1, 0, 0, 1};
+    r.score = {9.0, 2.0, 1.0, 9.0};
+    r.mass = {0.40, 0.03, 0.01, 0.30};   // held units carry most of the mass; D = 0.04
+    r.cap = 1000;
+    r.label_cost = 5;
+    GatedRecall g = admit_recall_gated({r}, 1.0, 0.05);
+    REQUIRE(g.gated);
+    REQUIRE(g.regions[0].taken == 0);
+    REQUIRE(g.regions[0].admitted == std::vector<char>({0, 0, 0, 0}));
+    REQUIRE(std::fabs(g.deficit_before - 0.04) < 1e-12);
+    REQUIRE(std::fabs(g.deficit_after - 0.04) < 1e-12);
+    // Held units never count towards D, whatever their mass.
+    r.mass = {5.0, 0.03, 0.01, 5.0};
+    REQUIRE(std::fabs(admit_recall_gated({r}, 1.0, 0.05).deficit_before - 0.04) < 1e-12);
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_stops_once_the_deficit_is_covered) {
+    RecallRegion r;
+    r.unit_cost = {10, 10, 10, 10, 10};
+    r.held = {0, 0, 0, 0, 0};
+    r.score = {1.0, 8.0, 2.0, 0.5, 0.4};
+    r.mass = {0.02, 0.30, 0.05, 0.01, 0.01};   // D = 0.39 of S = 1
+    r.cap = 1000;
+    r.label_cost = 5;
+    // theta .10: unit 1 leaves .09 < .10: one unit, nothing more.
+    GatedRecall g = admit_recall_gated({r}, 1.0, 0.10);
+    REQUIRE(!g.gated);
+    REQUIRE(g.regions[0].admitted == std::vector<char>({0, 1, 0, 0, 0}));
+    REQUIRE(g.regions[0].cost == 15);
+    REQUIRE(std::fabs(g.deficit_after - 0.09) < 1e-12);
+    // theta .05: unit 1 (.09 left), unit 2 (.04 left): stop.
+    g = admit_recall_gated({r}, 1.0, 0.05);
+    REQUIRE(g.regions[0].admitted == std::vector<char>({0, 1, 1, 0, 0}));
+    REQUIRE(g.regions[0].cost == 25);
+    // S scales the share: the same units against S = 4 are under .10 at the start.
+    REQUIRE(admit_recall_gated({r}, 4.0, 0.10).gated);
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_at_zero_fills_like_admit_recall_and_never_past_the_cap) {
+    RecallRegion r;
+    r.unit_cost = {10, 10, 10, 10, 10};
+    r.held = {0, 1, 0, 0, 0};
+    r.score = {3.0, 9.0, 5.0, 4.0, 1.0};
+    r.mass = {0.1, 0.5, 0.1, 0.1, 0.1};
+    r.cap = 30;
+    r.label_cost = 5;
+    const auto label = [](int, int) { return 5; };
+    const Admission fill = admit_recall(r.unit_cost, r.held, rank_units(r.score, r.held), r.cap, label);
+    const GatedRecall g = admit_recall_gated({r}, 1.0, 0.0);
+    REQUIRE(g.regions[0].admitted == fill.admitted);
+    REQUIRE(g.regions[0].cost == fill.cost);
+    REQUIRE(g.regions[0].cost <= r.cap);
+    // Diffuse mass under a strict theta: still bounded by the cap.
+    REQUIRE(admit_recall_gated({r}, 1.0, 0.01).regions[0].cost <= r.cap);
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_orders_units_across_regions_under_their_own_caps) {
+    RecallRegion a;
+    a.unit_cost = {10, 10};
+    a.held = {0, 0};
+    a.score = {1.0, 6.0};
+    a.mass = {0.05, 0.10};
+    a.cap = 15;
+    a.label_cost = 5;
+    RecallRegion b;
+    b.unit_cost = {10, 10};
+    b.held = {0, 0};
+    b.score = {7.0, 2.0};
+    b.mass = {0.20, 0.05};
+    b.cap = 1000;
+    b.label_cost = 5;
+    // D = .40. Order: b0 (7), a1 (6), b1 (2), a0 (1). theta .12: b0 -> .20, a1 -> .10 < .12: stop.
+    GatedRecall g = admit_recall_gated({a, b}, 1.0, 0.12);
+    REQUIRE(g.regions[0].admitted == std::vector<char>({0, 1}));
+    REQUIRE(g.regions[1].admitted == std::vector<char>({1, 0}));
+    // theta .01: a0 does not fit a's cap (15 + 10 + label change) and is skipped; b1 is taken.
+    g = admit_recall_gated({a, b}, 1.0, 0.01);
+    REQUIRE(g.regions[0].admitted == std::vector<char>({0, 1}));
+    REQUIRE(g.regions[0].cost <= a.cap);
+    REQUIRE(g.regions[1].admitted == std::vector<char>({1, 1}));
+}
+
+TEST_CASE(PFlashUnifiedFixture, unified_units_in_spans_needs_more_than_half_of_a_unit) {
+    const std::vector<int> begin = {0, 10, 20, 30};
+    const std::vector<int> end = {10, 20, 30, 40};
+    // Unit 0 fully kept; unit 1 half (5 of 10): not more than half; unit 2 six of ten over two spans; unit 3 none.
+    const auto in = units_in_spans(begin, end, {{0, 15}, {22, 25}, {27, 30}});
+    REQUIRE(in == std::vector<char>({1, 0, 1, 0}));
+    REQUIRE(units_in_spans(begin, end, {}) == std::vector<char>({0, 0, 0, 0}));
+}
+
 TEST_CASE(PFlashUnifiedFixture, unified_rank_units_orders_by_score_then_document) {
     REQUIRE(rank_units({0.5, 2.0, 0.5, NAN, 3.0}, {}) == std::vector<int>({4, 1, 0, 2, 3}));
     REQUIRE(rank_units({0.5, 2.0, 0.5}, {0, 1, 0}) == std::vector<int>({0, 2}));
