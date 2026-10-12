@@ -1544,6 +1544,9 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
     }
     disk_cache_.init();
+    // Report the effective state after initialization failure or a directory
+    // lock conflict; serving continues with the ordinary RAM cache.
+    if (disk_cache_.disabled()) config_.disk_cache_dir.clear();
     restore_replay_blobs();
     status_html_path_ = resolve_status_html();
 
@@ -4281,6 +4284,7 @@ void HttpServer::finalize_generation_cache(
                 // decision sees the requested cut as covered. Keying at the
                 // saved position re-targets the same cut on every request
                 // and the restore point never moves past it.
+                evict_extra_victims(cache.snap_reservation);
                 cache.snap_reservation.commit(
                     effective_prompt,
                     backend_.snapshot_bytes_estimate(saved_position));
@@ -4382,6 +4386,14 @@ void HttpServer::evict_inline_slot(int slot) {
         persist_evicted_slot(slot, prefix_cache_.persist_on_evict(slot), "ram eviction");
     }
     forget_inline_slot_metadata(slot);
+}
+
+void HttpServer::evict_extra_victims(
+        const PrefixCache::InlineReservation & reservation) {
+    for (const int slot : reservation.extra_victim_slots()) {
+        evict_inline_slot(slot);
+        backend_.snapshot_free(slot);
+    }
 }
 
 void HttpServer::note_session_slot(int slot) {
@@ -4646,6 +4658,7 @@ bool HttpServer::save_generated_turn(
         reservation.abort();
         return false;
     }
+    evict_extra_victims(reservation);
     reservation.commit_at(
         canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
     std::vector<bool> persist;
@@ -4655,9 +4668,11 @@ bool HttpServer::save_generated_turn(
         forget_inline_slot_metadata(evicted[i]);
         backend_.snapshot_free(evicted[i]);
     }
-    slot_tokens_[slot] = std::vector<int32_t>(
-        canonical.begin(), canonical.begin() + saved_pos);
-    note_session_slot(slot);
+    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+        slot_tokens_[slot] = std::vector<int32_t>(
+            canonical.begin(), canonical.begin() + saved_pos);
+        note_session_slot(slot);
+    }
     agent_turn_cache_slots_.insert(slot);
     std::fprintf(stderr,
         "[agent-turn-cache] saved generated turn slot=%d prefix=%d "
@@ -4798,13 +4813,16 @@ void HttpServer::remember_agent_turn(
     const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
         ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
+        evict_extra_victims(reservation);
         reservation.commit_at(
             canonical_tokens, saved_pos,
             backend_.snapshot_bytes_estimate(saved_pos));
         trim_snapshots_after_commit(slot);
         canonical_tokens.resize((size_t) saved_pos);
-        slot_tokens_[slot] = std::move(canonical_tokens);
-        note_session_slot(slot);
+        if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+            slot_tokens_[slot] = std::move(canonical_tokens);
+            note_session_slot(slot);
+        }
         agent_turn_cache_slots_.insert(slot);
         std::fprintf(stderr,
             "[agent-turn-cache] saved slot=%d prefix=%d source=%d:%d "

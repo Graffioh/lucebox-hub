@@ -118,7 +118,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             "[disk-cache] off for concurrent serving: this engine keeps no "
             "checkpoints in backend snapshot slots\n");
     }
-    prefix_cache_.set_record_evictions(disk_enabled);
+    // Recorded with the disk off too: a capture whose resident-budget plan
+    // evicts further checkpoints (PrefixCache::reserve_inline_snap) frees
+    // their payloads here.
+    prefix_cache_.set_record_evictions(true);
     struct DiskLoad {
         ServerJob * job = nullptr;
         std::vector<int32_t> key;
@@ -130,15 +133,25 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         std::thread reader;
     };
     std::optional<DiskLoad> disk_load;
-    std::vector<std::thread> finished_readers;
+    std::vector<DiskLoad> finished_readers;
     // Staging checkpoint for a disk restore: PrefixCache never uses it.
     constexpr int kDiskStagingIndex = PrefixCache::MAX_CACHE_SLOTS;
     auto drop_disk_load = [&]() {
         if (!disk_load) return;
         if (disk_load->reader.joinable()) {
-            finished_readers.push_back(std::move(disk_load->reader));
+            finished_readers.push_back(std::move(*disk_load));
         }
         disk_load.reset();
+    };
+    auto reap_readers = [&]() {
+        for (auto it = finished_readers.begin(); it != finished_readers.end();) {
+            if (it->result->done.load(std::memory_order_acquire)) {
+                it->reader.join();
+                it = finished_readers.erase(it);
+            } else {
+                ++it;
+            }
+        }
     };
 
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
@@ -507,8 +520,19 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             // A deeper state on disk (the index answers without a read):
             // load it off this thread, then restore from the staging slot.
-            const auto probe = disk_enabled
-                ? disk_cache_.longest_prefix(req.prompt_tokens)
+            std::vector<int> scoped_lengths;
+            const auto mode = req.disk_cache_policy.mode;
+            if (mode == DiskPrefixCacheMode::Fixed) {
+                scoped_lengths.push_back(disk_prefix_cache_fixed_boundary(
+                    req.disk_cache_policy, (int)req.prompt_tokens.size(),
+                    config_.disk_cache_min_tokens));
+            } else if (mode == DiskPrefixCacheMode::Auto) {
+                scoped_lengths = find_all_boundaries(
+                    req.prompt_tokens, prefix_cache_.chat_markers());
+            }
+            const auto probe = disk_enabled && mode != DiskPrefixCacheMode::Off
+                ? disk_cache_.longest_prefix(req.prompt_tokens,
+                    mode == DiskPrefixCacheMode::Full ? nullptr : &scoped_lengths)
                 : DiskPrefixCache::PrefixProbe{};
             if (disk_load && disk_load->job != job) drop_disk_load();
             if (probe.cur_pos > prefix_plan.restore.tokens &&
@@ -549,6 +573,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                         prefix_plan.restore.valid() ? "restoring from RAM"
                                                     : "prefilling");
                 }
+            } else if (disk_load && disk_load->job == job) {
+                drop_disk_load();
             }
 
             if (prefix_plan.restore.valid() && disk_cache_digest_enabled()) {
@@ -835,6 +861,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     std::chrono::steady_clock::time_point decode_only_until{};
 
     while (true) {
+        reap_readers();
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
         // Blocking dequeue only when idle; between decode steps only a poll.
         // Engines reject atomically when their current slot, staging, or
@@ -859,7 +886,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // scratch memory back and park in a blocking dequeue.
                     publish_live_count();
                     backend_.release_scratch();
-                    job = dequeue();
+                    job = finished_readers.empty() ? dequeue()
+                        : dequeue_for(std::chrono::milliseconds(5));
                     woke_from_idle = job != nullptr;
                 } else {
                     // A fresh idle transition may spend its bounded batching
@@ -875,6 +903,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             if (!job) break;  // queue empty: go decode what is already live
             if (job->client_disconnected.load(std::memory_order_acquire)) {
+                if (disk_load && disk_load->job == job) drop_disk_load();
                 finish_job(job);
                 continue;
             }
@@ -1182,8 +1211,36 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 OwnedSnapshot displaced = disk_enabled
                     ? backend_.snapshot_take_displaced(captured) : OwnedSnapshot{};
                 for (auto & evicted : prefix_cache_.take_evicted()) {
-                    if (evicted.slot != captured || displaced.empty()) continue;
-                    if (evicted.persist) {
+                    if (evicted.slot != captured) {
+                        // A further checkpoint the capture's resident-budget
+                        // plan evicted as it committed: its payload is still
+                        // in its own slot. Written like the displaced one,
+                        // then freed.
+                        bool queued = false;
+                        if (disk_enabled && evicted.persist && slot_tokens_.count(evicted.slot)) {
+                            const auto aux = slot_aux_.find(evicted.slot);
+                            const std::string blob =
+                                aux == slot_aux_.end() ? std::string() : aux->second;
+                            OwnedSnapshot snap = backend_.snapshot_detach(evicted.slot);
+                            const int pos = snap.empty() ? 0 : snap.cur_pos();
+                            queued = !snap.empty() &&
+                                disk_cache_.save_async(std::move(snap), evicted.ids, blob);
+                            if (queued) {
+                                disk_cache_.prune_ancestors(
+                                    evicted.ids, config_.disk_cache_cold_max_tokens);
+                            }
+                            std::fprintf(stderr,
+                                "[disk-cache] ram eviction checkpoint=%d tokens=%zu "
+                                "pos=%d -> %s\n", evicted.slot + 1, evicted.ids.size(),
+                                pos, queued ? "write queued" : "not written");
+                        }
+                        engine.discard_prefix_store(
+                            {(uint64_t)evicted.slot + 1, (int)evicted.ids.size()});
+                        forget_inline_slot_metadata(evicted.slot);
+                        continue;
+                    }
+                    if (displaced.empty()) continue;
+                    if (evicted.persist && slot_tokens_.count(captured)) {
                         const auto aux = slot_aux_.find(captured);
                         const int pos = displaced.cur_pos();
                         const bool queued = disk_cache_.save_async(
@@ -1203,7 +1260,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (resolution == Resolution::saved) {
                     // The slot holds the new checkpoint now.
                     forget_inline_slot_metadata(captured);
-                    if (disk_enabled) {
+                    if (disk_enabled && s.job->req.disk_cache_policy.mode == DiskPrefixCacheMode::Full) {
                         const int tokens = out.prefix_store.ticket.checkpoint.tokens;
                         const auto & prompt = s.job->req.prompt_tokens;
                         slot_tokens_[captured] = std::vector<int32_t>(
@@ -1301,7 +1358,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     }
 
     drop_disk_load();
-    for (auto & reader : finished_readers) reader.join();
+    for (auto & reader : finished_readers) reader.reader.join();
     finished_readers.clear();
 
     // Shutdown: unblock every parked client thread.

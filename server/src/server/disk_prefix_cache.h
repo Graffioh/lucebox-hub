@@ -181,7 +181,7 @@ public:
     // budget to the free space, apply the TTL and the budget, pick the most
     // recently used layout written with this identity salt (enables
     // first-request disk hits), and start the writer thread. Returns false
-    // on fatal error.
+    // when initialization fails; the disk cache disables itself in that case.
     bool init();
 
     // Look up a prompt on disk. On hit, loads the snapshot into `slot`
@@ -232,7 +232,9 @@ public:
     // key is a prefix of `prompt_ids`. len = key tokens, cur_pos = KV rows
     // the snapshot holds (<= len). {0, 0} on miss.
     struct PrefixProbe { int len = 0; int cur_pos = 0; };
-    PrefixProbe longest_prefix(const std::vector<int32_t> & prompt_ids);
+    // With allowed_lengths, only those exact scoped boundaries qualify.
+    PrefixProbe longest_prefix(const std::vector<int32_t> & prompt_ids,
+                               const std::vector<int> * allowed_lengths = nullptr);
 
     // Delete live-layout entries whose key is a strict prefix of `tokens`
     // and longer than `keep_max` tokens: a deeper state of the same session
@@ -367,7 +369,11 @@ private:
     // Exclusive lock on <cache_dir>/.lock: one process (and one model) per
     // directory, since startup deletes temporaries and the budget evicts
     // files of every layout in it.
+#if defined(_WIN32)
+    void * lock_handle_ = nullptr;
+#else
     int lock_fd_ = -1;
+#endif
 
     // Helpers (the _locked ones need mu_).
     uint64_t now() const;
@@ -385,6 +391,7 @@ private:
     void make_room_locked(uint64_t incoming);
     void writer_loop();
     void release_pending_locked(DiskEntry & e);
+    void touch_locked(DiskEntry & e);
 
     bool write_file(const std::string & path, const PendingWrite & job);
     OwnedSnapshot read_file(const std::string & path,

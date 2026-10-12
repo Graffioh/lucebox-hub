@@ -22,6 +22,10 @@
 #include <thread>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <io.h>
 #else
 #include <fcntl.h>
@@ -526,7 +530,9 @@ DiskPrefixCache::~DiskPrefixCache() {
         writer_cv_.notify_all();
         writer_.join();
     }
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (lock_handle_) CloseHandle(lock_handle_);
+#else
     if (lock_fd_ >= 0) ::close(lock_fd_);
 #endif
 }
@@ -609,24 +615,37 @@ static bool validate_snapshot_file(const std::string & path,
 bool DiskPrefixCache::init() {
     if (disabled()) return true;
     if (!mkdir_p(config_.cache_dir)) {
-        std::fprintf(stderr, "[disk-cache] failed to create dir: %s\n",
+        std::fprintf(stderr, "[disk-cache] disabled: failed to create dir: %s\n",
                      config_.cache_dir.c_str());
+        // No writer was started. Leaving the cache enabled would queue
+        // payloads forever and block serving once backpressure is reached.
+        config_.cache_dir.clear();
         return false;
     }
-#if !defined(_WIN32)
     const std::string lock_path = config_.cache_dir + "/.lock";
+#if defined(_WIN32)
+    // A share-mode-zero handle excludes every other server before scanning
+    // temporaries or enforcing the budget, just like flock on POSIX.
+    lock_handle_ = CreateFileW(fs::path(lock_path).c_str(), GENERIC_READ | GENERIC_WRITE,
+                              0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool locked = lock_handle_ != INVALID_HANDLE_VALUE;
+    if (!locked) lock_handle_ = nullptr;
+#else
     lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (lock_fd_ < 0 || ::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+    const bool locked = lock_fd_ >= 0 && ::flock(lock_fd_, LOCK_EX | LOCK_NB) == 0;
+#endif
+    if (!locked) {
         std::fprintf(stderr,
-                     "[disk-cache] disabled: %s is in use by another server "
+                     "[disk-cache] disabled: cannot lock %s (in use or not writable) "
                      "(pass --kv-cache-dir <other dir> to give this one its own)\n",
                      config_.cache_dir.c_str());
+#if !defined(_WIN32)
         if (lock_fd_ >= 0) ::close(lock_fd_);
         lock_fd_ = -1;
+#endif
         config_.cache_dir.clear();
         return true;
     }
-#endif
     std::lock_guard<std::mutex> lock(mu_);
     scan_all();
     // Budget and TTL hold from the first moment, before any request.
@@ -808,6 +827,16 @@ void DiskPrefixCache::release_pending_locked(DiskEntry & e) {
     e.pending.reset();
 }
 
+void DiskPrefixCache::touch_locked(DiskEntry & e) {
+    e.last_used = now();
+    if (e.pending) return;  // the writer publishes the latest timestamp
+    // Not fsynced: a crash may age an entry, but clean restarts retain uses.
+    if (FILE * f = std::fopen(e.path.c_str(), "r+b")) {
+        if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) write_u64(f, e.last_used);
+        std::fclose(f);
+    }
+}
+
 void DiskPrefixCache::remove_entry(size_t idx, const char * why) {
     DiskEntry & e = entries_[idx];
     const bool queued = e.pending != nullptr;
@@ -970,16 +999,7 @@ OwnedSnapshot DiskPrefixCache::load(const std::vector<int32_t> & prompt_ids) {
     if (idx >= 0) {
         // Persist last_used in the file so LRU order and the TTL survive a
         // restart. Not fsynced: losing it in a crash only ages the entry.
-        DiskEntry & entry = entries_[(size_t)idx];
-        entry.last_used = now();
-        if (!entry.pending) {
-            if (FILE * f = std::fopen(entry.path.c_str(), "r+b")) {
-                if (std::fseek(f, DISK_CACHE_LAST_USED_OFFSET, SEEK_SET) == 0) {
-                    write_u64(f, entry.last_used);
-                }
-                std::fclose(f);
-            }
-        }
+        touch_locked(entries_[(size_t)idx]);
     }
     return out;
 }
@@ -1042,7 +1062,8 @@ void DiskPrefixCache::for_each_aux(
 }
 
 DiskPrefixCache::PrefixProbe DiskPrefixCache::longest_prefix(
-        const std::vector<int32_t> & prompt_ids) {
+        const std::vector<int32_t> & prompt_ids,
+        const std::vector<int> * allowed_lengths) {
     PrefixProbe out;
     if (disabled()) return out;
     std::lock_guard<std::mutex> lock(mu_);
@@ -1053,6 +1074,9 @@ DiskPrefixCache::PrefixProbe DiskPrefixCache::longest_prefix(
         if (e.layout_id != layout_id_ || expired(e, t)) continue;
         if (e.token_count > prompt_ids.size()) continue;
         if ((int)e.token_count < config_.min_tokens) continue;
+        if (allowed_lengths &&
+            std::find(allowed_lengths->begin(), allowed_lengths->end(),
+                      (int)e.token_count) == allowed_lengths->end()) continue;
         lengths.push_back(e.token_count);
     }
     std::sort(lengths.begin(), lengths.end(), std::greater<uint32_t>());
@@ -1153,7 +1177,7 @@ bool DiskPrefixCache::save_async(OwnedSnapshot snap,
     // Already on disk (or queued): count it as a use.
     const int existing = find_entry(hash);
     if (existing >= 0) {
-        entries_[(size_t)existing].last_used = now();
+        touch_locked(entries_[(size_t)existing]);
         return true;
     }
     // Make room first, so the budget holds while the file is being written.
@@ -1212,7 +1236,7 @@ bool DiskPrefixCache::save(int slot, const std::vector<int32_t> & prompt_ids,
         std::lock_guard<std::mutex> lock(mu_);
         const int existing = find_entry(hash);
         if (existing >= 0) {
-            entries_[(size_t)existing].last_used = now();
+            touch_locked(entries_[(size_t)existing]);
             return true;
         }
     }

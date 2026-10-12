@@ -314,6 +314,7 @@ static void print_usage(const char * prog) {
         "  --kv-cache-dir <path>|off   Directory for the on-disk KV session cache\n"
         "                              (default: $XDG_CACHE_HOME/lucebox/kv-cache, else\n"
         "                              ~/.cache/lucebox/kv-cache; off disables it)\n"
+        "                              On Windows: %LOCALAPPDATA%/lucebox/kv-cache\n"
         "  --no-kv-cache               Same as --kv-cache-dir off\n"
         "  --kv-cache-budget <MB>      Max disk usage in MB, hard cap with LRU eviction,\n"
         "                              clamped to the free space (default: 131072 = 128 GB)\n"
@@ -424,9 +425,16 @@ struct ModelOptions {
 
 };
 
-// $XDG_CACHE_HOME/lucebox/kv-cache, else ~/.cache/lucebox/kv-cache; empty
-// (disk cache off) when neither variable is set.
+// Native cache directory, or empty when no usable home/cache path is set.
 static std::string default_kv_cache_dir() {
+#if defined(_WIN32)
+    for (const char * variable : {"LOCALAPPDATA", "USERPROFILE"}) {
+        const char * value = std::getenv(variable);
+        if (value && *value && std::filesystem::path(value).is_absolute()) {
+            return (std::filesystem::path(value) / "lucebox" / "kv-cache").string();
+        }
+    }
+#endif
     const char * xdg = std::getenv("XDG_CACHE_HOME");
     if (xdg && xdg[0] == '/') return std::string(xdg) + "/lucebox/kv-cache";
     const char * home = std::getenv("HOME");

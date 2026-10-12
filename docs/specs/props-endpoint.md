@@ -398,7 +398,8 @@ non-strictly-consistent semantics as `full_cache` (§4.7).
 `capacity = 0` means the cache is disabled. `max_resident_bytes` and
 `resident_bytes` cover committed copied checkpoints used by concurrent paged
 serving; a maximum of `0` means unlimited. `budget_skips` counts captures
-declined because no single eligible LRU entry could make enough room.
+declined because the eligible LRU entries, alone or together, could not make
+enough room (or the checkpoint is larger than the whole budget).
 
 The capture and restore counters expose synchronous time spent copying
 checkpoint state on the scheduler thread. `*_attempts` include successful and
