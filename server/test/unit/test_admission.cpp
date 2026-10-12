@@ -55,3 +55,27 @@ TEST_CASE(AdmissionFixture, test_effective_overflows_zero_length_hit_is_a_hit) {
 TEST_CASE(AdmissionFixture, test_effective_overflows_full_cache_hit_still_too_large) {
     CHECK(effective_prompt_overflows(200000, 60000, 10000, 65536));
 }
+
+// PFlash's maximum context: with compression on, --max-ctx is capped at kPFlashMaxCtx; otherwise unchanged.
+TEST_CASE(AdmissionFixture, test_pflash_max_ctx_caps_only_with_compression) {
+    using luce::common::kPFlashMaxCtx;
+    CHECK(kPFlashMaxCtx == 220 * 1024);
+    CHECK(pflash_clamped_max_ctx(262144, true) == kPFlashMaxCtx);
+    CHECK(pflash_clamped_max_ctx(262144, false) == 262144);
+    CHECK(pflash_clamped_max_ctx(139264, true) == 139264);
+    CHECK(pflash_clamped_max_ctx(kPFlashMaxCtx, true) == kPFlashMaxCtx);
+    CHECK(pflash_clamped_max_ctx(kPFlashMaxCtx + 1, true) == kPFlashMaxCtx);
+    CHECK(pflash_clamped_max_ctx(0, true) == 0);   // unset: the backend default
+}
+
+// An oversized prompt that compression would take is still refused past PFlash's maximum context (the drafter
+// scores the raw prompt); between --max-ctx and that limit it passes as before.
+TEST_CASE(AdmissionFixture, test_oversized_with_compression_respects_pflash_max_ctx) {
+    using luce::common::kPFlashMaxCtx;
+    CHECK(!should_reject_oversized(200000, 1, 139264, true));
+    CHECK(!should_reject_oversized(kPFlashMaxCtx, 0, 139264, true));
+    CHECK(should_reject_oversized(kPFlashMaxCtx + 1, 0, 139264, true));
+    CHECK(should_reject_oversized(300000, 1, kPFlashMaxCtx, true));
+    CHECK(should_reject_oversized(300000, 1, kPFlashMaxCtx, false));
+    CHECK(!should_reject_oversized(1000, 1, 139264, false));
+}

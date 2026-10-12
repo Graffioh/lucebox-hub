@@ -3731,9 +3731,17 @@ bool HttpServer::validate_request_context(
             prompt_tokens, req.max_output, config_.max_ctx, pflash_will_run)) {
         return true;
     }
-    if (send_failure) send_error(fd, 400,
-               context_overflow_message(
-                   config_.max_ctx, prompt_tokens, req.max_output));
+    if (send_failure) {
+        if (pflash_will_run) {
+            send_error(fd, 400,
+                "request exceeds PFlash's maximum context: " + std::to_string(prompt_tokens) +
+                " prompt tokens > " + std::to_string(luce::common::kPFlashMaxCtx));
+        } else {
+            send_error(fd, 400,
+                context_overflow_message(
+                    config_.max_ctx, prompt_tokens, req.max_output));
+        }
+    }
     return false;
 }
 
