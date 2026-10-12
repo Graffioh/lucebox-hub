@@ -470,6 +470,27 @@ turns it off; the breaks do not count against the token ceiling).
 appends each compressed request's served prompt as JSONL, for evidence
 checks in evaluations.
 
+Coding-agent sessions (`PFLASH_AGENT_HISTORY=keep`, with
+`PFLASH_ADMISSION=cache`): in a conversation with tool activity (the request
+defines `tools`, or its history has an assistant tool call or a tool result)
+PFlash never compresses the agent's history or any tool output. The only
+thing it compresses is the newest turn when it is a user message with at
+least `--prefill-threshold` droppable tokens (a pasted document, on the
+first turn too): that content alone, on its own keep budget, after the raw
+history (restored from the prefix cache or prefilled) or after the
+conversation's view. Every other request is served raw with full prefill
+(`pflash_fallback.reason = keep_history`; a newest tool output of any size
+included), and a view is only continued: later turns and tool outputs are
+appended verbatim, a new big paste is compressed as a region of its own,
+and recall adds the passages of earlier pastes that the new question needs
+in the excerpt block at the start of the newest user message, after the
+cached view. The view is never rebuilt and never compressed again as a
+whole; when it cannot continue (or no longer fits the context) the raw
+prompt is served, and a raw prompt over the context gets the
+context-overflow error full prefill gets. The prefix-cache snapshot of such
+a view is taken at the view's end, so the next turn restores the whole view.
+Chats without tools are not affected.
+
 Every turn of a multi-turn chat keeps its role header, and user turns (the
 latest included) and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS`
 (default 256 drafter tokens; 0 keeps headers only) stay whole: the
