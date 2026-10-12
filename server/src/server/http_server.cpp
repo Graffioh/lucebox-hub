@@ -2726,6 +2726,32 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         }
         const char * recall = std::getenv("PFLASH_RECALL");
         pflash_unified_recall_ = !(recall && std::strcmp(recall, "0") == 0);
+        if (const char * gate = std::getenv("PFLASH_RECALL_GATE"); gate && *gate) {
+            char * end = nullptr;
+            const double theta = std::strtod(gate, &end);
+            if (end == gate || *end != '\0' || !std::isfinite(theta) || theta <= 0.0 || theta >= 1.0) {
+                fail(std::string("PFLASH_RECALL_GATE must be a number in (0, 1), got '") + gate + "'");
+            }
+            pflash_recall_gate_ = theta;
+        }
+        if (const char * source = std::getenv("PFLASH_RECALL_SOURCE"); source && *source) {
+            if (std::strcmp(source, "fresh") != 0) {
+                fail(std::string("PFLASH_RECALL_SOURCE must be 'fresh' or unset, got '") + source + "'");
+            }
+            pflash_recall_fresh_ = true;
+        }
+        if (const char * trace = std::getenv("PFLASH_RECALL_TRACE_UNITS"); trace && *trace) {
+            if (std::strcmp(trace, "1") != 0 && std::strcmp(trace, "0") != 0) {
+                fail(std::string("PFLASH_RECALL_TRACE_UNITS must be 0 or 1, got '") + trace + "'");
+            }
+            pflash_recall_trace_units_ = std::strcmp(trace, "1") == 0;
+        }
+        if (pflash_recall_gate_ > 0.0 && pflash_recall_fresh_) {
+            fail("PFLASH_RECALL_GATE and PFLASH_RECALL_SOURCE=fresh are separate arms; set one");
+        }
+        if ((pflash_recall_gate_ > 0.0 || pflash_recall_fresh_) && !pflash_unified_recall_) {
+            fail("PFLASH_RECALL_GATE / PFLASH_RECALL_SOURCE need recall on (PFLASH_RECALL=0 is set)");
+        }
         // Knobs of the legacy chat view and tool-session rules: replaced, named once.
         for (const char * legacy : {"PFLASH_AGENT_PASTE", "PFLASH_ARRIVE", "PFLASH_CHAT_RECALL",
                                     "PFLASH_CHAT_COMPRESS_NEW_TOKENS", "PFLASH_CHAT_REBUILD_MIN_TOKENS",
@@ -2740,6 +2766,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         };
         pflash_unified_config_ = "unified-v1|tools=" + pflash_region_tools_.identity +
             "|recall=" + (pflash_unified_recall_ ? "1" : "0") +
+            (pflash_recall_gate_ > 0.0 ? "|recall_gate=" + std::to_string(pflash_recall_gate_) : std::string()) +
+            (pflash_recall_fresh_ ? "|recall_source=fresh" : "") +
             "|threshold=" + std::to_string(config_.pflash_threshold) +
             "|drafter=" + config_.pflash_drafter_path +
             "|head=" + env("PFLASH_SCORING_HEAD_GGUF") + "|probe=" + env("PFLASH_SEGMENT_PROBE_GGUF") +
@@ -2748,9 +2776,10 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         for (int tokens : {16384, 32768, 65536, 131072}) {
             pflash_unified_config_ += std::to_string(pflash_keep_ratio(config_, tokens)) + ",";
         }
-        std::fprintf(stderr, "[pflash-unified] on: region tools=%s recall=%d\n",
+        std::fprintf(stderr, "[pflash-unified] on: region tools=%s recall=%d recall_gate=%g recall_source=%s\n",
                      pflash_region_tools_.identity.empty() ? "(none)" : pflash_region_tools_.identity.c_str(),
-                     (int) pflash_unified_recall_);
+                     (int) pflash_unified_recall_, pflash_recall_gate_ > 0.0 ? pflash_recall_gate_ : 0.0,
+                     pflash_recall_fresh_ ? "fresh" : "unheld");
         std::fflush(stderr);
     }
 
@@ -6662,6 +6691,8 @@ json HttpServer::pflash_unified_json() const {
     std::lock_guard<std::mutex> lk(pflash_failure_mu_);
     return {{"region_tools", pflash_region_tools_.identity},
             {"recall", pflash_unified_recall_},
+            {"recall_gate", pflash_recall_gate_ > 0.0 ? json(pflash_recall_gate_) : json(nullptr)},
+            {"recall_source", pflash_recall_fresh_ ? "fresh" : "unheld"},
             {"views", pflash_unified_views_.size()},
             {"view_bytes", pflash_unified_views_.bytes()},
             {"counts", pflash_unified_counts_}};
@@ -7215,7 +7246,8 @@ std::string HttpServer::apply_unified_view(
         return false;
     };
 
-    // §2.2-2.3: the newest turn -- one user message, or the group of tool messages -- holds the candidates.
+    // §2.2-2.3: the newest turn -- every message since the last reply: the run of user messages (a document sent on
+    // its own, then the question), or the group of tool messages -- holds the candidates.
     struct Candidate {
         size_t message = 0;
         pu::RegionKind kind = pu::RegionKind::UserContent;
@@ -7231,9 +7263,13 @@ std::string HttpServer::apply_unified_view(
     std::vector<Candidate> newest;
     const size_t last = messages.size() - 1;
     if (messages[last].role == "user") {
-        Candidate c;
-        c.message = last;
-        newest.push_back(std::move(c));
+        size_t first = last;
+        while (first > 0 && messages[first - 1].role == "user") --first;
+        for (size_t index = first; index <= last; ++index) {
+            Candidate c;
+            c.message = index;
+            newest.push_back(std::move(c));
+        }
     } else if (messages[last].role == "tool") {
         size_t first = last;
         while (first > 0 && messages[first - 1].role == "tool") --first;
@@ -7382,8 +7418,16 @@ std::string HttpServer::apply_unified_view(
             newest.back().kind == pu::RegionKind::UserContent && newest.back().located &&
             newest.back().db >= view.drafter_gen_begin) {
             recall_at = token_at(td, newest.back().cb);
+            // Gate arms: no drafter pass for a question when every unit of every region is already held.
+            bool unheld = !(pflash_recall_gate_ > 0.0 || pflash_recall_fresh_);
+            for (const auto & region : held_regions) {
+                unheld = unheld || std::find(region.held.begin(), region.held.end(), 0) != region.held.end();
+            }
             if (recall_at < view.raw_gen_begin) {
                 count("recall.unplaceable");
+            } else if (!unheld) {
+                count("recall.complete");
+                stats["recall_gate"] = {{"decision", "complete"}};
             } else {
                 recall = true;
             }
@@ -7627,6 +7671,12 @@ std::string HttpServer::apply_unified_view(
             region.reread.assign(lines.count(), 0);
             region.cap = unwidened;
             region.droppable = droppable;
+            if (pflash_recall_trace_units_) {
+                std::vector<long> cuts;
+                for (size_t cut : region.layout.cuts) cuts.push_back((long) cut - (long) region.cb);
+                admission[k]["trace_units"] = {{"cb", region.cb}, {"content_bytes", region.ce - region.cb},
+                                               {"cuts", cuts}, {"kept", region.kept}};
+            }
             admission[k]["units"] = units;
             admission[k]["kept_units"] = (int) std::count(admitted.admitted.begin(), admitted.admitted.end(), 1);
             admission[k]["mandatory_units"] =
@@ -7672,6 +7722,7 @@ std::string HttpServer::apply_unified_view(
         // §5 recall: each earlier region's unheld units, best first, under the region's cap, appended as
         // labelled excerpts at the start of the question; nothing served before is touched.
         json recall_stats = nullptr;
+        json gate_stats = nullptr;
         bool recall_fired = false;
         if (recall && scored) {
             Splice block;
@@ -7683,35 +7734,165 @@ std::string HttpServer::apply_unified_view(
             for (size_t ri = 1; ri < held_regions.size(); ++ri) {
                 if (held_regions[ri].cap > held_regions[largest].cap) largest = ri;
             }
+            // Each region's candidates: unheld units (PFLASH_RECALL_SOURCE=fresh: only those the drafter's
+            // selection for this question keeps), their scores, costs and the region's cap.
+            const size_t region_count = held_regions.size();
+            std::vector<pu::RecallRegion> candidates(region_count);
+            std::vector<std::vector<int>> orders(region_count);
+            std::vector<int> region_caps(region_count);
+            std::vector<std::pair<int, int>> fresh_spans;
+            for (const auto & span : result.kept_spans) fresh_spans.push_back({span.begin, span.end});
+            const bool fresh_ok = !pflash_recall_fresh_ || !fresh_spans.empty();
+            for (size_t ri = 0; ri < region_count; ++ri) {
+                pu::Region & region = held_regions[ri];
+                pu::RecallRegion & rc = candidates[ri];
+                const int units = region.layout.units();
+                rc.score.assign((size_t) units, 0.0);
+                rc.unit_cost.assign((size_t) units, 0);
+                rc.held = region.held;
+                if (pflash_recall_fresh_) {
+                    const auto kept = pu::units_in_spans(region.unit_db, region.unit_de, fresh_spans);
+                    for (int u = 0; u < units; ++u) {
+                        if (!kept[(size_t) u]) rc.held[(size_t) u] = 1;
+                    }
+                }
+                for (int u = 0; u < units; ++u) {
+                    rc.score[(size_t) u] = unit_score(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
+                    if (region.held[(size_t) u]) continue;
+                    if (region.lines.escaped) {
+                        const size_t from = region.layout.cuts[(size_t) u];
+                        const size_t to = region.layout.cuts[(size_t) u + 1];
+                        rc.unit_cost[(size_t) u] = encode_len(pu::json_unescape(text, from, to));
+                    } else {
+                        rc.unit_cost[(size_t) u] = region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
+                    }
+                }
+                rc.label_cost = encode_len(pu::recall_label_text(region.kind, region.brief) + "\n") + encode_len("\n");
+                region_caps[ri] = widened_cap(region.cap, region.droppable);
+                rc.cap = region_caps[ri] - (ri == largest ? wrapper : 0);
+                orders[ri] = pu::rank_units(rc.score, rc.held);
+            }
+            std::vector<pu::Admission> planned(region_count);
+            const auto nothing = [&] {
+                for (size_t ri = 0; ri < region_count; ++ri) {
+                    planned[ri].ok = true;
+                    planned[ri].admitted.assign((size_t) held_regions[ri].layout.units(), 0);
+                }
+            };
+            // The head's mass on a span: its candidates' lift x overlap / input (the lifts are mass per token
+            // relative to uniform, pflash_compress.cpp), pinned candidates excluded so that D <= S. S: every
+            // candidate that is not pinned, less what this request's new regions dropped (that content is
+            // neither present nor recallable here, and counting it would dilute the deficit of the older
+            // regions). A non-finite lift anywhere leaves S non-finite: unscorable, never a silent zero.
+            double context = 0.0;
+            double new_dropped = 0.0;
+            if (pflash_recall_gate_ > 0.0 || pflash_recall_trace_units_) {
+                const auto mass_of = [&] (int begin, int end) {
+                    double mass = 0.0;
+                    for (const auto & lift : lifts) {
+                        if (pinned(lift.first.begin, lift.first.end)) continue;
+                        const int lo = (std::max)(begin, lift.first.begin);
+                        const int hi = (std::min)(end, lift.first.end);
+                        if (hi > lo) mass += lift.second * (double) (hi - lo);
+                    }
+                    return mass / (double) (std::max)(1, input);
+                };
+                for (const auto & lift : lifts) {
+                    if (pinned(lift.first.begin, lift.first.end)) continue;
+                    context += lift.second * (double) (lift.first.end - lift.first.begin) / (double) (std::max)(1, input);
+                }
+                for (const auto & region : new_regions) {
+                    for (int u = 0; u < region.layout.units(); ++u) {
+                        if (!region.held[(size_t) u]) {
+                            new_dropped += mass_of(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
+                        }
+                    }
+                }
+                for (size_t ri = 0; ri < region_count; ++ri) {
+                    const pu::Region & region = held_regions[ri];
+                    auto & mass = candidates[ri].mass;
+                    mass.assign((size_t) region.layout.units(), 0.0);
+                    for (int u = 0; u < region.layout.units(); ++u) {
+                        if (!region.held[(size_t) u] || pflash_recall_trace_units_) {
+                            mass[(size_t) u] = mass_of(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
+                        }
+                    }
+                }
+            }
+            if (pflash_recall_trace_units_) {
+                json regions_trace = json::array();
+                for (size_t ri = 0; ri < region_count; ++ri) {
+                    const pu::Region & region = held_regions[ri];
+                    std::vector<int> cost((size_t) region.layout.units());
+                    for (int u = 0; u < region.layout.units(); ++u) {
+                        cost[(size_t) u] = region.lines.escaped
+                            ? encode_len(pu::json_unescape(text, region.layout.cuts[(size_t) u],
+                                                           region.layout.cuts[(size_t) u + 1]))
+                            : region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
+                    }
+                    regions_trace.push_back({{"region", ri}, {"cb", region.cb}, {"held", region.held},
+                                             {"mass", candidates[ri].mass}, {"cost", cost},
+                                             {"score", candidates[ri].score}, {"cap", candidates[ri].cap},
+                                             {"label_cost", candidates[ri].label_cost}});
+                }
+                stats["recall_units"] = {{"context_mass", context}, {"new_dropped_mass", new_dropped},
+                                         {"input", input}, {"regions", regions_trace}};
+            }
+            const double gate_context = context - new_dropped;
+            if (pflash_recall_gate_ > 0.0) {
+                if (!(gate_context > 0.0) || !std::isfinite(gate_context)) {
+                    count("recall.unscorable");
+                    gate_stats = {{"decision", "unscorable"}, {"theta", pflash_recall_gate_}};
+                    nothing();
+                } else {
+                    auto gated = pu::admit_recall_gated(candidates, gate_context, pflash_recall_gate_);
+                    planned = std::move(gated.regions);
+                    count(gated.gated ? "recall.gate_present" : "recall.gate_admitted");
+                    gate_stats = {{"decision", gated.gated ? "present" : "admitted"},
+                                  {"theta", pflash_recall_gate_}, {"context_mass", gate_context},
+                                  {"new_dropped_mass", new_dropped}, {"deficit_before", gated.deficit_before},
+                                  {"deficit_planned", gated.deficit_after}};
+                }
+            } else if (!fresh_ok) {
+                count("recall.no_kept_spans");
+                gate_stats = {{"decision", "no_kept_spans"}, {"source", "fresh"}};
+                nothing();
+            } else {
+                for (size_t ri = 0; ri < region_count; ++ri) {
+                    const int label_cost = candidates[ri].label_cost;
+                    planned[ri] = pu::admit_recall(candidates[ri].unit_cost, candidates[ri].held, orders[ri],
+                                                   candidates[ri].cap, [&] (int, int) { return label_cost; });
+                }
+                if (pflash_recall_fresh_) {
+                    int fresh_units = 0;
+                    for (size_t ri = 0; ri < region_count; ++ri) {
+                        for (size_t u = 0; u < candidates[ri].held.size(); ++u) {
+                            fresh_units += !candidates[ri].held[u];
+                        }
+                    }
+                    gate_stats = {{"decision", "fresh"}, {"source", "fresh"}, {"fresh_unheld_units", fresh_units}};
+                }
+            }
+            double final_deficit = 0.0;
+            int trimmed_units = 0;
             std::vector<int32_t> excerpts;
             std::vector<pu::Piece> excerpt_pieces;
             bool excerpts_trail = true;   // the last excerpt so far ends with a newline
             recall_stats = json::array();
-            for (size_t ri = 0; ri < held_regions.size(); ++ri) {
+            for (size_t ri = 0; ri < region_count; ++ri) {
                 pu::Region & region = held_regions[ri];
                 const int units = region.layout.units();
-                std::vector<double> score((size_t) units);
-                std::vector<int> cost((size_t) units, 0);
                 const auto run_text = [&] (int first, int last_unit) {
                     const size_t from = region.layout.cuts[(size_t) first];
                     const size_t to = region.layout.cuts[(size_t) last_unit + 1];
                     return region.lines.escaped ? pu::json_unescape(text, from, to) : text.substr(from, to - from);
                 };
-                for (int u = 0; u < units; ++u) {
-                    score[(size_t) u] = unit_score(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
-                    if (region.held[(size_t) u]) continue;
-                    cost[(size_t) u] = region.lines.escaped
-                        ? encode_len(run_text(u, u))
-                        : region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
-                }
                 const std::string label = pu::recall_label_text(region.kind, region.brief);
-                const int label_cost = encode_len(label + "\n") + encode_len("\n");
-                const int region_cap = widened_cap(region.cap, region.droppable);
-                int cap = region_cap;
-                if (ri == largest) cap -= wrapper;
-                const auto order = pu::rank_units(score, region.held);
-                auto admitted = pu::admit_recall(cost, region.held, order, cap,
-                                                 [&] (int, int) { return label_cost; });
+                const int region_cap = region_caps[ri];
+                const int cap = candidates[ri].cap;
+                const auto & order = orders[ri];
+                auto admitted = std::move(planned[ri]);
+                const int planned_taken = admitted.taken;
                 // The excerpts as served; over the cap (a tokenisation join), the lowest-ranked unit goes.
                 std::vector<int32_t> tokens;
                 std::vector<pu::Piece> pieces;
@@ -7761,10 +7942,17 @@ std::string HttpServer::apply_unified_view(
                 }
                 int appended_units = 0;
                 for (int u = 0; u < units; ++u) {
-                    if (!admitted.admitted[(size_t) u]) continue;
+                    if (!admitted.admitted[(size_t) u]) {
+                        // The gate's result as served: what the cap trim removed is still missing.
+                        if (!candidates[ri].held[(size_t) u] && (size_t) u < candidates[ri].mass.size()) {
+                            final_deficit += candidates[ri].mass[(size_t) u];
+                        }
+                        continue;
+                    }
                     region.held[(size_t) u] = 1;
                     ++appended_units;
                 }
+                trimmed_units += planned_taken - admitted.taken;
                 region.recalled_tokens += (int) tokens.size();
                 if (!tokens.empty()) excerpts_trail = trail;
                 for (auto piece : pieces) {
@@ -7777,6 +7965,10 @@ std::string HttpServer::apply_unified_view(
                                         {"tokens", tokens.size()}, {"cap", region_cap},
                                         {"wrapper", ri == largest ? wrapper : 0},
                                         {"cumulative_tokens", region.recalled_tokens}});
+            }
+            if (gate_stats.is_object() && gate_stats.contains("deficit_planned")) {
+                gate_stats["deficit_after"] = final_deficit / gate_context;
+                gate_stats["trimmed_units"] = trimmed_units;
             }
             if (excerpts.empty()) {
                 count("recall.empty");
@@ -7848,6 +8040,8 @@ std::string HttpServer::apply_unified_view(
             // §6: a view that cannot continue is reset to admission on the raw prompt.
             count("reset.context");
             stats["reset"] = "context";
+            stats.erase("recall_gate");
+            stats.erase("recall_units");
             continue;
         }
         // §6: a turn served raw instead of continuing a stored view leaves a raw view (no regions), so its
@@ -7893,6 +8087,7 @@ std::string HttpServer::apply_unified_view(
         stats["regions"] = next.regions.size();
         stats["reread_held_units"] = covered_units;
         if (!recall_stats.is_null()) stats["recall"] = recall_stats;
+        if (!gate_stats.is_null()) stats["recall_gate"] = gate_stats;
         if (recall && !scored) stats["recall"] = "unscored";
         json piece_list = json::array();
         for (const auto & piece : pieces) {

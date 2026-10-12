@@ -1259,6 +1259,15 @@ private:
     // and agent sessions. Unset, none of it runs and nothing below is read.
     bool pflash_unified_ = false;
     bool pflash_unified_recall_ = true;
+    // PFLASH_RECALL_GATE=<theta> (recall/FABLE-RECALL-GATE.md): recall only while the head mass on unheld units is at
+    // least theta of the context mass; < 0 = unset (fill each region's cap). PFLASH_RECALL_SOURCE=fresh: recall only
+    // unheld units the drafter's own selection for the question keeps. Either one also skips the drafter pass when
+    // every unit of every region is held.
+    double pflash_recall_gate_ = -1.0;
+    bool pflash_recall_fresh_ = false;
+    // PFLASH_RECALL_TRACE_UNITS=1: the view record carries each region's units (byte cuts, kept at paging; at a
+    // question: held, head mass, cost, score) for an offline replay of recall policies. Stats only.
+    bool pflash_recall_trace_units_ = false;
     pflash_unified::ToolList pflash_region_tools_;
     std::string pflash_unified_config_;   // config identity a stored view must match
     pflash_unified::ViewStore pflash_unified_views_;

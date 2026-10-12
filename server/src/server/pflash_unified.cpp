@@ -438,6 +438,31 @@ Admission admit_paging(const std::vector<int> & unit_cost, const std::vector<cha
     return out;
 }
 
+namespace {
+
+// The cost change of taking unit ``u`` into ``admitted``: its tokens, one label for the run it forms, minus the labels
+// of the runs it joins.
+int recall_delta(const std::vector<char> & admitted, const std::vector<int> & unit_cost, int u,
+                 const std::function<int(int, int)> & label_cost) {
+    const int n = (int) admitted.size();
+    int a = u;
+    int b = u;
+    int delta = unit_cost[(size_t) u];
+    if (u > 0 && admitted[(size_t) u - 1]) {
+        const auto run = run_around(admitted, u - 1);
+        a = run.first;
+        delta -= label_cost(run.first, run.second);
+    }
+    if (u + 1 < n && admitted[(size_t) u + 1]) {
+        const auto run = run_around(admitted, u + 1);
+        b = run.second;
+        delta -= label_cost(run.first, run.second);
+    }
+    return delta + label_cost(a, b);
+}
+
+}  // namespace
+
 Admission admit_recall(const std::vector<int> & unit_cost, const std::vector<char> & held,
                        const std::vector<int> & order, int cap,
                        const std::function<int(int, int)> & label_cost) {
@@ -449,26 +474,74 @@ Admission admit_recall(const std::vector<int> & unit_cost, const std::vector<cha
     for (int u : order) {
         if (u < 0 || u >= n || out.admitted[(size_t) u]) continue;
         if (u < (int) held.size() && held[(size_t) u]) continue;
-        const bool left = u > 0 && out.admitted[(size_t) u - 1];
-        const bool right = u + 1 < n && out.admitted[(size_t) u + 1];
-        int a = u;
-        int b = u;
-        int delta = unit_cost[(size_t) u];
-        if (left) {
-            const auto run = run_around(out.admitted, u - 1);
-            a = run.first;
-            delta -= label_cost(run.first, run.second);
-        }
-        if (right) {
-            const auto run = run_around(out.admitted, u + 1);
-            b = run.second;
-            delta -= label_cost(run.first, run.second);
-        }
-        delta += label_cost(a, b);
+        const int delta = recall_delta(out.admitted, unit_cost, u, label_cost);
         if (out.cost + delta > cap) continue;
         out.admitted[(size_t) u] = 1;
         out.cost += delta;
         ++out.taken;
+    }
+    return out;
+}
+
+GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta) {
+    GatedRecall out;
+    out.regions.resize(regions.size());
+    struct Entry {
+        size_t region;
+        int unit;
+        double score;
+    };
+    std::vector<Entry> order;
+    double deficit = 0.0;
+    for (size_t r = 0; r < regions.size(); ++r) {
+        const RecallRegion & region = regions[r];
+        const int n = (int) region.unit_cost.size();
+        Admission & a = out.regions[r];
+        a.admitted.assign((size_t) n, 0);
+        a.ok = region.cap >= 0;
+        for (int u = 0; u < n; ++u) {
+            if (u < (int) region.held.size() && region.held[(size_t) u]) continue;
+            const double mass = u < (int) region.mass.size() ? region.mass[(size_t) u] : 0.0;
+            if (std::isfinite(mass) && mass > 0.0) deficit += mass;
+            const double score = u < (int) region.score.size() ? region.score[(size_t) u] : NAN;
+            order.push_back({r, u, std::isnan(score) ? -INFINITY : score});
+        }
+    }
+    out.deficit_before = deficit / context_mass;
+    std::stable_sort(order.begin(), order.end(), [] (const Entry & x, const Entry & y) { return x.score > y.score; });
+    for (const Entry & e : order) {
+        if (deficit / context_mass < theta) break;
+        const RecallRegion & region = regions[e.region];
+        Admission & a = out.regions[e.region];
+        if (!a.ok) continue;
+        const auto label_cost = [&] (int, int) { return region.label_cost; };
+        const int delta = recall_delta(a.admitted, region.unit_cost, e.unit, label_cost);
+        if (a.cost + delta > region.cap) continue;
+        a.admitted[(size_t) e.unit] = 1;
+        a.cost += delta;
+        ++a.taken;
+        const double mass = e.unit < (int) region.mass.size() ? region.mass[(size_t) e.unit] : 0.0;
+        if (std::isfinite(mass) && mass > 0.0) deficit -= mass;
+    }
+    out.deficit_after = (std::max)(0.0, deficit) / context_mass;
+    out.gated = out.deficit_before < theta;
+    return out;
+}
+
+std::vector<char> units_in_spans(const std::vector<int> & unit_begin, const std::vector<int> & unit_end,
+                                 const std::vector<std::pair<int, int>> & spans) {
+    std::vector<char> out(unit_begin.size(), 0);
+    for (size_t u = 0; u < unit_begin.size(); ++u) {
+        const int b = unit_begin[u];
+        const int e = unit_end[u];
+        if (e <= b) continue;
+        long inside = 0;
+        for (const auto & span : spans) {
+            const int lo = (std::max)(b, span.first);
+            const int hi = (std::min)(e, span.second);
+            if (hi > lo) inside += hi - lo;
+        }
+        out[u] = inside > 0;
     }
     return out;
 }

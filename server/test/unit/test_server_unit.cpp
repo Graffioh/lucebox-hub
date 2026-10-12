@@ -17886,6 +17886,7 @@ struct MockUnifiedBackend : MockBackend {
     int chunk = 0;
     bool paragraphs = false;
     bool widen = false;
+    bool keep_scored_only = false;   // kept_spans = the candidates scored above 1 (the selection keeps only them)
     std::function<double(const std::string &, const std::string &)> score;
     int compress_calls = 0;
     CompressRequest last_request;
@@ -17916,6 +17917,12 @@ struct MockUnifiedBackend : MockBackend {
         }
         result.compressed_ids = ids;
         result.kept_spans = {{0, n}};
+        if (keep_scored_only) {
+            result.kept_spans.clear();
+            for (const auto & lift : result.candidate_lifts) {
+                if (lift.second > 1.0) result.kept_spans.push_back(lift.first);
+            }
+        }
         result.budget_widened = widen;
         result.ok = true;
         return result;
@@ -17945,6 +17952,10 @@ struct UnifiedOptions {
     bool paragraphs = false;                    // drafter candidates end at blank lines
     bool widen = false;                         // the drafter pass reports a stage-2 widened budget
     bool allow_errors = false;                  // a turn may be refused (context overflow)
+    const char * recall_gate = nullptr;         // PFLASH_RECALL_GATE
+    const char * recall_source = nullptr;       // PFLASH_RECALL_SOURCE
+    const char * trace_units = nullptr;         // PFLASH_RECALL_TRACE_UNITS
+    bool keep_scored_only = false;              // the drafter selection keeps only candidates scored above 1
 };
 
 // One server with PFLASH_UNIFIED=1, the turns in order. By default one fixture tokenizer is target and drafter, so
@@ -17956,6 +17967,9 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     luce_test::ScopedEnvVar unified{"PFLASH_UNIFIED", "1"};
     luce_test::ScopedEnvVar region{"PFLASH_REGION_TOOLS", region_tools};
     luce_test::ScopedEnvVar recall_env{"PFLASH_RECALL", recall};
+    luce_test::ScopedEnvVar recall_gate{"PFLASH_RECALL_GATE", options.recall_gate};
+    luce_test::ScopedEnvVar recall_source{"PFLASH_RECALL_SOURCE", options.recall_source};
+    luce_test::ScopedEnvVar trace_units{"PFLASH_RECALL_TRACE_UNITS", options.trace_units};
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", options.select_mode};
     luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
     char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
@@ -18011,6 +18025,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     backend.chunk = chunk;
     backend.paragraphs = options.paragraphs;
     backend.widen = options.widen;
+    backend.keep_scored_only = options.keep_scored_only;
     backend.score = score;
     LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
@@ -18345,6 +18360,287 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_off_flag) {
     TEST_ASSERT(run.calls_after == std::vector<int>({1, 1}));
     TEST_ASSERT(run.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
     TEST_ASSERT(run.prepared[1].pflash_stats["unified"].value("decision", "") == "continue");
+}
+
+// Like unified_fruit_score, with filler near zero: the head's mass sits on the line the question asks for.
+static double unified_sharp_fruit_score(const std::string & segment, const std::string & prompt) {
+    double score = 0.01;
+    if (prompt.find("KIWI?") != std::string::npos && segment.find("kiwi") != std::string::npos) score += 50.0;
+    if (prompt.find("MANGO?") != std::string::npos && segment.find("mango") != std::string::npos) score += 50.0;
+    return score;
+}
+
+static std::vector<json> unified_fruit_turns(const char * second_question) {
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", second_question}});
+    return {turn1, turn2};
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_pages_a_document_sent_before_its_question) {
+    // The documents arrive as their own user message and the question as the next one: both are the newest turn,
+    // so the documents are paged exactly as when they share one message with the question.
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc}},
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_sharp_fruit_score);
+    const json & u0 = run.prepared[0].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u0.value("decision", "") == "region", u0.dump());
+    const json & adm = u0["admission"];
+    TEST_ASSERT_MSG(adm.size() == 2, adm.dump());
+    TEST_ASSERT(adm[0].value("message", 0) == 1 && adm[0].value("decision", "") == "region");
+    TEST_ASSERT(adm[1].value("message", 0) == 2 && adm[1].value("decision", "") != "region");
+    TEST_ASSERT(run.prepared[0].tokens.size() < run.ids[0].size());
+    // The question is served verbatim, after the paged documents.
+    const std::string & s0 = run.served_text[0];
+    TEST_ASSERT(s0.find("Which line mentions KIWI?") != std::string::npos);
+    TEST_ASSERT(s0.find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(s0.find("Line 60: plain filler text here mango\n") == std::string::npos);
+    // The next question continues the view and recalls the dropped mango line; the served prefix is untouched (I1).
+    const json & u1 = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u1.value("decision", "") == "recall", u1.dump());
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango\n") != std::string::npos);
+    const int vg1 = run.prepared[0].snapshot_cut;
+    TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + vg1,
+                           run.prepared[1].tokens.begin()));
+    // Same paging as the one-message layout (where the question line is one more unit of the region): the same
+    // document lines are kept.
+    const auto one = run_unified_session(unified_fruit_turns("Which line mentions MANGO?"), nullptr, nullptr, 64,
+                                         unified_sharp_fruit_score);
+    const json & k_split = adm[0];
+    const json & k_one = one.prepared[0].pflash_stats["unified"]["admission"][0];
+    TEST_ASSERT_MSG(k_split.value("units", -1) + 1 == k_one.value("units", -2) &&
+                    k_split.value("kept_units", -1) == k_one.value("kept_units", -2) &&
+                    k_split.value("kept_tokens", -1) == k_one.value("kept_tokens", -2), k_split.dump() + k_one.dump());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_takes_only_what_the_question_needs) {
+    UnifiedOptions gate;
+    gate.recall_gate = "0.05";
+    const auto turns = unified_fruit_turns("Which line mentions MANGO?");
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
+                                         65536, gate);
+    const auto ungated = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score);
+    // Turn 1 is paging only: the gate changes nothing there.
+    TEST_ASSERT(run.prepared[0].tokens == ungated.prepared[0].tokens);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "recall", u.dump());
+    TEST_ASSERT(u["recall_gate"].value("decision", "") == "admitted");
+    // The mock scores against the whole prompt: the history's KIWI? lifts the held kiwi line as much as MANGO?
+    // lifts the dropped mango line, so the deficit starts near one half and one unit covers it.
+    const double before = u["recall_gate"].value("deficit_before", 0.0);
+    TEST_ASSERT_MSG(before > 0.4 && before < 0.6, u["recall_gate"].dump());
+    TEST_ASSERT(u["recall_gate"].value("deficit_after", 1.0) < 0.05);
+    // Nothing was trimmed at rendering: the served deficit is the planned one.
+    TEST_ASSERT(u["recall_gate"].value("trimmed_units", -1) == 0);
+    TEST_ASSERT(std::fabs(u["recall_gate"].value("deficit_after", 1.0) - u["recall_gate"].value("deficit_planned", 0.0)) <
+                1e-12);
+    // The mango line comes back; the ungated fill also brings back filler, the gate does not.
+    const std::string & s = run.served_text[1];
+    TEST_ASSERT(s.find("Line 60: plain filler text here mango\n") != std::string::npos);
+    const json & recall = u["recall"];
+    const json & full = ungated.prepared[1].pflash_stats["unified"]["recall"];
+    TEST_ASSERT(recall.is_array() && full.is_array());
+    TEST_ASSERT(recall[0].value("units", 0) == 1);
+    TEST_ASSERT_MSG(full[0].value("units", 0) > 1, full.dump());
+    TEST_ASSERT(run.prepared[1].tokens.size() < ungated.prepared[1].tokens.size());
+    // The served prefix is untouched (I1).
+    const int vg1 = run.prepared[0].snapshot_cut;
+    TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + vg1,
+                           run.prepared[1].tokens.begin()));
+    TEST_ASSERT(run.unified["counts"].value("recall.gate_admitted", 0) == 1);
+    TEST_ASSERT(run.unified.value("recall_gate", 0.0) == 0.05);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_appends_nothing_when_the_view_answers) {
+    UnifiedOptions gate;
+    gate.recall_gate = "0.05";
+    // The second question asks for the kiwi line again: it is held (kept at paging).
+    const auto run = run_unified_session(unified_fruit_turns("Which line mentions KIWI? Once more."), nullptr,
+                                         nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr, 65536, gate);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "continue", u.dump());
+    TEST_ASSERT(u["recall_gate"].value("decision", "") == "present");
+    TEST_ASSERT(u["recall_gate"].value("deficit_before", 1.0) < 0.05);
+    TEST_ASSERT(run.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
+    // The view grows by the new turn's raw tokens only.
+    const int grown = (int) run.prepared[1].tokens.size() - (int) run.prepared[0].tokens.size();
+    TEST_ASSERT(grown == (int) run.ids[1].size() - (int) run.ids[0].size());
+    TEST_ASSERT(run.calls_after == std::vector<int>({1, 2}));
+    TEST_ASSERT(run.unified["counts"].value("recall.gate_present", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_fails_closed_on_a_non_finite_lift) {
+    // One history candidate scores NaN at the second question (finite at paging): the deficit cannot be computed,
+    // so nothing is appended -- never a gate decision over a silently smaller mass.
+    const auto score = [] (const std::string & segment, const std::string & prompt) {
+        if (prompt.find("MANGO?") != std::string::npos && segment.find("Line 30:") != std::string::npos) return (double) NAN;
+        return unified_sharp_fruit_score(segment, prompt);
+    };
+    UnifiedOptions gate;
+    gate.recall_gate = "0.05";
+    const auto run = run_unified_session(unified_fruit_turns("Which line mentions MANGO?"), nullptr, nullptr, 64,
+                                         score, 0, 0.3f, nullptr, 65536, gate);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "continue", u.dump());
+    TEST_ASSERT(u["recall_gate"].value("decision", "") == "unscorable");
+    TEST_ASSERT(run.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.unified["counts"].value("recall.unscorable", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_leaves_newly_dropped_content_out_of_the_context) {
+    // The second question arrives with a new document that has a mango mark on every other line: paging keeps some
+    // of them and drops the rest. That dropped mass is neither present nor recallable, so the gate's S excludes it
+    // and the old region's missing mango line is measured against what the view could hold.
+    std::map<int, std::string> marks;
+    for (int i = 2; i <= 80; i += 2) marks[i] = "mango";
+    const std::string fresh_doc = unified_doc(80, marks, "Row ");
+    const auto turns = unified_fruit_turns((fresh_doc + "Which line mentions MANGO?").c_str());
+    UnifiedOptions gate;
+    gate.recall_gate = "0.01";
+    gate.trace_units = "1";
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
+                                         65536, gate);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "region_recall", u.dump());
+    const json & g = u["recall_gate"];
+    const json & q = u["recall_units"];
+    const double dropped = g.value("new_dropped_mass", 0.0);
+    TEST_ASSERT_MSG(dropped > 0.0, g.dump());
+    TEST_ASSERT(q.value("new_dropped_mass", 0.0) == dropped);
+    const double s = q.value("context_mass", 0.0) - dropped;
+    TEST_ASSERT(std::fabs(g.value("context_mass", 0.0) - s) < 1e-12);
+    double missing = 0.0;
+    const json & r = q["regions"][0];
+    for (size_t k = 0; k < r["held"].size(); ++k) {
+        if (!r["held"][k].get<int>()) missing += r["mass"][k].get<double>();
+    }
+    TEST_ASSERT_MSG(std::fabs(g.value("deficit_before", 0.0) - missing / s) < 1e-9, g.dump());
+    // The old region's mango line comes back at the start of the question.
+    TEST_ASSERT(g.value("decision", "") == "admitted");
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango\n") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_skips_the_drafter_once_everything_is_held) {
+    // A flat scorer: the deficit stays above a tiny theta, so questions recall to the cap until the region is
+    // complete; after that a question runs no drafter pass at all.
+    const std::string doc = unified_doc(80, {});
+    json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Question 0?"}},
+    });
+    std::vector<json> turns{turn};
+    for (int q = 1; q <= 8; ++q) {
+        turn.push_back({{"role", "assistant"}, {"content", "Ok."}});
+        turn.push_back({{"role", "user"}, {"content", "Question " + std::to_string(q) + "?"}});
+        turns.push_back(turn);
+    }
+    UnifiedOptions gate;
+    gate.recall_gate = "0.000001";
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, nullptr, 0, 0.3f, nullptr, 65536, gate);
+    const size_t n = run.prepared.size();
+    for (int line = 1; line <= 80; ++line) {
+        TEST_ASSERT_MSG(unified_occurrences(run.served_text.back(), "Line " + std::to_string(line) + ":") == 1,
+                        std::to_string(line));
+    }
+    TEST_ASSERT(run.unified["counts"].value("recall.complete", 0) >= 1);
+    TEST_ASSERT(run.calls_after[n - 1] == run.calls_after[n - 2]);
+    const json & last = run.prepared[n - 1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(last.value("decision", "") == "continue", last.dump());
+    TEST_ASSERT(last["recall_gate"].value("decision", "") == "complete");
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_fresh_source_takes_the_selection_minus_held) {
+    UnifiedOptions fresh;
+    fresh.recall_source = "fresh";
+    fresh.keep_scored_only = true;
+    const auto run = run_unified_session(unified_fruit_turns("Which line mentions MANGO?"), nullptr, nullptr, 64,
+                                         unified_fruit_score, 0, 0.3f, nullptr, 65536, fresh);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "recall", u.dump());
+    TEST_ASSERT(u["recall_gate"].value("decision", "") == "fresh");
+    TEST_ASSERT(u["recall"][0].value("units", 0) == 1);
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango\n") != std::string::npos);
+    // The question asks for nothing the selection keeps outside the view: nothing is appended.
+    const auto none = run_unified_session(unified_fruit_turns("Which line mentions KIWI? Once more."), nullptr,
+                                          nullptr, 64, unified_fruit_score, 0, 0.3f, nullptr, 65536, fresh);
+    TEST_ASSERT(none.prepared[1].pflash_stats["unified"].value("decision", "") == "continue");
+    TEST_ASSERT(none.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_trace_units_records_without_changing_bytes) {
+    UnifiedOptions traced;
+    traced.trace_units = "1";
+    const auto turns = unified_fruit_turns("Which line mentions MANGO?");
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
+                                         65536, traced);
+    const auto plain = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score);
+    for (size_t i = 0; i < run.prepared.size(); ++i) TEST_ASSERT(run.prepared[i].tokens == plain.prepared[i].tokens);
+    // Paging: the region's cuts relative to its content, and the units it kept.
+    const json & paged = run.prepared[0].pflash_stats["unified"]["admission"][0]["trace_units"];
+    const int units = run.prepared[0].pflash_stats["unified"]["admission"][0].value("units", 0);
+    TEST_ASSERT(paged["cuts"].size() == (size_t) units + 1);
+    TEST_ASSERT(paged["kept"].size() == (size_t) units);
+    // A question: every unit's held flag, mass, cost and score, and the context mass.
+    const json & q = run.prepared[1].pflash_stats["unified"]["recall_units"];
+    TEST_ASSERT(q.value("context_mass", 0.0) > 0.0);
+    const json & r = q["regions"][0];
+    TEST_ASSERT(r["held"] == paged["kept"]);
+    TEST_ASSERT(r["mass"].size() == (size_t) units && r["cost"].size() == (size_t) units);
+    double total = 0.0;
+    for (const auto & m : r["mass"]) total += m.get<double>();
+    TEST_ASSERT(total > 0.0 && total <= q.value("context_mass", 0.0) + 1e-9);
+    TEST_ASSERT(plain.prepared[1].pflash_stats["unified"].find("recall_units") ==
+                plain.prepared[1].pflash_stats["unified"].end());
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_flags_fail_startup_on_bad_values) {
+    const std::string path = write_pflash_bpe_tokenizer_fixture({"a"}, "abc");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    ServerConfig config;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    luce_test::ScopedEnvVar unified{"PFLASH_UNIFIED", "1"};
+    const auto refused = [&] (const char * gate, const char * source, const char * recall) {
+        luce_test::ScopedEnvVar g{"PFLASH_RECALL_GATE", gate};
+        luce_test::ScopedEnvVar s{"PFLASH_RECALL_SOURCE", source};
+        luce_test::ScopedEnvVar r{"PFLASH_RECALL", recall};
+        LuceEngine engine(std::make_unique<MockBackend>());
+        try {
+            HttpServer server(engine, tokenizer, config);
+        } catch (const std::runtime_error &) {
+            return true;
+        }
+        return false;
+    };
+    TEST_ASSERT(refused("0", nullptr, nullptr));
+    TEST_ASSERT(refused("1", nullptr, nullptr));
+    TEST_ASSERT(refused("1.5", nullptr, nullptr));
+    TEST_ASSERT(refused("0.1x", nullptr, nullptr));
+    TEST_ASSERT(refused("nan", nullptr, nullptr));
+    TEST_ASSERT(refused(nullptr, "kept", nullptr));
+    TEST_ASSERT(refused("0.1", "fresh", nullptr));
+    TEST_ASSERT(refused("0.1", nullptr, "0"));
+    {
+        luce_test::ScopedEnvVar trace{"PFLASH_RECALL_TRACE_UNITS", "yes"};
+        TEST_ASSERT(refused(nullptr, nullptr, nullptr));
+    }
+    TEST_ASSERT(!refused("0.1", nullptr, nullptr));
+    TEST_ASSERT(!refused(nullptr, "fresh", nullptr));
+    TEST_ASSERT(!refused(nullptr, nullptr, nullptr));
+    unlink(path.c_str());
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_experimental_flags_fail_startup) {
