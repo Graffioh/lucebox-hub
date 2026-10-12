@@ -477,13 +477,24 @@ The drafter keeps a scoring session per conversation
 (`PFLASH_DRAFTER_SESSIONS`, default 2, least recently used evicted; 0 scores
 every prompt from scratch): the cache of blocks 0-14, the block-15 keys and
 the probe logits of the prompt it last scored, with the recurrent state
-checkpointed 64 tokens before its end. A prompt that shares that prefix runs
-only its new tokens through the drafter, from the end or from the
-checkpoint (the previous turn's generation prompt is replaced), and the new
-query scores against every stored key. Sessions live with the loaded drafter,
-so they pay off with `--draft-residency persistent` (and `--prefill-skip-park`
-where the target and drafter fit together); the default releases the drafter
-after each compression.
+checkpointed at the last 8192-token grid point at or before 64 tokens from
+its end. A prompt that shares that prefix runs only its new tokens through
+the drafter, from the checkpoint, and the new query scores against every
+stored key. Every call keeps a fresh call's partition (ubatches and key
+chunks counted from token 0), so a resumed selection is the one a fresh pass
+would make; the query step reads its rows from this call or from an exact F32
+store, and a request that cannot resume exactly is scored from token 0 with
+the reason logged (`[qwen35-scorer] redo from token 0`).
+With the default `--draft-residency auto` the drafter is released after each
+compression; the sessions a call used are copied to host RAM first (pinned
+when the device offers it; `PFLASH_SESSION_OFFLOAD_PINNED=0` uses plain
+memory), only the positions a resume reads, and when the drafter loads again
+only the session the new prompt can resume from comes back to the GPU. A
+stored session is restored only under the drafter, head, probe and session
+settings it was stored with; anything else drops it, and the call scores
+from token 0.
+`--draft-residency persistent` keeps the sessions on the GPU and copies
+nothing.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through
