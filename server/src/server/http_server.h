@@ -1200,6 +1200,9 @@ private:
     // every unit of every region is held.
     double pflash_recall_gate_ = -1.0;
     bool pflash_recall_fresh_ = false;
+    // PFLASH_RECALL_TRACE_UNITS=1: the view record carries each region's units (byte cuts, kept at paging; at a
+    // question: held, head mass, cost, score) for an offline replay of recall policies. Stats only.
+    bool pflash_recall_trace_units_ = false;
     pflash_unified::ToolList pflash_region_tools_;
     std::string pflash_unified_config_;   // config identity a stored view must match
     pflash_unified::ViewStore pflash_unified_views_;

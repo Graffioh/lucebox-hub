@@ -2607,6 +2607,12 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
             }
             pflash_recall_fresh_ = true;
         }
+        if (const char * trace = std::getenv("PFLASH_RECALL_TRACE_UNITS"); trace && *trace) {
+            if (std::strcmp(trace, "1") != 0 && std::strcmp(trace, "0") != 0) {
+                fail(std::string("PFLASH_RECALL_TRACE_UNITS must be 0 or 1, got '") + trace + "'");
+            }
+            pflash_recall_trace_units_ = std::strcmp(trace, "1") == 0;
+        }
         if (pflash_recall_gate_ > 0.0 && pflash_recall_fresh_) {
             fail("PFLASH_RECALL_GATE and PFLASH_RECALL_SOURCE=fresh are separate arms; set one");
         }
@@ -7355,6 +7361,12 @@ std::string HttpServer::apply_unified_view(
             region.reread.assign(lines.count(), 0);
             region.cap = unwidened;
             region.droppable = droppable;
+            if (pflash_recall_trace_units_) {
+                std::vector<long> cuts;
+                for (size_t cut : region.layout.cuts) cuts.push_back((long) cut - (long) region.cb);
+                admission[k]["trace_units"] = {{"cb", region.cb}, {"content_bytes", region.ce - region.cb},
+                                               {"cuts", cuts}, {"kept", region.kept}};
+            }
             admission[k]["units"] = units;
             admission[k]["kept_units"] = (int) std::count(admitted.admitted.begin(), admitted.admitted.end(), 1);
             admission[k]["mandatory_units"] =
@@ -7457,9 +7469,10 @@ std::string HttpServer::apply_unified_view(
                     planned[ri].admitted.assign((size_t) held_regions[ri].layout.units(), 0);
                 }
             };
-            if (pflash_recall_gate_ > 0.0) {
-                // The head's mass on a span: its candidates' lift x overlap / input (the lifts are mass per token
-                // relative to uniform, pflash_compress.cpp). S: every candidate that is not pinned.
+            // The head's mass on a span: its candidates' lift x overlap / input (the lifts are mass per token
+            // relative to uniform, pflash_compress.cpp). S: every candidate that is not pinned.
+            double context = 0.0;
+            if (pflash_recall_gate_ > 0.0 || pflash_recall_trace_units_) {
                 const auto mass_of = [&] (int begin, int end) {
                     double mass = 0.0;
                     for (const auto & lift : lifts) {
@@ -7469,7 +7482,6 @@ std::string HttpServer::apply_unified_view(
                     }
                     return mass / (double) (std::max)(1, input);
                 };
-                double context = 0.0;
                 for (const auto & lift : lifts) {
                     if (pinned(lift.first.begin, lift.first.end) || !std::isfinite(lift.second)) continue;
                     context += lift.second * (double) (lift.first.end - lift.first.begin) / (double) (std::max)(1, input);
@@ -7479,11 +7491,31 @@ std::string HttpServer::apply_unified_view(
                     auto & mass = candidates[ri].mass;
                     mass.assign((size_t) region.layout.units(), 0.0);
                     for (int u = 0; u < region.layout.units(); ++u) {
-                        if (!region.held[(size_t) u]) {
+                        if (!region.held[(size_t) u] || pflash_recall_trace_units_) {
                             mass[(size_t) u] = mass_of(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
                         }
                     }
                 }
+            }
+            if (pflash_recall_trace_units_) {
+                json regions_trace = json::array();
+                for (size_t ri = 0; ri < region_count; ++ri) {
+                    const pu::Region & region = held_regions[ri];
+                    std::vector<int> cost((size_t) region.layout.units());
+                    for (int u = 0; u < region.layout.units(); ++u) {
+                        cost[(size_t) u] = region.lines.escaped
+                            ? encode_len(pu::json_unescape(text, region.layout.cuts[(size_t) u],
+                                                           region.layout.cuts[(size_t) u + 1]))
+                            : region.unit_te[(size_t) u] - region.unit_tb[(size_t) u];
+                    }
+                    regions_trace.push_back({{"region", ri}, {"cb", region.cb}, {"held", region.held},
+                                             {"mass", candidates[ri].mass}, {"cost", cost},
+                                             {"score", candidates[ri].score}, {"cap", candidates[ri].cap},
+                                             {"label_cost", candidates[ri].label_cost}});
+                }
+                stats["recall_units"] = {{"context_mass", context}, {"input", input}, {"regions", regions_trace}};
+            }
+            if (pflash_recall_gate_ > 0.0) {
                 if (!(context > 0.0) || !std::isfinite(context)) {
                     count("recall.unscorable");
                     gate_stats = {{"decision", "unscorable"}, {"theta", pflash_recall_gate_}};
@@ -7670,6 +7702,7 @@ std::string HttpServer::apply_unified_view(
             count("reset.context");
             stats["reset"] = "context";
             stats.erase("recall_gate");
+            stats.erase("recall_units");
             continue;
         }
         // §6: a turn served raw instead of continuing a stored view leaves a raw view (no regions), so its

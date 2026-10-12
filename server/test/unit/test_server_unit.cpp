@@ -16095,6 +16095,7 @@ struct UnifiedOptions {
     bool allow_errors = false;                  // a turn may be refused (context overflow)
     const char * recall_gate = nullptr;         // PFLASH_RECALL_GATE
     const char * recall_source = nullptr;       // PFLASH_RECALL_SOURCE
+    const char * trace_units = nullptr;         // PFLASH_RECALL_TRACE_UNITS
     bool keep_scored_only = false;              // the drafter selection keeps only candidates scored above 1
 };
 
@@ -16109,6 +16110,7 @@ static UnifiedRun run_unified_session(const std::vector<json> & turns, const jso
     luce_test::ScopedEnvVar recall_env{"PFLASH_RECALL", recall};
     luce_test::ScopedEnvVar recall_gate{"PFLASH_RECALL_GATE", options.recall_gate};
     luce_test::ScopedEnvVar recall_source{"PFLASH_RECALL_SOURCE", options.recall_source};
+    luce_test::ScopedEnvVar trace_units{"PFLASH_RECALL_TRACE_UNITS", options.trace_units};
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", options.select_mode};
     luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
     char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
@@ -16620,6 +16622,32 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_fresh_source_takes_the_selectio
     TEST_ASSERT(none.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture, test_unified_recall_trace_units_records_without_changing_bytes) {
+    UnifiedOptions traced;
+    traced.trace_units = "1";
+    const auto turns = unified_fruit_turns("Which line mentions MANGO?");
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
+                                         65536, traced);
+    const auto plain = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score);
+    for (size_t i = 0; i < run.prepared.size(); ++i) TEST_ASSERT(run.prepared[i].tokens == plain.prepared[i].tokens);
+    // Paging: the region's cuts relative to its content, and the units it kept.
+    const json & paged = run.prepared[0].pflash_stats["unified"]["admission"][0]["trace_units"];
+    const int units = run.prepared[0].pflash_stats["unified"]["admission"][0].value("units", 0);
+    TEST_ASSERT(paged["cuts"].size() == (size_t) units + 1);
+    TEST_ASSERT(paged["kept"].size() == (size_t) units);
+    // A question: every unit's held flag, mass, cost and score, and the context mass.
+    const json & q = run.prepared[1].pflash_stats["unified"]["recall_units"];
+    TEST_ASSERT(q.value("context_mass", 0.0) > 0.0);
+    const json & r = q["regions"][0];
+    TEST_ASSERT(r["held"] == paged["kept"]);
+    TEST_ASSERT(r["mass"].size() == (size_t) units && r["cost"].size() == (size_t) units);
+    double total = 0.0;
+    for (const auto & m : r["mass"]) total += m.get<double>();
+    TEST_ASSERT(total > 0.0 && total <= q.value("context_mass", 0.0) + 1e-9);
+    TEST_ASSERT(plain.prepared[1].pflash_stats["unified"].find("recall_units") ==
+                plain.prepared[1].pflash_stats["unified"].end());
+}
+
 TEST_CASE(ServerUnitFixture, test_unified_recall_gate_flags_fail_startup_on_bad_values) {
     const std::string path = write_pflash_bpe_tokenizer_fixture({"a"}, "abc");
     Tokenizer tokenizer;
@@ -16648,6 +16676,10 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_flags_fail_startup_on_bad_
     TEST_ASSERT(refused(nullptr, "kept", nullptr));
     TEST_ASSERT(refused("0.1", "fresh", nullptr));
     TEST_ASSERT(refused("0.1", nullptr, "0"));
+    {
+        luce_test::ScopedEnvVar trace{"PFLASH_RECALL_TRACE_UNITS", "yes"};
+        TEST_ASSERT(refused(nullptr, nullptr, nullptr));
+    }
     TEST_ASSERT(!refused("0.1", nullptr, nullptr));
     TEST_ASSERT(!refused(nullptr, "fresh", nullptr));
     TEST_ASSERT(!refused(nullptr, nullptr, nullptr));
