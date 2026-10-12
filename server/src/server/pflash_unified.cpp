@@ -541,7 +541,7 @@ std::vector<char> units_in_spans(const std::vector<int> & unit_begin, const std:
             const int hi = (std::min)(e, span.second);
             if (hi > lo) inside += hi - lo;
         }
-        out[u] = 2 * inside > (long) (e - b);
+        out[u] = inside > 0;
     }
     return out;
 }

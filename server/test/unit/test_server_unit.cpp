@@ -16540,6 +16540,10 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_takes_only_what_the_questi
     const double before = u["recall_gate"].value("deficit_before", 0.0);
     TEST_ASSERT_MSG(before > 0.4 && before < 0.6, u["recall_gate"].dump());
     TEST_ASSERT(u["recall_gate"].value("deficit_after", 1.0) < 0.05);
+    // Nothing was trimmed at rendering: the served deficit is the planned one.
+    TEST_ASSERT(u["recall_gate"].value("trimmed_units", -1) == 0);
+    TEST_ASSERT(std::fabs(u["recall_gate"].value("deficit_after", 1.0) - u["recall_gate"].value("deficit_planned", 0.0)) <
+                1e-12);
     // The mango line comes back; the ungated fill also brings back filler, the gate does not.
     const std::string & s = run.served_text[1];
     TEST_ASSERT(s.find("Line 60: plain filler text here mango\n") != std::string::npos);
@@ -16573,6 +16577,57 @@ TEST_CASE(ServerUnitFixture, test_unified_recall_gate_appends_nothing_when_the_v
     TEST_ASSERT(grown == (int) run.ids[1].size() - (int) run.ids[0].size());
     TEST_ASSERT(run.calls_after == std::vector<int>({1, 2}));
     TEST_ASSERT(run.unified["counts"].value("recall.gate_present", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_fails_closed_on_a_non_finite_lift) {
+    // One history candidate scores NaN at the second question (finite at paging): the deficit cannot be computed,
+    // so nothing is appended -- never a gate decision over a silently smaller mass.
+    const auto score = [] (const std::string & segment, const std::string & prompt) {
+        if (prompt.find("MANGO?") != std::string::npos && segment.find("Line 30:") != std::string::npos) return (double) NAN;
+        return unified_sharp_fruit_score(segment, prompt);
+    };
+    UnifiedOptions gate;
+    gate.recall_gate = "0.05";
+    const auto run = run_unified_session(unified_fruit_turns("Which line mentions MANGO?"), nullptr, nullptr, 64,
+                                         score, 0, 0.3f, nullptr, 65536, gate);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "continue", u.dump());
+    TEST_ASSERT(u["recall_gate"].value("decision", "") == "unscorable");
+    TEST_ASSERT(run.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.unified["counts"].value("recall.unscorable", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_gate_leaves_newly_dropped_content_out_of_the_context) {
+    // The second question arrives with a new document that has a mango mark on every other line: paging keeps some
+    // of them and drops the rest. That dropped mass is neither present nor recallable, so the gate's S excludes it
+    // and the old region's missing mango line is measured against what the view could hold.
+    std::map<int, std::string> marks;
+    for (int i = 2; i <= 80; i += 2) marks[i] = "mango";
+    const std::string fresh_doc = unified_doc(80, marks, "Row ");
+    const auto turns = unified_fruit_turns((fresh_doc + "Which line mentions MANGO?").c_str());
+    UnifiedOptions gate;
+    gate.recall_gate = "0.01";
+    gate.trace_units = "1";
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, unified_sharp_fruit_score, 0, 0.3f, nullptr,
+                                         65536, gate);
+    const json & u = run.prepared[1].pflash_stats["unified"];
+    TEST_ASSERT_MSG(u.value("decision", "") == "region_recall", u.dump());
+    const json & g = u["recall_gate"];
+    const json & q = u["recall_units"];
+    const double dropped = g.value("new_dropped_mass", 0.0);
+    TEST_ASSERT_MSG(dropped > 0.0, g.dump());
+    TEST_ASSERT(q.value("new_dropped_mass", 0.0) == dropped);
+    const double s = q.value("context_mass", 0.0) - dropped;
+    TEST_ASSERT(std::fabs(g.value("context_mass", 0.0) - s) < 1e-12);
+    double missing = 0.0;
+    const json & r = q["regions"][0];
+    for (size_t k = 0; k < r["held"].size(); ++k) {
+        if (!r["held"][k].get<int>()) missing += r["mass"][k].get<double>();
+    }
+    TEST_ASSERT_MSG(std::fabs(g.value("deficit_before", 0.0) - missing / s) < 1e-9, g.dump());
+    // The old region's mango line comes back at the start of the question.
+    TEST_ASSERT(g.value("decision", "") == "admitted");
+    TEST_ASSERT(run.served_text[1].find("Line 60: plain filler text here mango\n") != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_unified_recall_gate_skips_the_drafter_once_everything_is_held) {

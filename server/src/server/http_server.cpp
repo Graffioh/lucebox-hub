@@ -7470,21 +7470,33 @@ std::string HttpServer::apply_unified_view(
                 }
             };
             // The head's mass on a span: its candidates' lift x overlap / input (the lifts are mass per token
-            // relative to uniform, pflash_compress.cpp). S: every candidate that is not pinned.
+            // relative to uniform, pflash_compress.cpp), pinned candidates excluded so that D <= S. S: every
+            // candidate that is not pinned, less what this request's new regions dropped (that content is
+            // neither present nor recallable here, and counting it would dilute the deficit of the older
+            // regions). A non-finite lift anywhere leaves S non-finite: unscorable, never a silent zero.
             double context = 0.0;
+            double new_dropped = 0.0;
             if (pflash_recall_gate_ > 0.0 || pflash_recall_trace_units_) {
                 const auto mass_of = [&] (int begin, int end) {
                     double mass = 0.0;
                     for (const auto & lift : lifts) {
+                        if (pinned(lift.first.begin, lift.first.end)) continue;
                         const int lo = (std::max)(begin, lift.first.begin);
                         const int hi = (std::min)(end, lift.first.end);
-                        if (hi > lo && std::isfinite(lift.second)) mass += lift.second * (double) (hi - lo);
+                        if (hi > lo) mass += lift.second * (double) (hi - lo);
                     }
                     return mass / (double) (std::max)(1, input);
                 };
                 for (const auto & lift : lifts) {
-                    if (pinned(lift.first.begin, lift.first.end) || !std::isfinite(lift.second)) continue;
+                    if (pinned(lift.first.begin, lift.first.end)) continue;
                     context += lift.second * (double) (lift.first.end - lift.first.begin) / (double) (std::max)(1, input);
+                }
+                for (const auto & region : new_regions) {
+                    for (int u = 0; u < region.layout.units(); ++u) {
+                        if (!region.held[(size_t) u]) {
+                            new_dropped += mass_of(region.unit_db[(size_t) u], region.unit_de[(size_t) u]);
+                        }
+                    }
                 }
                 for (size_t ri = 0; ri < region_count; ++ri) {
                     const pu::Region & region = held_regions[ri];
@@ -7513,20 +7525,23 @@ std::string HttpServer::apply_unified_view(
                                              {"score", candidates[ri].score}, {"cap", candidates[ri].cap},
                                              {"label_cost", candidates[ri].label_cost}});
                 }
-                stats["recall_units"] = {{"context_mass", context}, {"input", input}, {"regions", regions_trace}};
+                stats["recall_units"] = {{"context_mass", context}, {"new_dropped_mass", new_dropped},
+                                         {"input", input}, {"regions", regions_trace}};
             }
+            const double gate_context = context - new_dropped;
             if (pflash_recall_gate_ > 0.0) {
-                if (!(context > 0.0) || !std::isfinite(context)) {
+                if (!(gate_context > 0.0) || !std::isfinite(gate_context)) {
                     count("recall.unscorable");
                     gate_stats = {{"decision", "unscorable"}, {"theta", pflash_recall_gate_}};
                     nothing();
                 } else {
-                    auto gated = pu::admit_recall_gated(candidates, context, pflash_recall_gate_);
+                    auto gated = pu::admit_recall_gated(candidates, gate_context, pflash_recall_gate_);
                     planned = std::move(gated.regions);
                     count(gated.gated ? "recall.gate_present" : "recall.gate_admitted");
                     gate_stats = {{"decision", gated.gated ? "present" : "admitted"},
-                                  {"theta", pflash_recall_gate_}, {"context_mass", context},
-                                  {"deficit_before", gated.deficit_before}, {"deficit_after", gated.deficit_after}};
+                                  {"theta", pflash_recall_gate_}, {"context_mass", gate_context},
+                                  {"new_dropped_mass", new_dropped}, {"deficit_before", gated.deficit_before},
+                                  {"deficit_planned", gated.deficit_after}};
                 }
             } else if (!fresh_ok) {
                 count("recall.no_kept_spans");
@@ -7548,6 +7563,8 @@ std::string HttpServer::apply_unified_view(
                     gate_stats = {{"decision", "fresh"}, {"source", "fresh"}, {"fresh_unheld_units", fresh_units}};
                 }
             }
+            double final_deficit = 0.0;
+            int trimmed_units = 0;
             std::vector<int32_t> excerpts;
             std::vector<pu::Piece> excerpt_pieces;
             bool excerpts_trail = true;   // the last excerpt so far ends with a newline
@@ -7565,6 +7582,7 @@ std::string HttpServer::apply_unified_view(
                 const int cap = candidates[ri].cap;
                 const auto & order = orders[ri];
                 auto admitted = std::move(planned[ri]);
+                const int planned_taken = admitted.taken;
                 // The excerpts as served; over the cap (a tokenisation join), the lowest-ranked unit goes.
                 std::vector<int32_t> tokens;
                 std::vector<pu::Piece> pieces;
@@ -7614,10 +7632,17 @@ std::string HttpServer::apply_unified_view(
                 }
                 int appended_units = 0;
                 for (int u = 0; u < units; ++u) {
-                    if (!admitted.admitted[(size_t) u]) continue;
+                    if (!admitted.admitted[(size_t) u]) {
+                        // The gate's result as served: what the cap trim removed is still missing.
+                        if (!candidates[ri].held[(size_t) u] && (size_t) u < candidates[ri].mass.size()) {
+                            final_deficit += candidates[ri].mass[(size_t) u];
+                        }
+                        continue;
+                    }
                     region.held[(size_t) u] = 1;
                     ++appended_units;
                 }
+                trimmed_units += planned_taken - admitted.taken;
                 region.recalled_tokens += (int) tokens.size();
                 if (!tokens.empty()) excerpts_trail = trail;
                 for (auto piece : pieces) {
@@ -7630,6 +7655,10 @@ std::string HttpServer::apply_unified_view(
                                         {"tokens", tokens.size()}, {"cap", region_cap},
                                         {"wrapper", ri == largest ? wrapper : 0},
                                         {"cumulative_tokens", region.recalled_tokens}});
+            }
+            if (gate_stats.is_object() && gate_stats.contains("deficit_planned")) {
+                gate_stats["deficit_after"] = final_deficit / gate_context;
+                gate_stats["trimmed_units"] = trimmed_units;
             }
             if (excerpts.empty()) {
                 count("recall.empty");

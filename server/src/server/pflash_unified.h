@@ -171,7 +171,8 @@ struct GatedRecall {
 GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double context_mass, double theta);
 
 // PFLASH_RECALL_SOURCE=fresh (RECONCILE §2.1, "fresh.kept - view.held"): per unit [unit_begin, unit_end), whether
-// more than half of its tokens lie in ``spans`` (the drafter selection's kept spans for this request).
+// any of its tokens lie in ``spans`` (the drafter selection's kept spans for this request). Any overlap, so a kept
+// span that the probe cut differently from the recorded units is never dropped; the recall caps bound the rest.
 std::vector<char> units_in_spans(const std::vector<int> & unit_begin, const std::vector<int> & unit_end,
                                  const std::vector<std::pair<int, int>> & spans);
 

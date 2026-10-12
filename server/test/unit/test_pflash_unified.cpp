@@ -339,13 +339,14 @@ TEST_CASE(PFlashUnifiedFixture, unified_recall_gate_orders_units_across_regions_
     REQUIRE(g.regions[1].admitted == std::vector<char>({1, 1}));
 }
 
-TEST_CASE(PFlashUnifiedFixture, unified_units_in_spans_needs_more_than_half_of_a_unit) {
-    const std::vector<int> begin = {0, 10, 20, 30};
-    const std::vector<int> end = {10, 20, 30, 40};
-    // Unit 0 fully kept; unit 1 half (5 of 10): not more than half; unit 2 six of ten over two spans; unit 3 none.
-    const auto in = units_in_spans(begin, end, {{0, 15}, {22, 25}, {27, 30}});
-    REQUIRE(in == std::vector<char>({1, 0, 1, 0}));
-    REQUIRE(units_in_spans(begin, end, {}) == std::vector<char>({0, 0, 0, 0}));
+TEST_CASE(PFlashUnifiedFixture, unified_units_in_spans_takes_any_overlap) {
+    const std::vector<int> begin = {0, 10, 20, 30, 40};
+    const std::vector<int> end = {10, 20, 30, 40, 50};
+    // Unit 0 fully kept; unit 1 half; unit 2 one token (a kept span the probe cut across the unit edge); unit 3
+    // touches a span only at its edge (no token inside); unit 4 none.
+    const auto in = units_in_spans(begin, end, {{0, 15}, {29, 30}, {40, 40}});
+    REQUIRE(in == std::vector<char>({1, 1, 1, 0, 0}));
+    REQUIRE(units_in_spans(begin, end, {}) == std::vector<char>({0, 0, 0, 0, 0}));
 }
 
 TEST_CASE(PFlashUnifiedFixture, unified_rank_units_orders_by_score_then_document) {
