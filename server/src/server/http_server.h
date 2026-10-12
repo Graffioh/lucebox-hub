@@ -977,6 +977,8 @@ private:
         int snapshot_cut = -1;
         // PFlash details for usage.timings.pflash (see build_timings_json).
         nlohmann::json pflash_stats;
+        // PFLASH_UNIFIED=1: why the unified view handed this request to the chat view ("" = it did not).
+        std::string unified_handback;
         int error_status = 0;
         std::string error;
         // The drafter's own error when compression failed in the backend
@@ -997,13 +999,15 @@ private:
     // PFLASH_UNIFIED=1, after the shared query and pins (A1): pages the newest turn's large uncached content
     // (a user message, or listed tool outputs), continues the conversation's view, and recalls unheld units of
     // earlier regions at a new user question. ``request`` carries the drafter ids, the pinned spans and the
-    // learned query; ``messages`` the normalised messages the prompt was rendered from. ``not_ready``
-    // non-empty: served raw for that reason.
+    // learned query; ``messages`` the normalised messages the prompt was rendered from. ``handback`` set (the
+    // reason): the view did not take the request -- ``not_ready`` non-empty, a prompt it cannot cut, or a conversation it would
+    // start while a threshold's worth of uncached, unpinned prompt lies outside its regions -- and the chat view
+    // (the release path) serves it; nothing of the unified view's state changed.
     std::string apply_unified_view(const ParsedRequest & req, PreparedPrompt & prepared,
                                    const http_detail::PflashChatTurnSpan & turn,
                                    const std::vector<ChatMessage> & messages,
                                    ModelBackend::CompressRequest request, int chunk_size,
-                                   const std::string & not_ready);
+                                   const std::string & not_ready, std::string & handback);
     // Multi-turn: serve the conversation's previous view plus this turn's
     // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
     // the parts the fresh selection keeps -- with the segments the fresh
@@ -1259,12 +1263,10 @@ private:
     // and agent sessions. Unset, none of it runs and nothing below is read.
     bool pflash_unified_ = false;
     bool pflash_unified_recall_ = true;
-    // PFLASH_RECALL_GATE=<theta> (recall/FABLE-RECALL-GATE.md): recall only while the head mass on unheld units is at
-    // least theta of the context mass; < 0 = unset (fill each region's cap). PFLASH_RECALL_SOURCE=fresh: recall only
-    // unheld units the drafter's own selection for the question keeps. Either one also skips the drafter pass when
-    // every unit of every region is held.
+    // PFLASH_RECALL_GATE=<theta> (recall/FABLE-RECALL-GATE.md; default 0.075 under PFLASH_UNIFIED=1): recall only
+    // while the head mass on unheld units is at least theta of the context mass; also skips the drafter pass when
+    // every unit of every region is held. < 0 = "off" (fill each region's cap).
     double pflash_recall_gate_ = -1.0;
-    bool pflash_recall_fresh_ = false;
     // PFLASH_RECALL_TRACE_UNITS=1: the view record carries each region's units (byte cuts, kept at paging; at a
     // question: held, head mass, cost, score) for an offline replay of recall policies. Stats only.
     bool pflash_recall_trace_units_ = false;

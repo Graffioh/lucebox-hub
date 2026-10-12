@@ -528,24 +528,6 @@ GatedRecall admit_recall_gated(const std::vector<RecallRegion> & regions, double
     return out;
 }
 
-std::vector<char> units_in_spans(const std::vector<int> & unit_begin, const std::vector<int> & unit_end,
-                                 const std::vector<std::pair<int, int>> & spans) {
-    std::vector<char> out(unit_begin.size(), 0);
-    for (size_t u = 0; u < unit_begin.size(); ++u) {
-        const int b = unit_begin[u];
-        const int e = unit_end[u];
-        if (e <= b) continue;
-        long inside = 0;
-        for (const auto & span : spans) {
-            const int lo = (std::max)(b, span.first);
-            const int hi = (std::min)(e, span.second);
-            if (hi > lo) inside += hi - lo;
-        }
-        out[u] = inside > 0;
-    }
-    return out;
-}
-
 std::vector<int> rank_units(const std::vector<double> & score, const std::vector<char> & skip) {
     std::vector<int> order;
     for (int u = 0; u < (int) score.size(); ++u) {
@@ -715,6 +697,13 @@ void ViewStore::remember(View view) {
         }
         entries_.erase(entries_.begin() + (std::ptrdiff_t) oldest);
     }
+}
+
+void ViewStore::forget_lineage(uint64_t lineage) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                  [&] (const Entry & e) { return e.view.lineage == lineage; }),
+                   entries_.end());
 }
 
 size_t ViewStore::size() const {
