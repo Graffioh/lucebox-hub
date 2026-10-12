@@ -716,25 +716,31 @@ PflashAdmission pflash_cold_history_admission(
     int history_uncached_droppable, int threshold) noexcept;
 // Agent history (PFLASH_AGENT_HISTORY=keep, cache admission only; unset or
 // any other value = off, today's decisions). In a conversation with tool
-// activity whose newest turn is a user turn after an assistant turn, the
-// earlier conversation (everything before that user turn) is never
-// compressed: only the new user turn's content may be, and only when its
-// droppable tokens reach the threshold (decision ``NewContent``: a region
-// plan over that content alone, served on a raw base or the conversation's
-// view). Smaller new content is served raw (``KeepHistory``), or as the
-// view continues it. A newest tool output, a first turn and a raw prompt
-// over the context keep today's rules.
+// activity (a "tool session") the agent's history and tool output are never
+// compressed: the only content PFlash may compress is the newest turn when it
+// is a user message whose droppable tokens reach the threshold (decision
+// ``NewContent``: a region plan over that content alone, served on a raw base
+// -- the raw prompt's own tokens before it, so a first turn's system prompt
+// and tools as well -- or on the conversation's view). Everything else is
+// served raw (``KeepHistory``, or the raw decision that already applies), and
+// a view is only continued: new turns appended verbatim (a tool output of any
+// size included), recall at the newest user message, never rebuilt and never
+// compressed again as a whole. A raw prompt over the context is not
+// compressed either: unless a big newest paste brings it under, the request
+// gets the context-overflow error full prefill gets.
 bool pflash_agent_history_enabled() noexcept;
-// The newest turn of ``turns`` when it is a user turn with an assistant turn
-// before it: returns nullptr and sets ``newest``; otherwise the reason it is
-// out of scope ("no_turns", "newest_not_user", "no_history") and newest = -1.
+// The newest turn of ``turns`` when it is a user turn with content: returns
+// nullptr and sets ``newest``; otherwise what the newest turn is
+// ("no_turns", "newest_not_user": a tool output, an assistant prefill or an
+// empty user turn) and newest = -1.
 const char * pflash_keep_history_scope(
     const std::vector<PflashChatTurn> & turns, int & newest) noexcept;
-// The decision for an in-scope request: UnderThreshold stays; new content
-// of at least ``threshold`` droppable tokens turns Compress, WarmCache and
-// ColdHistory into NewContent; smaller new content turns Compress (and
-// WarmCache when ``arrive`` would compress the uncached tail) into
-// KeepHistory; ColdHistory and WarmCache without arrive stay (both raw).
+// The decision for a tool session without a view: UnderThreshold stays;
+// newest user content of at least ``threshold`` droppable tokens turns
+// Compress, WarmCache and ColdHistory into NewContent; otherwise
+// (``new_droppable`` is 0 when the newest turn is not a user message)
+// Compress, and WarmCache when ``arrive`` would compress the uncached tail,
+// become KeepHistory; ColdHistory and WarmCache without arrive stay (raw).
 PflashAdmission pflash_keep_history_admission(
     PflashAdmission admission, int new_droppable, int threshold,
     bool arrive) noexcept;
@@ -994,11 +1000,12 @@ private:
     // no scoring: a repeated prompt, or a small follow-up with recall off;
     // it returns false for the caller to compress. With one it always
     // serves: a continued view, or the fresh prompt as a new view.
-    // ``keep_history`` (PFLASH_AGENT_HISTORY=keep, in scope): the view only
-    // continues -- new tokens are appended verbatim (no compress-new), the
-    // view is not rebuilt when it outgrows a fresh selection, and when it
-    // cannot continue it returns false for the caller to serve the raw
-    // prompt; only a view over the context limit is still rebuilt.
+    // ``keep_history`` (PFLASH_AGENT_HISTORY=keep, a tool session): the view
+    // only continues -- new tokens are appended verbatim (no compress-new),
+    // recalled passages are clipped to the message content that holds them,
+    // the view is never rebuilt (neither when it outgrows a fresh selection
+    // nor at the context limit), and when it cannot continue it returns false
+    // for the caller to serve the raw prompt.
     bool serve_pflash_chat_view(
         const ParsedRequest & req,
         const std::vector<int32_t> & drafter_ids,

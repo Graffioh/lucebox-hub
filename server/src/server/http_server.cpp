@@ -1164,13 +1164,10 @@ const char * pflash_keep_history_scope(
         last.content_end <= last.content_begin) {
         return "newest_not_user";
     }
-    for (size_t index = 0; index + 1 < turns.size(); ++index) {
-        if (turns[index].role == "assistant" || turns[index].role == "model") {
-            newest = (int) turns.size() - 1;
-            return nullptr;
-        }
-    }
-    return "no_history";
+    // A first turn too: whatever precedes the newest user message (the
+    // system prompt and tools, earlier turns) is served as it is.
+    newest = (int) turns.size() - 1;
+    return nullptr;
 }
 
 PflashAdmission pflash_keep_history_admission(
@@ -5503,6 +5500,11 @@ std::string HttpServer::apply_pflash_compression(
             const auto tool_activity = [&] {
                 if (tool_activity_state < 0) {
                     tool_activity_state = 0;
+                    // Tools defined: a tool session whatever the messages.
+                    if (http_detail::pflash_has_tool_activity(req.tools, {})) {
+                        tool_activity_state = 1;
+                        return true;
+                    }
                     try {
                         tool_activity_state = http_detail::pflash_has_tool_activity(
                             req.tools,
@@ -5519,29 +5521,25 @@ std::string HttpServer::apply_pflash_compression(
                 }
                 return tool_activity_state == 1;
             };
-            // Agent history (PFLASH_AGENT_HISTORY=keep): in a conversation
-            // with tool activity whose newest turn is a user turn after an
-            // assistant turn, everything before that user turn is kept as
-            // served before (raw, or the view); only the new user turn's
-            // content may be compressed, on its own budget, when its
-            // droppable tokens reach the threshold. Out of scope (no tools):
-            // nothing is computed or recorded, as with the flag off; a tool
-            // request out of scope (first turn, newest turn a tool output,
-            // raw prompt over the context) records why and keeps today's
-            // decision.
+            // Agent history (PFLASH_AGENT_HISTORY=keep): in a tool session
+            // (tool activity) the history and tool output are never
+            // compressed. Only the newest turn, when it is a user message,
+            // may be: its content alone, on its own budget, when its
+            // droppable tokens reach the threshold. Everything else is served
+            // raw, and a view is only continued. Chats without tools:
+            // nothing is computed or recorded, as with the flag off.
             json keep_history_stats;
             int keep_newest = -1;
-            if (http_detail::pflash_agent_history_enabled() && messages_input &&
-                chat_turn.valid()) {
+            bool keep_scope = false;
+            if (http_detail::pflash_agent_history_enabled()) {
                 if (tool_activity()) {
-                    const char * reason = http_detail::pflash_keep_history_scope(
-                        chat_turn.turns, keep_newest);
-                    if (!reason && !raw_fits) {
-                        reason = "raw_too_long";
-                        keep_newest = -1;
-                    }
-                    keep_history_stats = {{"in_scope", reason == nullptr}};
-                    if (reason) keep_history_stats["reason"] = reason;
+                    keep_scope = true;
+                    const bool parsed = messages_input && chat_turn.valid();
+                    const char * newest_kind = parsed
+                        ? http_detail::pflash_keep_history_scope(chat_turn.turns, keep_newest)
+                        : "unparsed";
+                    keep_history_stats = {{"in_scope", true},
+                                          {"newest", newest_kind ? newest_kind : "user"}};
                 } else if (!tool_error.empty()) {
                     std::fprintf(stderr,
                         "[pflash-keep-history] messages not readable (%s); rule skipped\n",
@@ -5561,35 +5559,74 @@ std::string HttpServer::apply_pflash_compression(
                 std::lock_guard<std::mutex> lk(pflash_failure_mu_);
                 ++pflash_keep_history_counts_[decision];
             };
-            if (has_view && keep_newest >= 0) {
-                // Agent history on a conversation with a view (it holds the
-                // raw history and any earlier compressed content as served):
-                // the view continues; a large new user content is compressed
-                // on its own after the cached view, whatever PFLASH_ARRIVE.
+            // The raw prompt, full prefill, for a tool session nothing may be
+            // compressed in: counted with the raw fallbacks (reason
+            // keep_history) and never refused. A raw prompt over the context
+            // then gets the context-overflow error, as with full prefill.
+            const auto serve_keep_raw = [&] (int new_droppable, const char * why) {
+                count_keep_history("keep_history");
+                {
+                    std::lock_guard<std::mutex> lk(pflash_failure_mu_);
+                    ++pflash_fallback_served_;
+                    ++pflash_fallback_reasons_["keep_history"];
+                }
+                prepared.pflash_stats = {{"admission", admission_stats}};
+                prepared.pflash_stats["pflash_fallback"] = {
+                    {"reason", "keep_history"},
+                    {"prompt_tokens", prompt_tokens},
+                    {"new_droppable", new_droppable},
+                };
+                std::fprintf(stderr,
+                    "[pflash-keep-history] serving the raw prompt (%d tokens): %s, "
+                    "newest user content droppable~%d, threshold %d%s\n",
+                    prompt_tokens, why, new_droppable, config_.pflash_threshold,
+                    raw_fits ? "" : "; the raw prompt does not fit the context");
+                std::fflush(stderr);
+            };
+            if (keep_scope && !(messages_input && chat_turn.valid())) {
+                // A tool session whose turns cannot be located: nothing can
+                // be told apart from the history, so nothing is compressed.
+                admission_stats = {{"view", false}, {"decision", "keep_history"},
+                                   {"raw_fits", raw_fits},
+                                   {"keep_history", keep_history_stats}};
+                serve_keep_raw(0, "turns not parsed");
+                return {};
+            }
+            if (has_view && keep_scope) {
+                // A tool session with a view (the raw history and any earlier
+                // pastes as served): the view continues. A newest user
+                // message over the threshold is compressed on its own after
+                // the cached view, whatever PFLASH_ARRIVE; anything else --
+                // a tool output of any size included -- is appended verbatim.
                 admission_stats = {{"view", true}};
-                const auto & newest = chat_turn.turns[(size_t) keep_newest];
-                const int new_droppable = content_droppable(newest);
-                const bool region = newest.role_begin >= existing.drafter_gen_begin &&
-                    new_droppable >= config_.pflash_threshold;
-                if (region) {
-                    region_plan = {true, "new_content",
-                                   {{newest.content_begin, newest.content_end}},
-                                   existing.drafter_gen_begin,
-                                   existing.view_gen_begin, input_tokens, true, 0};
+                int new_droppable = 0;
+                bool region = false;
+                if (keep_newest >= 0) {
+                    const auto & newest = chat_turn.turns[(size_t) keep_newest];
+                    new_droppable = content_droppable(newest);
+                    region = newest.role_begin >= existing.drafter_gen_begin &&
+                        new_droppable >= config_.pflash_threshold;
+                    if (region) {
+                        region_plan = {true, "new_content",
+                                       {{newest.content_begin, newest.content_end}},
+                                       existing.drafter_gen_begin,
+                                       existing.view_gen_begin, input_tokens, true, 0};
+                    }
+                    keep_history_stats["new_begin"] = newest.content_begin;
+                    keep_history_stats["new_end"] = newest.content_end;
                 }
                 keep_history_view = true;
                 keep_history_stats["decision"] = region ? "new_content" : "view";
-                keep_history_stats["new_begin"] = newest.content_begin;
-                keep_history_stats["new_end"] = newest.content_end;
                 keep_history_stats["new_droppable"] = new_droppable;
                 keep_history_stats["base"] = "view";
                 admission_stats["keep_history"] = keep_history_stats;
                 count_keep_history(region ? "new_content" : "view");
                 std::fprintf(stderr,
-                    "[pflash-keep-history] %s on the view: new user content [%d,%d) "
-                    "droppable~%d threshold=%d\n",
-                    region ? "new_content" : "view", newest.content_begin,
-                    newest.content_end, new_droppable, config_.pflash_threshold);
+                    "[pflash-keep-history] %s on the view: newest %s droppable~%d "
+                    "threshold=%d\n",
+                    region ? "new_content" : "view",
+                    keep_newest >= 0 ? "user content" : "turn not a user message (appended)",
+                    new_droppable, config_.pflash_threshold);
             } else if (has_view) {
                 admission_stats = {{"view", true}};
                 if (!keep_history_stats.is_null()) {
@@ -5681,17 +5718,19 @@ std::string HttpServer::apply_pflash_compression(
                             tool_error.c_str());
                     }
                 }
-                // Agent history, no view: the earlier conversation is served
-                // raw -- from the prefix cache, or prefilled -- and only the
-                // newest user content is compressed when it is large
-                // (new_content, a region plan on a raw base); otherwise the
-                // whole prompt is served raw (keep_history). Cold history and
-                // under-threshold stay as they are.
+                // Agent history, no view: the history is served raw -- from
+                // the prefix cache, or prefilled -- and only a newest user
+                // message over the threshold is compressed (new_content, a
+                // region plan on a raw base); otherwise the whole prompt is
+                // served raw (keep_history; a newest tool output of any size
+                // included). Cold history and under-threshold stay as they
+                // are (both raw).
                 int keep_new_droppable = 0;
                 int raw_base = -1;
-                if (keep_newest >= 0) {
-                    const auto & newest = chat_turn.turns[(size_t) keep_newest];
-                    keep_new_droppable = content_droppable(newest);
+                if (keep_scope) {
+                    const http_detail::PflashChatTurn * newest = keep_newest >= 0
+                        ? &chat_turn.turns[(size_t) keep_newest] : nullptr;
+                    keep_new_droppable = newest ? content_droppable(*newest) : 0;
                     const auto before = admission;
                     admission = http_detail::pflash_keep_history_admission(
                         admission, keep_new_droppable, config_.pflash_threshold,
@@ -5702,7 +5741,7 @@ std::string HttpServer::apply_pflash_compression(
                         // prefill would serve them): fail closed to raw when
                         // the two tokenizers' parses do not line up.
                         ChatMarkers markers;
-                        raw_base = resolve_chat_markers(tokenizer_, markers)
+                        raw_base = newest && resolve_chat_markers(tokenizer_, markers)
                             ? http_detail::pflash_raw_base_target(
                                   tokenizer_, markers, req.prompt_tokens,
                                   *drafter_tokenizer_, drafter_ids,
@@ -5716,9 +5755,11 @@ std::string HttpServer::apply_pflash_compression(
                     keep_history_stats["decision_before"] =
                         http_detail::pflash_admission_name(before);
                     keep_history_stats["fired"] = admission != before;
-                    keep_history_stats["history_end"] = newest.role_begin;
-                    keep_history_stats["new_begin"] = newest.content_begin;
-                    keep_history_stats["new_end"] = newest.content_end;
+                    if (newest) {
+                        keep_history_stats["history_end"] = newest->role_begin;
+                        keep_history_stats["new_begin"] = newest->content_begin;
+                        keep_history_stats["new_end"] = newest->content_end;
+                    }
                     keep_history_stats["new_droppable"] = keep_new_droppable;
                     keep_history_stats["base"] = raw_base >= 0 ? "raw" : "none";
                     if (raw_base >= 0) keep_history_stats["raw_base_tokens"] = raw_base;
@@ -5794,28 +5835,13 @@ std::string HttpServer::apply_pflash_compression(
                                 config_.pflash_threshold);
                             std::fflush(stderr);
                         } else if (admission == http_detail::PflashAdmission::KeepHistory) {
-                            // Small new content on an agent history: the raw
-                            // prompt, full prefill (counted with the raw
-                            // fallbacks, reason keep_history); never refused.
-                            count_keep_history("keep_history");
-                            {
-                                std::lock_guard<std::mutex> lk(pflash_failure_mu_);
-                                ++pflash_fallback_served_;
-                                ++pflash_fallback_reasons_["keep_history"];
-                            }
-                            prepared.pflash_stats["pflash_fallback"] = {
-                                {"reason", "keep_history"},
-                                {"prompt_tokens", prompt_tokens},
-                                {"new_droppable", keep_new_droppable},
-                            };
-                            std::fprintf(stderr,
-                                "[pflash-keep-history] serving the raw prompt (%d tokens): "
-                                "new user content droppable~%d, threshold %d%s\n",
-                                prompt_tokens, keep_new_droppable,
-                                config_.pflash_threshold,
+                            // Nothing to compress in a tool session but its
+                            // history: the raw prompt, full prefill.
+                            serve_keep_raw(keep_new_droppable,
                                 keep_history_stats.value("raw_base_failed", false)
-                                    ? ", raw base mismatch" : "");
-                            std::fflush(stderr);
+                                    ? "raw base mismatch"
+                                    : (keep_newest >= 0 ? "newest user content under the threshold"
+                                                        : "newest turn not a user message"));
                         }
                         return {};
                     }
@@ -6473,7 +6499,25 @@ bool HttpServer::serve_pflash_chat_view(
             http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
         // Whole kept pieces: a passage the view holds only part of comes
         // back in one piece, in order, not as a fragment far from the rest.
+        // Agent history: the piece is clipped to the content of the message
+        // that holds the missing part (a compressed paste), so the excerpt
+        // block never repeats raw history or this turn's own messages.
         for (const auto & span : *kept_spans) {
+            if (keep_history) {
+                for (const auto & message : turn.turns) {
+                    const int lo = (std::max)(span.begin, message.content_begin);
+                    const int hi = (std::min)((std::min)(span.end, message.content_end),
+                                              view.drafter_gen_begin);
+                    if (hi <= lo) continue;
+                    for (const auto & part : missing) {
+                        if (part.begin < hi && part.end > lo) {
+                            recalled.push_back({lo, hi});
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             for (const auto & part : missing) {
                 if (part.begin < span.end && part.end > span.begin) {
                     recalled.push_back(span);
@@ -6582,8 +6626,10 @@ bool HttpServer::serve_pflash_chat_view(
     const bool outgrown = !keep_history && compressed && rebuild_ratio > 0.0 &&
         (double) served.size() > rebuild_ratio * (double) fresh->size() &&
         (int) served.size() >= http_detail::pflash_chat_rebuild_min_tokens();
+    // Agent history: never rebuilt, not even at the context limit (a rebuild
+    // compresses the history); the caller serves the raw prompt instead.
     if (too_long || outgrown) {
-        return compressed && serve_fresh("rebuild", view.turns + 1);
+        return compressed && !keep_history && serve_fresh("rebuild", view.turns + 1);
     }
 
     auto spans = view.spans;
