@@ -258,6 +258,9 @@ struct HttpServerTestAccess {
     static json pflash_keep_history(const HttpServer & server) {
         return server.pflash_keep_history_json();
     }
+    static json pflash_unified(const HttpServer & server) {
+        return server.pflash_unified_json();
+    }
     // A committed inline prefix-cache entry: ids[0, cut) restorable from
     // ``slot`` (the backend reports the snapshot).
     static void seed_prefix_cache(HttpServer & server, int slot, int cut,
@@ -16011,5 +16014,464 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_base_target_fails_closed) {
         tokenizer, markers, ids, tokenizer, ids, fewer, (int) fewer.size() - 1) == -1);
     TEST_ASSERT(http_detail::pflash_raw_base_target(
         tokenizer, markers, ids, tokenizer, ids, parsed.turns, 99) == -1);
+    unlink(path.c_str());
+}
+
+// ── PFLASH_UNIFIED=1 (STAGE1-DESIGN.md) ──────────────────────────────────
+
+// Scores every candidate (a line, or ``chunk`` tokens) with ``score(segment text, prompt text)`` and returns the
+// candidate scores the unified path admits units by; the selection itself is ignored there.
+struct MockUnifiedBackend : MockBackend {
+    const Tokenizer * tokenizer = nullptr;
+    int chunk = 0;
+    std::function<double(const std::string &, const std::string &)> score;
+    int compress_calls = 0;
+    CompressRequest last_request;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        const auto & ids = request.input_ids;
+        const int n = (int) ids.size();
+        std::vector<std::string> pieces((size_t) n);
+        std::string whole;
+        for (int i = 0; i < n; ++i) {
+            pieces[(size_t) i] = tokenizer->decode(std::vector<int32_t>{ids[(size_t) i]});
+            whole += pieces[(size_t) i];
+        }
+        CompressResult result;
+        int begin = 0;
+        for (int i = 0; i < n; ++i) {
+            const bool cut = chunk > 0 ? i + 1 - begin >= chunk
+                                       : pieces[(size_t) i].find('\n') != std::string::npos;
+            if (!cut && i + 1 < n) continue;
+            std::string segment;
+            for (int k = begin; k <= i; ++k) segment += pieces[(size_t) k];
+            result.candidate_lifts.push_back({{begin, i + 1}, score ? score(segment, whole) : 1.0});
+            begin = i + 1;
+        }
+        result.compressed_ids = ids;
+        result.kept_spans = {{0, n}};
+        result.ok = true;
+        return result;
+    }
+};
+
+struct UnifiedRun {
+    std::vector<HttpServerTestAccess::PreparedPrompt> prepared;
+    std::vector<std::vector<int32_t>> ids;
+    std::vector<std::string> served_text;
+    std::vector<std::string> raw_text;
+    std::vector<int> calls_after;
+    std::vector<json> view_records;
+    json unified;
+};
+
+using UnifiedScore = std::function<double(const std::string &, const std::string &)>;
+
+// One server with PFLASH_UNIFIED=1, the turns in order (fixture tokenizer as target and drafter, which share every
+// token boundary).
+static UnifiedRun run_unified_session(const std::vector<json> & turns, const json & tools, const char * region_tools,
+                                      int threshold, const UnifiedScore & score, int chunk = 0,
+                                      float keep_ratio = 0.3f, const char * recall = nullptr,
+                                      int max_ctx = 65536) {
+    luce_test::ScopedEnvVar unified{"PFLASH_UNIFIED", "1"};
+    luce_test::ScopedEnvVar region{"PFLASH_REGION_TOOLS", region_tools};
+    luce_test::ScopedEnvVar recall_env{"PFLASH_RECALL", recall};
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "cache"};
+    char trace_path[] = "/tmp/pflash_unified_view_XXXXXX";
+    const int trace_fd = mkstemp(trace_path);
+    TEST_ASSERT(trace_fd >= 0);
+    close(trace_fd);
+    luce_test::ScopedEnvVar view_trace{"PFLASH_VIEW_TRACE_PATH", trace_path};
+    std::vector<std::string> rendered;
+    std::string cover;
+    for (const auto & messages : turns) {
+        ToolMemory tool_memory;
+        const auto chat = normalize_chat_messages(messages, ApiFormat::OPENAI_CHAT, tool_memory);
+        rendered.push_back(render_chat_template(
+            chat, ChatFormat::QWEN3, /*add_generation_prompt=*/true, /*enable_thinking=*/true,
+            tools.is_array() && !tools.empty() ? tools.dump() : ""));
+        cover += rendered.back();
+    }
+    cover += "[]\xE2\x80\xA6" "0123456789:;,.-|\\\"" "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ";
+    const std::string path = write_pflash_bpe_tokenizer_fixture({"user", "assistant", "system", "\n", "tool"}, cover);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    UnifiedRun run;
+    for (const auto & text : rendered) {
+        run.ids.push_back(tokenizer.encode(text));
+        run.raw_text.push_back(text);
+    }
+    auto backend_owner = std::make_unique<MockUnifiedBackend>();
+    MockUnifiedBackend & backend = *backend_owner;
+    backend.tokenizer = &tokenizer;
+    backend.chunk = chunk;
+    backend.score = score;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = threshold;
+    config.pflash_keep_ratio = keep_ratio;
+    config.max_ctx = max_ctx;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        for (size_t index = 0; index < turns.size(); ++index) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            request.messages = turns[index];
+            if (tools.is_array() && !tools.empty()) request.tools = tools;
+            request.prompt_tokens = run.ids[index];
+            request.max_output = 16;
+            run.prepared.push_back(HttpServerTestAccess::prepare_prompt(server, request));
+            TEST_ASSERT_MSG(run.prepared.back().error.empty(), run.prepared.back().error);
+            run.served_text.push_back(tokenizer.decode(run.prepared.back().tokens));
+            run.calls_after.push_back(backend.compress_calls);
+        }
+        run.unified = HttpServerTestAccess::pflash_unified(server);
+    }
+    std::ifstream in(trace_path);
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty()) run.view_records.push_back(json::parse(line));
+    }
+    unlink(trace_path);
+    unlink(path.c_str());
+    return run;
+}
+
+// "Line i: plain filler text here[ mark]\n" for i in 1..lines.
+static std::string unified_doc(int lines, const std::map<int, std::string> & marks,
+                               const std::string & prefix = "Line ") {
+    std::string out;
+    for (int i = 1; i <= lines; ++i) {
+        out += prefix + std::to_string(i) + ": plain filler text here";
+        const auto it = marks.find(i);
+        if (it != marks.end()) out += " " + it->second;
+        out += "\n";
+    }
+    return out;
+}
+
+static size_t unified_occurrences(const std::string & text, const std::string & needle) {
+    size_t n = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) ++n;
+    return n;
+}
+
+// Wants the kiwi line when the prompt asks KIWI?, the mango line when it asks MANGO?.
+static double unified_fruit_score(const std::string & segment, const std::string & prompt) {
+    double score = 1.0;
+    if (prompt.find("KIWI?") != std::string::npos && segment.find("kiwi") != std::string::npos) score += 50.0;
+    if (prompt.find("MANGO?") != std::string::npos && segment.find("mango") != std::string::npos) score += 50.0;
+    return score;
+}
+
+static json unified_tool_call(const std::string & id, const std::string & name, const json & arguments) {
+    return {{"id", id}, {"type", "function"}, {"function", {{"name", name}, {"arguments", arguments.dump()}}}};
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_paste_pages_then_recall_appends_and_repeats) {
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2, turn2}, nullptr, nullptr, 64, unified_fruit_score);
+
+    // Turn 1: the paste is paged; the system prompt, the pinned edges, the question and the kiwi line stay whole.
+    const auto & p1 = run.prepared[0];
+    TEST_ASSERT(p1.compressed);
+    TEST_ASSERT_MSG(p1.pflash_stats["unified"].value("decision", "") == "region", p1.pflash_stats.dump());
+    const std::string & s1 = run.served_text[0];
+    TEST_ASSERT(s1.find("You are helpful.") != std::string::npos);
+    TEST_ASSERT(s1.find("Line 1: plain filler text here\nLine 2: plain filler text here\n"
+                        "[Server note: this message was shortened:") != std::string::npos);
+    TEST_ASSERT(s1.find("Line 7: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(s1.find("mango") == std::string::npos);
+    TEST_ASSERT(s1.find("lines not shown \xE2\x80\xA6]\n") != std::string::npos);
+    TEST_ASSERT(s1.find("Line 80: plain filler text here\nWhich line mentions KIWI?") != std::string::npos);
+    TEST_ASSERT(run.prepared[0].tokens.size() < run.ids[0].size());
+
+    // Turn 2: turn 1's served prompt is reused token for token; the mango line comes back in a labelled block at
+    // the start of the question; nothing turn 1 kept is appended again.
+    const auto & p2 = run.prepared[1];
+    const int vg1 = p1.snapshot_cut;
+    TEST_ASSERT(vg1 > 0);
+    TEST_ASSERT(std::equal(p1.tokens.begin(), p1.tokens.begin() + vg1, p2.tokens.begin()));
+    const std::string & s2 = run.served_text[1];
+    const size_t answer = s2.find("Line 7.<|im_end|>");
+    const size_t block = s2.find("[Earlier in this conversation]\n[From an earlier user message]\n");
+    const size_t mango = s2.find("Line 60: plain filler text here mango\n");
+    const size_t close = s2.find("mango\n\n[End of earlier excerpts]\n\nWhich line mentions MANGO?");
+    TEST_ASSERT(answer != std::string::npos);
+    TEST_ASSERT_MSG(block != std::string::npos && block > answer, s2.substr(answer));
+    TEST_ASSERT_MSG(mango != std::string::npos && mango > block && close != std::string::npos && close > mango,
+                    s2.substr(block));
+    TEST_ASSERT(s2.find("here\n\n[From an earlier user message]\nLine 60:", block) != std::string::npos);
+    for (int line = 1; line <= 80; ++line) {
+        TEST_ASSERT_MSG(unified_occurrences(s2, "Line " + std::to_string(line) + ":") <= 1, std::to_string(line));
+    }
+    TEST_ASSERT(p2.pflash_stats["unified"].value("decision", "") == "recall");
+
+    // Turn 3, a retry: the same bytes, no drafter pass.
+    TEST_ASSERT(run.prepared[2].tokens == p2.tokens);
+    TEST_ASSERT(run.prepared[2].pflash_stats["unified"].value("decision", "") == "repeat");
+    TEST_ASSERT(run.calls_after == std::vector<int>({1, 2, 2}));
+    TEST_ASSERT(run.unified["counts"].value("serve.region", 0) == 1);
+    TEST_ASSERT(run.unified["counts"].value("recall.fired", 0) == 1);
+    TEST_ASSERT(run.view_records.size() == 3);
+    for (const auto & record : run.view_records) TEST_ASSERT(record.value("schema_version", 0) == 3);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_tool_output_needs_listing) {
+    const json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "read_file"}, {"description", "Read a file"}}}},
+        {{"type", "function"}, {"function", {{"name", "terminal"}, {"description", "Run a command"}}}},
+    });
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Read both files. Which line mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "docs/a.md"}}),
+            unified_tool_call("call_2", "terminal", {{"cmd", "cat docs/b.md"}}),
+            unified_tool_call("call_3", "read_file", {{"path", "docs/c.md"}}),
+        })}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", unified_doc(80, {{9, "kiwi"}}, "A")}},
+        {{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", unified_doc(80, {}, "B")}},
+        {{"role", "tool"}, {"tool_call_id", "call_3"}, {"content", unified_doc(1, {}, "C")}},
+    });
+    const auto listed = run_unified_session({turn}, tools, "read_file", 64, unified_fruit_score);
+    const json & admission = listed.prepared[0].pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission.size() == 3, admission.dump());
+    TEST_ASSERT(admission[0].value("decision", "") == "region");
+    TEST_ASSERT(admission[1].value("decision", "") == "unlisted");
+    TEST_ASSERT(admission[2].value("decision", "") == "small");
+    const std::string & served = listed.served_text[0];
+    TEST_ASSERT(served.find("A9: plain filler text here kiwi\n") != std::string::npos);
+    TEST_ASSERT(served.find("[Server note: this tool result was shortened:") != std::string::npos);
+    for (int line = 1; line <= 80; ++line) {
+        TEST_ASSERT(served.find("B" + std::to_string(line) + ": plain filler text here\n") != std::string::npos);
+    }
+    // "*": every tool output may be paged; the one-line one is still too small.
+    const auto all = run_unified_session({turn}, tools, "*", 64, unified_fruit_score);
+    const json & all_admission = all.prepared[0].pflash_stats["unified"]["admission"];
+    TEST_ASSERT(all_admission[0].value("decision", "") == "region");
+    TEST_ASSERT(all_admission[1].value("decision", "") == "region");
+    TEST_ASSERT(all_admission[2].value("decision", "") == "small");
+    // Nothing listed: the tool turn is served raw, without a drafter pass.
+    const auto none = run_unified_session({turn}, tools, nullptr, 64, unified_fruit_score);
+    TEST_ASSERT(!none.prepared[0].compressed);
+    TEST_ASSERT(none.prepared[0].tokens == none.ids[0]);
+    TEST_ASSERT(none.calls_after[0] == 0);
+    TEST_ASSERT(none.prepared[0].pflash_stats["unified"].value("reason", "") == "no_region");
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_line_model_json_string_served) {
+    // A JSON-wrapped read (the shape some harnesses return): numbered lines inside a string field.
+    std::string body;
+    for (int i = 1; i <= 80; ++i) {
+        body += std::to_string(i) + "|row " + std::to_string(i) + (i == 33 ? " kiwi" : "") + "\n";
+    }
+    const std::string wrapped = json({{"content", body}, {"total_lines", 80}, {"truncated", false}}).dump();
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Which row mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "rows.txt"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", wrapped}},
+    });
+    const auto run = run_unified_session({turn}, tools, "read_file", 64, unified_fruit_score, /*chunk=*/7);
+    const auto & prepared = run.prepared[0];
+    TEST_ASSERT_MSG(prepared.compressed, prepared.pflash_stats.dump());
+    const json & admission = prepared.pflash_stats["unified"]["admission"][0];
+    TEST_ASSERT(admission.value("escaped_lines", false));
+    const std::string & served = run.served_text[0];
+    const size_t open = served.rfind("<tool_response>\n");
+    const size_t close = served.find("\n</tool_response>", open);
+    TEST_ASSERT(open != std::string::npos && close != std::string::npos);
+    const json result = json::parse(served.substr(open + 16, close - open - 16), nullptr, false);
+    TEST_ASSERT_MSG(!result.is_discarded(), served.substr(open, 400));
+    TEST_ASSERT(result.value("total_lines", 0) == 80);
+    TEST_ASSERT(result.value("truncated", true) == false);
+    const std::string content = result.value("content", "");
+    TEST_ASSERT(content.find("1|row 1\n2|row 2\n[Server note: this tool result was shortened:") == 0);
+    TEST_ASSERT(content.find("33|row 33 kiwi\n") != std::string::npos);
+    TEST_ASSERT(content.find(" lines not shown \xE2\x80\xA6]\n") != std::string::npos);
+    TEST_ASSERT(content.find("\n79|row 79\n80|row 80\n") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_user_question_only) {
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "doc.md"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"},
+         {"content", unified_doc(80, {{7, "kiwi"}, {60, "mango"}})}},
+    });
+    // An agent step: another call and a small result. No recall, no drafter pass; the view continues.
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+        unified_tool_call("call_2", "read_file", {{"path", "note.md"}})})}});
+    turn2.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "short note"}});
+    // The answer, then a new user question: recall at the question.
+    json turn3 = turn2;
+    turn3.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn3.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2, turn3}, tools, "read_file", 64, unified_fruit_score);
+    TEST_ASSERT(run.calls_after == std::vector<int>({1, 1, 2}));
+    TEST_ASSERT(run.prepared[1].pflash_stats["unified"].value("decision", "") == "continue");
+    TEST_ASSERT(run.prepared[2].pflash_stats["unified"].value("decision", "") == "recall");
+    for (size_t turn = 1; turn < 3; ++turn) {
+        const int vg = run.prepared[turn - 1].snapshot_cut;
+        TEST_ASSERT(std::equal(run.prepared[turn - 1].tokens.begin(), run.prepared[turn - 1].tokens.begin() + vg,
+                               run.prepared[turn].tokens.begin()));
+    }
+    const std::string & s3 = run.served_text[2];
+    const size_t block = s3.find("[Earlier in this conversation]\n[From the earlier result of read_file "
+                                 "{\"path\":\"doc.md\"}]\n");
+    TEST_ASSERT_MSG(block != std::string::npos, s3);
+    TEST_ASSERT(s3.find("Line 60: plain filler text here mango\n", block) != std::string::npos);
+    TEST_ASSERT(s3.find("short note") < block);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_frontier_cold_large_history_never_paged) {
+    // A cold transcript: a large paste in turn 1 and a large listed tool output in turn 2, the newest turn a short
+    // question. Nothing before the newest turn is ever paged: raw, no drafter pass.
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", unified_doc(80, {{7, "kiwi"}}) + "Summarise this."}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "doc.md"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", unified_doc(80, {}, "T")}},
+        {{"role", "assistant"}, {"content", "Done."}},
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+    });
+    const auto run = run_unified_session({turn}, tools, "read_file", 64, unified_fruit_score);
+    TEST_ASSERT(!run.prepared[0].compressed);
+    TEST_ASSERT(run.prepared[0].tokens == run.ids[0]);
+    TEST_ASSERT(run.calls_after[0] == 0);
+    TEST_ASSERT(run.prepared[0].pflash_stats["unified"]["admission"][0].value("decision", "") == "small");
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_reread_never_paged_and_holds_units) {
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Which line mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "doc.md"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", doc}},
+    });
+    // The agent reads the whole file again: a re-read, served verbatim.
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+        unified_tool_call("call_2", "read_file", {{"path", "doc.md"}, {"offset", 1}})})}});
+    turn2.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", doc}});
+    json turn3 = turn2;
+    turn3.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn3.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2, turn3}, tools, "read_file", 64, unified_fruit_score);
+    const json & admission = run.prepared[1].pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission[0].value("decision", "") == "reread", admission.dump());
+    TEST_ASSERT(run.prepared[1].pflash_stats["unified"].value("reread_held_units", 0) > 0);
+    TEST_ASSERT(run.calls_after[1] == 1);
+    // Everything was re-read: the question finds nothing to recall.
+    TEST_ASSERT(run.served_text[2].find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.unified["counts"].value("recall.empty", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_coverage_bound_worst_case) {
+    // A scorer that ranks every unit: questions recall until the whole region is held, then nothing more.
+    const std::string doc = unified_doc(80, {});
+    json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Question 0?"}},
+    });
+    std::vector<json> turns{turn};
+    for (int q = 1; q <= 8; ++q) {
+        turn.push_back({{"role", "assistant"}, {"content", "Ok."}});
+        turn.push_back({{"role", "user"}, {"content", "Question " + std::to_string(q) + "?"}});
+        turns.push_back(turn);
+    }
+    const auto run = run_unified_session(turns, nullptr, nullptr, 64, nullptr);
+    const std::string & last = run.served_text.back();
+    for (int line = 1; line <= 80; ++line) {
+        TEST_ASSERT_MSG(unified_occurrences(last, "Line " + std::to_string(line) + ":") == 1, std::to_string(line));
+    }
+    // Once everything is back, a question appends nothing: the view grows by the new turn's raw tokens only.
+    TEST_ASSERT(run.unified["counts"].value("recall.empty", 0) >= 1);
+    const size_t n = run.prepared.size();
+    TEST_ASSERT(run.prepared[n - 1].pflash_stats["unified"].value("decision", "") == "continue");
+    const int grown = (int) run.prepared[n - 1].tokens.size() - (int) run.prepared[n - 2].tokens.size();
+    const int raw_grown = (int) run.ids[n - 1].size() - (int) run.ids[n - 2].size();
+    TEST_ASSERT(grown == raw_grown);
+    // Cumulative appended by recall never exceeds what paging dropped plus labels and wrappers.
+    int recalled = 0;
+    for (size_t turn = 1; turn < n; ++turn) {
+        const json & recall = run.prepared[turn].pflash_stats["unified"]["recall"];
+        if (recall.is_array()) for (const auto & region : recall) recalled = region.value("cumulative_tokens", 0);
+    }
+    const json & paged = run.prepared[0].pflash_stats["unified"]["admission"][0];
+    TEST_ASSERT(recalled > 0);
+    TEST_ASSERT(recalled <= paged.value("region_tokens", 0) - paged.value("kept_tokens", 0) + 400);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_recall_off_flag) {
+    const std::string doc = unified_doc(80, {{7, "kiwi"}, {60, "mango"}});
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which line mentions KIWI?"}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", "Line 7."}});
+    turn2.push_back({{"role", "user"}, {"content", "Which line mentions MANGO?"}});
+    const auto run = run_unified_session({turn1, turn2}, nullptr, nullptr, 64, unified_fruit_score, 0, 0.3f, "0");
+    TEST_ASSERT(run.calls_after == std::vector<int>({1, 1}));
+    TEST_ASSERT(run.served_text[1].find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.prepared[1].pflash_stats["unified"].value("decision", "") == "continue");
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_experimental_flags_fail_startup) {
+    const std::string path = write_pflash_bpe_tokenizer_fixture({"a"}, "abc");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    ServerConfig config;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    luce_test::ScopedEnvVar unified{"PFLASH_UNIFIED", "1"};
+    {
+        luce_test::ScopedEnvVar arm{"PFLASH_UNIFIED_DEFRAG", "1"};
+        LuceEngine engine(std::make_unique<MockBackend>());
+        bool threw = false;
+        try {
+            HttpServer server(engine, tokenizer, config);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        TEST_ASSERT(threw);
+    }
+    {
+        luce_test::ScopedEnvVar tools{"PFLASH_REGION_TOOLS", "read_file,,grep"};
+        LuceEngine engine(std::make_unique<MockBackend>());
+        bool threw = false;
+        try {
+            HttpServer server(engine, tokenizer, config);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        TEST_ASSERT(threw);
+    }
     unlink(path.c_str());
 }

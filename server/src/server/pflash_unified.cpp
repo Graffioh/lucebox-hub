@@ -23,75 +23,6 @@ bool json_ws(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
-// The decoded bytes of an escaped (JSON string) span; malformed escapes are kept as written.
-std::string json_unescape(const std::string & text, size_t begin, size_t end) {
-    std::string out;
-    out.reserve(end - begin);
-    auto hex4 = [&](size_t at, uint32_t & v) {
-        if (at + 4 > end) return false;
-        v = 0;
-        for (size_t k = at; k < at + 4; ++k) {
-            const char c = text[k];
-            v <<= 4;
-            if (c >= '0' && c <= '9') v |= (uint32_t) (c - '0');
-            else if (c >= 'a' && c <= 'f') v |= (uint32_t) (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') v |= (uint32_t) (c - 'A' + 10);
-            else return false;
-        }
-        return true;
-    };
-    auto put_utf8 = [&](uint32_t cp) {
-        if (cp < 0x80) {
-            out += (char) cp;
-        } else if (cp < 0x800) {
-            out += (char) (0xC0 | (cp >> 6));
-            out += (char) (0x80 | (cp & 0x3F));
-        } else if (cp < 0x10000) {
-            out += (char) (0xE0 | (cp >> 12));
-            out += (char) (0x80 | ((cp >> 6) & 0x3F));
-            out += (char) (0x80 | (cp & 0x3F));
-        } else {
-            out += (char) (0xF0 | (cp >> 18));
-            out += (char) (0x80 | ((cp >> 12) & 0x3F));
-            out += (char) (0x80 | ((cp >> 6) & 0x3F));
-            out += (char) (0x80 | (cp & 0x3F));
-        }
-    };
-    size_t i = begin;
-    while (i < end) {
-        if (text[i] != '\\' || i + 1 >= end) {
-            out += text[i++];
-            continue;
-        }
-        const char c = text[i + 1];
-        switch (c) {
-            case 'n': out += '\n'; i += 2; continue;
-            case 't': out += '\t'; i += 2; continue;
-            case 'r': out += '\r'; i += 2; continue;
-            case 'b': out += '\b'; i += 2; continue;
-            case 'f': out += '\f'; i += 2; continue;
-            case '"': case '\\': case '/': out += c; i += 2; continue;
-            case 'u': {
-                uint32_t v = 0;
-                if (!hex4(i + 2, v)) break;
-                size_t used = 6;
-                if (v >= 0xD800 && v < 0xDC00 && i + 12 <= end && text[i + 6] == '\\' && text[i + 7] == 'u') {
-                    uint32_t lo = 0;
-                    if (hex4(i + 8, lo) && lo >= 0xDC00 && lo < 0xE000) {
-                        v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
-                        used = 12;
-                    }
-                }
-                put_utf8(v);
-                i += used;
-                continue;
-            }
-            default: break;
-        }
-        out += text[i++];
-    }
-    return out;
-}
 
 uint64_t fnv1a(const std::string & s) {
     uint64_t h = 1469598103934665603ull;
@@ -300,6 +231,76 @@ bool layout_region(const Lines & lines, const std::vector<size_t> & common,
 }
 
 // ── Text ────────────────────────────────────────────────────────────────
+
+std::string json_unescape(const std::string & text, size_t begin, size_t end) {
+    std::string out;
+    out.reserve(end - begin);
+    auto hex4 = [&](size_t at, uint32_t & v) {
+        if (at + 4 > end) return false;
+        v = 0;
+        for (size_t k = at; k < at + 4; ++k) {
+            const char c = text[k];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= (uint32_t) (c - '0');
+            else if (c >= 'a' && c <= 'f') v |= (uint32_t) (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= (uint32_t) (c - 'A' + 10);
+            else return false;
+        }
+        return true;
+    };
+    auto put_utf8 = [&](uint32_t cp) {
+        if (cp < 0x80) {
+            out += (char) cp;
+        } else if (cp < 0x800) {
+            out += (char) (0xC0 | (cp >> 6));
+            out += (char) (0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out += (char) (0xE0 | (cp >> 12));
+            out += (char) (0x80 | ((cp >> 6) & 0x3F));
+            out += (char) (0x80 | (cp & 0x3F));
+        } else {
+            out += (char) (0xF0 | (cp >> 18));
+            out += (char) (0x80 | ((cp >> 12) & 0x3F));
+            out += (char) (0x80 | ((cp >> 6) & 0x3F));
+            out += (char) (0x80 | (cp & 0x3F));
+        }
+    };
+    size_t i = begin;
+    while (i < end) {
+        if (text[i] != '\\' || i + 1 >= end) {
+            out += text[i++];
+            continue;
+        }
+        const char c = text[i + 1];
+        switch (c) {
+            case 'n': out += '\n'; i += 2; continue;
+            case 't': out += '\t'; i += 2; continue;
+            case 'r': out += '\r'; i += 2; continue;
+            case 'b': out += '\b'; i += 2; continue;
+            case 'f': out += '\f'; i += 2; continue;
+            case '"': case '\\': case '/': out += c; i += 2; continue;
+            case 'u': {
+                uint32_t v = 0;
+                if (!hex4(i + 2, v)) break;
+                size_t used = 6;
+                if (v >= 0xD800 && v < 0xDC00 && i + 12 <= end && text[i + 6] == '\\' && text[i + 7] == 'u') {
+                    uint32_t lo = 0;
+                    if (hex4(i + 8, lo) && lo >= 0xDC00 && lo < 0xE000) {
+                        v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                        used = 12;
+                    }
+                }
+                put_utf8(v);
+                i += used;
+                continue;
+            }
+            default: break;
+        }
+        out += text[i++];
+    }
+    return out;
+}
+
 
 std::string json_escape(const std::string & text) {
     static const char * hex = "0123456789abcdef";

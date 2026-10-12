@@ -31,6 +31,7 @@
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
 #include "sse_emitter.h"
+#include "pflash_unified.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -966,6 +967,16 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
+    // PFLASH_UNIFIED=1, after the shared query and pins (A1): pages the newest turn's large uncached content
+    // (a user message, or listed tool outputs), continues the conversation's view, and recalls unheld units of
+    // earlier regions at a new user question. ``request`` carries the drafter ids, the pinned spans and the
+    // learned query; ``messages`` the normalised messages the prompt was rendered from. ``not_ready``
+    // non-empty: served raw for that reason.
+    std::string apply_unified_view(const ParsedRequest & req, PreparedPrompt & prepared,
+                                   const http_detail::PflashChatTurnSpan & turn,
+                                   const std::vector<ChatMessage> & messages,
+                                   ModelBackend::CompressRequest request, int chunk_size,
+                                   const std::string & not_ready);
     // Multi-turn: serve the conversation's previous view plus this turn's
     // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
     // the parts the fresh selection keeps -- with the segments the fresh
@@ -1179,6 +1190,15 @@ private:
     // Multi-turn PFlash views, matched by raw prompt prefix.
     http_detail::PflashChatViewStore pflash_views_;
 
+    // PFLASH_UNIFIED=1, read once at construction (STAGE1-DESIGN.md): one view and recall mechanism for chat
+    // and agent sessions. Unset, none of it runs and nothing below is read.
+    bool pflash_unified_ = false;
+    bool pflash_unified_recall_ = true;
+    pflash_unified::ToolList pflash_region_tools_;
+    std::string pflash_unified_config_;   // config identity a stored view must match
+    pflash_unified::ViewStore pflash_unified_views_;
+    std::atomic<uint64_t> pflash_unified_lineage_{0};
+
     // Live status tracker (read by /status/json, written by worker thread).
     ServerStatus status_;
 
@@ -1261,8 +1281,11 @@ private:
     std::map<std::string, uint64_t> pflash_refused_reasons_;    // refused, by why
     // Tool-session decisions, by name (/props pflash.keep_history).
     std::map<std::string, uint64_t> pflash_keep_history_counts_;
+    // Unified decisions and events, by name (/props pflash.unified).
+    std::map<std::string, uint64_t> pflash_unified_counts_;
     nlohmann::json pflash_failure_counters_json() const;
     nlohmann::json pflash_keep_history_json() const;
+    nlohmann::json pflash_unified_json() const;
 
     // Active client thread tracking.
     std::atomic<int>                active_clients_{0};

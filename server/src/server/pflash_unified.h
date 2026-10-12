@@ -99,6 +99,8 @@ enum class RegionKind { UserContent, ToolOutput };
 
 // ``text`` escaped for the inside of a JSON string.
 std::string json_escape(const std::string & text);
+// The decoded bytes of text[begin, end) read as the inside of a JSON string; malformed escapes stay as written.
+std::string json_unescape(const std::string & text, size_t begin, size_t end);
 
 std::string marker_text(int lines_not_shown);
 std::string preamble_text(RegionKind kind, int shown_lines, int total_lines);
@@ -172,6 +174,7 @@ struct Region {
     std::string content_sha;             // hex digest of the raw content bytes
     size_t cb = 0, ce = 0;               // content bytes in the rendered prompt text
     int tb = 0, te = 0;                  // target tokens of the content
+    int db = 0, de = 0;                  // drafter tokens of the content
     Lines lines;
     Layout layout;
     std::vector<uint64_t> hashes;        // line_hashes(lines)
