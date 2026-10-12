@@ -35,6 +35,16 @@ int pflash_scoring_exact_rows_end(int S);
 // <= ``cap``; else 0 (a fresh call).
 int pflash_scoring_resume(int checkpoint, int shared, int S, int cap);
 
+// Token capacity of a new or regrown scoring session for an ``S``-token prompt: S + S/2 + 4096 (headroom, so later
+// turns of the conversation append without reallocating), but never past ``ctx_limit`` rounded up to 256 (the
+// longest prompt the session can be asked to hold: the target's max context and the drafter's trained context;
+// <= 0 = no limit) and never below S rounded up to 256 (what this call needs).
+int pflash_session_capacity(int S, int ctx_limit);
+
+// The session token limit from the drafter's trained context and the serving engine's max context: the smaller of
+// the two that are > 0, or 0 when neither is.
+int pflash_session_ctx_limit(int drafter_ctx, int engine_max_ctx);
+
 // Exact F32 block-14 rows of query token sets (the query step's candidate and END sets), kept per session for later
 // turns whose activations are gone. Only sets whose last token is below the storing call's exact-rows end are put.
 class PFlashExactRowSets {

@@ -107,6 +107,10 @@ struct Qwen35DrafterState {
     TargetWeights weights;
     std::string gguf_path;
     std::string gguf_sha256;
+    int ctx_train = 0;           // the drafter GGUF's <arch>.context_length (0: absent)
+    // Longest prompt a scoring session is sized for (pflash_session_ctx_limit of ctx_train and the engine's max
+    // context, DrafterContext::engine_max_ctx); set at every scoring call. 0 = no limit.
+    int session_ctx_limit = 0;
     ggml_context *        head_ctx = nullptr;
     ggml_backend_buffer_t head_buf = nullptr;
     ggml_tensor *         head_wq  = nullptr;  // [hidden, n_head * head_dim], query rows only

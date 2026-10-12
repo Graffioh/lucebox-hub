@@ -1301,6 +1301,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
             return results;
         }
         drafter_loaded_ = true;
+        drafter_ctx_.engine_max_ctx = cfg_.device.max_ctx;   // scoring sessions are never sized past it
         std::fprintf(stderr, "[compress] drafter ready\n");
         // pflash + kvflash synergy: the drafter doubles as the pool's
         // Memory Indexer (tau-step reselect). Pager stays LRU without it.

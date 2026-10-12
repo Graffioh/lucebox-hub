@@ -626,6 +626,10 @@ bool load_qwen35_drafter(const std::string & gguf_path,
                          DrafterContext & out) {
     auto * st = new Qwen35DrafterState();
     st->gguf_path = gguf_path;
+    {
+        const auto meta = read_gguf_metadata(gguf_path, /*compute_sha256=*/ false);
+        st->ctx_train = meta.ok && meta.context_length > 0 ? meta.context_length : 0;
+    }
     // The scorer never needs logits, and tied-embedding Qwen3.5-0.8B
     // exports omit output.weight, so skip the lm_head entirely.
     TargetLoadPlan plan;

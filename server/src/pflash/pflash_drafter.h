@@ -43,6 +43,9 @@ struct DrafterContext {
     Qwen35DrafterState *  state   = nullptr;   // owned scorer weights + heads
     int                   gpu     = -1;
     bool                  loaded  = false;
+    // The serving engine's max context (its --max-ctx), set by the owner after load_drafter(); scoring sessions are
+    // never sized past it (nor past the drafter's trained context). 0 = unknown: the drafter's context alone.
+    int                   engine_max_ctx = 0;
     // Scoring sessions copied to host RAM by drafter_offload_sessions() while
     // the drafter is released; free_drafter() keeps them, the next scoring
     // call restores them (qwen35_drafter.h).

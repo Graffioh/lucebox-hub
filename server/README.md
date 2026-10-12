@@ -495,6 +495,10 @@ settings it was stored with; anything else drops it, and the call scores
 from token 0.
 `--draft-residency persistent` keeps the sessions on the GPU and copies
 nothing.
+A new session is sized with headroom (S + S/2 + 4096 tokens for an S-token
+prompt) so later turns append without reallocating, but never past the
+engine's `--max-ctx` or the drafter's trained context, and never below the
+prompt itself.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through

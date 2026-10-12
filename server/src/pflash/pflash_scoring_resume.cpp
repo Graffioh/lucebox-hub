@@ -58,4 +58,17 @@ int PFlashExactRowSets::invalidate_from(int position) {
     return (int) (before - sets_.size());
 }
 
+int pflash_session_capacity(int S, int ctx_limit) {
+    const auto align256 = [](long v) { return (v + 255) / 256 * 256; };
+    const long need = align256(std::max(S, 0));
+    long want = (long) S + S / 2 + 4096;
+    if (ctx_limit > 0) want = std::min(want, align256(ctx_limit));
+    return (int) std::max(need, want);
+}
+
+int pflash_session_ctx_limit(int drafter_ctx, int engine_max_ctx) {
+    if (drafter_ctx > 0 && engine_max_ctx > 0) return std::min(drafter_ctx, engine_max_ctx);
+    return std::max(std::max(drafter_ctx, engine_max_ctx), 0);
+}
+
 } // namespace luce::pflash

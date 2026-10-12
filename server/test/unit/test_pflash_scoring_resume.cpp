@@ -122,3 +122,30 @@ TEST_CASE(PFlashScoringResumeFixture, query_sets_store_exact_rows_only) {
     CHECK(sets.invalidate_from(30) == 1);
     CHECK(sets.size() == 0);
 }
+
+// Session capacity: headroom S + S/2 + 4096, clamped to the context limit, never below S padded to 256.
+TEST_CASE(PFlashScoringResumeFixture, session_capacity_is_headroom_clamped_to_the_context_limit) {
+    using luce::pflash::pflash_session_capacity;
+    CHECK(pflash_session_capacity(100000, 0) == 100000 + 50000 + 4096);
+    CHECK(pflash_session_capacity(100000, 262144) == 100000 + 50000 + 4096);
+    CHECK(pflash_session_capacity(200000, 262144) == 262144);
+    CHECK(pflash_session_capacity(217177, 225280) == 225280);
+    CHECK(pflash_session_capacity(250000, 225280) == 250112);   // the prompt itself always fits (padded to 256)
+    CHECK(pflash_session_capacity(200000, 225000) == 225024);   // limit rounded up to 256
+    for (int S : {1, 255, 256, 8191, 65536, 131071, 225279, 262144}) {
+        for (int limit : {0, 1, 4096, 131072, 225280, 262144}) {
+            const int c = pflash_session_capacity(S, limit);
+            CHECK(c >= (S + 255) / 256 * 256);
+            CHECK(c <= std::max((S + 255) / 256 * 256, limit > 0 ? (limit + 255) / 256 * 256 : S + S / 2 + 4096));
+        }
+    }
+}
+
+TEST_CASE(PFlashScoringResumeFixture, session_ctx_limit_is_the_smaller_known_context) {
+    using luce::pflash::pflash_session_ctx_limit;
+    CHECK(pflash_session_ctx_limit(262144, 225280) == 225280);
+    CHECK(pflash_session_ctx_limit(262144, 0) == 262144);
+    CHECK(pflash_session_ctx_limit(0, 139264) == 139264);
+    CHECK(pflash_session_ctx_limit(0, 0) == 0);
+    CHECK(pflash_session_ctx_limit(-1, 8192) == 8192);
+}

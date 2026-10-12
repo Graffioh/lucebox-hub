@@ -783,7 +783,8 @@ Qwen35ScoringSession * acquire_scoring_session(
     if (target->capacity < S_padded) {
         free_qwen35_scoring_session(*target);
         // Headroom so the next turns append without reallocating.
-        const int capacity = limit == 0 ? S_padded : S + S / 2 + 4096;
+        const int capacity = limit == 0 ? S_padded
+                                        : luce::pflash::pflash_session_capacity(S, st.session_ctx_limit);
         if (!allocate_scoring_session(w, capacity, *target)) {
             set_last_error("qwen35 scoring session allocation failed");
             return nullptr;
@@ -1042,7 +1043,7 @@ void qwen35_restore_sessions(DrafterContext & ctx, Qwen35DrafterState & st, cons
     // grew would have; the stored prefix goes into the longer tensors unchanged.
     const int S = (int) ids.size();
     int capacity = host.bookkeeping.capacity;
-    if (capacity < align_up_i(S, 256)) capacity = S + S / 2 + 4096;
+    if (capacity < align_up_i(S, 256)) capacity = luce::pflash::pflash_session_capacity(S, st.session_ctx_limit);
     auto session = std::make_unique<Qwen35ScoringSession>();
     if (host.bookkeeping.capacity <= 0 ||
         !allocate_scoring_session(st.weights, capacity, *session)) {
@@ -3175,6 +3176,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
     // Sessions offloaded when the drafter was last released come back before
     // any scoring (the strict scorer is the only one that reads them).
+    st->session_ctx_limit = luce::pflash::pflash_session_ctx_limit(st->ctx_train, ctx.engine_max_ctx);
     qwen35_restore_sessions(ctx, *st, ids);
     // Strict budget selection scores with the block-15 head; the
     // legacy all-layer running-max scorer stays available for legacy

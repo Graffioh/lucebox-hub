@@ -1383,6 +1383,7 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
             return result;
         }
         pflash_drafter_loaded_ = true;
+        pflash_drafter_.engine_max_ctx = cfg_.device.max_ctx;   // scoring sessions are never sized past it
         std::fprintf(stderr, "[target-split][compress] drafter ready\n");
     }
 
