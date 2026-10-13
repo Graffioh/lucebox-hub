@@ -17,6 +17,7 @@
 #include "client_send_buffer.h"
 #include "common/model_backend.h"
 #include "common/concurrency/paged_kv_offload.h"
+#include "common/output_constraint.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -255,10 +256,14 @@ struct ServerConfig {
 
     // Disk prefix cache
     std::string disk_cache_dir;             // empty = disabled
-    size_t      disk_cache_budget_mb = 4096; // max disk usage in MB
+    size_t      disk_cache_budget_mb = 131072; // max disk usage in MB (128 GB)
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
+    double      disk_cache_ttl_hours = 72.0;  // delete files unused this long (0 = never)
+    // Graceful shutdown writes the RAM snapshots to disk (one last
+    // eviction) for at most this long; < 0 = no limit.
+    double      disk_cache_shutdown_flush_s = 120.0;
     DiskPrefixCachePolicy disk_cache_policy;
 
     // Optional Jinja chat template (overrides the hardcoded ChatFormat::QWEN3
@@ -296,6 +301,23 @@ bool should_clamp_flowkv_disk_cache(
 // Agent clients append system notes (a context budget, reminders) after
 // the tool results; those notes are append-only history too.
 bool ends_with_tool_result(const std::vector<ChatMessage> & messages);
+// Structured output. The format object a request asks its output to follow:
+// response_format (chat completions), text.format (responses) or
+// output_format (messages); null when it asks for none. Read from the body
+// text as ordered JSON, so the grammar keeps the schema's property order.
+nlohmann::ordered_json request_output_format(const std::string & body);
+// The JSON schema a format object asks for. False with `error` set for an
+// unsupported format type; true with a null schema for plain text.
+bool output_format_schema(const nlohmann::ordered_json & format,
+                          nlohmann::ordered_json & schema, std::string & error);
+// Whether tool_choice obliges the reply to call a tool ("required", or a
+// named function in any of the three APIs).
+bool tool_choice_requires_call(const json & tool_choice);
+// The grammar for a constrained reply: optional leading whitespace, then the
+// schema's JSON (when a schema is given) or a tool call that starts with one
+// of `tool_openers` (when given). Throws on a schema it cannot convert.
+std::string output_constraint_grammar(const nlohmann::ordered_json & schema,
+                                      const std::vector<std::string> & tool_openers);
 bool canonical_turn_matches_checkpoint(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & completed_turn,
@@ -763,6 +785,9 @@ struct ParsedRequest {
     json                      messages;
     // Original request body (for upstream proxy forwarding)
     json                      raw_body;
+    // Structured output format (http_detail::request_output_format), null
+    // when the request asks for none.
+    nlohmann::ordered_json    output_format;
     // Response ID
     std::string               response_id;
     // Thinking/reasoning state
@@ -1061,6 +1086,33 @@ private:
         bool visible_output_seen, bool client_disconnected,
         bool replay_cache);
     void forget_inline_slot_metadata(int slot);
+    // Free a RAM snapshot slot for reuse, writing it to disk first when
+    // PrefixCache::persist_on_evict() says so (see persist_evicted_slot).
+    void evict_inline_slot(int slot);
+    // Just before `reservation` commits: write (when persist_on_evict says
+    // so) and free the further entries its resident-budget plan evicts
+    // (PrefixCache::InlineReservation::extra_victim_slots). The commit then
+    // drops their metadata. A capture that fails never gets here.
+    void evict_extra_victims(const PrefixCache::InlineReservation & reservation);
+    // Disk persistence (docs/PREFIX_CACHE.md): a snapshot is written only
+    // when it leaves RAM, never after every turn. Hands the payload of
+    // `slot` to the disk writer when `persist` is set and the slot has a disk
+    // key (slot_tokens_); the slot is left empty. Returns true when queued.
+    bool persist_evicted_slot(int slot, bool persist, const char * reason);
+    // Slots committed during the current request get this request's
+    // tool-call replay text (slot_aux_) once its response is known.
+    void note_session_slot(int slot);
+    void record_session_aux(const ParsedRequest & req, const SseEmitter & emitter);
+    // The tool-call replay text a session's prompt was rendered with
+    // (ToolMemory), stored with its disk snapshot so a restart renders the
+    // same tokens; restored into ToolMemory at startup.
+    std::string session_replay_blob(const ParsedRequest & req,
+                                    const SseEmitter * emitter);
+    void restore_replay_blobs();
+    // Graceful shutdown: evict every RAM snapshot to disk (newest of each
+    // conversation and the heads; not edit backups), bounded by
+    // disk_cache_shutdown_flush_s.
+    void flush_sessions_to_disk(const char * reason);
     // After a commit in `slot`: free the snapshots it supersedes, then evict
     // until committed snapshots fit the resident budget again.
     void trim_snapshots_after_commit(int slot);
@@ -1138,8 +1190,17 @@ private:
         const std::vector<ChatMessage> & chat_messages,
         const ParsedRequest & req, bool add_generation_prompt,
         std::string & rendered, std::string & error);
-    bool validate_request_context(SocketHandle fd, const ParsedRequest & req,
-                                  bool send_failure = true);
+    // A direct request's max_tokens is trimmed to the context its prompt
+    // leaves; a routed one (another model may hold it whole) is refused
+    // without a response, so the router can try the next model.
+    bool validate_request_context(SocketHandle fd, ParsedRequest & req,
+                                  bool routed = false);
+    // Constrain the reply to the request's structured output format and
+    // tool_choice (common/output_constraint.h). False after sending a 400
+    // for a format it cannot serve.
+    bool attach_output_constraint(SocketHandle fd, ParsedRequest & req);
+    // Every token's text, built on first use and shared by all requests.
+    std::shared_ptr<const ConstraintVocab> output_constraint_vocab();
     void log_parsed_request(const ParsedRequest & req) const;
     RoutingAdmission enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
                                   bool report_admission = false);
@@ -1170,6 +1231,8 @@ private:
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
     ChatFormat       chat_format_;
+    std::once_flag   constraint_vocab_once_;
+    std::shared_ptr<const ConstraintVocab> constraint_vocab_;
     PFlashDrafterIpcClient pflash_remote_;
     ToolMemory       tool_memory_;
     PrefixCache      prefix_cache_;
@@ -1201,9 +1264,12 @@ private:
     std::string status_html_path_;
     std::string resolve_status_html();
 
-    // Track prompt tokens for each snapshot slot (for shutdown save).
+    // Disk key of each RAM snapshot slot (written on eviction/shutdown).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::unordered_set<int> agent_turn_cache_slots_;
+    // Replay blob stored with each slot's disk snapshot.
+    std::unordered_map<int, std::string> slot_aux_;
+    std::vector<int> request_session_slots_;
 
     // Memory held by the live cache and saved snapshots, rebuilt on the
     // generation thread after each request and read by /props (see

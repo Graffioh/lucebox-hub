@@ -90,10 +90,138 @@ when the selected boundary advances beyond the restored prefix.
 The disk prefix cache is a separate persistence/overflow layer for token-keyed
 snapshots. Today it is integrated with the inline/effective-prompt path; exact
 prefill snapshots are kept in RAM unless a dedicated raw-prompt disk path is
-added. With the default `full` policy a lookup probes the whole prompt and
-then every chat boundary, deepest first, so a restart recovers the inline
-snapshots the previous process persisted (probes are index lookups; only a
-hit reads a file).
+added. With the default `full` policy a lookup probes the whole prompt, every
+chat boundary and the deepest stored entry that prefixes the prompt, deepest
+first, so a restart recovers the sessions the previous process persisted
+(probes are index lookups; only a hit reads a file). See
+[Disk Session Cache](#disk-session-cache).
+
+## Disk Session Cache
+
+The disk session cache keeps agent and chat sessions on an SSD, so a session
+whose RAM snapshots are gone (another session evicted them, the server
+restarted, the user switched model) restores its KV and prefills only the new
+suffix. It is on by default.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--kv-cache-dir <path>\|off` | `$XDG_CACHE_HOME/lucebox/kv-cache`, else `~/.cache/lucebox/kv-cache` | Directory of the cache; `off` (or `--no-kv-cache`) disables it. |
+| `--kv-cache-budget <MB>` | `131072` (128 GB) | Hard cap on the bytes of all snapshot files, clamped to the free space. |
+| `--kv-cache-ttl <hours>` | `72` | Delete files unused for this long; `0` = never. |
+| `--kv-cache-shutdown-flush <s>` | `120` | Longest a graceful shutdown spends writing RAM snapshots; `-1` = no limit. |
+| `--kv-cache-cold-max <N>` | `10240` | Longest head kept when a deeper state of its session is written; cold-head checkpoints without RAM slots. |
+| `--kv-cache-interval <N>` | `10240` | Continued checkpoint pacing (fallback without RAM slots). |
+
+**When something is written.** Only when a snapshot leaves RAM, never after a
+turn:
+
+- a RAM eviction: a new snapshot takes the slot of an older one (its
+  reservation's victim), the resident budget evicts several to make room for
+  a large one (see *Several evictions for one capture*), or it evicts one
+  after a commit;
+- a graceful shutdown (SIGTERM/SIGINT): one last eviction of everything still
+  in RAM, most recently used first, for at most `--kv-cache-shutdown-flush`
+  seconds. The log line `[disk-cache] shutdown flush:` gives the sessions,
+  files, bytes and seconds, and what the limit dropped.
+
+A crash, `kill -9` or power loss loses what was only in RAM; the states written
+before it still restore. An active session therefore writes nothing while it
+stays resident: a 90-120K-token Qwen3.8-27B session with q4_0 KV is 1.5-2.2 GB
+per snapshot.
+
+**What is written.** Since #835 every request snapshots the end of its last
+message, a new turn's snapshot keeps the previous turn's one while the budget
+holds it (an edit of the last message resumes there), and the turns before it
+are pruned. On eviction (and at shutdown) the disk gets:
+
+- each conversation's newest snapshot: the inline snapshot of the last
+  request, or the agent-turn state with the generated reply (tool path,
+  `--agent-turn-cache`), on the single-sequence and the concurrent (paged)
+  paths alike;
+- the system/tools heads (protected pins and the shallowest entries).
+
+It does not get the kept previous turn (an *edit backup*) while a deeper
+snapshot of its conversation is resident (`PrefixCache::persist_on_evict`):
+it only serves an edit of the last message, which the deeper snapshot's file
+cannot, and writing it would double the bytes per conversation. Once the
+deeper snapshot is gone, the kept turn is that conversation's newest and is
+written like any other. Pruned (superseded) turns are not written either.
+When a session's state is written, its shallower files on disk are deleted,
+except a head at or below `--kv-cache-cold-max` tokens or, without one, the
+shallowest (a longer head).
+
+Compressed prompts (PFlash, FlowKV) are not raw history and never get a disk
+key; a request whose disk scope is not `full` gives its snapshots no key
+either.
+
+**How it is written.** Eviction hands the snapshot's buffer to the disk writer
+without a copy (Qwen keeps snapshots in host memory; other backends copy to
+host first) and the request continues at once. The snapshot is indexed
+immediately, counts against the budget, and a lookup serves it from memory
+until its file exists. A writer thread writes `<file>.tmp`, `fdatasync`s it,
+renames it into place and syncs the directory. Queued writes are bounded
+(4 GiB of payload); past that the evicting request waits, logged as
+`[disk-cache] waited`.
+
+**Restore.** With the default `full` policy a lookup probes the whole prompt,
+every chat boundary and the deepest stored key that prefixes the prompt
+(index lookups; only a hit reads a file). A disk state deeper than the best
+RAM hit wins over it: a session evicted to disk usually still matches the
+shared head in RAM. If that read fails, the RAM hit is used. The single-sequence path reads the
+file on the request that restores it (the only request running). The
+concurrent scheduler reads it on a reader thread while the request waits at
+the head of the queue and the live streams keep decoding, then restores it
+into the new sequence's pages through a staging checkpoint. A hit's state is
+bit-identical to the RAM snapshot it was written from (raw bytes in the
+cache's own type; q4_0 stays q4_0).
+
+A session's prompt is rendered with the exact text the model generated for
+its earlier tool calls (ToolMemory, which a new process does not have). Each
+file stores that replay text and startup loads it back into ToolMemory.
+
+**Budget.** Every layout directory under the cache directory is indexed, also
+files of another model or KV type, so the cap covers the whole directory. The
+budget never exceeds the cache's bytes plus the free space minus a reserve
+(the larger of 1 GiB and 5% of the disk, at most 16 GiB). Before a write the
+least recently used files are deleted until the new file fits. A hit rewrites
+the file's `last_used` field in place, so LRU order survives restarts.
+
+**TTL.** A file unused for longer than `--kv-cache-ttl` hours is deleted at
+startup, before each write, and when a lookup meets it.
+
+**Safety.**
+
+- Format v5 ends with an XXH64 checksum of the whole file (the header with
+  `last_used` zeroed). A hit verifies it while reading: a corrupt or partial
+  file is a logged miss, it is deleted and the prompt is prefilled. Startup
+  deletes leftover `.tmp` files, files of older formats and truncated files.
+- A file is restored only when its identity matches: model path, size, mtime
+  and a content fingerprint (SHA-1 of the first and last MiB), KV cache types,
+  K rotation, `--max-ctx`, chat template and draft model, plus the snapshot's
+  tensor names, types and shapes. Qwen checks every adopted tensor against the
+  live cache (the paged restore against the page table too).
+- Each file stores the exact key token ids; a hit compares them with the
+  prompt.
+- One server per directory: startup takes an exclusive lock on
+  `<dir>/.lock`; a second server on the same directory runs without a disk
+  cache and logs it.
+
+**Fallbacks without RAM slots.** With `--prefix-cache-slots 0` there is
+nothing to evict, so the older per-request checkpoints remain: the cold head
+(a prompt longer than `--kv-cache-cold-max` first prefills to the last chat
+boundary at or below it) and continued checkpoints. The `fixed`/`auto` disk
+scopes (`--disk-prefix-cache`) also keep their scoped-prefix write. All of
+them go through the same asynchronous writer.
+
+**Not covered.** Single-sequence `--paged-attention` keeps no snapshots, and
+the concurrent `qwen4exp` engine keeps its checkpoints outside the backend's
+snapshot slots: both run without a disk cache (logged at startup).
+
+**Follow-up: cache-aware admission.** Compression admission that counts the
+cached prefix as warm (on the PFlash branches, not on `main`) consults RAM
+only. `DiskPrefixCache::longest_prefix(prompt)` returns the deepest restorable
+key length and KV position without reading a file, so admission can take the
+max of the RAM and disk prefixes.
 
 ## Snapshot Memory Management
 
@@ -230,7 +358,7 @@ behind, keyed by the prompt plus the generated tokens the next request renders
 identically (see [Agent Turn Cache](API.md#agent-turn-cache)). Qwen defers that
 snapshot: while the next request continues the conversation it is never copied
 to system RAM, and it is copied out only before other work would overwrite the
-live state, or when the disk cache persists it at shutdown. Restoring the
+live state, or when it is evicted to disk. Restoring the
 snapshot the live state already holds copies nothing back either.
 
 Coding agents grow one conversation turn by turn, and each turn's snapshot is a
@@ -240,7 +368,9 @@ shared system/tools head) and protected tool pins. A conversation therefore
 holds about two snapshots instead of one per turn. Chains that are abandoned,
 for example after a client compacts its context, are bounded by
 `--prefix-cache-max-mib`: when a new snapshot would not fit, the cache replaces
-the oldest leaf first and skips the capture if nothing can make room. Snapshots
+the oldest leaf first. When no single entry makes enough room, it evicts several,
+least recently used first (see below), and skips the capture only if nothing
+can make room or the snapshot is larger than the whole limit. Snapshots
 the new one supersedes (including the one it restored from) count as freed,
 because they are pruned as soon as it is committed; a failed capture keeps them.
 After each commit the cache also evicts, oldest leaf first, until the committed
@@ -253,11 +383,27 @@ request runs, process memory can exceed the limit by up to one snapshot.
 Concurrent paged serving measures the exact backend allocation required for
 each checkpoint before copying it. The cache keeps committed checkpoints under
 `--concurrent-prefix-cache-max-mib`: when necessary it replaces one eligible least-recently-used
-entry, and if no single eligible entry can make enough room it skips the new
-checkpoint without disturbing the committed cache. The configured limit covers
-resident committed checkpoint buffers. During an atomic replacement, the new
-buffer and the selected victim can coexist briefly, so transient process memory
-can exceed the limit by up to one checkpoint.
+entry, and when no single eligible entry can make enough room it evicts several
+(below). The configured limit covers resident committed checkpoint buffers.
+During an atomic replacement, the new buffer and the entries it replaces can
+coexist briefly, so transient process memory can exceed the limit by up to one
+checkpoint.
+
+**Several evictions for one capture.** Both paths use the same rule. A capture
+that fits the limit at all, but that no single entry can make room for, plans
+several evictions, least recently used first: edit backups (not written to
+disk while their deeper snapshot is resident), then leaves. The plan never
+takes a protected pin, a head that other resident entries extend, the
+capture's own ancestors or restore source, or an entry another capture in
+flight writes, evicts or counts as freed. It is all or nothing: it exists only
+if the capture fits once those entries are gone, otherwise the capture is
+skipped and nothing is touched. The entries leave RAM only when the capture
+commits (the single-sequence path writes and frees them just before the
+commit), so a capture that fails or is cancelled evicts none of them; each one
+goes to the disk cache like any other eviction. Without this a long session
+that arrives after many short ones (subagent threads) was never captured, so
+it never reached the disk either. A checkpoint larger than the whole limit is
+still skipped (`budget_skips`).
 
 By default the limit is sized when the scheduler starts, from the batch
 engine's own estimate of one checkpoint at `--max-ctx`: every slot keeps its
@@ -284,6 +430,7 @@ cache staging, preventing disk loads from overwriting a live in-memory entry.
 | File | Role |
 |------|------|
 | `server/prefix_cache.{h,cpp}` | LRU logic, boundary detection, hashing |
+| `server/disk_prefix_cache.{h,cpp}` | Disk snapshots: file format, index, budget, TTL |
 | `common/snapshot_backend.h` | Platform-aware snapshot backend selection |
 | `common/model_backend.h` | `snapshot_save/free/used/cur_pos` interface |
 | `qwen35/qwen35_target_graph.cpp` | `snapshot_target_cache()`, `restore_target_cache()` |

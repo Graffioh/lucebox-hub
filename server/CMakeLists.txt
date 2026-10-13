@@ -714,6 +714,8 @@ add_library(luce_common STATIC
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/gbnf.cpp
+    src/common/output_constraint.cpp
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -742,6 +744,7 @@ add_library(luce_common STATIC
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
     src/server/tool_parser.cpp
+    src/server/json_schema_grammar.cpp
     src/server/tool_hint.cpp
     src/server/tool_memory.cpp
     src/server/response_error.cpp
@@ -2463,6 +2466,7 @@ if(LUCE_TESTS)
             test/unit/test_mmq_tile_selection.cpp
             test/unit/test_mixed_mmq_policy.cpp
             test/unit/test_spec_acceptance.cpp
+            test/unit/test_output_constraint.cpp
             test/unit/test_ds4_spec_sampling.cpp
             test/unit/test_ds4_env.cpp
             test/unit/test_kvflash_ubatch.cpp

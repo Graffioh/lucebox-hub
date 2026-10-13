@@ -179,6 +179,12 @@ public:
         bool active() const;
         int slot() const { return slot_; }
         int target_cut() const { return target_cut_; }
+        // Committed entries besides the slot's own victim that this capture
+        // evicts when it commits (see reserve_inline_snap), in eviction
+        // order. Only those still resident are listed. A caller that owns
+        // their payloads (the single-sequence path) writes and frees them
+        // just before the commit; the commit drops their metadata.
+        std::vector<int> extra_victim_slots() const;
 
         // Commit after the engine saved the payload, cancel before the target
         // slot was touched, or abort after a failed write invalidated it.
@@ -234,6 +240,13 @@ public:
     // With a `restore_point_spacing` (ModelBackend::restore_point_spacing), a
     // cut other than the end of the last message moves down to the deepest
     // spaced restore point, and nothing is reserved when that adds no prefix.
+    // Resident budget: when no single entry makes room for a capture that
+    // fits the budget at all, the reservation plans several, least recently
+    // used first (edit backups, then leaves); see the definition for what is
+    // never planned. All or nothing: a plan exists only when the capture
+    // fits once they are gone, else the capture is skipped and nothing is
+    // touched. They are evicted when it commits, never when it fails or is
+    // cancelled.
     InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
@@ -266,7 +279,37 @@ public:
     // Evicts committed entries, never `keep_slot` or protected pins, until the
     // resident bytes fit the budget again. Returns the evicted slots; the
     // caller frees their snapshot payloads.
-    std::vector<int> enforce_resident_budget(int keep_slot);
+    // `persist` (optional) gets persist_on_evict() of each evicted slot,
+    // decided before it was erased.
+    std::vector<int> enforce_resident_budget(
+        int keep_slot, std::vector<bool> * persist = nullptr);
+
+    // ── Disk persistence of evicted entries ─────────────────────────
+    // Whether the entry in `slot`, about to leave RAM, should be written to
+    // disk: every conversation's newest snapshot and the shared heads are;
+    // a previous turn kept only as an edit backup (see
+    // prune_superseded_ancestors) is not while a deeper snapshot of its
+    // conversation is resident. False when `slot` holds no entry.
+    bool persist_on_evict(int slot) const;
+    // Token ids an entry in `slot` covers (empty when none).
+    std::vector<int32_t> entry_tokens(int slot) const;
+    struct Evicted {
+        int slot = -1;
+        std::vector<int32_t> ids;
+        bool persist = false;
+    };
+    // Opt-in log of entries a commit replaced (its reservation's victim) or
+    // the resident budget evicted, for callers whose payload outlives the
+    // metadata (the concurrent scheduler writes them to disk).
+    void set_record_evictions(bool on) { record_evictions_ = on; }
+    std::vector<Evicted> take_evicted() {
+        std::vector<Evicted> out;
+        out.swap(evicted_log_);
+        return out;
+    }
+    // Every committed entry, most recently used first, with its
+    // persist_on_evict() flag: graceful shutdown evicts them all.
+    std::vector<Evicted> entries_for_shutdown() const;
 
     // Declares that the caller prunes after every commit, so the budget check
     // counts the entries a capture supersedes as freed when it lands.
@@ -346,6 +389,9 @@ private:
         std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
         bool                 protect = false;  // sticky tools-boundary pin
         size_t               resident_bytes = 0;
+        // Kept behind a deeper snapshot of its conversation only so an
+        // edit of the last message can resume (prune_superseded_ancestors).
+        bool                 edit_backup = false;
     };
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
@@ -359,11 +405,21 @@ private:
         PrefixHash victim;
         bool       has_victim;
         size_t     bytes;
+        // Further entries this capture evicts when it commits, in order.
+        std::vector<PrefixHash> extra_victims;
+        std::vector<int> extra_slots;
+        // Slots of every entry it counts as freed (its superseded ancestors
+        // and its victims): no other capture counts them again.
+        std::vector<int> credited_slots;
     };
     std::vector<ActiveReservation> active_reservations_;
     uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
     bool prunes_superseded_ = false;
+    bool record_evictions_ = false;
+    std::vector<Evicted> evicted_log_;
+    // Log entries_[idx] into evicted_log_ (when recording) before an erase.
+    void record_eviction(int idx);
     size_t resident_bytes_ = 0;
 
     // Full-cache state
@@ -422,8 +478,11 @@ private:
         bool record_hit);
     bool inline_reservation_active(uint64_t id) const;
     void release_inline_reservation(uint64_t id);
-    // A capture in flight writes this slot.
+    // A capture in flight writes this slot or evicts its entry.
     bool slot_reserved(int slot) const;
+    // A capture in flight counts this slot's entry as freed.
+    bool slot_credited(int slot) const;
+    const ActiveReservation * find_active_reservation(uint64_t id) const;
     bool commit_inline_reservation(InlineReservation & reservation,
                                    const std::vector<int32_t> & prompt_ids,
                                    int committed_cut, size_t resident_bytes,

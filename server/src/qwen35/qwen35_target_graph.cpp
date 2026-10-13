@@ -3407,7 +3407,8 @@ bool replace_paged_target_cache(
         const std::vector<uint32_t> & block_table,
         int block_size,
         int token_count,
-        PrefixSnapshot & destination) {
+        PrefixSnapshot & destination,
+        PrefixSnapshot * displaced) {
     PrefixSnapshot candidate;
     if (!snapshot_paged_target_cache(
             cache, seq_slot, block_table, block_size, token_count,
@@ -3417,6 +3418,12 @@ bool replace_paged_target_cache(
     }
     using std::swap;
     swap(candidate, destination);
+    // The replaced payload goes to `displaced` (its owner writes or frees
+    // it) when one is given, else it is freed here.
+    if (displaced && candidate.ctx) {
+        free_prefix_snapshot(*displaced);
+        swap(candidate, *displaced);
+    }
     free_prefix_snapshot(candidate);
     return true;
 }

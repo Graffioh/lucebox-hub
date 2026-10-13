@@ -541,6 +541,20 @@ bool PrefixCache::InlineReservation::active() const {
     return cache_ && cache_->inline_reservation_active(id_);
 }
 
+std::vector<int> PrefixCache::InlineReservation::extra_victim_slots() const {
+    std::vector<int> out;
+    const ActiveReservation * active =
+        cache_ ? cache_->find_active_reservation(id_) : nullptr;
+    if (!active) return out;
+    for (size_t i = 0; i < active->extra_victims.size(); ++i) {
+        const int idx = cache_->find_entry(active->extra_victims[i]);
+        if (idx >= 0 && cache_->entries_[(size_t)idx].slot == active->extra_slots[i]) {
+            out.push_back(active->extra_slots[i]);
+        }
+    }
+    return out;
+}
+
 bool PrefixCache::InlineReservation::commit(
         const std::vector<int32_t> & prompt_ids,
         size_t resident_bytes, bool protect) {
@@ -598,11 +612,16 @@ void PrefixCache::InlineReservation::take(InlineReservation && other) {
 }
 
 bool PrefixCache::inline_reservation_active(uint64_t id) const {
-    if (id == 0) return false;
+    return find_active_reservation(id) != nullptr;
+}
+
+const PrefixCache::ActiveReservation *
+PrefixCache::find_active_reservation(uint64_t id) const {
+    if (id == 0) return nullptr;
     for (const auto & active : active_reservations_) {
-        if (active.id == id) return true;
+        if (active.id == id) return &active;
     }
-    return false;
+    return nullptr;
 }
 
 void PrefixCache::release_inline_reservation(uint64_t id) {
@@ -617,6 +636,18 @@ void PrefixCache::release_inline_reservation(uint64_t id) {
 bool PrefixCache::slot_reserved(int slot) const {
     for (const auto & active : active_reservations_) {
         if (active.slot == slot) return true;
+        for (const int extra : active.extra_slots) {
+            if (extra == slot) return true;
+        }
+    }
+    return false;
+}
+
+bool PrefixCache::slot_credited(int slot) const {
+    for (const auto & active : active_reservations_) {
+        for (const int credited : active.credited_slots) {
+            if (credited == slot) return true;
+        }
     }
     return false;
 }
@@ -783,6 +814,9 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
     }
 
     size_t estimated_bytes = 0;
+    std::vector<PrefixHash> extra_victims;
+    std::vector<int> extra_slots;
+    std::vector<int> credited_slots;
     if (max_resident_bytes_ > 0) {
         estimated_bytes = estimate_bytes ? estimate_bytes(target_cut) : 0;
         // When the caller prunes after every commit, the entries this
@@ -841,26 +875,97 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
             // A turn kept behind a conversation's newest snapshot first (see
             // select_inline_evict_victim), then leaves, then the rest;
             // unprotected entries before protected ones.
-            int victim = -1;
-            for (int pass = 0; pass < 5 && victim < 0; ++pass) {
-                const bool require_middle = pass == 0;
-                const bool require_leaf = pass == 1 || pass == 2;
-                const bool allow_protected = pass == 2 || pass == 4;
-                for (int i = 0; i < (int)entries_.size(); ++i) {
-                    if (restore_source_slot >= 0 &&
-                        entries_[(size_t)i].slot == restore_source_slot)
-                        continue;
-                    if (slot_reserved(entries_[(size_t)i].slot)) continue;
-                    if (!fits(i)) continue;
-                    if (require_middle && !is_middle(i)) continue;
-                    if (require_leaf && !is_leaf(i)) continue;
-                    if (!allow_protected && entries_[(size_t)i].protect)
-                        continue;
-                    victim = i;
-                    break;
+            const auto pick_single = [&](int first_pass, int last_pass) {
+                for (int pass = first_pass; pass <= last_pass; ++pass) {
+                    const bool require_middle = pass == 0;
+                    const bool require_leaf = pass == 1 || pass == 2;
+                    const bool allow_protected = pass == 2 || pass == 4;
+                    for (int i = 0; i < (int)entries_.size(); ++i) {
+                        if (restore_source_slot >= 0 &&
+                            entries_[(size_t)i].slot == restore_source_slot)
+                            continue;
+                        if (slot_reserved(entries_[(size_t)i].slot)) continue;
+                        if (!fits(i)) continue;
+                        if (require_middle && !is_middle(i)) continue;
+                        if (require_leaf && !is_leaf(i)) continue;
+                        if (!allow_protected && entries_[(size_t)i].protect)
+                            continue;
+                        return i;
+                    }
                 }
-            }
-            if (victim >= 0) {
+                return -1;
+            };
+            // No single unprotected turn or leaf makes room: plan several,
+            // least recently used first, before falling back to a protected
+            // pin or a head. Each one goes to disk as it leaves RAM, so a
+            // long session that arrives after many short ones is still
+            // captured. Upstream skipped this capture instead (one victim
+            // per reservation) so a capture never disturbs the committed
+            // cache until it lands; the plan keeps that: it is all or
+            // nothing, decided before anything is evicted, and its entries
+            // are evicted only when the capture commits. A capture that
+            // fails or is cancelled evicts none of them, and one larger
+            // than the whole budget plans none. What a plan never takes:
+            // protected pins; heads (entries that other resident entries
+            // extend, unless kept only as an edit backup); this capture's
+            // own ancestors and restore source, which it builds on; and
+            // entries a capture in flight writes, evicts or already counts
+            // as freed, so two captures never count the same bytes.
+            const auto plan_several = [&]() {
+                std::vector<int> plan;
+                if (estimated_bytes == 0 ||
+                    estimated_bytes > max_resident_bytes_) return plan;
+                size_t freed = reclaimed_bytes;
+                if (planned_victim >= 0 && !reclaimed[(size_t)planned_victim]) {
+                    freed += entries_[(size_t)planned_victim].resident_bytes;
+                }
+                const size_t held = resident_bytes_ + pending_bytes;
+                const auto room = [&]() {
+                    const size_t after_free = freed <= held ? held - freed : 0;
+                    return after_free <= max_resident_bytes_ &&
+                        estimated_bytes <= max_resident_bytes_ - after_free;
+                };
+                // Edit backups first (they are not written to disk while
+                // their deeper snapshot is resident), then leaves.
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (int i = 0; i < (int)entries_.size(); ++i) {
+                        const auto & entry = entries_[(size_t)i];
+                        if (i == planned_victim || reclaimed[(size_t)i] ||
+                            entry.protect) continue;
+                        if (restore_source_slot >= 0 &&
+                            entry.slot == restore_source_slot) continue;
+                        if (slot_reserved(entry.slot) ||
+                            slot_credited(entry.slot)) continue;
+                        if (is_strict_prefix(entry.ids, prompt_ids.data(),
+                                             (size_t)target_cut)) continue;
+                        const bool leaf = is_leaf(i);
+                        if (pass == 0 ? !(entry.edit_backup && !leaf) : !leaf)
+                            continue;
+                        plan.push_back(i);
+                        freed += entry.resident_bytes;
+                        if (room()) return plan;
+                    }
+                }
+                plan.clear();
+                return plan;
+            };
+            int victim = pick_single(0, 1);
+            std::vector<int> several;
+            if (victim < 0) several = plan_several();
+            if (victim < 0 && several.empty()) victim = pick_single(2, 4);
+            if (!several.empty()) {
+                size_t bytes = 0;
+                for (const int i : several) {
+                    extra_victims.push_back(entries_[(size_t)i].hash);
+                    extra_slots.push_back(entries_[(size_t)i].slot);
+                    bytes += entries_[(size_t)i].resident_bytes;
+                }
+                std::fprintf(stderr,
+                    "[pc] resident budget plans %zu evictions (%zu bytes) for "
+                    "capture slot=%d estimate=%zu resident=%zu budget=%zu\n",
+                    several.size(), bytes, slot, estimated_bytes,
+                    resident_bytes_, max_resident_bytes_);
+            } else if (victim >= 0) {
                 victim_key = entries_[(size_t)victim].hash;
                 has_victim = true;
                 const int redirected_slot = entries_[(size_t)victim].slot;
@@ -883,12 +988,19 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
                 return {};
             }
         }
+        for (size_t i = 0; i < reclaimed.size(); ++i) {
+            if (reclaimed[i]) credited_slots.push_back(entries_[i].slot);
+        }
     }
 
     uint64_t id = next_inline_reservation_++;
     if (id == 0) id = next_inline_reservation_++;
+    if (has_victim) credited_slots.push_back(slot);
+    credited_slots.insert(credited_slots.end(), extra_slots.begin(), extra_slots.end());
     active_reservations_.push_back(
-        {id, slot, key, victim_key, has_victim, estimated_bytes});
+        {id, slot, key, victim_key, has_victim, estimated_bytes,
+         std::move(extra_victims), std::move(extra_slots),
+         std::move(credited_slots)});
     return InlineReservation(
         this, id, slot, target_cut, victim_key, has_victim, protect);
 }
@@ -901,6 +1013,7 @@ void PrefixCache::replace_inline_entry(
         if (entries_[(size_t)i].slot == slot) {
             std::fprintf(stderr,
                 "[pc] dropping stale entry for reused slot=%d\n", slot);
+            record_eviction(i);
             erase_inline_entry(i);
         }
     }
@@ -930,9 +1043,32 @@ bool PrefixCache::commit_inline_reservation(
         reservation.abort();
         return false;
     }
+    // The further entries its plan evicts, before the slot's own victim:
+    // an edit backup leaves while its deeper snapshot is still resident, so
+    // it is not written to disk (persist_on_evict).
+    if (const ActiveReservation * active = find_active_reservation(reservation.id_)) {
+        size_t evicted = 0, freed = 0;
+        for (size_t i = 0; i < active->extra_victims.size(); ++i) {
+            const int idx = find_entry(active->extra_victims[i]);
+            if (idx < 0 || entries_[(size_t)idx].slot != active->extra_slots[i]) continue;
+            ++evicted;
+            freed += entries_[(size_t)idx].resident_bytes;
+            record_eviction(idx);
+            erase_inline_entry(idx);
+        }
+        if (evicted > 0) {
+            std::fprintf(stderr,
+                "[pc] resident budget evicted %zu snapshot(s), %zu MiB, for "
+                "capture slot=%d\n",
+                evicted, freed / (1024 * 1024), reservation.slot_);
+        }
+    }
     if (reservation.has_victim_) {
         const int victim = find_entry(reservation.victim_);
-        if (victim >= 0) erase_inline_entry(victim);
+        if (victim >= 0) {
+            record_eviction(victim);
+            erase_inline_entry(victim);
+        }
     }
     replace_inline_entry(
         reservation.slot_, committed_cut, prompt_ids,
@@ -1044,6 +1180,7 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     if (previous >= 0 &&
         (max_resident_bytes_ == 0 || resident_bytes_ - others <= max_resident_bytes_)) {
         superseded.erase(std::find(superseded.begin(), superseded.end(), previous));
+        entries_[(size_t)previous].edit_backup = true;
     }
     size_t freed = 0;
     // Erase from the back so earlier indices stay valid.
@@ -1063,7 +1200,8 @@ std::vector<int> PrefixCache::prune_superseded_ancestors(
     return pruned;
 }
 
-std::vector<int> PrefixCache::enforce_resident_budget(int keep_slot) {
+std::vector<int> PrefixCache::enforce_resident_budget(
+        int keep_slot, std::vector<bool> * persist) {
     std::vector<int> evicted;
     if (disabled_ || max_resident_bytes_ == 0) return evicted;
     const size_t before = resident_bytes_;
@@ -1074,7 +1212,10 @@ std::vector<int> PrefixCache::enforce_resident_budget(int keep_slot) {
         // ancestor; never the new entry or a protected pin.
         const int victim = pick_evict_victim(keep);
         if (victim < 0) break;
-        evicted.push_back(entries_[(size_t)victim].slot);
+        const int slot = entries_[(size_t)victim].slot;
+        evicted.push_back(slot);
+        if (persist) persist->push_back(persist_on_evict(slot));
+        record_eviction(victim);
         erase_inline_entry(victim);
     }
     if (!evicted.empty()) {
@@ -1084,6 +1225,38 @@ std::vector<int> PrefixCache::enforce_resident_budget(int keep_slot) {
             evicted.size(), before, resident_bytes_, max_resident_bytes_);
     }
     return evicted;
+}
+
+bool PrefixCache::persist_on_evict(int slot) const {
+    const int idx = find_slot_entry(slot);
+    if (idx < 0) return false;
+    const auto & entry = entries_[(size_t)idx];
+    if (!entry.edit_backup || entry.protect) return true;
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        if (i != idx && is_strict_prefix(entry.ids, entries_[(size_t)i].ids)) {
+            return false;  // its conversation's deeper snapshot is resident
+        }
+    }
+    return true;
+}
+
+std::vector<int32_t> PrefixCache::entry_tokens(int slot) const {
+    const int idx = find_slot_entry(slot);
+    return idx < 0 ? std::vector<int32_t>{} : entries_[(size_t)idx].ids;
+}
+
+void PrefixCache::record_eviction(int idx) {
+    if (!record_evictions_ || idx < 0 || idx >= (int)entries_.size()) return;
+    const auto & entry = entries_[(size_t)idx];
+    evicted_log_.push_back({entry.slot, entry.ids, persist_on_evict(entry.slot)});
+}
+
+std::vector<PrefixCache::Evicted> PrefixCache::entries_for_shutdown() const {
+    std::vector<Evicted> out;
+    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+        out.push_back({it->slot, it->ids, persist_on_evict(it->slot)});
+    }
+    return out;
 }
 
 static void update_atomic_max(std::atomic<uint64_t> & value,

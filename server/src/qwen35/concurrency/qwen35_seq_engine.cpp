@@ -659,7 +659,8 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
     PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
     if (!replace_paged_target_cache(
             b_.cache_, slot, sequence.block_table,
-            (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot)) {
+            (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot,
+            &b_.displaced_snapshots_[checkpoint])) {
         event.elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - capture_started).count();

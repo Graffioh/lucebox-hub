@@ -237,13 +237,24 @@ banner.
   "disk_bytes":    0,
   "enabled":       false,
   "in_use":        0,
-  "lifetime_hits": 0
+  "lifetime_hits": 0,
+  "disk_enabled": false,
+  "disk_budget_mb": 131072,
+  "disk_ttl_hours": 72
 }
 ```
 
 The full-prompt cache (disk-backed). When `enabled = false`,
 `capacity`, `in_use`, `lifetime_hits`, and `disk_bytes` are all
 zero and ignored.
+
+`disk_enabled` reports whether the separate SSD session cache initialized
+successfully. It can be false even when RAM caching is enabled, for example
+when the cache directory cannot be created or is locked by another server.
+`disk_budget_mb` is the configured disk cap in MiB (1,048,576 bytes per unit),
+and `disk_ttl_hours` is the idle expiry in hours (`0` means never expire).
+These configured values remain present when `disk_enabled` is false; they
+do not report live disk usage or the cap after the free-space clamp.
 
 Counters use atomic loads (`std::memory_order_relaxed`); the
 snapshot is tear-free per field but the set of fields is **not
@@ -387,7 +398,8 @@ non-strictly-consistent semantics as `full_cache` (§4.7).
 `capacity = 0` means the cache is disabled. `max_resident_bytes` and
 `resident_bytes` cover committed copied checkpoints used by concurrent paged
 serving; a maximum of `0` means unlimited. `budget_skips` counts captures
-declined because no single eligible LRU entry could make enough room.
+declined because the eligible LRU entries, alone or together, could not make
+enough room (or the checkpoint is larger than the whole budget).
 
 The capture and restore counters expose synchronous time spent copying
 checkpoint state on the scheduler thread. `*_attempts` include successful and

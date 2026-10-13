@@ -208,6 +208,10 @@ public:
     // Optional prefix-checkpoint admission. Unsupported engines remain on
     // cold admission and never receive a plan from the scheduler.
     virtual bool supports_prefix_store() const { return false; }
+    // True when checkpoint id N lives in the backend's snapshot slot N-1
+    // (ModelBackend::snapshot_detach/snapshot_adopt reach it), which the
+    // disk session cache needs.
+    virtual bool prefix_store_in_backend_snapshots() const { return false; }
     // Conservative resident-byte estimate for one checkpoint. Returning zero
     // means the engine cannot safely participate in a configured byte budget.
     virtual size_t estimate_prefix_store_bytes(int) const { return 0; }

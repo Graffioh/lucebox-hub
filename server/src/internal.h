@@ -695,7 +695,8 @@ bool replace_paged_target_cache(
     const std::vector<uint32_t> & block_table,
     int block_size,
     int token_count,
-    PrefixSnapshot & destination);
+    PrefixSnapshot & destination,
+    PrefixSnapshot * displaced = nullptr);
 
 // Restore a copied paged snapshot into fresh destination pages and one
 // recurrent-state slab. `block_table` describes the destination sequence and

@@ -1162,11 +1162,126 @@ ModelBackend::SnapshotRef Qwen35Backend::snapshot_ref(int slot) const {
     return ref;
 }
 
+// Hand a PrefixSnapshot's payload to an OwnedSnapshot and leave it empty.
+// Only full states (dense, paged) are useful on disk; a thin KV-only one is
+// freed instead. A payload outside host memory is copied to host first.
+static OwnedSnapshot take_prefix_snapshot(PrefixSnapshot & snap) {
+    if (!snap.ctx || !snap.buf ||
+        (snap.layout != PrefixSnapshot::Layout::dense &&
+         snap.layout != PrefixSnapshot::Layout::paged)) {
+        free_prefix_snapshot(snap);
+        return {};
+    }
+    OwnedSnapshot out;
+    if (ggml_backend_buffer_is_host(snap.buf)) {
+        out = OwnedSnapshot(snap.ctx, snap.buf, snap.cur_pos, snap.last_tok);
+        snap.ctx = nullptr;
+        snap.buf = nullptr;
+    } else {
+        out = OwnedSnapshot::clone_to_host(snap.ctx, snap.cur_pos, snap.last_tok);
+    }
+    free_prefix_snapshot(snap);
+    return out;
+}
+
+OwnedSnapshot Qwen35Backend::snapshot_detach(int slot) {
+    if (slot < 0 || slot >= PREFIX_SLOTS) return {};
+    // A deferred snapshot is still the live state: copy it out first.
+    if (live_snapshot_deferred_ && slot == live_snapshot_slot_) {
+        materialize_live_snapshot();
+    }
+    if (slot == live_snapshot_slot_) {
+        live_snapshot_slot_ = -1;
+        live_snapshot_deferred_ = false;
+    }
+    return take_prefix_snapshot(prefix_snapshots_[slot]);
+}
+
+OwnedSnapshot Qwen35Backend::snapshot_take_displaced(int slot) {
+    if (slot < 0 || slot >= PREFIX_SLOTS) return {};
+    return take_prefix_snapshot(displaced_snapshots_[slot]);
+}
+
+bool Qwen35Backend::adopt_paged_snapshot(int slot, ggml_context * ctx,
+                                         ggml_backend_buffer_t buf,
+                                         int cur_pos) {
+    snapshot_free(slot);
+    auto & snap = prefix_snapshots_[slot];
+    snap.attn_k_snap.assign(cache_.attn_k.size(), nullptr);
+    snap.attn_v_snap.assign(cache_.attn_v.size(), nullptr);
+    snap.ssm_state_snap.assign(cache_.ssm_state.size(), nullptr);
+    snap.conv_state_snap.assign(cache_.conv_state.size(), nullptr);
+    snap.target_feat_snap = nullptr;
+    const char * mismatch = nullptr;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t && !mismatch;
+         t = ggml_get_next_tensor(ctx, t)) {
+        size_t idx = 0;
+        ggml_tensor ** dst = nullptr;
+        if (std::sscanf(t->name, "snap_cache_k_%zu", &idx) == 1 &&
+            idx < snap.attn_k_snap.size()) {
+            dst = &snap.attn_k_snap[idx];
+        } else if (std::sscanf(t->name, "snap_cache_v_%zu", &idx) == 1 &&
+                   idx < snap.attn_v_snap.size()) {
+            dst = &snap.attn_v_snap[idx];
+        } else if (std::sscanf(t->name, "snap_ssm_state_%zu", &idx) == 1 &&
+                   idx < snap.ssm_state_snap.size()) {
+            dst = &snap.ssm_state_snap[idx];
+        } else if (std::sscanf(t->name, "snap_conv_state_%zu", &idx) == 1 &&
+                   idx < snap.conv_state_snap.size()) {
+            dst = &snap.conv_state_snap[idx];
+        }
+        if (!dst || *dst) mismatch = "unexpected or duplicate tensor";
+        else *dst = t;
+    }
+    // Every live layer needs its tensor, and KV rows must equal cur_pos;
+    // restore_paged_target_cache() checks types and shapes against the
+    // cache and the page table before it copies anything.
+    for (size_t i = 0; i < cache_.attn_k.size() && !mismatch; ++i) {
+        const bool present = cache_.attn_k[i] != nullptr;
+        if ((snap.attn_k_snap[i] != nullptr) != present ||
+            (snap.attn_v_snap[i] != nullptr) != present ||
+            (present && (snap.attn_k_snap[i]->ne[1] != cur_pos ||
+                         snap.attn_v_snap[i]->ne[1] != cur_pos))) {
+            mismatch = "attention KV";
+        }
+    }
+    for (size_t i = 0; i < cache_.ssm_state.size() && !mismatch; ++i) {
+        const bool present = cache_.ssm_state[i] != nullptr;
+        if ((snap.ssm_state_snap[i] != nullptr) != present ||
+            (snap.conv_state_snap[i] != nullptr) != present) {
+            mismatch = "recurrent state";
+        }
+    }
+    if (mismatch || cur_pos <= 0 || cur_pos > cache_.max_ctx) {
+        std::fprintf(stderr,
+                     "[qwen35] paged snapshot adopt rejected slot=%d: %s\n",
+                     slot, mismatch ? mismatch : "position");
+        snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+        snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+        return false;
+    }
+    snap.ctx = ctx;
+    snap.buf = buf;
+    snap.layout = PrefixSnapshot::Layout::paged;
+    snap.cur_pos = cur_pos;
+    snap.last_tok = -1;
+    snap.kv_k_type = cache_.kv_k_type;
+    snap.max_ctx = cache_.max_ctx;
+    snap.target_feat_cap = 0;
+    std::fprintf(stderr, "[qwen35] paged snapshot adopted slot=%d pos=%d\n",
+                 slot, cur_pos);
+    return true;
+}
+
 bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
                                    ggml_backend_buffer_t buf, int cur_pos,
                                    int32_t last_tok) {
-    if (cfg_.paged_attention) return false;
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
+    if (cfg_.paged_attention) {
+        // Paged restores scatter from host memory (paged_snapshot_buffer_type).
+        if (!ggml_backend_buffer_is_host(buf)) return false;
+        return adopt_paged_snapshot(slot, ctx, buf, cur_pos);
+    }
     snapshot_free(slot);
 
     auto & snap = prefix_snapshots_[slot];
@@ -1221,8 +1336,55 @@ bool Qwen35Backend::snapshot_adopt(int slot, ggml_context * ctx,
         return false;
     }
 
+    // Names alone do not prove compatibility: a snapshot taken with another
+    // KV type or model shape would be restored as garbage. Every tensor must
+    // match the live cache's type and per-row shape, and hold cur_pos rows.
+    const auto same_rows = [](const ggml_tensor * s, const ggml_tensor * c) {
+        return s && c && s->type == c->type && s->ne[0] == c->ne[0] &&
+               s->ne[2] == c->ne[2] && s->ne[3] == c->ne[3];
+    };
+    const auto same_shape = [&](const ggml_tensor * s, const ggml_tensor * c) {
+        return same_rows(s, c) && s->ne[1] == c->ne[1];
+    };
+    const char * mismatch = nullptr;
+    for (int i = 0; i < n_full_attn && !mismatch; ++i) {
+        const ggml_tensor * ck = i < (int)cache_.attn_k.size() ? cache_.attn_k[i] : nullptr;
+        const ggml_tensor * cv = i < (int)cache_.attn_v.size() ? cache_.attn_v[i] : nullptr;
+        if (!same_rows(snap.attn_k_snap[i], ck) ||
+            !same_rows(snap.attn_v_snap[i], cv) ||
+            snap.attn_k_snap[i]->ne[1] != cur_pos ||
+            snap.attn_v_snap[i]->ne[1] != cur_pos) {
+            mismatch = "attention KV";
+        }
+    }
+    for (int i = 0; i < n_delta && !mismatch; ++i) {
+        const ggml_tensor * cs = i < (int)cache_.ssm_state.size() ? cache_.ssm_state[i] : nullptr;
+        const ggml_tensor * cc = i < (int)cache_.conv_state.size() ? cache_.conv_state[i] : nullptr;
+        if (!same_shape(snap.ssm_state_snap[i], cs) ||
+            !same_shape(snap.conv_state_snap[i], cc)) {
+            mismatch = "recurrent state";
+        }
+    }
+    if (!mismatch && cache_.target_feat &&
+        (snap.target_feat_snap->type != cache_.target_feat->type ||
+         snap.target_feat_snap->ne[0] != cache_.target_feat->ne[0] ||
+         snap.target_feat_snap->ne[1] !=
+             std::min<int64_t>(cur_pos, cache_.target_feat_cap))) {
+        mismatch = "target features";
+    }
+    if (mismatch) {
+        std::fprintf(stderr,
+                     "[qwen35] snapshot adopt rejected slot=%d: %s type/shape "
+                     "differs from the live cache\n", slot, mismatch);
+        snap.attn_k_snap.clear(); snap.attn_v_snap.clear();
+        snap.ssm_state_snap.clear(); snap.conv_state_snap.clear();
+        snap.target_feat_snap = nullptr;
+        return false;
+    }
+
     snap.ctx     = ctx;
     snap.buf     = buf;
+    snap.layout  = PrefixSnapshot::Layout::dense;  // restore_target_cache requires it
     snap.cur_pos = cur_pos;
     snap.last_tok        = last_tok;
     snap.kv_k_type       = cache_.kv_k_type;
@@ -1504,6 +1666,7 @@ void Qwen35Backend::shutdown() {
     draft_feature_mirror_free(feature_mirror_);
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_prefix_snapshot(prefix_snapshots_[i]);
+        free_prefix_snapshot(displaced_snapshots_[i]);
     }
     if (!target_parked_) free_target_weights(w_);
     vision_.reset();  // its buffers belong to target_backend_, freed below
@@ -1774,7 +1937,16 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         // mask-less FA span, so rows beyond the restored prefix must be ZERO,
         // not leftovers from the previous request. cudaMemset is ~0.2ms.
         if (cache_.base_buf) ggml_backend_buffer_clear(cache_.base_buf, 0);
-        restore_target_cache(prefix_snapshots_[slot], cache_);
+        // Decoding on a cache the restore did not fill yields garbage.
+        if (!restore_target_cache(prefix_snapshots_[slot], cache_)) {
+            std::fprintf(stderr, "[qwen35] restore slot=%d failed: %s\n",
+                         slot, luce_last_error());
+            cache_.cur_pos = 0;
+            result.fail(GenerateErrorCode::InvalidSnapshotSlot,
+                        std::string("snapshot restore failed: ") + luce_last_error());
+            out_io.emit(-1);
+            return result;
+        }
     }
 
     // Now generate from restored state

@@ -317,8 +317,16 @@ static void print_usage(const char * prog) {
         "  --prefill-upstream-model <NAME> Model name on forwarded requests.\n"
         "\n"
         "Disk KV cache:\n"
-        "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
-        "  --kv-cache-budget <MB>      Max disk usage in MB (default: 4096)\n"
+        "  --kv-cache-dir <path>|off   Directory for the on-disk KV session cache\n"
+        "                              (default: $XDG_CACHE_HOME/lucebox/kv-cache, else\n"
+        "                              ~/.cache/lucebox/kv-cache; off disables it)\n"
+        "                              On Windows: %LOCALAPPDATA%/lucebox/kv-cache\n"
+        "  --no-kv-cache               Same as --kv-cache-dir off\n"
+        "  --kv-cache-budget <MB>      Max disk usage in MB, hard cap with LRU eviction,\n"
+        "                              clamped to the free space (default: 131072 = 128 GB)\n"
+        "  --kv-cache-ttl <hours>      Delete snapshots unused for this long (default: 72, 0 = never)\n"
+        "  --kv-cache-shutdown-flush <s>  Max seconds a graceful shutdown spends writing\n"
+        "                              RAM snapshots to disk (default: 120, -1 = no limit)\n"
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
         "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
         "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
@@ -425,6 +433,23 @@ struct ModelOptions {
 
 };
 
+// Native cache directory, or empty when no usable home/cache path is set.
+static std::string default_kv_cache_dir() {
+#if defined(_WIN32)
+    for (const char * variable : {"LOCALAPPDATA", "USERPROFILE"}) {
+        const char * value = std::getenv(variable);
+        if (value && *value && std::filesystem::path(value).is_absolute()) {
+            return (std::filesystem::path(value) / "lucebox" / "kv-cache").string();
+        }
+    }
+#endif
+    const char * xdg = std::getenv("XDG_CACHE_HOME");
+    if (xdg && xdg[0] == '/') return std::string(xdg) + "/lucebox/kv-cache";
+    const char * home = std::getenv("HOME");
+    if (home && home[0] == '/') return std::string(home) + "/.cache/lucebox/kv-cache";
+    return std::string();
+}
+
 static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                                bool load_balancing, bool first_model) {
     if (argc < 2 || argv[1][0] == '-') {
@@ -446,6 +471,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     bool target_device_seen = false;
     bool target_devices_seen = false;
     bargs.model_path = argv[1];
+    // The disk session cache is on by default (--kv-cache-dir off disables).
+    sconfig.disk_cache_dir = default_kv_cache_dir();
 
     for (int i = 2; i < argc; i++) {
         const std::string option = argv[i];
@@ -992,9 +1019,31 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
                 std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
             }
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
-            sconfig.disk_cache_dir = argv[++i];
+            const std::string dir = argv[++i];
+            sconfig.disk_cache_dir =
+                (dir == "off" || dir == "none" || dir.empty()) ? std::string() : dir;
+        } else if (std::strcmp(argv[i], "--no-kv-cache") == 0) {
+            sconfig.disk_cache_dir.clear();
+        } else if (std::strcmp(argv[i], "--kv-cache-shutdown-flush") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            const double secs = std::strtod(argv[++i], &end);
+            if (!end || *end != '\0') {
+                std::fprintf(stderr, "--kv-cache-shutdown-flush expects seconds, got %s\n",
+                             argv[i]);
+                return 1;
+            }
+            sconfig.disk_cache_shutdown_flush_s = secs;
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
             sconfig.disk_cache_budget_mb = (size_t)std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-cache-ttl") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            const double hours = std::strtod(argv[++i], &end);
+            if (!end || *end != '\0' || !(hours >= 0.0)) {
+                std::fprintf(stderr, "--kv-cache-ttl expects hours >= 0 (0 = never), got %s\n",
+                             argv[i]);
+                return 1;
+            }
+            sconfig.disk_cache_ttl_hours = hours;
         } else if (std::strcmp(argv[i], "--kv-cache-min-tokens") == 0 && i + 1 < argc) {
             sconfig.disk_cache_min_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-interval") == 0 && i + 1 < argc) {
@@ -1519,30 +1568,32 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
 
     // Continuous Qwen serving supports copied in-memory prefix checkpoints:
     // restore allocates fresh pages and scatters logical K/V through the new
-    // sequence's block table. Exact-prefill and disk snapshots still use the
-    // classic single-sequence format and remain disabled in paged mode.
+    // sequence's block table. Checkpoints that leave RAM go to the disk
+    // session cache (the scheduler writes and reads them). Exact-prefill
+    // snapshots still use the classic single-sequence format and remain
+    // disabled in paged mode; single-sequence paged serving keeps no
+    // snapshots at all, so it has no disk cache either.
     // This rewrites ServerConfig rather than rejecting the launch, which is
     // why it lives here and not in the gate.
     if (backend_cache.paged_attention) {
-        if (backend_execution.max_concurrency > 1) {
-            if (sconfig.prefix_cache_cap > 0) {
-                std::fprintf(stderr,
-                    "[server] concurrent paged serving enables copied in-memory "
-                    "prefix checkpoints; full-prefill and disk caches remain disabled\n");
-            } else {
-                std::fprintf(stderr,
-                    "[server] concurrent paged serving: prefix checkpoints are "
-                    "disabled; full-prefill and disk caches remain disabled\n");
-            }
+        if (backend_execution.max_concurrency > 1 && sconfig.prefix_cache_cap > 0) {
+            std::fprintf(stderr,
+                "[server] concurrent paged serving enables copied in-memory "
+                "prefix checkpoints and %s; the full-prefill cache stays disabled\n",
+                sconfig.disk_cache_dir.empty() ? "no disk cache (off)"
+                                               : "the disk session cache");
         } else {
             std::fprintf(stderr,
-                "[server] single-sequence --paged-attention still disables "
-                "prefix snapshots\n");
+                "[server] %s: prefix checkpoints and the disk cache are "
+                "disabled\n",
+                backend_execution.max_concurrency > 1
+                    ? "concurrent paged serving without prefix slots"
+                    : "single-sequence --paged-attention");
             sconfig.prefix_cache_cap = 0;
+            sconfig.disk_cache_dir.clear();
+            sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
         }
         sconfig.prefill_cache_cap = 0;
-        sconfig.disk_cache_dir.clear();
-        sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
     // Every concurrent engine takes its prefix checkpoints from the scheduler:
     // paged engines copy pages, qwen4exp copies full-cache snapshots. Both use

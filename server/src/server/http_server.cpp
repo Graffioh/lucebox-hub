@@ -27,6 +27,8 @@
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
+#include "tool_parser.h"
+#include "json_schema_grammar.h"
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
@@ -2138,6 +2140,9 @@ json build_props_body(const ServerConfig & config,
             {"disk_bytes",    pcfs.disk_bytes},
             {"lifetime_hits", pcfs.lifetime_hits},
             {"disk_policy",   disk_prefix_cache_policy_name(config.disk_cache_policy)},
+            {"disk_enabled",  !config.disk_cache_dir.empty()},
+            {"disk_budget_mb", config.disk_cache_budget_mb},
+            {"disk_ttl_hours", config.disk_cache_ttl_hours},
         }},
         {"tool_replay", {
             {"max_entries",     tms.max_entries},
@@ -2418,7 +2423,58 @@ std::vector<ChatMessage> normalize_chat_messages(
 //   max_ctx, sha1(chat_template_src), and the effective K-rotation basis
 //   (LUCE_KV_ROTATE resolves against the K-cache type; a cache written
 //   rotated must never be adopted by an un-rotated session or vice versa).
+// Also covered: the KV cache types (a q8_0 snapshot must never be adopted by
+// a q4_0 session), the draft model (it decides the captured target-feature
+// layers), and a content fingerprint of the model file (SHA-1 of its first
+// and last MiB plus its size; hashing the whole multi-GB file at every
+// startup would cost tens of seconds, and a re-quantized or replaced file
+// changes its header and tail).
 // Returns all-zeroes if model_path is empty (back-compat / disk disabled).
+static void append_file_identity(std::vector<uint8_t> & buf,
+                                 const std::string & path, bool content) {
+    uint32_t plen = (uint32_t)path.size();
+    buf.insert(buf.end(), (uint8_t *)&plen, (uint8_t *)&plen + 4);
+    buf.insert(buf.end(), path.begin(), path.end());
+    if (path.empty()) return;
+    struct stat st{};
+    int64_t file_size = 0, file_mtime = 0;
+    if (::stat(path.c_str(), &st) == 0) {
+        file_size  = (int64_t)st.st_size;
+        file_mtime = (int64_t)st.st_mtime;
+    }
+    buf.insert(buf.end(), (uint8_t *)&file_size,  (uint8_t *)&file_size  + 8);
+    buf.insert(buf.end(), (uint8_t *)&file_mtime, (uint8_t *)&file_mtime + 8);
+    if (!content) return;
+    uint8_t digest[20] = {};
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+        constexpr int64_t kChunk = 1 << 20;
+        std::vector<uint8_t> data;
+        auto read_at = [&](int64_t off, int64_t len) {
+            if (len <= 0) return;
+            in.clear();
+            in.seekg((std::streamoff)off);
+            const size_t start = data.size();
+            data.resize(start + (size_t)len);
+            in.read((char *)data.data() + start, (std::streamsize)len);
+            data.resize(start + (size_t)std::max<std::streamsize>(0, in.gcount()));
+        };
+        read_at(0, std::min(kChunk, file_size));
+        if (file_size > kChunk) {
+            const int64_t tail = std::max(kChunk, file_size - kChunk);
+            read_at(tail, file_size - tail);
+        }
+        sha1_hash(data.data(), data.size(), digest);
+    }
+    buf.insert(buf.end(), digest, digest + 20);
+}
+
+static uint64_t disk_cache_ttl_seconds(double hours) {
+    if (!(hours > 0.0)) return 0;  // 0 (or invalid) = never expire
+    const double secs = hours * 3600.0;
+    return secs < 1.0 ? 1 : (uint64_t)std::llround(secs);
+}
+
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
     std::array<uint8_t, 16> salt{};
     if (cfg.model_path.empty()) return salt;
@@ -2451,6 +2507,14 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     buf.insert(buf.end(), tmpl_digest, tmpl_digest + 20);
     uint8_t k_rotated = dflash_kv_k_rotation_enabled(cfg.kv_cache_k) ? 1 : 0;
     buf.push_back(k_rotated);
+    // Snapshot bytes are stored in the cache's own type.
+    for (const std::string * kv : {&cfg.kv_cache_k, &cfg.kv_cache_v}) {
+        uint32_t n = (uint32_t)kv->size();
+        buf.insert(buf.end(), (uint8_t *)&n, (uint8_t *)&n + 4);
+        buf.insert(buf.end(), kv->begin(), kv->end());
+    }
+    append_file_identity(buf, cfg.model_path, /*content=*/true);
+    append_file_identity(buf, cfg.draft_path, /*content=*/false);
 
     uint8_t digest[20];
     sha1_hash(buf.data(), buf.size(), digest);
@@ -2610,7 +2674,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
-                   config.disk_cache_cold_max_tokens}, backend_)
+                   config.disk_cache_cold_max_tokens,
+                   disk_cache_ttl_seconds(config.disk_cache_ttl_hours)}, backend_)
 {
     config_.image_input_enabled = backend_.supports_images() &&
         config_.pflash_upstream_base.empty() &&
@@ -2635,6 +2700,10 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
         disk_cache_.set_identity_salt(compute_disk_cache_salt(config));
     }
     disk_cache_.init();
+    // Report the effective state after initialization failure or a directory
+    // lock conflict; serving continues with the ordinary RAM cache.
+    if (disk_cache_.disabled()) config_.disk_cache_dir.clear();
+    restore_replay_blobs();
     status_html_path_ = resolve_status_html();
 
     // PPP env overrides (operator-facing; no CLI flags required).
@@ -2848,20 +2917,12 @@ void HttpServer::shutdown() {
         queue_tail_ = nullptr;
     }
 
-    // Shutdown save: persist all tracked snapshot slots to disk.
-    // Safe to access slot_tokens_ without locking — worker is joined.
-    if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
-        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
-                     slot_tokens_.size());
-        backend_.snapshot_flush_deferred();
-        for (auto & [slot, tokens] : slot_tokens_) {
-            if (backend_.snapshot_used(slot)) {
-                disk_cache_.learn_layout(slot);
-                disk_cache_.save(slot, tokens);
-            }
-        }
-        slot_tokens_.clear();
-    }
+    // Graceful shutdown is one last eviction: write each conversation's
+    // newest snapshot and the heads. Safe without locking — the worker is
+    // joined. A crash or kill -9 loses what was only in RAM.
+    flush_sessions_to_disk("shutdown");
+    slot_tokens_.clear();
+    slot_aux_.clear();
 }
 
 bool HttpServer::start_worker() {
@@ -3075,19 +3136,11 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
     }
 
-    // Persist disk cache (worker joined — no race on slot_tokens_).
-    if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
-        std::fprintf(stderr, "[disk-cache] shutdown: saving %zu tracked slots\n",
-                     slot_tokens_.size());
-        backend_.snapshot_flush_deferred();
-        for (auto & [slot, tokens] : slot_tokens_) {
-            if (backend_.snapshot_used(slot)) {
-                disk_cache_.learn_layout(slot);
-                disk_cache_.save(slot, tokens);
-            }
-        }
-        slot_tokens_.clear();
-    }
+    // Graceful shutdown is one last eviction (worker joined — no race on
+    // slot_tokens_).
+    flush_sessions_to_disk("shutdown");
+    slot_tokens_.clear();
+    slot_aux_.clear();
 
 #if defined(_WIN32)
     // Status-event sockets remain owned until shutdown(). Keep Winsock alive
@@ -3365,6 +3418,179 @@ json HttpServer::model_routing_status() {
     }
     return {{"routing", "primary-first"}, {"waiting", routing_waiters_},
             {"queue_limit", config_.routing_queue_limit}, {"models", models}};
+}
+
+// ─── Structured output ──────────────────────────────────────────────────
+
+namespace http_detail {
+
+nlohmann::ordered_json request_output_format(const std::string & body) {
+    if (body.find("\"response_format\"") == std::string::npos &&
+        body.find("\"output_format\"") == std::string::npos &&
+        body.find("\"format\"") == std::string::npos) {
+        return nullptr;
+    }
+    const auto ordered = nlohmann::ordered_json::parse(body, nullptr, false);
+    if (!ordered.is_object()) return nullptr;
+    if (ordered.contains("response_format")) return ordered["response_format"];
+    if (ordered.contains("output_format")) return ordered["output_format"];
+    const auto text = ordered.find("text");
+    if (text != ordered.end() && text->is_object() && text->contains("format")) {
+        return (*text)["format"];
+    }
+    return nullptr;
+}
+
+// A string member of a client object; "" when it is absent or not a string.
+// (json::value would throw on a client's {"type": 1}.)
+template <typename Json>
+std::string string_member(const Json & object, const char * key) {
+    if (!object.is_object()) return {};
+    const auto it = object.find(key);
+    return it != object.end() && it->is_string() ? it->template get<std::string>()
+                                                 : std::string();
+}
+
+bool output_format_schema(const nlohmann::ordered_json & format,
+                          nlohmann::ordered_json & schema, std::string & error) {
+    schema = nullptr;
+    if (format.is_null()) return true;
+    if (!format.is_object()) {
+        error = "response_format must be an object";
+        return false;
+    }
+    if (format.contains("type") && !format["type"].is_string()) {
+        error = "response_format type must be a string";
+        return false;
+    }
+    const std::string type = string_member(format, "type");
+    if (type.empty() || type == "text") return true;
+    if (type == "json_object") {
+        // A schema beside json_object narrows it, as in llama-server.
+        schema = format.contains("schema") ? format["schema"]
+                                           : nlohmann::ordered_json::object();
+    } else if (type == "json_schema") {
+        // Chat completions nest the schema under json_schema; responses and
+        // messages put it on the format itself.
+        const auto & holder = format.contains("json_schema") ? format["json_schema"] : format;
+        schema = holder.is_object() && holder.contains("schema")
+            ? holder["schema"] : nlohmann::ordered_json::object();
+    } else {
+        error = "response_format type must be text, json_object or json_schema, not '" +
+                type + "'";
+        return false;
+    }
+    if (!schema.is_object()) {
+        error = "the response_format schema must be a JSON object";
+        return false;
+    }
+    if (schema.empty()) schema["type"] = "object";  // an empty schema means any object
+    return true;
+}
+
+bool tool_choice_requires_call(const json & tool_choice) {
+    if (tool_choice.is_string()) {
+        return tool_choice == "required" || tool_choice == "any";
+    }
+    if (!tool_choice.is_object()) return false;
+    const std::string type = string_member(tool_choice, "type");
+    return type == "any" || type == "tool" || type == "function" ||
+           tool_choice.contains("function");
+}
+
+static std::string gbnf_literal(const std::string & text) {
+    std::string out = "\"";
+    for (const char c : text) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out += c;
+        }
+    }
+    return out + "\"";
+}
+
+std::string output_constraint_grammar(const nlohmann::ordered_json & schema,
+                                      const std::vector<std::string> & tool_openers) {
+    return build_grammar([&](const GrammarBuilder & builder) {
+        std::string replies;
+        if (!schema.is_null()) {
+            auto resolved = schema;
+            builder.resolve_refs(resolved);
+            replies = builder.add_schema("reply", resolved);
+        }
+        if (!tool_openers.empty()) {
+            std::string openers;
+            for (const auto & opener : tool_openers) {
+                if (!openers.empty()) openers += " | ";
+                openers += gbnf_literal(opener);
+            }
+            // The grammar only admits the opener; the tool parser reads the
+            // call, and the constraint lets go of the output once it starts.
+            if (!replies.empty()) replies += " | ";
+            replies += builder.add_rule("tool-call", "(" + openers + ") .*");
+        }
+        builder.add_rule("root", "[ \\t\\n]{0,4} (" + replies + ")");
+    });
+}
+
+}  // namespace http_detail
+
+std::shared_ptr<const ConstraintVocab> HttpServer::output_constraint_vocab() {
+    std::call_once(constraint_vocab_once_, [this] {
+        std::vector<std::string> pieces((size_t) tokenizer_.vocab_size());
+        for (int32_t id = 0; id < tokenizer_.vocab_size(); ++id) {
+            pieces[(size_t) id] = tokenizer_.token_text(id);
+        }
+        constraint_vocab_ = ConstraintVocab::build(
+            std::move(pieces), {tokenizer_.eos_id(), tokenizer_.eos_chat_id()});
+    });
+    return constraint_vocab_;
+}
+
+bool HttpServer::attach_output_constraint(SocketHandle fd, ParsedRequest & req) {
+    nlohmann::ordered_json schema;
+    std::string error;
+    if (!http_detail::output_format_schema(req.output_format, schema, error)) {
+        send_error(fd, 400, error);
+        return false;
+    }
+    const bool tools_off = req.tool_choice == "none" ||
+        http_detail::string_member(req.tool_choice, "type") == "none";
+    const bool has_tools = req.tools.is_array() && !req.tools.empty() && !tools_off;
+    const bool must_call = has_tools && http_detail::tool_choice_requires_call(req.tool_choice);
+    if (schema.is_null() && !must_call) return true;
+
+    // With tools the reply may call one first; a forced call must.
+    std::vector<std::string> openers = has_tools ? tool_call_openers(req.tools)
+                                                 : std::vector<std::string>{};
+    std::string grammar;
+    try {
+        grammar = http_detail::output_constraint_grammar(
+            must_call ? nlohmann::ordered_json() : schema, openers);
+    } catch (const std::exception & e) {
+        send_error(fd, 400, std::string("response_format: ") + e.what());
+        return false;
+    }
+    auto matcher = gbnf::Matcher::compile(grammar, "root", error);
+    if (!matcher) {
+        send_error(fd, 400, "response_format: " + error);
+        return false;
+    }
+    OutputConstraint::Options options;
+    if (req.started_in_thinking) {
+        options.wait_for = config_.think_marker_token_ids.empty()
+            ? std::string("</think>")
+            : tokenizer_.decode(config_.think_marker_token_ids);
+    }
+    options.release_prefixes = std::move(openers);
+    options.calls_only = must_call;
+    req.sampler.constraint = std::make_shared<OutputConstraint>(
+        output_constraint_vocab(), std::move(matcher), std::move(options));
+    return true;
 }
 
 // ─── Request parsing ────────────────────────────────────────────────────
@@ -3742,18 +3968,29 @@ bool HttpServer::render_and_tokenize_request(
 // Context-length gate. Oversized prompts pass through when compression
 // (pflash) will run — the post-compress check is the real gate.
 bool HttpServer::validate_request_context(
-        SocketHandle fd, const ParsedRequest & req, bool send_failure) {
+        SocketHandle fd, ParsedRequest & req, bool routed) {
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const bool pflash_will_run =
         !req.images && config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr &&
         (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
          prompt_tokens >= config_.pflash_threshold);
+    if (!routed && !pflash_will_run) {
+        const int fitted =
+            fit_reply_to_context(prompt_tokens, req.max_output, config_.max_ctx);
+        if (fitted > 0 && fitted < req.max_output) {
+            std::fprintf(stderr,
+                "[server] max_tokens=%d trimmed to %d: the prompt takes %d of "
+                "the %d-token context\n",
+                req.max_output, fitted, prompt_tokens, config_.max_ctx);
+            req.max_output = fitted;
+        }
+    }
     if (!should_reject_oversized(
             prompt_tokens, req.max_output, config_.max_ctx, pflash_will_run)) {
         return true;
     }
-    if (send_failure) {
+    if (!routed) {
         if (pflash_will_run) {
             send_error(fd, 400,
                 "request exceeds PFlash's maximum context: " + std::to_string(prompt_tokens) +
@@ -3771,7 +4008,7 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
         "max_tokens=%d max_ctx=%d thinking=%s reasoning_effort=%s "
-        "started_in_thinking=%s stops=%zu model=%s\n",
+        "started_in_thinking=%s stops=%zu grammar=%s model=%s\n",
         req.response_id.c_str(), api_format_name(req.format),
         req.stream ? "true" : "false",
         json_array_size(req.messages), json_array_size(req.tools),
@@ -3781,7 +4018,8 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
             (req.reasoning_effort.empty() ? "default" :
                 req.reasoning_effort.c_str()),
         req.started_in_thinking ? "true" : "false",
-        req.stop_sequences.size(), req.model.c_str());
+        req.stop_sequences.size(), req.sampler.constraint ? "on" : "off",
+        req.model.c_str());
 }
 
 RoutingAdmission HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req,
@@ -3829,6 +4067,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     bool count_tokens_only = false;
     try {
         req.raw_body = json::parse(hr.body);
+        req.output_format = http_detail::request_output_format(hr.body);
         if (!parse_endpoint_request(
                 hr.path, req.raw_body, req, count_tokens_only)) return false;
         return models_.empty()
@@ -3934,6 +4173,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             send_response(fd, 200, "application/json", response.dump() + "\n");
             return true;
         }
+        if (!attach_output_constraint(fd, req)) return true;
     } catch (const json::parse_error & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
         return true;
@@ -3942,7 +4182,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         return true;
     }
 
-    if (!validate_request_context(fd, req, admission == nullptr)) {
+    if (!validate_request_context(fd, req, admission != nullptr)) {
         if (admission) *admission = RoutingAdmission::unfit;
         return true;
     }
@@ -7046,6 +7286,7 @@ std::vector<int> HttpServer::request_restore_points(const std::vector<int32_t> &
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
+    request_session_slots_.clear();
     if (req.images) return {};
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
@@ -7203,6 +7444,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
 
     std::vector<int> lookup_lengths;
+    DiskPrefixCache::PrefixProbe disk_probe;
     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full &&
         !effective_prompt.empty()) {
         // Probes are index lookups; only a hit reads a file. A restart then
@@ -7212,6 +7454,17 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             (int) effective_prompt.size(),
             find_all_boundaries(effective_prompt, prefix_cache_.chat_markers()),
             config_.disk_cache_min_tokens);
+        // Session states (agent turns with their generated text) are keyed
+        // past the prompt's chat boundaries; the index knows their lengths.
+        const auto probe = disk_cache_.longest_prefix(effective_prompt);
+        disk_probe = probe;
+        if (probe.len > 0 &&
+            std::find(lookup_lengths.begin(), lookup_lengths.end(), probe.len) ==
+                lookup_lengths.end()) {
+            lookup_lengths.insert(lookup_lengths.begin(), probe.len);
+            std::sort(lookup_lengths.begin(), lookup_lengths.end(),
+                      std::greater<int>());
+        }
     } else if (selected_boundary > 0) {
         lookup_lengths.push_back(selected_boundary);
     } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
@@ -7224,29 +7477,42 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
 
-    if (!cache.using_restore && !disk_cache_.disabled()) {
+    // A RAM hit does not end the search: a session whose deep snapshot was
+    // evicted to disk often still matches a shallow resident entry (the
+    // shared system/tools head). The deeper disk state wins; the index
+    // answers without a read, and a failed read keeps the RAM hit.
+    bool disk_lookup = !cache.using_restore;
+    const int ram_prefix_len = cache.using_restore ? cache.prefix_len : 0;
+    if (cache.using_restore && !disk_cache_.disabled() &&
+        !prepared.compressed && disk_probe.len > 0 && disk_probe.cur_pos > cache.prefix_len &&
+        disk_probe.len < (int) effective_prompt.size()) {
+        lookup_lengths.assign(1, disk_probe.len);
+        disk_lookup = true;
+    }
+    if (disk_lookup && !disk_cache_.disabled()) {
         for (int lookup_length : lookup_lengths) {
             std::vector<int32_t> prefix_tokens(
                 effective_prompt.begin(),
                 effective_prompt.begin() + lookup_length);
             if (!disk_cache_.lookup(prefix_tokens, kDiskStagingSlot)) continue;
 
-            cache.cache_slot = kDiskStagingSlot;
-            cache.prefix_len = backend_.snapshot_cur_pos(kDiskStagingSlot);
-            if (cache.prefix_len <= 0 ||
-                cache.prefix_len > (int) effective_prompt.size()) {
+            const int hit_pos = backend_.snapshot_cur_pos(kDiskStagingSlot);
+            if (hit_pos <= 0 || hit_pos > (int) effective_prompt.size()) {
                 std::fprintf(stderr,
                     "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
-                    cache.prefix_len, effective_prompt.size());
+                    hit_pos, effective_prompt.size());
                 backend_.snapshot_free(kDiskStagingSlot);
                 continue;
             }
+            cache.cache_slot = kDiskStagingSlot;
+            cache.prefix_len = hit_pos;
             cache.using_restore = true;
             cache.disk_hit = true;
             std::fprintf(stderr,
-                "[disk-cache] hit policy=%s len=%d slot=%d pos=%d\n",
+                "[disk-cache] hit policy=%s len=%d slot=%d pos=%d (RAM had %d)\n",
                 disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
-                lookup_length, kDiskStagingSlot, cache.prefix_len);
+                lookup_length, kDiskStagingSlot, cache.prefix_len,
+                ram_prefix_len);
             break;
         }
     }
@@ -7335,7 +7601,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         }
     }
 
+    // A compressed prompt is not raw history: never persist a prefix of it.
+    // With RAM prefix slots the inline snapshot holds the head and reaches
+    // disk when it is evicted, so this extra prefill-and-write is only the
+    // fallback without them.
     if (!cache.using_restore && !disk_cache_.disabled() &&
+        prefix_cache_.disabled() && !prepared.compressed &&
         cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
@@ -7459,7 +7730,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
     cache.snap_prepared = cache.snap_slot >= 0;
     if (cache.snap_prepared) {
-        forget_inline_slot_metadata(cache.snap_slot);
+        evict_inline_slot(cache.snap_slot);
         backend_.snapshot_free(cache.snap_slot);
         generate_request.snap_slot = cache.snap_slot;
         generate_request.snap_pos = cache.snap_cut;
@@ -7468,6 +7739,19 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         backend_.snapshot_free(cache.full_snap_slot);
     }
 
+    if (cache.using_restore && disk_cache_digest_enabled()) {
+        backend_.snapshot_flush_deferred();
+        int n_tensors = 0;
+        uint64_t n_bytes = 0;
+        const uint64_t digest = snapshot_state_digest(
+            backend_.snapshot_ref(cache.cache_slot), &n_tensors, &n_bytes);
+        std::fprintf(stderr,
+            "[disk-cache] digest %s source=%s pos=%d tensors=%d bytes=%llu "
+            "xxh64=%016llx\n",
+            req.response_id.c_str(), cache.disk_hit ? "ssd" : "ram",
+            cache.prefix_len, n_tensors, (unsigned long long)n_bytes,
+            (unsigned long long)digest);
+    }
     std::fprintf(stderr,
         "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
         "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
@@ -7550,21 +7834,21 @@ void HttpServer::finalize_generation_cache(
                 // decision sees the requested cut as covered. Keying at the
                 // saved position re-targets the same cut on every request
                 // and the restore point never moves past it.
+                evict_extra_victims(cache.snap_reservation);
                 cache.snap_reservation.commit(
                     effective_prompt,
                     backend_.snapshot_bytes_estimate(saved_position));
                 trim_snapshots_after_commit(cache.snap_slot);
-                // The shutdown/disk key is exact: it must not claim rows the
-                // snapshot lacks.
-                slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
-                    effective_prompt.begin(),
-                    effective_prompt.begin() + saved_position);
-                if (!disk_cache_.disabled()) {
-                    disk_cache_.learn_layout(cache.snap_slot);
-                    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-                        disk_cache_.save(
-                            cache.snap_slot, slot_tokens_[cache.snap_slot]);
-                    }
+                // The disk key is exact: it must not claim rows the snapshot
+                // lacks. A compressed view is never written to disk, so it
+                // gets no key. The write happens only if this snapshot is
+                // evicted from RAM (evict_inline_slot) or at shutdown.
+                if (!prepared.compressed &&
+                    cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+                    slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
+                        effective_prompt.begin(),
+                        effective_prompt.begin() + saved_position);
+                    note_session_slot(cache.snap_slot);
                 }
             } else {
                 backend_.snapshot_free(cache.snap_slot);
@@ -7580,7 +7864,10 @@ void HttpServer::finalize_generation_cache(
 
     // Long conversations get a continued checkpoint after crossing the
     // configured interval so a future turn can restore prompt plus output.
-    if (!disk_cache_.disabled() &&
+    // With RAM prefix slots a session's state is written when it is evicted
+    // from RAM instead; this checkpoint is the fallback without them.
+    if (!disk_cache_.disabled() && prefix_cache_.disabled() &&
+        !prepared.compressed &&
         cache.disk_policy.mode == DiskPrefixCacheMode::Full && result.ok() &&
         generation_produced_output) {
         const int final_position =
@@ -7619,6 +7906,157 @@ void HttpServer::forget_inline_slot_metadata(int slot) {
     if (slot < 0) return;
     agent_turn_cache_slots_.erase(slot);
     slot_tokens_.erase(slot);
+    slot_aux_.erase(slot);
+}
+
+bool HttpServer::persist_evicted_slot(int slot, bool persist, const char * reason) {
+    if (slot < 0 || !persist || disk_cache_.disabled()) return false;
+    const auto key = slot_tokens_.find(slot);
+    // No key: a compressed view, a non-`full` disk scope, or no snapshot.
+    if (key == slot_tokens_.end() || !backend_.snapshot_used(slot)) return false;
+    const auto aux = slot_aux_.find(slot);
+    OwnedSnapshot snap = backend_.snapshot_detach(slot);
+    if (snap.empty()) return false;
+    const int pos = snap.cur_pos();
+    const bool queued = disk_cache_.save_async(
+        std::move(snap), key->second,
+        aux == slot_aux_.end() ? std::string() : aux->second);
+    const int pruned = queued
+        ? disk_cache_.prune_ancestors(key->second, config_.disk_cache_cold_max_tokens)
+        : 0;
+    std::fprintf(stderr,
+        "[disk-cache] %s slot=%d tokens=%zu pos=%d -> %s (pruned %d older)\n",
+        reason, slot, key->second.size(), pos,
+        queued ? "write queued" : "not written", pruned);
+    return queued;
+}
+
+void HttpServer::evict_inline_slot(int slot) {
+    if (slot >= 0) {
+        persist_evicted_slot(slot, prefix_cache_.persist_on_evict(slot), "ram eviction");
+    }
+    forget_inline_slot_metadata(slot);
+}
+
+void HttpServer::evict_extra_victims(
+        const PrefixCache::InlineReservation & reservation) {
+    for (const int slot : reservation.extra_victim_slots()) {
+        evict_inline_slot(slot);
+        backend_.snapshot_free(slot);
+    }
+}
+
+void HttpServer::note_session_slot(int slot) {
+    if (slot >= 0) request_session_slots_.push_back(slot);
+}
+
+std::string HttpServer::session_replay_blob(const ParsedRequest & req,
+                                           const SseEmitter * emitter) {
+    json entries = json::array();
+    if (tool_memory_.disabled()) return std::string();
+    const auto messages =
+        normalize_chat_messages(req.messages, req.format, tool_memory_, true);
+    for (const auto & m : messages) {
+        if (!m.tool_calls_replayed || m.content.empty()) continue;
+        json ids = json::array();
+        for (const auto & call : m.tool_calls) ids.push_back(call.id);
+        entries.push_back({{"ids", ids}, {"raw", m.content}});
+    }
+    // This response's own calls, remembered by remember_agent_turn().
+    std::vector<std::string> ids;
+    if (emitter) {
+        for (const auto & call : emitter->tool_calls()) ids.push_back(call.id);
+    }
+    if (!ids.empty()) {
+        const std::string raw = tool_memory_.lookup(ids);
+        if (!raw.empty()) entries.push_back({{"ids", ids}, {"raw", raw}});
+    }
+    if (entries.empty()) return std::string();
+    return json{{"tool_memory", entries}}.dump();
+}
+
+void HttpServer::restore_replay_blobs() {
+    size_t restored = 0;
+    disk_cache_.for_each_aux([&](const std::string & blob) {
+        const json doc = json::parse(blob, nullptr, /*allow_exceptions=*/false);
+        if (!doc.is_object() || !doc.contains("tool_memory") ||
+            !doc["tool_memory"].is_array()) {
+            return;
+        }
+        for (const auto & entry : doc["tool_memory"]) {
+            if (!entry.is_object() || !entry.contains("ids") ||
+                !entry["ids"].is_array() || !entry.contains("raw") ||
+                !entry["raw"].is_string()) {
+                continue;
+            }
+            std::vector<std::string> ids;
+            for (const auto & id : entry["ids"]) {
+                if (id.is_string()) ids.push_back(id.get<std::string>());
+            }
+            tool_memory_.remember(ids, entry["raw"].get<std::string>());
+            ++restored;
+        }
+    });
+    if (restored > 0) {
+        std::fprintf(stderr,
+            "[disk-cache] restored %zu tool-call replay entries\n", restored);
+    }
+}
+
+void HttpServer::record_session_aux(const ParsedRequest & req,
+                                    const SseEmitter & emitter) {
+    std::vector<int> slots;
+    slots.swap(request_session_slots_);
+    if (disk_cache_.disabled()) return;
+    std::string blob;
+    bool computed = false;
+    for (const int slot : slots) {
+        if (!slot_tokens_.count(slot)) continue;
+        if (!computed) {
+            blob = session_replay_blob(req, &emitter);
+            computed = true;
+        }
+        slot_aux_[slot] = blob;
+    }
+}
+
+void HttpServer::flush_sessions_to_disk(const char * reason) {
+    if (disk_cache_.disabled()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const double limit = config_.disk_cache_shutdown_flush_s;
+    const auto elapsed = [&] {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+    size_t queued = 0, backups = 0, skipped = 0;
+    const auto before = disk_cache_.stats();
+    // Graceful shutdown evicts everything: each conversation's newest
+    // snapshot and the heads, most recently used first, so the time limit
+    // drops the least valuable ones. Queuing can wait for the writer
+    // (bounded queued bytes), so the limit is checked between snapshots.
+    for (const auto & entry : prefix_cache_.entries_for_shutdown()) {
+        if (!entry.persist) {
+            ++backups;
+            continue;
+        }
+        if (limit >= 0 && elapsed() >= limit) {
+            ++skipped;
+            continue;
+        }
+        if (persist_evicted_slot(entry.slot, true, reason)) ++queued;
+        forget_inline_slot_metadata(entry.slot);
+    }
+    const auto drained = disk_cache_.drain(
+        limit < 0 ? -1.0 : (std::max)(0.0, limit - elapsed()));
+    std::fprintf(stderr,
+        "[disk-cache] %s flush: %zu snapshots queued (%zu edit backups not "
+        "written), %llu files %.1f MB written in %.2fs (limit %.0fs; %llu "
+        "writes and %zu snapshots dropped by it)\n",
+        reason, queued, backups,
+        (unsigned long long)(disk_cache_.stats().writes - before.writes),
+        (double)(disk_cache_.stats().write_bytes - before.write_bytes) / (1024.0 * 1024.0),
+        elapsed(), limit,
+        (unsigned long long)drained.cancelled, skipped);
 }
 
 void HttpServer::trim_snapshots_after_commit(int slot) {
@@ -7629,7 +8067,13 @@ void HttpServer::trim_snapshots_after_commit(int slot) {
         }
     };
     release(prefix_cache_.prune_superseded_ancestors(slot));
-    release(prefix_cache_.enforce_resident_budget(slot));
+    std::vector<bool> persist;
+    const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
+    for (size_t i = 0; i < evicted.size(); ++i) {
+        persist_evicted_slot(evicted[i], persist[i], "ram eviction");
+        forget_inline_slot_metadata(evicted[i]);
+        backend_.snapshot_free(evicted[i]);
+    }
 }
 
 void HttpServer::publish_memory_report() {
@@ -7753,7 +8197,7 @@ bool HttpServer::save_generated_turn(
         return false;
     }
     const int slot = reservation.slot();
-    forget_inline_slot_metadata(slot);
+    evict_inline_slot(slot);
     backend_.snapshot_free(slot);
     // The next request usually continues this state, so the backend may
     // keep it live instead of copying it out.
@@ -7764,14 +8208,21 @@ bool HttpServer::save_generated_turn(
         reservation.abort();
         return false;
     }
+    evict_extra_victims(reservation);
     reservation.commit_at(
         canonical, saved_pos, backend_.snapshot_bytes_estimate(saved_pos));
-    for (const int evicted : prefix_cache_.enforce_resident_budget(slot)) {
-        forget_inline_slot_metadata(evicted);
-        backend_.snapshot_free(evicted);
+    std::vector<bool> persist;
+    const auto evicted = prefix_cache_.enforce_resident_budget(slot, &persist);
+    for (size_t i = 0; i < evicted.size(); ++i) {
+        persist_evicted_slot(evicted[i], persist[i], "ram eviction");
+        forget_inline_slot_metadata(evicted[i]);
+        backend_.snapshot_free(evicted[i]);
     }
-    slot_tokens_[slot] = std::vector<int32_t>(
-        canonical.begin(), canonical.begin() + saved_pos);
+    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+        slot_tokens_[slot] = std::vector<int32_t>(
+            canonical.begin(), canonical.begin() + saved_pos);
+        note_session_slot(slot);
+    }
     agent_turn_cache_slots_.insert(slot);
     std::fprintf(stderr,
         "[agent-turn-cache] saved generated turn slot=%d prefix=%d "
@@ -7896,7 +8347,7 @@ void HttpServer::remember_agent_turn(
         reservation.cancel();
         return;
     }
-    forget_inline_slot_metadata(slot);
+    evict_inline_slot(slot);
     backend_.snapshot_free(slot);
 
     GenerateRequest replay;
@@ -7912,12 +8363,16 @@ void HttpServer::remember_agent_turn(
     const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
         ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
+        evict_extra_victims(reservation);
         reservation.commit_at(
             canonical_tokens, saved_pos,
             backend_.snapshot_bytes_estimate(saved_pos));
         trim_snapshots_after_commit(slot);
         canonical_tokens.resize((size_t) saved_pos);
-        slot_tokens_[slot] = std::move(canonical_tokens);
+        if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+            slot_tokens_[slot] = std::move(canonical_tokens);
+            note_session_slot(slot);
+        }
         agent_turn_cache_slots_.insert(slot);
         std::fprintf(stderr,
             "[agent-turn-cache] saved slot=%d prefix=%d source=%d:%d "
@@ -7954,6 +8409,8 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
+    // A grammar masks one position at a time: no speculative blocks.
+    inputs.request.force_ar_decode = req.sampler.constraint != nullptr;
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
     inputs.request.stream = false;
@@ -8023,6 +8480,9 @@ void HttpServer::configure_generation_io(
 
     io.on_token = [this, job, &req, &emitter, &output](
             int32_t token) -> bool {
+        // The grammar moves with every token the request keeps, before the
+        // backend samples the next one.
+        if (req.sampler.constraint) req.sampler.constraint->accept(token);
         if (output.client_disconnected ||
             job->client_disconnected.load(std::memory_order_acquire)) {
             output.client_disconnected = true;
@@ -8494,6 +8954,7 @@ void HttpServer::process_job(ServerJob * job) {
         req, prepared, cache, result, emitter, completion_tokens,
         visible_output_seen, client_disconnected,
         /*replay_cache=*/true);
+    record_session_aux(req, emitter);
 
     if (client_disconnected) {
         std::fprintf(stderr, "[server] client disconnected — generation aborted "
