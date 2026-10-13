@@ -8,6 +8,12 @@ namespace luce::common {
 
 inline constexpr size_t kPFlashMaxInstructionSpans = 64;
 
+// PFlash's maximum context (220 x 1024 tokens). The drafter scores the whole raw prompt, and its scoring forward's
+// memory grows with the prompt: on a 32 GB R9700 with the 27B target resident it runs out of memory above this
+// (233K-token prompt: OOM; 217K: served). With prefill compression on, the server caps --max-ctx at this and refuses
+// raw prompts longer than it (server/admission.h).
+inline constexpr int kPFlashMaxCtx = 225280;
+
 // Half-open token range in the drafter-tokenized prompt.
 struct PFlashTokenSpan {
     int begin = 0;

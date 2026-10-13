@@ -12,6 +12,7 @@
 //                              [--max-tokens 4096] [--target-device auto:0]
 
 #include "http_server.h"
+#include "admission.h"
 #include "chat_template.h"
 #include "launch_profiles.h"
 #include "model_card.h"
@@ -1085,6 +1086,22 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         }
         bargs.device.max_ctx = meta.context_length;
     }
+    // PFlash's maximum context (kPFlashMaxCtx): the drafter scores the whole raw prompt, so with compression on the
+    // context is capped there.
+    {
+        const bool compression_on = sconfig.pflash_mode != ServerConfig::PflashMode::OFF &&
+                                    !sconfig.pflash_drafter_path.empty();
+        const int requested = bargs.device.max_ctx;
+        const int clamped = pflash_clamped_max_ctx(requested, compression_on);
+        if (clamped != requested) {
+            std::fprintf(stderr,
+                "[server] --max-ctx %d%s capped at %d: PFlash prefill compression is on and its drafter's scoring "
+                "memory grows with the prompt (PFlash maximum context)\n",
+                requested, bargs.device.fit_ctx ? " (auto)" : "", clamped);
+            bargs.device.max_ctx = clamped;
+            if (sconfig.max_ctx > 0) sconfig.max_ctx = clamped;
+        }
+    }
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {
         std::fprintf(stderr, "[server] --decode-kv-offload-mb requires --max-concurrency greater than 1\n");
@@ -1313,6 +1330,13 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
     auto & bargs = model.bargs;
     auto & sconfig = model.sconfig;
+    if (sconfig.pflash_mode != ServerConfig::PflashMode::OFF) {
+        std::string error;
+        if (!http_detail::validate_pflash_environment(error)) {
+            std::fprintf(stderr, "[server] invalid PFlash configuration: %s\n", error.c_str());
+            return 1;
+        }
+    }
     auto & spark_autotune = model.spark_autotune;
     auto & spark_slots = model.spark_slots;
     auto & spark_vram_gib = model.spark_vram_gib;
@@ -1620,24 +1644,10 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 std::fprintf(stderr, " %d:%.3f", p.first, p.second);
             std::fprintf(stderr, "\n");
         }
-        // A query-source flag (request probe, identifier query) works only
-        // with strict head selection. Without it every compression call fails
-        // and FlowKV / PFlash silently serve the prompt verbatim: refuse to
-        // start instead.
         if (const char * ident = std::getenv("PFLASH_EVAL_REF_IDENT_QUERY")) {
             if (std::strcmp(ident, "off") != 0) {
                 std::fprintf(stderr, "[server] PFLASH_EVAL_REF_IDENT_QUERY=%s: EVALUATION REFERENCE ARM "
                              "(identifier heuristic), not a product path\n", ident);
-            }
-        }
-        if (luce::pflash::pflash_query_probe_requested() ||
-            std::getenv("PFLASH_EVAL_REF_IDENT_QUERY") != nullptr) {
-            luce::pflash::PFlashSelectionConfig check;
-            std::string check_error;
-            if (!luce::pflash::resolve_pflash_selection(1 << 16, 32, check, check_error)) {
-                std::fprintf(stderr, "[server] invalid PFlash selection config: %s\n",
-                             check_error.c_str());
-                return 1;
             }
         }
         if (!sconfig.pflash_upstream_base.empty()) {

@@ -422,7 +422,7 @@ struct V2Fixture {
     std::vector<int> candidates;
 };
 const std::vector<V2Fixture> kV2Fixtures = {
-#include "request_probe_v2_parity.inc"
+#include "fixtures/request_probe_v2_parity.inc"
 };
 } // namespace
 

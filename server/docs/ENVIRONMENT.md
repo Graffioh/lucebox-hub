@@ -12,6 +12,10 @@ Anything else in the inventory below is legacy surface: prefer the CLI flag
 where one exists, and treat undocumented variables as internal. The
 consolidation of this list into CLI flags is tracked as follow-up work.
 
+PFlash's existing tuning, serving and evaluation overrides are documented in
+[PFlash configuration](PFLASH_CONFIGURATION.md), including the measured release
+profile and the requirements checked at startup.
+
 ## Documented variables
 
 | Variable | Default | Purpose |

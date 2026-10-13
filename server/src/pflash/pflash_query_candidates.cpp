@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,18 +28,20 @@ constexpr const char * kEndEnv = "PFLASH_QUERY_END";
 
 bool parse_int(const char * raw, int lo, int hi, int & out) {
     if (!raw || !*raw) return false;
+    errno = 0;
     char * end = nullptr;
     const long v = std::strtol(raw, &end, 10);
-    if (!end || *end != '\0' || v < lo || v > hi) return false;
+    if (errno == ERANGE || end == raw || *end != '\0' || v < lo || v > hi) return false;
     out = (int) v;
     return true;
 }
 
 bool parse_float(const char * raw, float & out) {
     if (!raw || !*raw) return false;
+    errno = 0;
     char * end = nullptr;
     const float v = std::strtof(raw, &end);
-    if (!end || *end != '\0' || !std::isfinite(v)) return false;
+    if (errno == ERANGE || end == raw || *end != '\0' || !std::isfinite(v)) return false;
     out = v;
     return true;
 }

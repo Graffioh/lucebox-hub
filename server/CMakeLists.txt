@@ -1096,8 +1096,8 @@ endif()
 
 # PFlash phase-split harness
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke/pflash_daemon.cpp")
-    add_executable(pflash_daemon test/smoke/pflash_daemon.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash/pflash_daemon.cpp")
+    add_executable(pflash_daemon test/pflash/pflash_daemon.cpp)
     target_include_directories(pflash_daemon PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     target_link_libraries(pflash_daemon PRIVATE luce_common ggml ${LUCE_GGML_BACKEND_TARGET})
     if(LUCE_GPU_BACKEND STREQUAL "cuda")
@@ -1129,7 +1129,7 @@ if(LUCE_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
 
-    # Test sources live under test/{unit,smoke,bench}/ while the shared
+    # Test sources live under test/{unit,smoke,bench,pflash}/ while the shared
     # helpers (CppUnitTestFramework.hpp, host_check.h, ...) stay at test/.
     # Put the helper dir on every test target's include path.
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/test)
@@ -2289,7 +2289,7 @@ if(LUCE_TESTS)
 
     # PFlash fold replay: the runtime's fold selection over recorded traces
     # (CPU only; the drafter GGUF supplies the vocabulary).
-    add_executable(pflash_fold_replay test/pflash_fold_replay.cpp)
+    add_executable(pflash_fold_replay test/pflash/pflash_fold_replay.cpp)
     target_include_directories(pflash_fold_replay PRIVATE ${LUCE_SRC_INCLUDE_DIRS})
     if(LUCE_GPU_BACKEND STREQUAL "hip")
         target_compile_definitions(pflash_fold_replay PRIVATE LUCE_BACKEND_HIP=1 GGML_USE_HIP)
@@ -2475,15 +2475,15 @@ if(LUCE_TESTS)
             test/unit/test_chain_rollback_policy.cpp
             test/unit/test_ddtree_tau.cpp
             test/unit/test_anchor_transitive.cpp
-            test/unit/test_pflash_drafter_ipc.cpp
-            test/unit/test_pflash_selection.cpp
-            test/unit/test_pflash_fold.cpp
-            test/unit/test_pflash_request_probe.cpp
-            test/unit/test_pflash_request_stage2.cpp
-            test/unit/test_pflash_query_candidates.cpp
-            test/unit/test_pflash_scoring_resume.cpp
-            test/unit/test_pflash_session_offload.cpp
-            test/unit/test_pflash_ident_query.cpp
+            test/pflash/test_pflash_drafter_ipc.cpp
+            test/pflash/test_pflash_selection.cpp
+            test/pflash/test_pflash_fold.cpp
+            test/pflash/test_pflash_request_probe.cpp
+            test/pflash/test_pflash_request_stage2.cpp
+            test/pflash/test_pflash_query_candidates.cpp
+            test/pflash/test_pflash_scoring_resume.cpp
+            test/pflash/test_pflash_session_offload.cpp
+            test/pflash/test_pflash_ident_query.cpp
             test/unit/test_qwen35_causal_mask.cpp
             test/unit/test_model_test_paths.cpp
             test/unit/test_gguf_mmap.cpp

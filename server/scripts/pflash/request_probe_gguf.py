@@ -8,17 +8,19 @@ requestprobe.extraction_version (the run-extraction rule the tau was calibrated 
 request_runs_v2_minrun2_ge_raw_logit). Torch weights are written as-is:
 LayerNorm(1024), Linear(1024, W).weight [W, 1024], Linear(W, 1).weight [1, W].
 
-  pflash_request_probe_gguf.py OUT.gguf --drafter-sha256 HEX --tau T --weights probe.npz
+  request_probe_gguf.py OUT.gguf --drafter-sha256 HEX --tau T --weights probe.npz
       npz keys: norm_weight, norm_bias, fc1_weight, fc1_bias, fc2_weight, fc2_bias (torch shapes)
-  pflash_request_probe_gguf.py OUT.gguf --drafter-sha256 HEX --tau T --random-seed S [--width W]
+  request_probe_gguf.py OUT.gguf --drafter-sha256 HEX --tau T --random-seed S [--width W]
       random weights, for runtime plumbing tests only (not a trained probe)
 
 Needs numpy and gguf-py (PYTHONPATH=server/deps/llama.cpp/gguf-py).
 """
 import argparse
 import sys
+from pathlib import Path
 
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "deps/llama.cpp/gguf-py"))
 import gguf
 
 HIDDEN = 1024

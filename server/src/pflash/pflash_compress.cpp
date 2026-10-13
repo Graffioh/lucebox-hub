@@ -456,7 +456,12 @@ void write_compression_trace(
         if (index) std::fputc(',', file);
         std::fprintf(file, "%d", compressed_ids[index]);
     }
-    std::fputs("]}\n", file);
+    std::fputc(']', file);
+    if (trace_fields && trace_fields->spread_threshold > 0.0) {
+        std::fprintf(file, ",\"spread\":%.17g,\"spread_threshold\":%.17g",
+                     trace_fields->spread, trace_fields->spread_threshold);
+    }
+    std::fputs("}\n", file);
     std::fclose(file);
 }
 
@@ -465,7 +470,43 @@ thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
 thread_local PFlashScoringStats g_last_scoring_stats;
 thread_local std::vector<PFlashCandidateLift> g_last_candidate_lifts;
 thread_local PFlashStage2Outcome g_last_stage2_outcome;
+thread_local PFlashRelevanceSpread g_last_relevance_spread;
 } // namespace
+
+PFlashRelevanceSpread pflash_relevance_spread(
+        const std::vector<double> & scores,
+        const std::vector<uint8_t> & selected,
+        const std::vector<uint8_t> & forced) {
+    PFlashRelevanceSpread out;
+    if (selected.size() != scores.size() || forced.size() != scores.size()) return out;
+    double total = 0.0;
+    for (const double score : scores) {
+        if (!std::isfinite(score)) return out;
+        total += score;
+    }
+    double entropy = 0.0;
+    if (total > 0.0) {
+        for (const double score : scores) {
+            if (!(score > 0.0)) continue;
+            const double p = score / total;
+            entropy -= p * std::log(p);
+        }
+    }
+    int k = 0;
+    for (size_t index = 0; index < scores.size(); ++index) {
+        if (selected[index] && !forced[index]) ++k;
+    }
+    out.valid = true;
+    out.entropy = entropy;
+    out.k = k;
+    out.candidates = (int) scores.size();
+    out.spread = std::exp(entropy) / (double) std::max(k, 1);
+    return out;
+}
+
+const PFlashRelevanceSpread & pflash_last_relevance_spread() {
+    return g_last_relevance_spread;
+}
 
 const PFlashStage2Outcome & pflash_last_stage2_outcome() {
     return g_last_stage2_outcome;
@@ -496,6 +537,7 @@ void pflash_clear_kept_spans() {
     g_last_scoring_stats = {};
     g_last_candidate_lifts.clear();
     g_last_stage2_outcome = {};
+    g_last_relevance_spread = {};
 }
 
 std::vector<int32_t> select_pflash_chunks(
@@ -622,6 +664,8 @@ std::vector<int32_t> select_pflash_chunks(
             for (const auto & candidate : candidates) {
                 if (candidate.mandatory) mandatory_mask[candidate.ordinal] = 1;
             }
+            g_last_relevance_spread = pflash_relevance_spread(
+                exact_chunk_scores, anchor_mask, mandatory_mask);
             PFlashTraceFields fields{
                 &ids, query_begin, query_end, config.mode, config.query_parser,
                 selector_budget, fold.stop, fold.retained_tokens, kept_mass,
@@ -643,6 +687,10 @@ std::vector<int32_t> select_pflash_chunks(
             fields.extra_queries = &config.extra_queries;
             fields.request_probe = config.request_probe_trace;
             fields.ident_query = config.ident_query_trace;
+            if (config.fallback_spread > 0.0) {
+                fields.spread = g_last_relevance_spread.spread;
+                fields.spread_threshold = config.fallback_spread;
+            }
             write_compression_trace(
                 input_tokens, keep_ratio, segments ? 0 : config.chunk_size, query_tokens,
                 pool_kernel, (int) fold.anchors.size(), chunk_means, anchor_mask,
@@ -726,6 +774,8 @@ std::vector<int32_t> select_pflash_chunks(
     std::fflush(stderr);
 
     if (write_trace) {
+        g_last_relevance_spread = pflash_relevance_spread(
+            exact_chunk_scores, selected_mask, mandatory_mask);
         const int trace_chunk = segments ? 0 : config.chunk_size;
         const int n_keep_approx = segments
             ? (int) selected.ordinals.size()
@@ -746,6 +796,10 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.extra_queries = &config.extra_queries;
         strict_fields.request_probe = config.request_probe_trace;
         strict_fields.ident_query = config.ident_query_trace;
+        if (config.fallback_spread > 0.0) {
+            strict_fields.spread = g_last_relevance_spread.spread;
+            strict_fields.spread_threshold = config.fallback_spread;
+        }
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,
