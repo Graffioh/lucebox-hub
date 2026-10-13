@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "pflash_types.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -377,6 +379,25 @@ struct ModelBackend {
         // that knob controls lexical anchors, not neural scorer Q rows.
         int                  score_query_end = -1;
         int                  score_query_tokens = 8;
+        // Role-derived instruction structure in drafter-token coordinates.
+        // Empty is a valid instruction-free or legacy request.
+        std::vector<PFlashTokenSpan> required_instruction_spans;
+        // Strict selection with the block-15 head: the tokens after the query
+        // window are scored candidates rather than a kept suffix. The caller
+        // pins what of that suffix must stay (the generation prompt).
+        bool                 query_suffix_candidates = false;
+        // Earlier user questions (their scorer windows), most recent first:
+        // they score the context alongside the query at halving weights.
+        std::vector<PFlashTokenSpan> history_query_spans;
+        // The latest user turn's tail, a second query window at full weight
+        // (prompt-end chat queries; {-1, -1} otherwise).
+        PFlashTokenSpan turn_query_span{-1, -1};
+        // PFLASH_SELECT_QUERY_HEAD=1: the user's prose blocks around pasted
+        // material, extra query windows at full weight (also kept verbatim).
+        std::vector<PFlashTokenSpan> extra_query_spans;
+        // PFLASH_SELECT_QUERY_PROBE=1: the human user messages' content
+        // spans (latest first) the request probe reads.
+        PFlashRequestMessages request_messages;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
@@ -386,6 +407,31 @@ struct ModelBackend {
     struct CompressResult {
         bool                 ok = false;
         std::vector<int32_t> compressed_ids;  // surviving token IDs
+        // Strict selection: the input spans behind compressed_ids, ascending.
+        // Empty when the backend does not report them (remote drafter).
+        std::vector<PFlashTokenSpan> kept_spans;
+        // Drafter session reuse: the token scoring resumed from and the
+        // tokens it ran (-1 when unknown), and its forward time.
+        // Strict selection with the head: every candidate's attention lift
+        // (mass per token relative to uniform); empty when unknown.
+        std::vector<std::pair<PFlashTokenSpan, double>> candidate_lifts;
+        int                  scorer_resume = -1;
+        int                  scorer_new_tokens = -1;
+        double               scorer_forward_s = 0.0;
+        // Request stage 2 (STAGE2-CONTRACT.md section 5 step 5): the keep budget was widened x1.5 (drafter
+        // tokens B -> B'), and when B' covers the prompt the caller serves it raw.
+        bool                 budget_widened = false;
+        bool                 raw_fits = false;
+        int                  stage2_budget = -1;
+        int                  stage2_budget_widened = -1;
+
+        static CompressResult from_compressed_ids(
+                std::vector<int32_t> ids) {
+            CompressResult result;
+            result.compressed_ids = std::move(ids);
+            result.ok = !result.compressed_ids.empty();
+            return result;
+        }
     };
 
     // Typed compress API (preferred for in-process callers).

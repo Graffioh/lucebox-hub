@@ -31,6 +31,7 @@
 #include "common/specla_mode.h"
 #include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
+#include "pflash/pflash_selection.h"
 #include "placement/draft_residency.h"
 #include "placement/device_select.h"
 #include "kvflash_pager.h"
@@ -296,7 +297,7 @@ static void print_usage(const char * prog) {
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
         "                              10000:0.5 40000:0.2 100000:0.1\n"
-        "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
+        "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --draft-residency auto|persistent|request-scoped\n"
         "                         Drafter lifetime policy (default: auto)\n"
@@ -1618,6 +1619,26 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             for (const auto & p : sconfig.pflash_curve)
                 std::fprintf(stderr, " %d:%.3f", p.first, p.second);
             std::fprintf(stderr, "\n");
+        }
+        // A query-source flag (request probe, identifier query) works only
+        // with strict head selection. Without it every compression call fails
+        // and FlowKV / PFlash silently serve the prompt verbatim: refuse to
+        // start instead.
+        if (const char * ident = std::getenv("PFLASH_EVAL_REF_IDENT_QUERY")) {
+            if (std::strcmp(ident, "off") != 0) {
+                std::fprintf(stderr, "[server] PFLASH_EVAL_REF_IDENT_QUERY=%s: EVALUATION REFERENCE ARM "
+                             "(identifier heuristic), not a product path\n", ident);
+            }
+        }
+        if (luce::pflash::pflash_query_probe_requested() ||
+            std::getenv("PFLASH_EVAL_REF_IDENT_QUERY") != nullptr) {
+            luce::pflash::PFlashSelectionConfig check;
+            std::string check_error;
+            if (!luce::pflash::resolve_pflash_selection(1 << 16, 32, check, check_error)) {
+                std::fprintf(stderr, "[server] invalid PFlash selection config: %s\n",
+                             check_error.c_str());
+                return 1;
+            }
         }
         if (!sconfig.pflash_upstream_base.empty()) {
             std::fprintf(stderr, "[server] pflash upstream: %s  model=%s\n",

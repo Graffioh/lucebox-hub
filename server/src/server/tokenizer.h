@@ -53,6 +53,10 @@ public:
     // Look up a token by its exact string. Returns -1 if not found.
     int32_t token_to_id(const std::string & token) const;
 
+    // True for an added token (GGUF token type control or user-defined:
+    // chat and tool markup such as <|im_start|>, <tool_call>).
+    bool is_added_token(int32_t id) const;
+
 private:
     // Pre-tokenize text into pieces using Qwen3/3.5 regex pattern.
     std::vector<std::string> pre_tokenize(const std::string & text) const;
