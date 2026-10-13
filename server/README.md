@@ -385,23 +385,26 @@ the whole request's device footprint. `/status/json` reports
 
 ### PFlash
 
+With a trained scoring head (`PFLASH_SCORING_HEAD_GGUF`), every PFlash setting
+left unset takes the measured release profile: threshold 16384, the curve
+`16384:0.315 32768:0.270 65536:0.270 120000:0.225`, budget selection over probe
+segments and the request-probe query. Without a head the built-in defaults
+below apply. The [PFlash configuration reference](docs/PFLASH_CONFIGURATION.md)
+lists both, the validated overrides and the active experiments.
+
 | Option | Default | Purpose |
 |---|---|---|
-The [PFlash configuration reference](docs/PFLASH_CONFIGURATION.md) lists validated
-overrides, active experiments, and the measured release profile separately from
-the built-in defaults below.
-
 | `--prefill-compression off\|auto\|always` | `off` | Select when PFlash compresses a prompt. |
-| `--prefill-threshold <N>` | `32000` | Token threshold used by auto mode. |
-| `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
-| `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
+| `--prefill-threshold <N>` | `32000` (`16384` with a head) | Token threshold used by auto mode. |
+| `--prefill-keep-ratio <F>` | `0.05` (the release curve with a head) | Fraction of source tokens kept. |
+| `--prefill-curve T:R [T:R ...]` | none (the release curve with a head) | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF (Qwen3.5-0.8B). |
 | `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
-| `PFLASH_SELECT_MODE=top_k` + `PFLASH_SELECT_TOPK <K>` | unset: legacy selection | Rank rule: keep the K highest-scoring optional segments in score order instead of filling the keep ratio, with the keep-ratio budget still a hard ceiling (min(K segments, the budget)). Use it where the evidence is compact and sits in the first few ranks -- needle retrieval, passage QA, code -- so a small K reaches it for a fraction of the budget's tokens. Do not use it where the answer needs a whole document identified, since the evidence there spans many segments and K cuts it off. |
-| `PFLASH_SELECT_QUERY_HEAD=1` (with `PFLASH_SELECT_QUERY_PARSER=latest_user`) | off | The question may come before pasted material. The user's leading prose block (up to the first paste-like line: a code fence, heading, separator, record/file header, tag, JSON or table data, indented or code-shaped line) is scored as an extra query window and kept verbatim; the trailing prose block after the last paste becomes the query window instead of the fixed tail. Caps: `PFLASH_SELECT_QUERY_HEAD_TOKENS` / `PFLASH_SELECT_QUERY_TAIL_TOKENS` (256); a longer block contributes its first and last cap/2 tokens. Blocks under 16 tokens are ignored; a message with no paste structure keeps today's window, except that a short opening paragraph ending in `?` before a long plain text counts as the head. |
+| `PFLASH_SELECT_MODE=top_k` + `PFLASH_SELECT_TOPK <K>` | unset: legacy selection (`budget_only` with a head) | Rank rule: keep the K highest-scoring optional segments in score order instead of filling the keep ratio, with the keep-ratio budget still a hard ceiling (min(K segments, the budget)). Use it where the evidence is compact and sits in the first few ranks -- needle retrieval, passage QA, code -- so a small K reaches it for a fraction of the budget's tokens. Do not use it where the answer needs a whole document identified, since the evidence there spans many segments and K cuts it off. |
+| `PFLASH_SELECT_QUERY_HEAD=1` (with `PFLASH_SELECT_QUERY_PARSER=latest_user`) | off (on with a head) | The question may come before pasted material. The user's leading prose block (up to the first paste-like line: a code fence, heading, separator, record/file header, tag, JSON or table data, indented or code-shaped line) is scored as an extra query window and kept verbatim; the trailing prose block after the last paste becomes the query window instead of the fixed tail. Caps: `PFLASH_SELECT_QUERY_HEAD_TOKENS` / `PFLASH_SELECT_QUERY_TAIL_TOKENS` (256); a longer block contributes its first and last cap/2 tokens. Blocks under 16 tokens are ignored; a message with no paste structure keeps today's window, except that a short opening paragraph ending in `?` before a long plain text counts as the head. |
 | `PFLASH_SELECT_STRATEGY=fold` (with `PFLASH_SELECT_MODE=budget_only`) | `segments` | Fold selection: each of the top 20 segments (`PFLASH_SELECT_FOLD_K`) is completed to its smallest enclosing block -- a function or class in code (Python indentation or brace-matched C/C++/JS/TS/Go/Rust bodies), a numbered record such as `Document N:`, a markdown section, else a blank-line paragraph (`PFLASH_SELECT_FOLD_PARAGRAPHS=0` turns that last fallback off). A block over 1500 tokens (`PFLASH_SELECT_FOLD_CAP`) keeps its first 150 (`PFLASH_SELECT_FOLD_HEAD`) plus the segment. Code-like prompts (most non-blank lines inside functions; JSON and markdown are not) rank segments by mass (density x length), others by density. The keep-ratio budget stays the ceiling. Needs the head scorer; the drafter loads its vocabulary to read the prompt's structure. |
 
 PFlash's maximum context is 225,280 tokens (220 x 1024): the drafter scores

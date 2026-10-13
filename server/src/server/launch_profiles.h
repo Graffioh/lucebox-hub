@@ -10,7 +10,9 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace luce::server {
@@ -298,6 +300,65 @@ inline const std::vector<LaunchProfileEnv> & cluster_launch_env() {
         // The fast reduce reads pinned host rows from the GPU.
         {"HSA_FORCE_FINE_GRAIN_PCIE", "1"},
     };
+    return env;
+}
+
+// PFlash with a trained scoring head (PFLASH_SCORING_HEAD_GGUF): the release
+// profile measured for the PFlash v2 post (Qwen3.8-27B target, Qwen3.5-0.8B
+// drafter, R9700). With prefill compression on, the server installs these
+// environment defaults and the threshold and curve below for flags the
+// command line did not give; a variable that is already set keeps its value.
+// Without a head the built-in defaults stay. The request-probe query needs
+// PFLASH_REQUEST_PROBE_GGUF, and its candidates and pin the segment probe
+// too; each yields to an experiment arm it cannot combine with.
+inline constexpr int kPFlashReleaseThreshold = 16384;
+
+inline const std::vector<std::pair<int, float>> & pflash_release_curve() {
+    static const std::vector<std::pair<int, float>> curve = {
+        {16384, 0.315f}, {32768, 0.270f}, {65536, 0.270f}, {120000, 0.225f}};
+    return curve;
+}
+
+inline std::vector<LaunchProfileEnv> pflash_release_env() {
+    const auto set = [](const char * name) {
+        const char * raw = std::getenv(name);
+        return raw && *raw;
+    };
+    const auto is = [](const char * name, const char * value) {
+        const char * raw = std::getenv(name);
+        return raw && std::strcmp(raw, value) == 0;
+    };
+    if (!set("PFLASH_SCORING_HEAD_GGUF")) return {};
+    std::vector<LaunchProfileEnv> env = {
+        // Units are taken by relevance per token until the budget is full;
+        // relevance spread too flat over a whole prompt gets full prefill.
+        {"PFLASH_SELECT_MODE", "budget_only"},
+        {"PFLASH_SELECT_SCORE", "density"},
+        {"PFLASH_SELECT_CHUNK_SIZE", "256"},
+        {"PFLASH_SELECT_QUERY_TOKENS", "128"},
+        {"PFLASH_SELECT_QUERY_HEAD", "1"},
+        {"PFLASH_SELECT_PARAGRAPH_JOIN", "0"},
+        {"PFLASH_FALLBACK_SPREAD", "0.11"},
+        // Admission counts only tokens no cache restores, a newly arriving
+        // region is scored alone, and a drifted chat view is rebuilt only
+        // once it holds 64K tokens.
+        {"PFLASH_ADMISSION", "cache"},
+        {"PFLASH_ARRIVE", "1"},
+        {"PFLASH_CHAT_REBUILD_MIN_TOKENS", "65536"},
+    };
+    const bool segment_probe = set("PFLASH_SEGMENT_PROBE_GGUF");
+    if (segment_probe) env.push_back({"PFLASH_SELECT_SEGMENTS", "probe"});
+    // Another scorer or the identifier query replaces the request-probe query.
+    if (set("PFLASH_REQUEST_PROBE_GGUF") &&
+        (!set("PFLASH_SELECT_SCORER") || is("PFLASH_SELECT_SCORER", "head")) &&
+        !is("PFLASH_EVAL_REF_IDENT_QUERY", "heur")) {
+        env.push_back({"PFLASH_SELECT_QUERY_PROBE", "1"});
+        if (segment_probe && !is("PFLASH_SELECT_QUERY_PROBE", "0") &&
+            !set("PFLASH_REQUEST_STAGE2_GGUF")) {
+            env.push_back({"PFLASH_QUERY_CANDIDATES", "1"});
+            env.push_back({"PFLASH_QUERY_PIN", "512"});
+        }
+    }
     return env;
 }
 

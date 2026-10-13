@@ -86,7 +86,8 @@ inline constexpr float kQuerySpreadFloor = 0.25f;  // robust spread floor (logit
 
 // The step-1 query knobs (resolve_pflash_selection reads them from the environment). Defaults = the development
 // operating point of the candidate replay (k1-gap-tw50-end25-soft-pgap: extent by the largest gap, TW share .5, END share .25, softmax, pin by the gap rule). That config did NOT pass the frozen
-// no-regression rule (it loses one FU-layout item vs today's windows); no config did. Both switches stay off by default.
+// no-regression rule (it loses one FU-layout item vs today's windows); no config did. Both switches stay off by default;
+// the release profile (server/launch_profiles.h) sets one candidate and a 512-token pin.
 struct PFlashQueryConfig {
     int candidates = 0;                                   // K; 0 = off
     PFlashUnitScore unit_score = PFlashUnitScore::Max;

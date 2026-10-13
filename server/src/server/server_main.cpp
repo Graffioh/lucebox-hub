@@ -292,12 +292,16 @@ static void print_usage(const char * prog) {
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
         "  --prefill-threshold <N>     Auto threshold for a prompt or aggregate\n"
-        "                              aged history (default: 32000)\n"
+        "                              aged history (default: 32000; 16384 with\n"
+        "                              PFLASH_SCORING_HEAD_GGUF, the release profile)\n"
         "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
         "  --prefill-curve T:R [T:R ...]  Piecewise keep-ratio curve over\n"
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
         "                              10000:0.5 40000:0.2 100000:0.1\n"
+        "                              With PFLASH_SCORING_HEAD_GGUF and neither\n"
+        "                              flag: 16384:0.315 32768:0.270 65536:0.270\n"
+        "                              120000:0.225\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3.5-0.8B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --draft-residency auto|persistent|request-scoped\n"
@@ -387,6 +391,8 @@ struct ModelOptions {
     bool target_device_auto = false;   // --target-device auto
     bool target_device_from_env = false;  // the device came from LUCE_TARGET_DEVICE
     bool draft_device_set = false;     // --draft-device given explicitly
+    bool pflash_threshold_set = false; // --prefill-threshold given explicitly
+    bool pflash_ratio_set = false;     // --prefill-keep-ratio or --prefill-curve given explicitly
     std::optional<DevicePlacement> expert_device;  // --expert-device
     const luce::server::LaunchProfile * profile = nullptr;  // --profile; env installed at load
 
@@ -909,8 +915,10 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
         } else if (std::strcmp(argv[i], "--prefill-threshold") == 0 && i + 1 < argc) {
             sconfig.pflash_threshold = std::atoi(argv[++i]);
+            model.pflash_threshold_set = true;
         } else if (std::strcmp(argv[i], "--prefill-keep-ratio") == 0 && i + 1 < argc) {
             sconfig.pflash_keep_ratio = (float)std::atof(argv[++i]);
+            model.pflash_ratio_set = true;
         } else if (std::strcmp(argv[i], "--prefill-drafter") == 0 && i + 1 < argc) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
@@ -926,6 +934,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             sconfig.pflash_upstream_model = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-curve") == 0 && i + 1 < argc) {
             sconfig.pflash_curve.clear();
+            model.pflash_ratio_set = true;
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 const char * arg = argv[++i];
                 const char * colon = std::strchr(arg, ':');
@@ -1331,6 +1340,18 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     auto & bargs = model.bargs;
     auto & sconfig = model.sconfig;
     if (sconfig.pflash_mode != ServerConfig::PflashMode::OFF) {
+        // A trained scoring head serves the measured release profile for
+        // every setting the operator left unset.
+        const auto release_env = luce::server::pflash_release_env();
+        if (!release_env.empty()) {
+            apply_env_defaults("PFlash release profile", release_env);
+            if (!model.pflash_threshold_set) {
+                sconfig.pflash_threshold = luce::server::kPFlashReleaseThreshold;
+            }
+            if (!model.pflash_ratio_set) {
+                sconfig.pflash_curve = luce::server::pflash_release_curve();
+            }
+        }
         std::string error;
         if (!http_detail::validate_pflash_environment(error)) {
             std::fprintf(stderr, "[server] invalid PFlash configuration: %s\n", error.c_str());

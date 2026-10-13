@@ -88,6 +88,17 @@ has_pair "$out" --prefix-cache-slots 4 || fail "LUCE_PREFIX_CACHE_SLOTS not forw
 has_pair "$out" --prefix-cache-max-mib 8192 || fail "LUCE_PREFIX_CACHE_MAX_MIB not forwarded"
 has_pair "$out" --prefill-cache-slots 2 || fail "LUCE_PREFILL_CACHE_SLOTS not forwarded"
 
+# ── PFlash ratio and threshold defaults stay with luce_server ──────────────
+out="$(run_entrypoint LUCE_PREFILL_MODE=auto LUCE_PREFILL_DRAFTER="$TARGET" --)"
+has_pair "$out" --prefill-compression auto || fail "LUCE_PREFILL_MODE not forwarded"
+for flag in --prefill-keep-ratio --prefill-threshold; do
+    has_flag "$out" "$flag" && fail "entrypoint overrides the native PFlash default with $flag"
+done
+out="$(run_entrypoint LUCE_PREFILL_MODE=auto LUCE_PREFILL_DRAFTER="$TARGET" \
+    LUCE_PREFILL_KEEP=0.2 LUCE_PREFILL_THRESHOLD=8192 --)"
+has_pair "$out" --prefill-keep-ratio 0.2 || fail "LUCE_PREFILL_KEEP not forwarded"
+has_pair "$out" --prefill-threshold 8192 || fail "LUCE_PREFILL_THRESHOLD not forwarded"
+
 # ── no arguments serves, with auto device selection by default ─────────────
 out="$(run_entrypoint FAKE_PROBE="$DUAL_AMD_DS4" --)"
 grep -Fxq "ENV_LUCE_TARGET_DEVICE=auto" <<<"$out" || fail "LUCE_TARGET_DEVICE=auto not exported"

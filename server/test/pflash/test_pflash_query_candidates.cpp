@@ -7,10 +7,14 @@
 #include "pflash/pflash_selection.h"
 #include "scoped_env.h"
 #include "server/http_server.h"
+#include "server/launch_profiles.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace luce::pflash;
@@ -76,7 +80,8 @@ std::vector<std::unique_ptr<luce_test::ScopedEnvVar>> clean_startup_env() {
             "PFLASH_CHAT_REBUILD_RATIO", "PFLASH_DRAFTER_SESSIONS", "PFLASH_DRAFTER_TRIM_POOL",
             "PFLASH_SESSION_OFFLOAD_PINNED", "PFLASH_QWEN35_LEGACY_SCORER",
             "PFLASH_SELECT_QUERY_PROBE_STUB", "PFLASH_QUERY_GRID", "PFLASH_QUERY_GRID_OUT",
-            "PFLASH_REQUEST_STAGE2_GGUF", "PFLASH_SEGMENT_PROBE_GGUF"}) {
+            "PFLASH_REQUEST_STAGE2_GGUF", "PFLASH_SEGMENT_PROBE_GGUF", "PFLASH_SCORING_HEAD_GGUF",
+            "PFLASH_REQUEST_PROBE_GGUF"}) {
         vars.push_back(std::make_unique<luce_test::ScopedEnvVar>(name, nullptr));
     }
     return vars;
@@ -132,6 +137,80 @@ TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_preserves_defaults_an
     luce_test::ScopedEnvVar output{"PFLASH_QUERY_GRID_OUT", "grid.jsonl"};
     luce_test::ScopedEnvVar oracle{"PFLASH_QUERY_ORACLE_DIR", "oracle"};
     REQUIRE(validate_pflash_environment(error));
+}
+
+TEST_CASE(PFlashQueryCandidatesFixture, release_profile_is_the_default_with_a_trained_head) {
+    const auto clean = clean_startup_env();
+    using namespace luce::common::http_detail;
+    using luce::server::pflash_release_env;
+    using Vars = std::vector<std::unique_ptr<luce_test::ScopedEnvVar>>;
+    const auto has = [](const char * name) {
+        for (const auto & env : pflash_release_env()) {
+            if (std::string(env.name) == name) return true;
+        }
+        return false;
+    };
+    // As the server installs it: a variable that is already set keeps its value.
+    const auto install = [](Vars & vars) {
+        for (const auto & env : pflash_release_env()) {
+            if (!std::getenv(env.name)) vars.push_back(std::make_unique<luce_test::ScopedEnvVar>(env.name, env.value));
+        }
+    };
+    std::string error;
+    PFlashSelectionConfig selection;
+    REQUIRE(pflash_release_env().empty());
+
+    luce_test::ScopedEnvVar head{"PFLASH_SCORING_HEAD_GGUF", "head.gguf"};
+    REQUIRE(has("PFLASH_SELECT_MODE") && !has("PFLASH_SELECT_SEGMENTS") && !has("PFLASH_SELECT_QUERY_PROBE"));
+    {
+        Vars vars;
+        install(vars);
+        REQUIRE(validate_pflash_environment(error));
+    }
+
+    luce_test::ScopedEnvVar segments{"PFLASH_SEGMENT_PROBE_GGUF", "segment.gguf"};
+    luce_test::ScopedEnvVar request{"PFLASH_REQUEST_PROBE_GGUF", "request.gguf"};
+    {
+        Vars vars;
+        install(vars);
+        REQUIRE(validate_pflash_environment(error));
+        REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
+        REQUIRE(selection.configured && selection.mode == PFlashSelectionMode::BudgetOnly);
+        REQUIRE(selection.segmentation == PFlashSegmentation::Probe &&
+                selection.candidate_score == PFlashCandidateScore::Density);
+        REQUIRE(selection.chunk_size == 256 && selection.query_tokens == 128);
+        REQUIRE(selection.query_head && selection.query_probe && selection.fallback_spread == 0.11);
+        REQUIRE(selection.query.candidates == 1 && selection.query.pin_tokens == 512);
+        REQUIRE(has_pflash_selection_environment() && pflash_query_probe_requested());
+        REQUIRE(pflash_cache_admission_enabled() && pflash_arrive_enabled() && !pflash_paragraph_join());
+        REQUIRE(pflash_chat_rebuild_min_tokens() == 65536 && pflash_chat_rebuild_ratio() == 2.0);
+        REQUIRE(pflash_chat_recall());
+    }
+    {
+        luce_test::ScopedEnvVar spread{"PFLASH_FALLBACK_SPREAD", "off"};
+        luce_test::ScopedEnvVar admission{"PFLASH_ADMISSION", "length"};
+        Vars vars;
+        install(vars);
+        REQUIRE(validate_pflash_environment(error));
+        REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
+        REQUIRE(selection.fallback_spread == 0.0 && !pflash_cache_admission_enabled());
+    }
+    // Arms that replace the request-probe query or exclude its candidates still start.
+    for (const auto & arm : std::vector<std::pair<const char *, const char *>>{
+            {"PFLASH_SELECT_SCORER", "legacy"}, {"PFLASH_EVAL_REF_IDENT_QUERY", "heur"},
+            {"PFLASH_REQUEST_STAGE2_GGUF", "stage2.gguf"}, {"PFLASH_SELECT_QUERY_PROBE", "0"}}) {
+        luce_test::ScopedEnvVar flag{arm.first, arm.second};
+        Vars vars;
+        install(vars);
+        REQUIRE(validate_pflash_environment(error));
+        REQUIRE(resolve_pflash_selection(65536, 32, selection, error));
+        REQUIRE(!has("PFLASH_QUERY_CANDIDATES") && !selection.query.any());
+    }
+
+    REQUIRE(luce::server::kPFlashReleaseThreshold == 16384);
+    const auto & curve = luce::server::pflash_release_curve();
+    REQUIRE(curve.size() == 4 && curve.front() == std::make_pair(16384, 0.315f) &&
+            curve.back() == std::make_pair(120000, 0.225f));
 }
 
 TEST_CASE(PFlashQueryCandidatesFixture, startup_validation_rejects_invalid_and_incompatible_flags) {

@@ -356,9 +356,11 @@ if [ "$LUCE_PREFILL_MODE" != off ]; then
     [ -n "${LUCE_PREFILL_DRAFTER:-}" ] || die "LUCE_PREFILL_MODE=$LUCE_PREFILL_MODE requires LUCE_PREFILL_DRAFTER"
     [ -f "$LUCE_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $LUCE_PREFILL_DRAFTER"
     CMD+=(--prefill-compression "$LUCE_PREFILL_MODE"
-          --prefill-keep-ratio "${LUCE_PREFILL_KEEP:-0.05}"
-          --prefill-threshold "${LUCE_PREFILL_THRESHOLD:-32000}"
           --prefill-drafter "$LUCE_PREFILL_DRAFTER")
+    # Unset, luce_server picks the ratio and threshold: the release profile
+    # with a trained scoring head, else 0.05 and 32000.
+    [ -n "${LUCE_PREFILL_KEEP:-}" ]      && CMD+=(--prefill-keep-ratio "$LUCE_PREFILL_KEEP")
+    [ -n "${LUCE_PREFILL_THRESHOLD:-}" ] && CMD+=(--prefill-threshold "$LUCE_PREFILL_THRESHOLD")
 fi
 
 # Operator flags go last: luce_server keeps the last value of a repeated flag.
