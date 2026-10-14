@@ -139,6 +139,12 @@ struct PFlashSelectionConfig {
     // first. The head scores the context against each and mixes the masses
     // with the query's at weights 1/2, 1/4, ... (multi-turn chats).
     std::vector<luce::common::PFlashTokenSpan> history_queries;
+    // Per request: windows a later request of the same chat will score as
+    // history queries but this one does not (the latest user question's
+    // counterpart in a tool session, whose prompt ends after tool output).
+    // Never scored: the scorer keeps their rows in its session, so the next
+    // request can resume instead of scoring from token 0.
+    std::vector<luce::common::PFlashTokenSpan> keep_queries;
     // Per request: the tail of the latest user turn, scored as a second
     // query window at full weight next to the prompt-end query. The last
     // token reads the whole request; the user's own tokens match literal

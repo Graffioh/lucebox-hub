@@ -114,7 +114,8 @@ std::vector<int32_t> drafter_score_and_compress(
     const std::vector<PFlashTokenSpan> & history_queries,
     PFlashTokenSpan turn_query,
     const std::vector<PFlashTokenSpan> & extra_queries,
-    const PFlashRequestMessages * request_messages) {
+    const PFlashRequestMessages * request_messages,
+    const std::vector<PFlashTokenSpan> & keep_queries) {
     pflash_clear_kept_spans();
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
@@ -139,6 +140,12 @@ std::vector<int32_t> drafter_score_and_compress(
             if (window.begin >= 0 && window.end > window.begin &&
                 window.end <= (int) ids.size()) {
                 experiment.history_queries.push_back(window);
+            }
+        }
+        for (const auto & window : keep_queries) {
+            if (window.begin >= 0 && window.end > window.begin &&
+                window.end <= (int) ids.size()) {
+                experiment.keep_queries.push_back(window);
             }
         }
         if (turn_query.begin >= 0 && turn_query.end > turn_query.begin &&

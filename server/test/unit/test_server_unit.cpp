@@ -11368,7 +11368,83 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT_MSG(tokenizer.decode({ids.begin() + history.end,
                                       ids.begin() + history.end + 2}) == "Sure.",
                     text_of(history));
+    // A chat whose prompt ends at the latest question's reply has nothing to
+    // keep: that question's window is the query itself.
+    TEST_ASSERT(request.keep_query_spans.empty());
     unlink(path.c_str());
+}
+
+// A tool session's prompt ends after tool output: the latest question's
+// history window (its reply's header) is kept for the next request, which
+// scores exactly that window once a new question arrives.
+TEST_CASE(ServerUnitFixture, test_pflash_tool_session_keeps_next_history_query) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", nullptr};
+
+    std::string material;
+    for (int i = 0; i < 80; ++i) material += "filler words here. ";
+    std::vector<ChatMessage> messages{
+        {"system", "You are helpful.", ""},
+        {"user", "What is the first answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "Here is text: " + material, ""},
+    };
+    const auto run = [&] (const std::vector<ChatMessage> & chat,
+                          ModelBackend::CompressRequest & out,
+                          std::vector<int32_t> & ids_out) {
+        const std::string rendered = render_chat_template(
+            chat, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+            /*enable_thinking=*/true);
+        const std::string path = write_pflash_bpe_tokenizer_fixture(
+            {"What", " is", " the", " answer", " first", "?", "user", "assistant",
+             "system", "tool", "\n", "Sure", ".", " filler", " words", " here",
+             "Here", " text", ":", " Next", " question"},
+            rendered);
+        Tokenizer tokenizer;
+        TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+        auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+        MockPflashCompressBackend & backend = *backend_owner;
+        LuceEngine engine(std::move(backend_owner));
+        ServerConfig config;
+        config.pflash_keep_ratio = 1.0f;
+        config.prefix_cache_cap = 0;
+        config.prefill_cache_cap = 0;
+        {
+            HttpServer server(engine, tokenizer, config);
+            server.set_drafter_tokenizer(&tokenizer);
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            json wire = json::array();
+            for (const auto & message : chat) {
+                wire.push_back({{"role", message.role}, {"content", message.content}});
+            }
+            request.messages = wire;
+            request.prompt_tokens = tokenizer.encode(rendered);
+            const std::string error =
+                HttpServerTestAccess::apply_pflash_compression(server, request);
+            TEST_ASSERT_MSG(error.empty(), error);
+        }
+        TEST_ASSERT(backend.compress_calls == 1);
+        out = backend.last_request;
+        ids_out = out.input_ids;
+        unlink(path.c_str());
+    };
+    ModelBackend::CompressRequest first;
+    std::vector<int32_t> first_ids;
+    run(messages, first, first_ids);
+    TEST_ASSERT(first.history_query_spans.empty());
+    TEST_ASSERT(first.keep_query_spans.size() == 1);
+
+    messages.push_back({"assistant", "Sure.", ""});
+    messages.push_back({"user", "Next question?", ""});
+    ModelBackend::CompressRequest second;
+    std::vector<int32_t> second_ids;
+    run(messages, second, second_ids);
+    TEST_ASSERT(second.history_query_spans.size() == 1);
+    const auto kept = first.keep_query_spans[0];
+    const auto history = second.history_query_spans[0];
+    TEST_ASSERT(kept.begin == history.begin && kept.end == history.end);
+    TEST_ASSERT(std::equal(first_ids.begin(), first_ids.begin() + kept.end, second_ids.begin()));
 }
 
 // Two turns over one document through prepare_prompt; returns the served

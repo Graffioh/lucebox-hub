@@ -5008,6 +5008,9 @@ std::string HttpServer::apply_pflash_compression(
     // Earlier user questions of a multi-turn chat, most recent first: they
     // score the context alongside the current query at halving weights.
     std::vector<PFlashTokenSpan> history_query_spans;
+    // The window a later request of this chat scores for the latest question
+    // as a history query, when this request does not score it (below).
+    std::vector<PFlashTokenSpan> keep_query_spans;
     // The latest user turn's tail (PFLASH_SELECT_QUERY_TOKENS), a second
     // query window next to the prompt-end query: literal strings in the
     // question (an identifier, a described function) match their passage.
@@ -5398,6 +5401,22 @@ std::string HttpServer::apply_pflash_compression(
                             history_query_spans.push_back(
                                 {window.end - window.tokens, window.end});
                         }
+                    }
+                    // A tool session's prompt ends after tool output, so the
+                    // latest question's history window (the header of the
+                    // reply that followed it) is no query here. The next
+                    // question scores it; the drafter keeps its rows so that
+                    // request resumes the scoring session instead of
+                    // scoring the whole prompt again.
+                    const size_t reply = (size_t) chat_turn.query_turn + 1;
+                    if (prompt_end_query && history_queries > 0 &&
+                        chat_turn.query_turn >= 0 &&
+                        reply < chat_turn.turns.size() &&
+                        chat_turn.turns[reply].role != "user" &&
+                        chat_turn.turns[reply].content_begin >
+                            chat_turn.turns[reply].role_begin) {
+                        const int end = chat_turn.turns[reply].content_begin;
+                        keep_query_spans.push_back({end - 1, end});
                     }
                 }
                 // The last non-system turns before the generation prompt
@@ -5835,6 +5854,7 @@ std::string HttpServer::apply_pflash_compression(
             http_detail::canonicalize_pflash_token_spans(std::move(pins));
         unified_request.query_suffix_candidates = query_suffix_candidates;
         unified_request.history_query_spans = history_query_spans;
+        unified_request.keep_query_spans = keep_query_spans;
         unified_request.turn_query_span = turn_query_span;
         unified_request.extra_query_spans = extra_query_spans;
         unified_request.request_messages = request_probe_messages;
@@ -6306,6 +6326,7 @@ std::string HttpServer::apply_pflash_compression(
         std::move(required_instruction_spans);
     compress_request.query_suffix_candidates = query_suffix_candidates;
     compress_request.history_query_spans = history_query_spans;
+    compress_request.keep_query_spans = keep_query_spans;
     compress_request.turn_query_span = turn_query_span;
     compress_request.extra_query_spans = extra_query_spans;
     compress_request.request_messages = request_probe_messages;

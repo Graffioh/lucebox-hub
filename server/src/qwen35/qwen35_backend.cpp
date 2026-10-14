@@ -1513,7 +1513,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
             score_query_end, request.required_instruction_spans,
             request.query_suffix_candidates, request.history_query_spans,
             request.turn_query_span, request.extra_query_spans,
-            &request.request_messages);
+            &request.request_messages, request.keep_query_spans);
         result.ok = !result.compressed_ids.empty();
         if (result.ok) result.kept_spans = pflash_last_kept_spans();
         if (result.ok) {

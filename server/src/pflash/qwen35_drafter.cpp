@@ -1462,6 +1462,16 @@ static std::vector<int32_t> strict_score_impl(
             }
         }
     }
+    // Rows a later request scores as history queries: kept with the session,
+    // never scored here.
+    std::vector<Qwen35ScoringSession::QueryRows> keep_rows;
+    for (const auto & span : experiment.keep_queries) {
+        if (drop_history || span.end > query_start || span.end - span.begin < 1) continue;
+        Qwen35ScoringSession::QueryRows keep;
+        keep.begin = span.begin;
+        keep.end = span.end;
+        if (rows_for(span.begin, span.end, keep.rows)) keep_rows.push_back(std::move(keep));
+    }
 
     ggml_tensor * wk_src = st.head_loaded ? st.head_wk : L.wk;
     session->keys_trained = st.head_loaded;
@@ -2224,16 +2234,18 @@ static std::vector<int32_t> strict_score_impl(
     for (const auto & [tokens, rows] : qrows) {
         session->query_sets.put(tokens, rows.data(), hidden, exact_rows_end);
     }
-    for (const auto & window : windows) {
-        if (window.end > exact_rows_end) continue;
+    const auto store_rows = [&] (int begin, int end, const std::vector<float> & rows) {
+        if (end > exact_rows_end) return;
         auto & stored = session->query_windows;
         stored.erase(std::remove_if(stored.begin(), stored.end(),
-            [&window] (const Qwen35ScoringSession::QueryRows & old) {
-                return old.begin == window.begin && old.end == window.end;
+            [begin, end] (const Qwen35ScoringSession::QueryRows & old) {
+                return old.begin == begin && old.end == end;
             }), stored.end());
-        stored.push_back({window.begin, window.end, window.rows});
+        stored.push_back({begin, end, rows});
         if (stored.size() > 8) stored.erase(stored.begin());
-    }
+    };
+    for (const auto & keep : keep_rows) store_rows(keep.begin, keep.end, keep.rows);
+    for (const auto & window : windows) store_rows(window.begin, window.end, window.rows);
     session->last_used = ++st.session_clock;
 
     // Block-15 NoPE Q/K scoring, once per query window: softmax over the

@@ -490,6 +490,9 @@ struct ModelBackend {
         // Earlier user questions (their scorer windows), most recent first:
         // they score the context alongside the query at halving weights.
         std::vector<PFlashTokenSpan> history_query_spans;
+        // Windows a later request scores as history queries, never scored
+        // here: the scorer keeps their rows so that request can resume.
+        std::vector<PFlashTokenSpan> keep_query_spans;
         // The latest user turn's tail, a second query window at full weight
         // (prompt-end chat queries; {-1, -1} otherwise).
         PFlashTokenSpan turn_query_span{-1, -1};

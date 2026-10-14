@@ -100,6 +100,9 @@ void free_drafter_weights(DrafterContext & ctx);
 //                    messages' content spans the request probe reads
 //                    (nullptr: none, the request falls back to today's
 //                    windows)
+//   keep_queries strict selection only: windows a later request scores as
+//                    history queries; never scored here, their rows are
+//                    kept so that request can resume the scoring session
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -116,6 +119,7 @@ std::vector<int32_t> drafter_score_and_compress(
     const std::vector<PFlashTokenSpan> & history_queries = {},
     PFlashTokenSpan turn_query = {-1, -1},
     const std::vector<PFlashTokenSpan> & extra_queries = {},
-    const PFlashRequestMessages * request_messages = nullptr);
+    const PFlashRequestMessages * request_messages = nullptr,
+    const std::vector<PFlashTokenSpan> & keep_queries = {});
 
 } // namespace luce::common
