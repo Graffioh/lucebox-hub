@@ -24,6 +24,12 @@ int pflash_scoring_resume(int checkpoint, int shared, int S, int cap) {
     return checkpoint;
 }
 
+std::vector<int> pflash_span_tokens(int begin, int end) {
+    std::vector<int> tokens;
+    for (int t = begin; t < end; ++t) tokens.push_back(t);
+    return tokens;
+}
+
 bool PFlashExactRowSets::put(const std::vector<int> & tokens, const float * rows, int hidden, int exact_end) {
     if (tokens.empty() || hidden <= 0 || !rows || tokens.front() < 0 || tokens.back() >= exact_end) return false;
     for (size_t i = 1; i < tokens.size(); ++i) {

@@ -45,6 +45,9 @@ int pflash_session_capacity(int S, int ctx_limit);
 // the two that are > 0, or 0 when neither is.
 int pflash_session_ctx_limit(int drafter_ctx, int engine_max_ctx);
 
+// The token positions of the window [begin, end), ascending; empty when end <= begin.
+std::vector<int> pflash_span_tokens(int begin, int end);
+
 // Exact F32 block-14 rows of query token sets (the query step's candidate and END sets), kept per session for later
 // turns whose activations are gone. Only sets whose last token is below the storing call's exact-rows end are put.
 class PFlashExactRowSets {

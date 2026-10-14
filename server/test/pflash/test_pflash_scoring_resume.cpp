@@ -123,6 +123,22 @@ TEST_CASE(PFlashScoringResumeFixture, query_sets_store_exact_rows_only) {
     CHECK(sets.size() == 0);
 }
 
+// Query windows are row sets keyed by their positions: a window stored before
+// a divergence point stays, one that reaches it is dropped.
+TEST_CASE(PFlashScoringResumeFixture, query_windows_are_position_sets) {
+    CHECK(pflash_span_tokens(5, 8) == std::vector<int>({5, 6, 7}));
+    CHECK(pflash_span_tokens(8, 8).empty());
+    PFlashExactRowSets windows;
+    const int hidden = 1;
+    const float row[] = {1};
+    std::vector<float> out;
+    CHECK(windows.put(pflash_span_tokens(447, 448), row, hidden, 65536));
+    CHECK(windows.put(pflash_span_tokens(12000, 12001), row, hidden, 65536));
+    CHECK(windows.invalidate_from(11000) == 1);
+    CHECK(windows.lookup(pflash_span_tokens(447, 448), hidden, out));
+    CHECK(!windows.lookup(pflash_span_tokens(12000, 12001), hidden, out));
+}
+
 // Session capacity: headroom S + S/2 + 4096, clamped to the context limit, never below S padded to 256.
 TEST_CASE(PFlashScoringResumeFixture, session_capacity_is_headroom_clamped_to_the_context_limit) {
     using luce::pflash::pflash_session_capacity;

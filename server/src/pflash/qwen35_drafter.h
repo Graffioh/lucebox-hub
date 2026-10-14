@@ -63,12 +63,8 @@ struct Qwen35ScoringSession {
     // questions), reused while they sit in the shared prefix: an agent step
     // appends tool output after the same user turn, and a new turn's history
     // queries are earlier turns' queries. Most recent last, at most 8.
-    struct QueryRows {
-        int begin = -1;
-        int end = -1;
-        std::vector<float> rows;            // [hidden, end - begin]
-    };
-    std::vector<QueryRows> query_windows;
+    // Keyed by the window's token positions.
+    luce::pflash::PFlashExactRowSets query_windows;
     // The query step's (PFLASH_QUERY_CANDIDATES / PFLASH_QUERY_PIN) query token sets, F32 rows exact for later
     // prompts that share them (never the BF16 request_rows).
     luce::pflash::PFlashExactRowSets query_sets;

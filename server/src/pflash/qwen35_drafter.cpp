@@ -684,13 +684,9 @@ Qwen35ScoringSession * acquire_scoring_session(
     // Stored windows hold exact rows only (see the store below): one is
     // reusable while it sits in the shared prefix.
     const auto stored_window = [&](const Qwen35ScoringSession & session, int begin, int end, int shared) {
-        const size_t floats = (size_t) w.n_embd * (size_t) (end - begin);
-        for (const auto & window : session.query_windows) {
-            if (window.begin == begin && window.end == end && end <= shared && window.rows.size() == floats) {
-                return true;
-            }
-        }
-        return false;
+        std::vector<float> rows;
+        return end <= shared &&
+               session.query_windows.lookup(luce::pflash::pflash_span_tokens(begin, end), w.n_embd, rows);
     };
     Qwen35ScoringSession * best = nullptr;
     int best_shared = 0;
@@ -1205,6 +1201,7 @@ static std::vector<int32_t> strict_score_impl(
     const int request_rows_invalidated = request_probe
         ? session->request_rows.invalidate_from(shared_prefix) : 0;
     session->query_sets.invalidate_from(shared_prefix);
+    session->query_windows.invalidate_from(shared_prefix);
     // A session is released (freed or kept) on every exit below.
     struct SessionExit {
         std::unique_ptr<Qwen35ScoringSession> & scratch;
@@ -1411,14 +1408,8 @@ static std::vector<int32_t> strict_score_impl(
                                     rows.size() * sizeof(float));
             return true;
         }
-        for (const auto & stored : session->query_windows) {
-            if (stored.begin == begin && stored.end == end &&
-                end <= shared_prefix && stored.rows.size() == rows.size()) {
-                rows = stored.rows;
-                return true;
-            }
-        }
-        return false;
+        return end <= shared_prefix &&
+               session->query_windows.lookup(luce::pflash::pflash_span_tokens(begin, end), hidden, rows);
     };
     {
         ScoredWindow query;
@@ -1464,10 +1455,10 @@ static std::vector<int32_t> strict_score_impl(
     }
     // Rows a later request scores as history queries: kept with the session,
     // never scored here.
-    std::vector<Qwen35ScoringSession::QueryRows> keep_rows;
+    std::vector<ScoredWindow> keep_rows;
     for (const auto & span : experiment.keep_queries) {
         if (drop_history || span.end > query_start || span.end - span.begin < 1) continue;
-        Qwen35ScoringSession::QueryRows keep;
+        ScoredWindow keep;
         keep.begin = span.begin;
         keep.end = span.end;
         if (rows_for(span.begin, span.end, keep.rows)) keep_rows.push_back(std::move(keep));
@@ -2234,18 +2225,14 @@ static std::vector<int32_t> strict_score_impl(
     for (const auto & [tokens, rows] : qrows) {
         session->query_sets.put(tokens, rows.data(), hidden, exact_rows_end);
     }
-    const auto store_rows = [&] (int begin, int end, const std::vector<float> & rows) {
-        if (end > exact_rows_end) return;
-        auto & stored = session->query_windows;
-        stored.erase(std::remove_if(stored.begin(), stored.end(),
-            [begin, end] (const Qwen35ScoringSession::QueryRows & old) {
-                return old.begin == begin && old.end == end;
-            }), stored.end());
-        stored.push_back({begin, end, rows});
-        if (stored.size() > 8) stored.erase(stored.begin());
-    };
-    for (const auto & keep : keep_rows) store_rows(keep.begin, keep.end, keep.rows);
-    for (const auto & window : windows) store_rows(window.begin, window.end, window.rows);
+    // The kept windows go last: the next request needs them, so the cap
+    // evicts this call's windows first.
+    for (const auto * list : {&windows, &keep_rows}) {
+        for (const auto & window : *list) {
+            session->query_windows.put(luce::pflash::pflash_span_tokens(window.begin, window.end),
+                                       window.rows.data(), hidden, exact_rows_end);
+        }
+    }
     session->last_used = ++st.session_clock;
 
     // Block-15 NoPE Q/K scoring, once per query window: softmax over the
