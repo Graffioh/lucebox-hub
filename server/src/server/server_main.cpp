@@ -12,7 +12,6 @@
 //                              [--max-tokens 4096] [--target-device auto:0]
 
 #include "http_server.h"
-#include "admission.h"
 #include "chat_template.h"
 #include "launch_profiles.h"
 #include "model_card.h"
@@ -1143,22 +1142,6 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             return 2;
         }
         bargs.device.max_ctx = meta.context_length;
-    }
-    // PFlash's maximum context (kPFlashMaxCtx): the drafter scores the whole raw prompt, so with compression on the
-    // context is capped there.
-    {
-        const bool compression_on = sconfig.pflash_mode != ServerConfig::PflashMode::OFF &&
-                                    !sconfig.pflash_drafter_path.empty();
-        const int requested = bargs.device.max_ctx;
-        const int clamped = pflash_clamped_max_ctx(requested, compression_on);
-        if (clamped != requested) {
-            std::fprintf(stderr,
-                "[server] --max-ctx %d%s capped at %d: PFlash prefill compression is on and its drafter's scoring "
-                "memory grows with the prompt (PFlash maximum context)\n",
-                requested, bargs.device.fit_ctx ? " (auto)" : "", clamped);
-            bargs.device.max_ctx = clamped;
-            if (sconfig.max_ctx > 0) sconfig.max_ctx = clamped;
-        }
     }
     if (sconfig.decode_kv_offload_bytes &&
         sconfig.decode_kv_offload_bytes != kAutoKvOffloadBytes && bargs.max_concurrency <= 1) {

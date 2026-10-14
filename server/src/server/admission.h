@@ -1,18 +1,8 @@
 #pragma once
 
 // Admission gate: reject oversized requests with HTTP 400.
-// When compression is enabled, lets oversized requests through up to PFlash's maximum context — the post-compress
-// check is the real gate.
-
-#include "common/pflash_types.h"
-
-// --max-ctx with prefill compression on: capped at PFlash's maximum context (kPFlashMaxCtx, common/pflash_types.h);
-// unchanged when compression is off or it fits (<= 0 means "unset", the backend default).
-inline int pflash_clamped_max_ctx(int max_ctx, bool compression_enabled)
-{
-    if (!compression_enabled || max_ctx <= luce::common::kPFlashMaxCtx) return max_ctx;
-    return luce::common::kPFlashMaxCtx;
-}
+// When compression is enabled, a raw prompt up to --max-ctx is let through even if its reply does not fit — the
+// post-compress check is the real gate.
 
 #include <algorithm>
 
@@ -32,9 +22,10 @@ inline bool should_reject_oversized(int prompt_tokens, int max_output,
         return false;  // fits — accept regardless of compression
     }
     // Oversized: reject if compression cannot help, or if the raw prompt is
-    // longer than PFlash's maximum context (the drafter scores it whole).
+    // longer than --max-ctx, the longest prompt PFlash takes (the drafter
+    // scores it whole).
     if (!compression_enabled) return true;
-    return prompt_tokens > luce::common::kPFlashMaxCtx;
+    return prompt_tokens > max_ctx;
 }
 
 // Post-compress gate: check whether the effective context overflows max_ctx.

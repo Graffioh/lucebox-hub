@@ -3992,9 +3992,11 @@ bool HttpServer::validate_request_context(
     }
     if (!routed) {
         if (pflash_will_run) {
+            // PFlash takes raw prompts up to --max-ctx (it makes room for the reply), so only the prompt counts.
             send_error(fd, 400,
-                "request exceeds PFlash's maximum context: " + std::to_string(prompt_tokens) +
-                " prompt tokens > " + std::to_string(luce::common::kPFlashMaxCtx));
+                "This model's maximum context length is " + std::to_string(config_.max_ctx) +
+                " tokens. However, your messages resulted in " + std::to_string(prompt_tokens) +
+                " tokens. Please reduce the length of the messages.");
         } else {
             send_error(fd, 400,
                 context_overflow_message(

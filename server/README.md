@@ -409,13 +409,16 @@ lists both, the validated overrides and the active experiments.
 | `PFLASH_SELECT_QUERY_HEAD=1` (with `PFLASH_SELECT_QUERY_PARSER=latest_user`) | off (on with a head) | The question may come before pasted material. The user's leading prose block (up to the first paste-like line: a code fence, heading, separator, record/file header, tag, JSON or table data, indented or code-shaped line) is scored as an extra query window and kept verbatim; the trailing prose block after the last paste becomes the query window instead of the fixed tail. Caps: `PFLASH_SELECT_QUERY_HEAD_TOKENS` / `PFLASH_SELECT_QUERY_TAIL_TOKENS` (256); a longer block contributes its first and last cap/2 tokens. Blocks under 16 tokens are ignored; a message with no paste structure keeps today's window, except that a short opening paragraph ending in `?` before a long plain text counts as the head. |
 | `PFLASH_SELECT_STRATEGY=fold` (with `PFLASH_SELECT_MODE=budget_only`) | `segments` | Fold selection: each of the top 20 segments (`PFLASH_SELECT_FOLD_K`) is completed to its smallest enclosing block -- a function or class in code (Python indentation or brace-matched C/C++/JS/TS/Go/Rust bodies), a numbered record such as `Document N:`, a markdown section, else a blank-line paragraph (`PFLASH_SELECT_FOLD_PARAGRAPHS=0` turns that last fallback off). A block over 1500 tokens (`PFLASH_SELECT_FOLD_CAP`) keeps its first 150 (`PFLASH_SELECT_FOLD_HEAD`) plus the segment. Code-like prompts (most non-blank lines inside functions; JSON and markdown are not) rank segments by mass (density x length), others by density. The keep-ratio budget stays the ceiling. Needs the head scorer; the drafter loads its vocabulary to read the prompt's structure. |
 
-PFlash's maximum context is 225,280 tokens (220 x 1024): the drafter scores
-the whole raw prompt, and its scoring memory grows with the prompt, so on a
-32 GB R9700 with the 27B target resident it runs out of memory above that.
-With compression on, `--max-ctx` (and `--max-ctx auto`) is capped there, with
-one line at startup, and a raw prompt longer than 225,280 tokens is refused
-with HTTP 400. Prompts between `--max-ctx` and that limit are compressed as
-before.
+With compression on, `--max-ctx` is also the longest raw prompt PFlash takes,
+and a longer one is refused with HTTP 400. A prompt that fits but leaves too
+little room for its reply is compressed, and the reply is checked against the
+compressed prompt. The drafter scores the whole raw prompt, and its scoring
+memory grows with it, so set `--max-ctx` to what the card holds beside the
+target: on a 32 GB R9700 with the 27B IQ4_XS target resident (q4_0 KV,
+`--prefill-skip-park`), `--max-ctx 204800` fits, with a 204K-token prompt
+peaking at 30.6 of 31.9 GiB. If the drafter does run out of memory, the
+request is served from the raw prompt with full prefill (`[pflash-fallback]
+... reason=compress_failed`).
 
 With a Qwen3.5-0.8B drafter and strict budget selection
 (`PFLASH_SELECT_MODE=budget_only`, `PFLASH_SELECT_CHUNK_SIZE`,
@@ -530,8 +533,8 @@ the reason logged (`[qwen35-scorer] redo from token 0`).
 With the default `--draft-residency auto` the drafter is released after each
 compression; the sessions a call used are copied to host RAM first (plain
 pageable memory; `PFLASH_SESSION_OFFLOAD_PINNED=1` uses the device's pinned
-host memory instead, which on an R9700 raised peak VRAM by up to 1 GiB near
-the 225,280-token cap, kept about 0.5 GiB of VRAM in use between requests and
+host memory instead, which on an R9700 raised peak VRAM by up to 1 GiB on
+220K-token prompts, kept about 0.5 GiB of VRAM in use between requests and
 slowed target prefill), only the positions a resume reads, and when the drafter loads again
 only the session the new prompt can resume from comes back to the GPU. A
 stored session is restored only under the drafter, head, probe and session
@@ -541,8 +544,8 @@ from token 0.
 nothing.
 A new session is sized with headroom (S + S/2 + 4096 tokens for an S-token
 prompt) so later turns append without reallocating, but never past the
-engine's `--max-ctx` (at most PFlash's 225,280-token maximum context) or the
-drafter's trained context, and never below the prompt itself.
+engine's `--max-ctx` or the drafter's trained context, and never below the
+prompt itself.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through
