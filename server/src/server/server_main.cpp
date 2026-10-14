@@ -1390,15 +1390,33 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             std::fprintf(stderr, "[server] invalid PFlash configuration: %s\n", error.c_str());
             return 1;
         }
-        // Concurrent serving compresses on a thread of its own while the
-        // slots decode: the target stays resident, and the paged pool leaves
-        // the drafter the memory to score a prompt that fills the context
-        // (longer ones are refused, see validate_request_context).
-        if (bargs.max_concurrency > 1) {
-            if (!luce::pflash::has_pflash_selection_environment()) {
+        // Concurrent dense Qwen3.5 serving compresses on a thread of its own
+        // while the slots decode: the target stays resident, and the paged
+        // pool leaves the drafter the memory to score a prompt that fills the
+        // context (longer ones are refused, see validate_request_context).
+        // That memory was measured for the trained head's scorer with the
+        // drafter released after each prompt.
+        if (bargs.max_concurrency > 1 &&
+            inspect_gguf_model_info(bargs.model_path.c_str()).arch == "qwen35") {
+            const char * head = std::getenv("PFLASH_SCORING_HEAD_GGUF");
+            const char * legacy = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
+            luce::pflash::PFlashSelectionConfig selection;
+            std::string selection_error;
+            if (!head || !*head || (legacy && std::strcmp(legacy, "1") == 0) ||
+                !luce::pflash::resolve_pflash_selection(1 << 16, 32, selection, selection_error) ||
+                selection.mode == luce::pflash::PFlashSelectionMode::Legacy ||
+                selection.scorer != luce::pflash::PFlashScorer::Head) {
                 std::fprintf(stderr,
-                    "[server] PFlash with --max-concurrency > 1 needs the strict selection "
-                    "profile (set PFLASH_SCORING_HEAD_GGUF)\n");
+                    "[server] PFlash with --max-concurrency > 1 needs the release profile's "
+                    "strict selection with the trained head's scorer (set "
+                    "PFLASH_SCORING_HEAD_GGUF; no legacy or split scorer)\n");
+                return 1;
+            }
+            if (sconfig.draft_residency == DraftResidencyPolicy::Persistent) {
+                std::fprintf(stderr,
+                    "[server] PFlash with --max-concurrency > 1 needs the drafter released after "
+                    "each prompt: --draft-residency persistent keeps its scoring sessions on the "
+                    "device, outside the memory reserved for it\n");
                 return 1;
             }
             if (!sconfig.pflash_skip_park) {
@@ -1640,7 +1658,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     sconfig.pflash_drafter_gpu = pflash_placement.drafter_gpu;
     sconfig.pflash_remote_drafter = pflash_placement.remote_drafter;
     sconfig.pflash_remote = pflash_placement.remote;
-    if (sconfig.pflash_remote_drafter && backend_execution.max_concurrency > 1) {
+    if (sconfig.pflash_remote_drafter && backend_execution.max_concurrency > 1 &&
+        arch == "qwen35") {
         std::fprintf(stderr,
             "[server] PFlash with --max-concurrency > 1 needs an in-process drafter "
             "(the IPC drafter is single-request only)\n");

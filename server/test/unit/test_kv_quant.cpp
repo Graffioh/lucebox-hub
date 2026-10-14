@@ -191,6 +191,15 @@ static void t4_tq3_shorthand() {
     ggml_type k, v;
     luce::resolve_kv_types(k, v);
     assert(k == GGML_TYPE_TQ3_0 && v == GGML_TYPE_TQ3_0);
+    // The PFlash drafter's cache resolves without the shorthand; the other
+    // settings still apply.
+    luce::resolve_kv_types(k, v, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                           /*tq3_shorthand=*/false);
+    assert(k == GGML_TYPE_Q4_0 && v == GGML_TYPE_Q4_0);
+    setenv("LUCE_KV_F16", "1", 1);
+    luce::resolve_kv_types(k, v, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                           /*tq3_shorthand=*/false);
+    assert(k == GGML_TYPE_F16 && v == GGML_TYPE_F16);
     clear_kv_env();
 
     std::puts("T4 PASS");

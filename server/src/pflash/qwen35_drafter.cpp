@@ -19,6 +19,7 @@
 #include "common/gguf_inspect.h"
 #include "anchor_params.h"
 #include "internal.h"
+#include "kv_quant.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -52,36 +53,17 @@ static size_t causal_mask_bytes(int kv_start, int n_tokens) {
     return (size_t)align_up_i(kv_start + n_tokens, 256) * align_up_i(n_tokens, 32) * sizeof(uint16_t);
 }
 
-// create_target_cache honours LUCE_KV_TQ3; the drafter cache never wants
-// the TurboQuant rotation, so force it off while the cache is created.
-struct ScopedKvTq3Off {
-    ScopedKvTq3Off() {
-#if defined(_WIN32)
-        char * raw = nullptr;
-        size_t len = 0;
-        _dupenv_s(&raw, &len, "LUCE_KV_TQ3");
-        had_ = raw != nullptr;
-        old_ = had_ ? raw : "";
-        free(raw);
-        _putenv_s("LUCE_KV_TQ3", "0");
-#else
-        const char * raw = std::getenv("LUCE_KV_TQ3");
-        had_ = raw != nullptr;
-        old_ = had_ ? raw : "";
-        setenv("LUCE_KV_TQ3", "0", 1);
-#endif
+// The drafter cache's KV types: the target's resolution without the
+// LUCE_KV_TQ3 shorthand, since the drafter never wants the TurboQuant
+// rotation. Resolved without touching the environment, which other threads
+// read while a concurrent server scores a prompt.
+struct DrafterKvTypes {
+    ggml_type k = GGML_TYPE_COUNT;
+    ggml_type v = GGML_TYPE_COUNT;
+    DrafterKvTypes() {
+        luce::resolve_kv_types(k, v, GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+                               /*tq3_shorthand=*/false);
     }
-    ~ScopedKvTq3Off() {
-#if defined(_WIN32)
-        // _putenv_s with empty value removes the variable on MSVCRT.
-        _putenv_s("LUCE_KV_TQ3", had_ ? old_.c_str() : "");
-#else
-        if (had_) setenv("LUCE_KV_TQ3", old_.c_str(), 1);
-        else unsetenv("LUCE_KV_TQ3");
-#endif
-    }
-    bool had_ = false;
-    std::string old_;
 };
 
 } // namespace
@@ -144,11 +126,11 @@ std::vector<int32_t> qwen35_score_and_compress(
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
 
     TargetCache cache;
-    {
-        ScopedKvTq3Off tq3_off;
-        if (!create_target_cache(w, S, 0, w.backend, cache, true)) {
-            return {};
-        }
+    const DrafterKvTypes kv;
+    if (!create_target_cache(w, S, 0, w.backend, cache, true, 0,
+                             /*paged_attention=*/false, 1,
+                             /*concurrent_tree=*/false, kv.k, kv.v)) {
+        return {};
     }
 
     ggml_init_params act_ip{};
@@ -621,13 +603,14 @@ int scoring_session_limit() {
 
 bool allocate_scoring_session(TargetWeights & w, int capacity,
                               Qwen35ScoringSession & session) {
-    {
-        ScopedKvTq3Off tq3_off;
-        if (!create_target_cache_partial(w, capacity, 0, w.backend, session.cache,
-                                         /*prefill_only=*/true, 0, kQwen35HeadBlock,
-                                         /*allocate_target_feat=*/false)) {
-            return false;
-        }
+    const DrafterKvTypes kv;
+    if (!create_target_cache_partial(w, capacity, 0, w.backend, session.cache,
+                                     /*prefill_only=*/true, 0, kQwen35HeadBlock,
+                                     /*allocate_target_feat=*/false, 0,
+                                     /*f32_ssm_intermediates=*/false,
+                                     /*paged_attention=*/false, 1,
+                                     /*concurrent_tree=*/false, kv.k, kv.v)) {
+        return false;
     }
     if (!ensure_ssm_snapshot(session.cache, w.backend)) {
         free_qwen35_scoring_session(session);

@@ -6829,9 +6829,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #if defined(GGML_USE_HIP)
     // Drop last graph's mmb activation cache: keyed by raw data pointers the pool recycles.
+    // Empty containers are left alone: graphs without the qwen4exp profile never fill them,
+    // and another backend may be computing on another thread.
     ggml_cuda_mmb_begin_graph();
-    g_hc_marked_xn.clear();
-    g_hc_q8_xn.clear();
+    if (!g_hc_marked_xn.empty()) g_hc_marked_xn.clear();
+    if (!g_hc_q8_xn.empty()) g_hc_q8_xn.clear();
 
     // xn is a view of HC_COMBINE_NORM, so reads() keys on (view_src, view_offs); a plain pointer test misses consumers.
     if (ggml_cuda_qwen4exp_enabled() && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {

@@ -786,8 +786,23 @@ void ggml_cuda_mmb_mark_f16_only(const ggml_tensor * t) { if (mmb_arch()) g_mmb_
 bool ggml_cuda_mmb_is_f16_only(const ggml_tensor * t) { return g_mmb_f16_only.count(t) > 0; }
 void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { if (mmb_arch()) g_mmb_bf16_only.insert(t); }
 bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
-void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_f16_cache) delete e.buf; g_mmb_f16_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } g_mmb_bf16_only.clear(); g_mmb_f16_only.clear(); g_mmb_q8_root = nullptr; g_mmb_q8_data = nullptr; }
+// True when no graph left MMB state behind. Only graphs computed under the qwen4exp profile create any, so a graph
+// without it (another model's backend, e.g. the PFlash drafter scoring on its own thread beside a serving target)
+// then only reads these process-wide containers instead of clearing them under the other thread.
+static bool mmb_graph_state_empty() {
+    if (!g_mmb_cache.empty() || !g_mmb_f16_cache.empty() || !g_mmb_bf16_only.empty() || !g_mmb_f16_only.empty()) return false;
+    if (g_mmb_q8_root || g_mmb_q8_data) return false;
+    for (const auto & e : g_mmb_slots) if (e.root || e.data || e.n) return false;
+    return true;
+}
+static bool mmb_buffers_empty() {
+    if (g_mmb_q8_buf || !g_mmb_shadow.empty()) return false;
+    for (const auto & e : g_mmb_slots) if (e.buf) return false;
+    return true;
+}
+void ggml_cuda_mmb_begin_graph() { if (!mmb_enabled() && mmb_graph_state_empty()) return; for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_f16_cache) delete e.buf; g_mmb_f16_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } g_mmb_bf16_only.clear(); g_mmb_f16_only.clear(); g_mmb_q8_root = nullptr; g_mmb_q8_data = nullptr; }
 void ggml_cuda_mmb_release_all() {
+    if (mmb_graph_state_empty() && mmb_buffers_empty()) return;
     ggml_cuda_mmb_begin_graph();
     delete g_mmb_q8_buf; g_mmb_q8_buf = nullptr; g_mmb_q8_cap = 0;
     for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }

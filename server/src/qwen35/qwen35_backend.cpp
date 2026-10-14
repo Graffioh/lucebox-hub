@@ -509,6 +509,16 @@ bool Qwen35Backend::init() {
     // pool's index space) as the write target of dead decode-batch rows.
     int64_t pool_tokens = 0;
     if (n_slots > 1) {
+        PagedKvAutoBudget budget;
+        // TODO: Size tensor-parallel pools from each device's free memory
+        // and account for fixed cache tensors mirrored by the meta backend.
+        budget.free_bytes = (int64_t)gpu_free;
+        budget.bytes_per_token = kvf_budget.bytes_per_token;
+        budget.reserve_bytes =
+            kvf_budget.reserve_bytes + cfg_.kv_pool_reserve_bytes;
+        budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
+            w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+            scratch_tokens, fixed_chain.enabled);
         if (cfg_.kv_pool_tokens > 0) {
             const int64_t max_pool_tokens =
                 ((int64_t)INT32_MAX - scratch_tokens) /
@@ -516,17 +526,25 @@ bool Qwen35Backend::init() {
             pool_tokens = (int64_t)paged_token_capacity(
                 (int)std::min<int64_t>(
                     cfg_.kv_pool_tokens, max_pool_tokens));
+            // Memory set aside for a model beside the slots (the PFlash
+            // drafter) bounds an explicit pool too.
+            if (cfg_.kv_pool_reserve_bytes > 0 && budget.bytes_per_token > 0) {
+                const int64_t fit = (std::max<int64_t>)(0,
+                    budget.free_bytes - budget.fixed_cache_bytes -
+                    budget.reserve_bytes) / budget.bytes_per_token;
+                if (pool_tokens > fit) {
+                    set_last_error(
+                        "--kv-pool-tokens " + std::to_string(pool_tokens) +
+                        " leaves less than the " +
+                        std::to_string(cfg_.kv_pool_reserve_bytes >> 20) +
+                        " MiB reserved for the PFlash drafter; at most " +
+                        std::to_string(fit / PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE) +
+                        " tokens fit");
+                    std::fprintf(stderr, "[parallel] %s\n", luce_last_error());
+                    return false;
+                }
+            }
         } else {
-            PagedKvAutoBudget budget;
-            // TODO: Size tensor-parallel pools from each device's free memory
-            // and account for fixed cache tensors mirrored by the meta backend.
-            budget.free_bytes = (int64_t)gpu_free;
-            budget.bytes_per_token = kvf_budget.bytes_per_token;
-            budget.reserve_bytes =
-                kvf_budget.reserve_bytes + cfg_.kv_pool_reserve_bytes;
-            budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-                scratch_tokens, fixed_chain.enabled);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =

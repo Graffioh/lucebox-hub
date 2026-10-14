@@ -1024,6 +1024,14 @@ private:
     // Prompt preparation keeps the FlowKV and whole-prompt PFlash policies
     // out of the decode path while preserving their shared precedence rules.
     PreparedPrompt prepare_prompt(const ParsedRequest & req);
+    // Concurrent dense Qwen3.5 serving compresses on the scheduler's PFlash
+    // thread (scheduler.cpp), for prompts up to --max-ctx; other engines keep
+    // their paths.
+    bool pflash_concurrent_serving() {
+        return backend_.seq_engine() != nullptr && config_.arch == "qwen35" &&
+               config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+               drafter_tokenizer_ != nullptr;
+    }
     void apply_flowkv_compression(const ParsedRequest & req,
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,

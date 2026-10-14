@@ -19567,11 +19567,14 @@ struct PflashStageRun {
     int steps_beside_drafter = 0;
     std::vector<int> admitted_sizes;
     std::vector<int> usage_prompt_tokens;  // per job, from its JSON reply
+    std::vector<RoutingAdmission> admissions;
 };
 
 // Long prompts (PFlash) and short chats (served as they are) on a 2-slot
 // engine; a chat starts first and the long prompts arrive while it decodes.
-static PflashStageRun run_pflash_stage_case(int chats, int long_prompts) {
+// Routed long prompts report their admission to a model router.
+static PflashStageRun run_pflash_stage_case(int chats, int long_prompts,
+                                            bool routed = false) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
     const auto prompt = pflash_long_system_prompt_case();
@@ -19616,6 +19619,7 @@ static PflashStageRun run_pflash_stage_case(int chats, int long_prompts) {
                 job->req.messages = prompt.messages;
                 job->req.prompt_tokens = ids;
                 job->req.max_output = 1;
+                job->report_admission = routed;
             }
             jobs.push_back(std::move(job));
         }
@@ -19627,6 +19631,7 @@ static PflashStageRun run_pflash_stage_case(int chats, int long_prompts) {
         for (auto & job : jobs) {
             std::unique_lock<std::mutex> lock(job->mu);
             run.done &= job->cv.wait_for(lock, std::chrono::seconds(10), [&] { return job->done; });
+            run.admissions.push_back(job->admission);
         }
         SchedulerTestHarness::stop(server);
         scheduler.join();
@@ -19683,4 +19688,31 @@ TEST_CASE(ServerUnitFixture, test_scheduler_pflash_serves_two_long_prompts) {
     TEST_ASSERT(run.admitted_sizes.size() == 2);
     TEST_ASSERT(run.admitted_sizes[0] < run.raw_tokens);
     TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);
+}
+
+// A routed long prompt is scored too, and served by the model that scored it.
+TEST_CASE(ServerUnitFixture, test_scheduler_pflash_compresses_a_routed_prompt) {
+    const auto run = run_pflash_stage_case(/*chats=*/0, /*long_prompts=*/1,
+                                           /*routed=*/true);
+    TEST_ASSERT(run.done);
+    TEST_ASSERT(run.compress_calls == 1);
+    TEST_ASSERT(run.admitted_sizes.size() == 1);
+    TEST_ASSERT(run.admitted_sizes[0] < run.raw_tokens);
+    TEST_ASSERT(run.admissions.size() == 1);
+    TEST_ASSERT(run.admissions[0] == RoutingAdmission::handled);
+    TEST_ASSERT(run.usage_prompt_tokens[0] == run.raw_tokens);
+}
+
+// Each thread reads the error its own failing call set: the PFlash thread
+// scores beside the scheduler, and neither may see, or free, the other's.
+TEST_CASE(ServerUnitFixture, test_last_error_is_per_thread) {
+    luce::common::set_last_error("scheduler error");
+    std::string seen_by_other;
+    std::thread other([&] {
+        luce::common::set_last_error("drafter error");
+        seen_by_other = luce_last_error();
+    });
+    other.join();
+    TEST_ASSERT(seen_by_other == "drafter error");
+    TEST_ASSERT(std::string(luce_last_error()) == "scheduler error");
 }

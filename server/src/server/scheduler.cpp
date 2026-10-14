@@ -770,7 +770,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         if (ar.status == SeqEngine::AdmitResult::Status::busy) {
             prepared_capture.cancel();
-            if (job->report_admission) {
+            // A routed prompt the drafter already scored waits for this
+            // model rather than being scored again for another.
+            if (job->report_admission && !job->pflash_prepared) {
                 job->admission = RoutingAdmission::busy;
                 finish_job(job);
                 return AdmissionDisposition::Retired;
@@ -886,13 +888,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // drafter, the chat-view store); the prefix cache stays with this
     // thread, which measures the prompt's restorable prefix before the
     // hand-off.
-    const bool pflash_concurrent =
-        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
-        drafter_tokenizer_ != nullptr;
+    const bool pflash_concurrent = pflash_concurrent_serving();
     PflashStageQueue pflash_stage;
     auto pflash_wants = [&](const ServerJob * job) {
-        if (!pflash_concurrent || job->pflash_prepared || job->req.images ||
-            job->report_admission) {
+        if (!pflash_concurrent || job->pflash_prepared || job->req.images) {
             return false;
         }
         return config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||

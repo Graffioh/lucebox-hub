@@ -171,7 +171,8 @@ void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who) {
 }
 
 void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
-                      ggml_type k_override, ggml_type v_override) {
+                      ggml_type k_override, ggml_type v_override,
+                      bool tq3_shorthand) {
     ggml_type k = GGML_TYPE_Q4_0;
     ggml_type v = GGML_TYPE_Q4_0;
 
@@ -182,7 +183,7 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
     if (const char * s = std::getenv("LUCE_KV_Q4")) {
         if (std::atoi(s) != 0) { k = GGML_TYPE_Q4_0;  v = GGML_TYPE_Q4_0;  }
     }
-    if (const char * s = std::getenv("LUCE_KV_TQ3")) {
+    if (const char * s = tq3_shorthand ? std::getenv("LUCE_KV_TQ3") : nullptr) {
         if (std::atoi(s) != 0) { k = GGML_TYPE_TQ3_0; v = GGML_TYPE_TQ3_0; }
     }
 
