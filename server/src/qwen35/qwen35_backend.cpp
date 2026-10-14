@@ -522,7 +522,8 @@ bool Qwen35Backend::init() {
             // and account for fixed cache tensors mirrored by the meta backend.
             budget.free_bytes = (int64_t)gpu_free;
             budget.bytes_per_token = kvf_budget.bytes_per_token;
-            budget.reserve_bytes = kvf_budget.reserve_bytes;
+            budget.reserve_bytes =
+                kvf_budget.reserve_bytes + cfg_.kv_pool_reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
                 w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
                 scratch_tokens, fixed_chain.enabled);
@@ -1439,9 +1440,14 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
 
     // Synchronize all backends to flush any outstanding async CUDA work
     // before loading the drafter. Without this, pending operations on
-    // target/draft streams can corrupt the drafter's allocations.
-    ggml_backend_synchronize(target_backend_);
-    if (draft_backend_) ggml_backend_synchronize(draft_backend_);
+    // target/draft streams can corrupt the drafter's allocations. Only
+    // parking frees their memory: a drafter beside resident models
+    // allocates its own, and concurrent serving scores on a thread of its
+    // own while the scheduler keeps the target busy.
+    if (should_park) {
+        ggml_backend_synchronize(target_backend_);
+        if (draft_backend_) ggml_backend_synchronize(draft_backend_);
+    }
 
     // Load drafter with its OWN backend (not target_backend_).
     // Matches test_dflash.cpp: separate backend supports multi-GPU

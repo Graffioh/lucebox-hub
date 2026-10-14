@@ -105,6 +105,9 @@ struct BackendArgs {
     // Total paged K/V pool in tokens shared by all slots (--kv-pool-tokens;
     // model-page-rounded). 0 = derive capacity from available device memory.
     long long       kv_pool_tokens   = 0;
+    // Device memory an automatically sized pool leaves free for a model that
+    // runs beside concurrent decode (the PFlash drafter). Bytes; 0 = none.
+    long long       kv_pool_reserve_bytes = 0;
     int             kq_stride_pad    = 32;
     int             draft_block_size = 0;  // 0 = drafter metadata
     int             draft_swa_window = 0;

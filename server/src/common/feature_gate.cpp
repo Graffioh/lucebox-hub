@@ -254,9 +254,14 @@ std::string check_feature_compatibility(
         if (args.fa_window != 0) {
             return "--paged-attention requires full attention (--fa-window 0)";
         }
-        if (admission.pflash_enabled) {
-            return "--paged-attention cannot be combined with PFlash prefill "
-                   "compression";
+        // Only concurrent dense Qwen3.5 serving compresses beside paged
+        // decode: its drafter scores on a thread of its own while the slots
+        // keep decoding, in memory the KV pool leaves free for it.
+        if (admission.pflash_enabled &&
+            (args.max_concurrency <= 1 || arch != "qwen35")) {
+            return "--paged-attention combines with PFlash prefill compression "
+                   "only for concurrent dense Qwen3.5 serving "
+                   "(--max-concurrency > 1)";
         }
         if (admission.fixed_kvflash_requested()) {
             return "--paged-attention cannot be combined with KVFlash";

@@ -16,11 +16,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 
@@ -79,6 +82,15 @@ enum class AdmissionDisposition {
     Deferred,  // engine had no room; caller keeps the job and retries it first
     Loading,   // its disk snapshot is being read; retried first, without backoff
     Retired,   // job finished or failed during admission; no slot was taken
+};
+
+// Long prompts handed to the PFlash compression thread: the scheduler
+// pushes, the compression thread pops.
+struct PflashStageQueue {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<ServerJob *> jobs;
+    bool stop = false;
 };
 
 }  // namespace
@@ -336,10 +348,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             /*prefilled_tokens=*/prompt_tokens - s.cached_prefix_tokens,
             /*effective_prompt_tokens=*/prompt_tokens,
         };
+        gen_timings.pflash = s.job->pflash_stats;
 
         if (!s.error) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
+            perf.pflash = req.client_prompt_tokens >= 0;
             perf.completion_tokens = s.completion_tokens;
             const int computed_prompt_tokens =
                 prompt_tokens - s.cached_prefix_tokens;
@@ -460,7 +474,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         if (n_gen_cap < 1) {
             // Degenerate ask: reply with an empty completion, no slot needed.
             SseEmitter emitter(req.format, req.response_id, req.model,
-                               (int)req.prompt_tokens.size(), req.tools,
+                               usage_prompt_tokens(req), req.tools,
                                &tool_memory_, req.stop_sequences,
                                req.started_in_thinking);
             GenTimings t{
@@ -787,7 +801,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // can still try another model; no tokenizer/model identity is on wire.
         auto emitter = std::make_unique<SseEmitter>(
             req.format, req.response_id, req.model,
-            (int)req.prompt_tokens.size(), req.tools, &tool_memory_,
+            usage_prompt_tokens(req), req.tools, &tool_memory_,
             req.stop_sequences, req.started_in_thinking);
         if (req.stream) {
             bool ok = send_sse_headers(job);
@@ -865,6 +879,116 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // has them until it ends.
     std::chrono::steady_clock::time_point decode_only_until{};
 
+    // PFlash. A prompt over the compression threshold leaves the line for
+    // the compression thread: live slots keep decoding while the drafter
+    // scores it, and it comes back to the head of the queue with the prompt
+    // to serve. That thread owns what prompt preparation touches (the
+    // drafter, the chat-view store); the prefix cache stays with this
+    // thread, which measures the prompt's restorable prefix before the
+    // hand-off.
+    const bool pflash_concurrent =
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr;
+    PflashStageQueue pflash_stage;
+    auto pflash_wants = [&](const ServerJob * job) {
+        if (!pflash_concurrent || job->pflash_prepared || job->req.images ||
+            job->report_admission) {
+            return false;
+        }
+        return config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+            (int)job->req.prompt_tokens.size() >= config_.pflash_threshold;
+    };
+    auto pflash_prepare = [this](ServerJob * job) {
+        if (job->client_disconnected.load(std::memory_order_acquire)) return;
+        const auto started = std::chrono::steady_clock::now();
+        const int raw_tokens = (int)job->req.prompt_tokens.size();
+        PreparedPrompt prepared = prepare_prompt(job->req);
+        if (prepared.error_status != 0) {
+            job->pflash_error_status = prepared.error_status;
+            job->pflash_error = std::move(prepared.error);
+            return;
+        }
+        job->pflash_stats = std::move(prepared.pflash_stats);
+        if (prepared.compressed) {
+            job->req.client_prompt_tokens = raw_tokens;
+            job->req.prompt_tokens = std::move(prepared.tokens);
+            // A view's generation prompt is where its next turn branches off.
+            if (job->req.pin_end_token <= 0 && prepared.snapshot_cut > 0) {
+                job->req.pin_end_token = prepared.snapshot_cut;
+            }
+            // A compressed prompt is not raw history: never persist it.
+            job->req.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
+        }
+        std::fprintf(stderr,
+            "[pflash-concurrent] %s: %d -> %zu tokens in %.2fs\n",
+            job->req.response_id.c_str(), raw_tokens,
+            job->req.prompt_tokens.size(),
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count());
+    };
+    // Prepared jobs return to the head of the queue, behind the prepared
+    // ones already waiting there, so they keep their order.
+    auto requeue_prepared = [this](ServerJob * job) {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        ServerJob ** link = &queue_head_;
+        while (*link && (*link)->pflash_prepared) link = &(*link)->next;
+        job->next = *link;
+        *link = job;
+        if (!job->next) queue_tail_ = job;
+        queue_cv_.notify_one();
+    };
+    std::thread pflash_thread;
+    if (pflash_concurrent) {
+        pflash_thread = std::thread([&pflash_stage, pflash_prepare,
+                                     requeue_prepared] {
+            for (;;) {
+                ServerJob * job = nullptr;
+                {
+                    std::unique_lock<std::mutex> lk(pflash_stage.mu);
+                    pflash_stage.cv.wait(lk, [&] {
+                        return pflash_stage.stop || !pflash_stage.jobs.empty();
+                    });
+                    if (pflash_stage.stop) return;
+                    job = pflash_stage.jobs.front();
+                    pflash_stage.jobs.pop_front();
+                }
+                pflash_prepare(job);
+                job->pflash_prepared = true;
+                requeue_prepared(job);
+            }
+        });
+    }
+    auto stop_pflash_thread = [&]() {
+        if (!pflash_thread.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(pflash_stage.mu);
+            pflash_stage.stop = true;
+        }
+        pflash_stage.cv.notify_all();
+        pflash_thread.join();
+    };
+    struct StopOnExit {
+        decltype(stop_pflash_thread) & stop;
+        ~StopOnExit() { stop(); }
+    } pflash_thread_guard{stop_pflash_thread};
+    // No response bytes are committed before admission, so a failed
+    // preparation answers like a failed admission.
+    auto fail_preparation = [&](ServerJob * job) {
+        const ParsedRequest & req = job->req;
+        std::fprintf(stderr, "[server] request failed: %s\n",
+                     job->pflash_error.c_str());
+        const ResponseError error = job->pflash_error_status == 400
+            ? ResponseError::invalid_request("invalid_request", job->pflash_error)
+            : job->pflash_error_status == 503
+            ? ResponseError::unavailable("unavailable", job->pflash_error)
+            : ResponseError::internal("server_error", job->pflash_error);
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(job->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
+        finish_job(job);
+    };
+
     while (true) {
         reap_readers();
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
@@ -910,6 +1034,24 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (job->client_disconnected.load(std::memory_order_acquire)) {
                 if (disk_load && disk_load->job == job) drop_disk_load();
                 finish_job(job);
+                continue;
+            }
+            if (pflash_wants(job)) {
+                if (job->parallel_started_at ==
+                        std::chrono::steady_clock::time_point{}) {
+                    job->parallel_started_at = std::chrono::steady_clock::now();
+                }
+                job->req.pflash_cached_prefix = restorable_prefix_tokens(
+                    job->req.prompt_tokens, job->req.disk_cache_policy);
+                {
+                    std::lock_guard<std::mutex> lk(pflash_stage.mu);
+                    pflash_stage.jobs.push_back(job);
+                }
+                pflash_stage.cv.notify_one();
+                continue;
+            }
+            if (job->pflash_error_status != 0) {
+                fail_preparation(job);
                 continue;
             }
             const AdmissionDisposition outcome = admit_job(job);
@@ -1363,6 +1505,21 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         }
     }
+
+    // A prompt still being compressed returns to the queue below; the ones
+    // not started yet are answered here.
+    stop_pflash_thread();
+    for (ServerJob * waiting : pflash_stage.jobs) {
+        const ParsedRequest & req = waiting->req;
+        const ResponseError error = ResponseError::unavailable(
+            "server_shutting_down", "server shutting down");
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(waiting->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
+        finish_job(waiting);
+    }
+    pflash_stage.jobs.clear();
 
     drop_disk_load();
     for (auto & reader : finished_readers) reader.reader.join();

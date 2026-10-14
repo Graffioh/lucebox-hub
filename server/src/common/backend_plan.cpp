@@ -144,6 +144,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     plan.cache_.fa_window = args.fa_window;
     plan.cache_.paged_attention = args.paged_attention;
     plan.cache_.kv_pool_tokens = args.kv_pool_tokens;
+    plan.cache_.kv_pool_reserve_bytes = args.kv_pool_reserve_bytes;
     plan.cache_.cache_type_k = args.cache_type_k;
     plan.cache_.cache_type_v = args.cache_type_v;
     plan.cache_.kq_stride_pad = args.kq_stride_pad;

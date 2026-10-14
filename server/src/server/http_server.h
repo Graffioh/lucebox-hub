@@ -46,6 +46,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #if !defined(_WIN32)
@@ -846,7 +847,20 @@ struct ParsedRequest {
     // The prompt ends with tool results: an agent's step, which clients only
     // append to.
     bool                      ends_with_tool_result = false;
+    // Concurrent serving: the restorable prefix of prompt_tokens (target
+    // tokens) the scheduler measured before it handed the request to the
+    // PFlash thread, which never reads the prefix cache. Empty = not measured.
+    std::optional<http_detail::PflashRestorablePrefix> pflash_cached_prefix;
+    // The client prompt's size when prompt_tokens holds the compressed
+    // prompt the concurrent scheduler serves; -1: prompt_tokens is the
+    // client's. usage.prompt_tokens reports it (usage_prompt_tokens).
+    int                       client_prompt_tokens = -1;
 };
+
+inline int usage_prompt_tokens(const ParsedRequest & req) {
+    return req.client_prompt_tokens >= 0 ? req.client_prompt_tokens
+                                         : (int) req.prompt_tokens.size();
+}
 
 // Resident budget the PrefixCache enforces: the concurrent limit in paged
 // mode, else --prefix-cache-max-mib, with auto sized from the backend's
@@ -1428,6 +1442,13 @@ struct ServerJob {
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
+    // Concurrent PFlash (scheduler.cpp): the job came back from the
+    // compression thread. When it was compressed, req.prompt_tokens holds the
+    // served prompt and req.client_prompt_tokens the client prompt's size.
+    bool          pflash_prepared = false;
+    nlohmann::json pflash_stats;          // usage.timings.pflash
+    int           pflash_error_status = 0; // prompt preparation failed
+    std::string   pflash_error;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────

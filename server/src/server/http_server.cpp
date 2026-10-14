@@ -4524,7 +4524,7 @@ json build_openai_completion_response(
     // the OpenAI shape (ignored by clients that don't recognize it).
     // spec_decode_ran disambiguates a real zero-acceptance speculative run
     // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
-    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const int prompt_tokens = usage_prompt_tokens(req);
     const json usage = {
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", counts.total},
@@ -4604,7 +4604,7 @@ json build_anthropic_response(
     }
 
     const json usage = {
-        {"input_tokens", (int) req.prompt_tokens.size()},
+        {"input_tokens", usage_prompt_tokens(req)},
         {"output_tokens", counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
@@ -4630,7 +4630,7 @@ json build_responses_api_response(
     const json output = responses_output_items(
         req.response_id + "_msg", emitter.accumulated_text(), emitter.tool_calls());
 
-    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const int prompt_tokens = usage_prompt_tokens(req);
     const json usage = {
         {"input_tokens", prompt_tokens},
         {"output_tokens", counts.total},
@@ -4943,7 +4943,12 @@ std::string HttpServer::apply_pflash_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
     const bool selection_environment =
         luce::pflash::has_pflash_selection_environment();
-    auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
+    // Concurrent serving measured the cache on the scheduler thread, which
+    // owns the prefix cache, before handing the request over.
+    const bool cache_measured = req.pflash_cached_prefix.has_value();
+    auto [full_slot, full_len] = cache_measured
+        ? std::pair<int, int>{-1, 0}
+        : prefix_cache_.lookup_full(req.prompt_tokens);
     if (http_detail::pflash_full_cache_restore_allowed(
             selection_environment) && full_slot >= 0) {
         std::fprintf(stderr,
@@ -6117,8 +6122,10 @@ std::string HttpServer::apply_pflash_compression(
                                    existing.view_gen_begin, input_tokens, true, 0};
                 }
             } else {
-                const auto restorable = restorable_prefix_tokens(
-                    req.prompt_tokens, req.disk_cache_policy);
+                const auto restorable = cache_measured
+                    ? *req.pflash_cached_prefix
+                    : restorable_prefix_tokens(
+                          req.prompt_tokens, req.disk_cache_policy);
                 const int cached_target = restorable.tokens;
                 const int cached_drafter = prompt_tokens > 0
                     ? (std::min)(input_tokens, (int) std::floor(

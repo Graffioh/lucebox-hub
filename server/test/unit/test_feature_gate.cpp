@@ -603,6 +603,24 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     parallel.max_concurrency = 65;
     CHECK(!gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
 
+    // PFlash runs beside paged decode only in concurrent dense Qwen3.5
+    // serving; single-request paged serving still rejects it.
+    BackendAdmissionContext pflash;
+    pflash.pflash_enabled = true;
+    pflash.pflash_drafter_configured = true;
+    for (const auto backend : {PlacementBackend::Cuda, PlacementBackend::Hip}) {
+        BackendArgs concurrent = paged;
+        concurrent.max_concurrency = 4;
+        CHECK(gate_result(concurrent, "qwen35", backend, pflash).empty());
+        concurrent.max_concurrency = 1;
+        CHECK(gate_result(concurrent, "qwen35", backend, pflash)
+                  .find("--max-concurrency > 1") != std::string::npos);
+    }
+    BackendArgs ds4_pflash = gate_args_hip_deepseek4();
+    ds4_pflash.paged_attention = true;
+    ds4_pflash.max_concurrency = 2;
+    CHECK(!gate_result(ds4_pflash, "deepseek4", PlacementBackend::Hip, pflash).empty());
+
     BackendArgs ds4 = gate_args_hip_deepseek4();
     ds4.paged_attention = true;
     ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES;

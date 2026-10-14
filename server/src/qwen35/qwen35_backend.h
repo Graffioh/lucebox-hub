@@ -75,6 +75,9 @@ struct Qwen35Config {
     // (--kv-pool-tokens; rounded up to whole 16-token blocks).
     // 0 derives the shared physical capacity from available device memory.
     int64_t      kv_pool_tokens  = 0;
+    // Device memory the automatically sized pool leaves free for the PFlash
+    // drafter, which scores beside concurrent decode (bytes).
+    int64_t      kv_pool_reserve_bytes = 0;
 
     // Draft
     int          draft_block_size = 0;  // 0 = use drafter metadata

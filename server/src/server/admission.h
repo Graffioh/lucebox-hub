@@ -6,6 +6,21 @@
 
 #include <algorithm>
 
+// Device memory concurrent serving leaves free beside the paged KV pool for the
+// PFlash drafter, which scores on its own thread while the slots decode: its
+// weights plus a workspace that grows linearly with the prompt it scores
+// (activations, its own cache, the largest ubatch's attention). The
+// per-token figure is the Qwen3.5-0.8B drafter's measured peak, 53 KiB per
+// token from 33K to 206K tokens, rounded up; its fixed part (0.6 GiB) is
+// under the weights.
+inline constexpr long long kPFlashScoringBytesPerToken = 56LL * 1024;
+
+inline long long pflash_concurrent_reserve_bytes(long long drafter_weight_bytes, int max_prompt_tokens)
+{
+    return (std::max)(0LL, drafter_weight_bytes) +
+           (long long)(std::max)(0, max_prompt_tokens) * kPFlashScoringBytesPerToken;
+}
+
 // The reply a request can get: what it asked for, trimmed to the context its
 // prompt leaves (0 when the prompt fills it). Clients ask for their usual cap
 // whatever the prompt, Claude Code 32000 tokens, so a long session would

@@ -1,4 +1,4 @@
-// Unit tests for should_reject_oversized and fit_reply_to_context — pure, GPU-free.
+// Unit tests for the admission gate, reply fitting and the concurrent PFlash reserve — pure, GPU-free.
 
 #include "CppUnitTestFramework.hpp"
 #include "server/admission.h"
@@ -80,4 +80,19 @@ TEST_CASE(AdmissionFixture, test_oversized_with_compression_respects_max_ctx) {
     CHECK(should_reject_oversized(200000, 1, 139264, true));
     CHECK(should_reject_oversized(204800, 1, 204800, false));
     CHECK(!should_reject_oversized(1000, 1, 139264, false));
+}
+
+// The drafter's reserve covers its measured peak (Qwen3.5-0.8B BF16 drafter, R9700, peak minus the floor before the
+// request) at every prompt length that was measured.
+TEST_CASE(AdmissionFixture, test_pflash_concurrent_reserve_covers_measured_drafter_peaks) {
+    const long long drafter_bytes = 1516744736;  // Qwen3.5-0.8B-BF16.gguf
+    const long long gib = 1LL << 30;
+    const struct { int tokens; double peak_gib; } measured[] = {
+        {33513, 2.26}, {57775, 3.43}, {83928, 4.83}, {136684, 7.38}, {206205, 11.04}};
+    for (const auto & m : measured) {
+        CHECK(pflash_concurrent_reserve_bytes(drafter_bytes, m.tokens) >= (long long)(m.peak_gib * gib));
+    }
+    CHECK(pflash_concurrent_reserve_bytes(drafter_bytes, 139264) ==
+          drafter_bytes + 139264LL * kPFlashScoringBytesPerToken);
+    CHECK(pflash_concurrent_reserve_bytes(-1, -1) == 0);
 }

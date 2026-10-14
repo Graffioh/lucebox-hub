@@ -19485,3 +19485,202 @@ TEST_CASE(ServerUnitFixture, test_unified_distinct_tokenizers_keep_lines_whole) 
     TEST_ASSERT_MSG(content_broke.empty(), content_broke + "\n" + content);
     TEST_ASSERT(content.find("item 33 value kiwikiwikiwikiwi\n") != std::string::npos);
 }
+
+// PFlash on the concurrent scheduler. The engine counts the steps that ran
+// while the drafter scored.
+class PflashStageEngine final : public SeqEngine {
+public:
+    explicit PflashStageEngine(const std::atomic<bool> & scoring) : scoring_(scoring) {}
+    int slot_count() const override { return 2; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t) const override { return false; }
+    StepPlanLimits step_plan_limits(int) const override {
+        StepPlanLimits limits;
+        limits.max_prefill_sequences = 2;
+        limits.max_prefill_tokens_per_sequence = 16;
+        limits.max_prefill_tokens_total = 32;
+        limits.prefill_allocation_quantum = 16;
+        return limits;
+    }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> & prompt, const SamplerCfg &) override {
+        AdmitResult result;
+        const int slot = !slots_[0].active ? 0 : !slots_[1].active ? 1 : -1;
+        if (slot < 0) {
+            result.status = AdmitResult::Status::busy;
+            return result;
+        }
+        slots_[(size_t)slot] = {true, (int)prompt.size()};
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            admitted_sizes.push_back((int)prompt.size());
+        }
+        result.status = AdmitResult::Status::admitted;
+        result.slot = slot;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        if (scoring_.load()) steps_beside_drafter.fetch_add(1);
+        StepResult result;
+        for (const StepInput & input : plan.decode) result.decode.push_back({input.slot, 7, false, {}});
+        for (const PrefillSlice & slice : plan.prefills) {
+            int & left = slots_[(size_t)slice.slot].remaining;
+            left -= std::min(left, slice.max_tokens);
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = left == 0 ? PrefillOutput::Status::completed
+                                   : PrefillOutput::Status::advanced;
+            if (left == 0) out.token = 7;
+            result.prefills.push_back(out);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return result;
+    }
+    void retire(int slot) override { slots_[(size_t)slot] = {}; }
+
+    std::mutex mu;
+    std::vector<int> admitted_sizes;
+    std::atomic<int> steps_beside_drafter{0};
+
+private:
+    struct Slot { bool active = false; int remaining = 0; };
+    const std::atomic<bool> & scoring_;
+    std::array<Slot, 2> slots_{};
+};
+
+struct PflashStageBackend : MockPflashBudgetBackend {
+    std::atomic<bool> scoring{false};
+    PflashStageEngine engine{scoring};
+    SeqEngine * seq_engine() override { return &engine; }
+    CompressResult compress(const CompressRequest & request) override {
+        scoring = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CompressResult result = MockPflashBudgetBackend::compress(request);
+        scoring = false;
+        return result;
+    }
+};
+
+struct PflashStageRun {
+    bool done = false;
+    int raw_tokens = 0;
+    int compress_calls = 0;
+    int steps_beside_drafter = 0;
+    std::vector<int> admitted_sizes;
+    std::vector<int> usage_prompt_tokens;  // per job, from its JSON reply
+};
+
+// Long prompts (PFlash) and short chats (served as they are) on a 2-slot
+// engine; a chat starts first and the long prompts arrive while it decodes.
+static PflashStageRun run_pflash_stage_case(int chats, int long_prompts) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const std::vector<int32_t> ids = tokenizer.encode(prompt.rendered);
+
+    auto backend_owner = std::make_unique<PflashStageBackend>();
+    PflashStageBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = 64;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    PflashStageRun run;
+    run.raw_tokens = (int)ids.size();
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const int n = chats + long_prompts;
+        std::vector<int> fds((size_t)n * 2, -1);
+        std::vector<std::unique_ptr<ServerJob>> jobs;
+        for (int i = 0; i < n; ++i) {
+            TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds[(size_t)i * 2]) == 0);
+            auto job = std::make_unique<ServerJob>();
+            job->fd = fds[(size_t)i * 2];
+            job->req.format = ApiFormat::OPENAI_CHAT;
+            job->req.stream = false;
+            job->req.model = "scheduler-test";
+            job->req.response_id = "job-" + std::to_string(i);
+            if (i < chats) {
+                job->req.prompt_tokens.assign(ids.begin(), ids.begin() + 4);
+                job->req.max_output = 60;
+            } else {
+                job->req.messages = prompt.messages;
+                job->req.prompt_tokens = ids;
+                job->req.max_output = 1;
+            }
+            jobs.push_back(std::move(job));
+        }
+        for (int i = 0; i < chats; ++i) SchedulerTestHarness::enqueue(server, jobs[(size_t)i].get());
+        std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+        if (chats > 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        for (int i = chats; i < n; ++i) SchedulerTestHarness::enqueue(server, jobs[(size_t)i].get());
+        run.done = true;
+        for (auto & job : jobs) {
+            std::unique_lock<std::mutex> lock(job->mu);
+            run.done &= job->cv.wait_for(lock, std::chrono::seconds(10), [&] { return job->done; });
+        }
+        SchedulerTestHarness::stop(server);
+        scheduler.join();
+        for (int i = 0; i < n; ++i) {
+            std::string reply;
+            char buf[4096];
+            ssize_t got;
+            while ((got = recv(fds[(size_t)i * 2 + 1], buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+                reply.append(buf, (size_t)got);
+            }
+            const size_t body = reply.find("\r\n\r\n");
+            TEST_ASSERT(body != std::string::npos);
+            const auto j = nlohmann::json::parse(reply.substr(body + 4));
+            run.usage_prompt_tokens.push_back(j["usage"]["prompt_tokens"].get<int>());
+        }
+        for (const int fd : fds) close(fd);
+    }
+    run.compress_calls = backend.compress_calls;
+    run.steps_beside_drafter = backend.engine.steps_beside_drafter.load();
+    run.admitted_sizes = backend.engine.admitted_sizes;
+    unlink(path.c_str());
+    return run;
+}
+
+// A long prompt on an idle server is scored, then served compressed; its
+// usage counts the prompt the client sent.
+TEST_CASE(ServerUnitFixture, test_scheduler_pflash_serves_a_long_prompt_on_an_idle_server) {
+    const auto run = run_pflash_stage_case(/*chats=*/0, /*long_prompts=*/1);
+    TEST_ASSERT(run.done);
+    TEST_ASSERT(run.compress_calls == 1);
+    TEST_ASSERT(run.admitted_sizes.size() == 1);
+    TEST_ASSERT(run.admitted_sizes[0] < run.raw_tokens);
+    TEST_ASSERT(run.usage_prompt_tokens.size() == 1);
+    TEST_ASSERT(run.usage_prompt_tokens[0] == run.raw_tokens);
+}
+
+// The chat already decoding keeps its slot stepping while the drafter
+// scores the long prompt beside it.
+TEST_CASE(ServerUnitFixture, test_scheduler_pflash_decodes_while_the_drafter_scores) {
+    const auto run = run_pflash_stage_case(/*chats=*/1, /*long_prompts=*/1);
+    TEST_ASSERT(run.done);
+    TEST_ASSERT(run.compress_calls == 1);
+    TEST_ASSERT(run.steps_beside_drafter > 0);
+    TEST_ASSERT(run.admitted_sizes.size() == 2);
+    TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);
+}
+
+// Two long prompts that arrive together are both scored and served
+// compressed.
+TEST_CASE(ServerUnitFixture, test_scheduler_pflash_serves_two_long_prompts) {
+    const auto run = run_pflash_stage_case(/*chats=*/0, /*long_prompts=*/2);
+    TEST_ASSERT(run.done);
+    TEST_ASSERT(run.compress_calls == 2);
+    TEST_ASSERT(run.admitted_sizes.size() == 2);
+    TEST_ASSERT(run.admitted_sizes[0] < run.raw_tokens);
+    TEST_ASSERT(run.admitted_sizes[1] < run.raw_tokens);
+}
