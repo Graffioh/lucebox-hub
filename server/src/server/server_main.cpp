@@ -302,7 +302,8 @@ static void print_usage(const char * prog) {
         "  --prefill-curve T:R [T:R ...]  Piecewise keep-ratio curve over\n"
         "                              (token,ratio) breakpoints; linear interp.\n"
         "                              Overrides --prefill-keep-ratio. Example:\n"
-        "                              10000:0.5 40000:0.2 100000:0.1\n"
+        "                              10000:0.5 40000:0.2 100000:0.1 (quoted\n"
+        "                              as one argument works the same)\n"
         "                              With PFLASH_SCORING_HEAD_GGUF and neither\n"
         "                              flag: 16384:0.315 32768:0.270 65536:0.270\n"
         "                              120000:0.225\n"
@@ -968,17 +969,15 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         } else if (std::strcmp(argv[i], "--prefill-curve") == 0 && i + 1 < argc) {
             sconfig.pflash_curve.clear();
             model.pflash_ratio_set = true;
+            std::string curve_error;
             while (i + 1 < argc && argv[i + 1][0] != '-') {
-                const char * arg = argv[++i];
-                const char * colon = std::strchr(arg, ':');
-                if (!colon) {
-                    std::fprintf(stderr, "[server] --prefill-curve: bad format '%s' (expected TOKENS:RATIO)\n", arg);
-                    print_usage(argv[0]);
-                    return 1;
-                }
-                int tok = std::atoi(arg);
-                float ratio = (float)std::atof(colon + 1);
-                sconfig.pflash_curve.push_back({tok, ratio});
+                if (!luce::server::parse_pflash_curve_arg(argv[++i], sconfig.pflash_curve, curve_error)) break;
+            }
+            if (curve_error.empty() && sconfig.pflash_curve.empty()) curve_error = "no TOKENS:RATIO points";
+            if (!curve_error.empty()) {
+                std::fprintf(stderr, "[server] --prefill-curve: %s\n", curve_error.c_str());
+                print_usage(argv[0]);
+                return 1;
             }
             std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
         } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
@@ -1728,12 +1727,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // KV types now come from each family's default (q8_0 for laguna, q4_0
     // base) unless the user passes --cache-type-k/v explicitly.
 
-    // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
+    // The PFlash scorer (Qwen3.5 drafter) runs ggml attention and reads none of
+    // the FlashPrefill kernel switches. LUCE_FP_USE_BSA stays on with PFlash so
+    // Gemma 4's sliding-window prefill keeps the BSA launcher it had before.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
         set_environment_variable("LUCE_FP_USE_BSA", "1", false);
-        set_environment_variable("LUCE_FP_ALPHA", "0.85", false);
-        set_environment_variable("LUCE_FA_WINDOW", "0", false);
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
@@ -2207,14 +2206,18 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
     if (pflash_enabled) {
         std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
-        std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
+        if (sconfig.pflash_curve.empty()) {
+            std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
+        } else {
+            std::fprintf(stderr, "[server] │  pflash_keep     = curve");
+            for (const auto & p : sconfig.pflash_curve) std::fprintf(stderr, " %d:%.3f", p.first, p.second);
+            std::fprintf(stderr, "\n");
+        }
         std::fprintf(stderr, "[server] │  pflash_drafter  = %s\n", sconfig.pflash_drafter_path.c_str());
         std::fprintf(stderr, "[server] │  pflash_drafter_gpu= %d\n", sconfig.pflash_drafter_gpu);
         std::fprintf(stderr, "[server] │  pflash_drafter_exec= %s\n",
                      sconfig.pflash_remote_drafter ? "remote-ipc" : "local");
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("LUCE_FP_USE_BSA") ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("LUCE_FP_ALPHA") ? getenv("LUCE_FP_ALPHA") : "0.12 (default)");
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",
                  draft_residency_policy_name(sconfig.draft_residency));

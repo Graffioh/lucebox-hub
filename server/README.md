@@ -205,7 +205,7 @@ New PFlash flags:
 
 | Flag | Purpose |
 |---|---|
-| `--prefill-curve T:R [T:R ...]` | Piecewise keep-ratio curve. Linear interpolation over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression at 10K tokens, 5× at 40K, 10× at 100K+). Overrides `--prefill-keep-ratio`; a per-session bandit override still takes precedence. |
+| `--prefill-curve T:R [T:R ...]` | Piecewise keep-ratio curve. Linear interpolation over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression at 10K tokens, 5× at 40K, 10× at 100K+). Points may be separate arguments or one quoted list. Overrides `--prefill-keep-ratio`; a per-session bandit override still takes precedence. |
 | `--prefill-upstream-base <URL>` | OpenAI-compatible upstream base URL. Enables proxy mode. |
 | `--prefill-upstream-key <KEY>` | Bearer token sent to the upstream. |
 | `--prefill-upstream-model <NAME>` | Model name sent on forwarded requests. |
