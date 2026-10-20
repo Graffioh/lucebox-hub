@@ -1094,6 +1094,13 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
+    // Multi-token inputs: one GEMM over the stacked (gate | up) alias and a
+    // SwiGLU over its two halves. A single token keeps the two matmuls, which
+    // the backend fuses with the GLU into one vector kernel.
+    if (L.w_gate_up && cur->ne[1] > 1 && L.w_gate_s == 1.0f && L.w_up_s == 1.0f) {
+        ggml_tensor * gu = ggml_swiglu(ctx, ggml_mul_mat(ctx, L.w_gate_up, cur));
+        return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, gu), L.w_down_s);
+    }
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
     ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up, cur);
     ggml_tensor * gu;

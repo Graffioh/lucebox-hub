@@ -723,6 +723,7 @@ bool load_target_gguf_partial(const std::string & path,
         static const char * const kPairs[][2] = {
             { ".attn_gate.weight", ".attn_qkv.weight"  },
             { ".ssm_beta.weight",  ".ssm_alpha.weight" },
+            { ".ffn_gate.weight",  ".ffn_up.weight"    },
         };
         std::vector<TargetTensorAlloc> ordered;
         ordered.reserve(allocs.size());
@@ -876,7 +877,7 @@ bool load_target_gguf_partial(const std::string & path,
             // Alias tensors over adjacent pairs. They read the same bytes as
             // the two source tensors (no copy, no extra VRAM).
             ggml_init_params sip{};
-            sip.mem_size   = (2 * n_layer + 8) * ggml_tensor_overhead();
+            sip.mem_size   = (3 * n_layer + 8) * ggml_tensor_overhead();
             sip.mem_buffer = nullptr;
             sip.no_alloc   = true;
             out.stack_ctx = ggml_init(sip);
@@ -908,6 +909,8 @@ bool load_target_gguf_partial(const std::string & path,
                 L.wqkv_z = make_stack(L.wqkv_gate, L.wqkv, nm);
                 std::snprintf(nm, sizeof(nm), "blk.%d.ssm_beta_alpha.stacked", il);
                 L.ssm_ba = make_stack(L.ssm_beta, L.ssm_alpha, nm);
+                std::snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_up.stacked", il);
+                L.w_gate_up = make_stack(L.w_gate, L.w_up, nm);
             }
             if (n_stacked > 0) {
                 std::fprintf(stderr, "[loader] stacked %d projection pairs (zero-copy aliases)\n", n_stacked);

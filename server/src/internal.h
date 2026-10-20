@@ -80,9 +80,11 @@ struct TargetLayer {
     // tensors share a type and were placed back to back in the weight buffer):
     //   wqkv_z: rows [0, n_z) = wqkv_gate (z), rows [n_z, ...) = wqkv
     //   ssm_ba: rows [0, dt_rank) = ssm_beta, rows [dt_rank, ...) = ssm_alpha
+    //   w_gate_up: rows [0, inter) = w_gate, rows [inter, ...) = w_up
     // One GEMV each instead of two; nullptr when stacking was not possible.
     ggml_tensor * wqkv_z         = nullptr;
     ggml_tensor * ssm_ba         = nullptr;
+    ggml_tensor * w_gate_up      = nullptr;
     // Fused raw-gate GDN kernel parameters: f32 [2 * dt_rank] = [dt_bias | A],
     // one small GPU tensor per DeltaNet layer (src[9] of the GDN op).
     ggml_tensor * ssm_gate_ba    = nullptr;
