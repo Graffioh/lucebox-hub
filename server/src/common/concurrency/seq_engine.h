@@ -370,6 +370,10 @@ public:
 
     // EOS check for scheduler-side stop decisions.
     virtual bool token_is_eos(int32_t token) const = 0;
+
+    // The most tokens one decode output carries (its committed_tokens and
+    // final token); 0 when the engine does not say.
+    virtual int max_decode_tokens() const { return 0; }
 };
 
 template <typename Advance>

@@ -244,6 +244,12 @@ struct ServerConfig {
     // prompt and tools). Only a prefix this many tokens past what the request
     // can already restore is worth the wait; zero turns the wait off.
     int shared_prefix_wait_min_tokens = 512;
+    // Under continuous batching, thinking that has written one 64-token span
+    // this many times is going round in circles (BudgetHook::loop_repeats)
+    // and is closed like an exhausted thinking budget: greedy decoding
+    // otherwise rewrites the same draft until the budget runs out. The
+    // single-slot decoders do not read it. Zero disables.
+    int thinking_loop_repeats = 6;
     // Auto resolves after all models load, before workers start. Zero disables.
     size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 

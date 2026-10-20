@@ -133,6 +133,9 @@ public:
                              const ImagePromptHandle & images) override;
 
     bool token_is_eos(int32_t token) const override;
+    int max_decode_tokens() const override {
+        return fixed_chain_ready_ ? fixed_chain_.width : 1;
+    }
 
 
 private:

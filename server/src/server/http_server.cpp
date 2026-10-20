@@ -2104,6 +2104,7 @@ json build_props_body(const ServerConfig & config,
             {"model_card_source",       config.model_card_source_label},
             {"default_max_tokens",      config.default_max_tokens},
             {"hard_limit_reply_budget", config.hard_limit_reply_budget},
+            {"thinking_loop_repeats", config.thinking_loop_repeats},
             {"think_max_tokens",        config.think_max_tokens},
             {"effort_tiers", {
                 {"low",    config.effort_tiers.low},

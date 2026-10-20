@@ -10335,6 +10335,121 @@ TEST_CASE(ServerUnitFixture, test_scheduler_runs_a_short_prompt_before_a_long_on
     TEST_ASSERT(last_document_step > question_step);
 }
 
+// An engine that thinks in a loop of 10, 11, 12 and answers (EOS) once the
+// close marker is fed back. It bursts four tokens when allowed.
+class LoopingThinkerEngine final : public SeqEngine {
+public:
+    int slot_count() const override { return 1; }
+    int max_context() const override { return 4096; }
+    bool token_is_eos(int32_t token) const override { return token == 2; }
+    int max_decode_tokens() const override { return 4; }
+    StepPlanLimits step_plan_limits(int) const override { return {1, 64, 64, 64}; }
+    AdmitResult admit(uint64_t, const std::vector<int32_t> &, const SamplerCfg &) override {
+        AdmitResult result;
+        result.status = active_ ? AdmitResult::Status::busy : AdmitResult::Status::admitted;
+        result.slot = 0;
+        active_ = true;
+        return result;
+    }
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        for (const PrefillSlice & slice : plan.prefills) {
+            PrefillOutput out;
+            out.slot = slice.slot;
+            out.status = PrefillOutput::Status::completed;
+            out.token = next();
+            result.prefills.push_back(out);
+        }
+        for (const StepInput & input : plan.decode) {
+            closed_ |= input.token == 31;
+            DecodeOutput out;
+            out.slot = input.slot;
+            const int burst = input.allow_speculation ? 4 : 1;
+            for (int i = 1; i < burst; ++i) out.committed_tokens.push_back(next());
+            out.token = next();
+            steps.push_back({input.token, input.allow_speculation, (int)out.committed_tokens.size()});
+            result.decode.push_back(std::move(out));
+        }
+        return result;
+    }
+    void retire(int) override { active_ = false; }
+
+    struct Step { int32_t input; bool speculation; int committed; };
+    std::vector<Step> steps;
+
+private:
+    int32_t next() { return closed_ ? 2 : (int32_t)(10 + n_++ % 3); }
+    bool active_ = false;
+    bool closed_ = false;
+    int n_ = 0;
+};
+
+struct LoopingThinkerBackend : MockBackend {
+    LoopingThinkerEngine engine;
+    SeqEngine * seq_engine() override { return &engine; }
+};
+
+// Thinking speculates while the budget is far from its close, and a loop
+// closes it: the close starts on a step that emitted one token, never inside
+// a burst, and the request answers instead of looping to its cap.
+TEST_CASE(ServerUnitFixture, test_scheduler_thinking_speculates_and_a_loop_closes_it) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<LoopingThinkerBackend>();
+    LoopingThinkerBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 0;
+    config.admission_coalesce_ms = 0;
+    config.think_close_token_ids = {30, 31};
+    config.think_marker_token_ids = {31};
+    config.thinking_loop_repeats = 6;
+    HttpServer server(engine, tokenizer, config);
+
+    int fds[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    ServerJob job;
+    job.fd = fds[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 3, 101, 4};
+    job.req.max_output = 400;
+    job.req.thinking_opt_in = true;
+    job.req.per_req_phase1_cap = 300;
+    job.req.per_req_reply_budget = 50;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "thinker";
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] { SchedulerTestHarness::run(server, backend.engine); });
+    bool done = false;
+    {
+        std::unique_lock<std::mutex> lock(job.mu);
+        done = job.cv.wait_for(lock, std::chrono::seconds(10), [&] { return job.done; });
+    }
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+    close(fds[0]);
+    close(fds[1]);
+    unlink(path.c_str());
+    TEST_ASSERT(done);
+
+    const auto & steps = backend.engine.steps;
+    int bursts = 0, generated = 1, close_step = -1;
+    for (int i = 0; i < (int)steps.size(); ++i) {
+        if (close_step < 0 && steps[(size_t)i].input == 30) close_step = i;
+        bursts += close_step < 0 && steps[(size_t)i].committed > 0;
+        generated += steps[(size_t)i].committed + 1;
+    }
+    TEST_ASSERT(bursts > 0);           // thinking speculated before its close
+    TEST_ASSERT(close_step > 0);       // the loop was closed
+    TEST_ASSERT(!steps[(size_t)close_step - 1].speculation);
+    TEST_ASSERT(steps[(size_t)close_step - 1].committed == 0);
+    TEST_ASSERT(generated < 120);      // well short of the thinking cap
+}
+
 // Short prompts arriving one after another hold a longer one back for a
 // few steps at most.
 TEST_CASE(ServerUnitFixture, test_scheduler_short_prompts_do_not_stall_a_long_one) {

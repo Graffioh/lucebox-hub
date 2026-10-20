@@ -72,6 +72,7 @@ struct SchedSlot {
     luce::common::BudgetHook hook;
     luce::common::ThinkingBudget budget;
     bool degenerate_close = false;
+    bool loop_close_armed = false;
     // Speculative verifier positions over the request's rounds (see
     // SeqEngine::DecodeOutput), for its /status perf record.
     luce::common::SpecAcceptanceStats acceptance;
@@ -898,6 +899,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.hook.close_token_ids = config_.think_close_token_ids;
             s.hook.marker_token_ids = config_.think_marker_token_ids;
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
+            s.hook.loop_repeats = config_.thinking_loop_repeats;
         }
         s.budget = luce::common::ThinkingBudget(s.hook, s.n_gen_cap);
         live_slots++;
@@ -997,6 +999,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // (StepPlanLimits::prefill_time_share): no prompt chunk joins a step that
     // has them until it ends.
     std::chrono::steady_clock::time_point decode_only_until{};
+    // Longest burst a decode output carries (0: unknown, no bursts while a
+    // thinking budget can still replace a token).
+    const int max_decode_tokens = engine.max_decode_tokens();
     // Steps in a row that ran short prompts while longer ones waited. After
     // kShortFirstSteps, the longer ones join the next step: short prompts
     // arriving one after another (agents' next turns) cannot stall them.
@@ -1330,6 +1335,18 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         // Phase 3 — Build the resident cohort. Parked requests retain their
         // socket/emitter and pending token, but never enter a device graph.
+        // A slot whose thinking loops closes it at its next single-token
+        // step: the close replaces that token, never one inside a burst.
+        const auto arm_loop_close = [&](int i) {
+            SchedSlot & s = slots[(size_t)i];
+            if (!s.budget.looping() || s.loop_close_armed) return;
+            s.budget.arm_loop_close();
+            s.loop_close_armed = true;
+            std::fprintf(stderr,
+                "[parallel] %s thinking repeats itself after %zu tokens: "
+                "closing it\n", s.job->req.response_id.c_str(),
+                s.gen_tokens.size());
+        };
         auto build_plan = [&]() {
             step_plan.decode.clear();
             prefill_candidates.clear();
@@ -1338,9 +1355,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 if (!s.job || parked(i)) continue;
                 if (!s.prefilling) {
                     // A grammar masks one position at a time: no bursts.
+                    // While thinking, a burst must not reach the token the
+                    // budget replaces: none closes inside it.
+                    const bool budget_clear = s.budget.settled() ||
+                        (max_decode_tokens > 0 &&
+                         !s.budget.needs_ar_tail(max_decode_tokens));
+                    if (!budget_clear) arm_loop_close(i);
                     step_plan.decode.push_back(
                         {i, s.pending_tok,
-                         s.budget.settled() && !s.job->req.sampler.constraint});
+                         budget_clear && !s.job->req.sampler.constraint});
                 } else {
                     prefill_candidates.push_back({i, s.admission_order});
                 }
