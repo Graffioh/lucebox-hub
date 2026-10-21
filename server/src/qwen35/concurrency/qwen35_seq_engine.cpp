@@ -1478,6 +1478,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             output.committed_tokens.assign(
                 proposal.tokens.begin() + 1,
                 proposal.tokens.begin() + proposal.accepted);
+            output.spec_offered = static_cast<int>(proposal.tokens.size());
+            output.spec_accepted = static_cast<int>(proposal.verified);
         } else {
             output.token =
                 ar_lanes[static_cast<size_t>(ar_for_input[i])].pending;
