@@ -165,7 +165,8 @@ view, a one-line header indexed at startup; at most 256 views, the least
 recently written dropped first, and the cache's TTL applies, counted from a
 view's last write and checked at startup and at every lookup (a view in use
 returns to RAM and is written again when it leaves). Views written for another
-model, template or context (the cache's identity salt) are never read. A view
+model, template or context (the cache's identity salt), or under older paging
+rules (a version in the same identity), are never read. A view
 file that does not load, or whose offsets and per-line and per-unit data do not
 agree, is deleted and the request proceeds without it. A conversation served
 raw after a PFlash failure, or handed to the chat view, loses its views in RAM
