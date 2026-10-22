@@ -112,6 +112,13 @@ json responses_output_items(const std::string & message_id,
     return items;
 }
 
+void set_responses_status(json & response, const std::string & finish_reason) {
+    const bool incomplete = finish_reason == "length";
+    response["status"] = incomplete ? "incomplete" : "completed";
+    response["incomplete_details"] = incomplete
+        ? json({{"reason", "max_output_tokens"}}) : json(nullptr);
+}
+
 // ─── Constructor ────────────────────────────────────────────────────────
 
 SseEmitter::SseEmitter(ApiFormat format,
@@ -1074,7 +1081,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             }));
         }
 
-        // response.completed
+        // response.completed, or response.incomplete at the output cap
         json resp_usage = {
             {"input_tokens", prompt_tokens_},
             {"output_tokens", completion_tokens},
@@ -1092,7 +1099,10 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
             {"output_text", accumulated_content_},
             {"usage", resp_usage}
         };
-        out.push_back(format_responses_event("response.completed", {{"response", shell}}));
+        set_responses_status(shell, fr);
+        out.push_back(format_responses_event(
+            fr == "length" ? "response.incomplete" : "response.completed",
+            {{"response", shell}}));
         break;
     }
 

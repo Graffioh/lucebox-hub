@@ -71,6 +71,13 @@ nlohmann::json responses_output_items(const std::string & message_id,
                                       const std::string & text,
                                       const std::vector<ToolCall> & calls);
 
+// Sets the Responses API status of a finished turn, shared by the stream
+// and the non-streaming response: a reply cut at the output cap
+// (finish_reason "length") is "incomplete" with reason "max_output_tokens",
+// so clients can retry; anything else is "completed".
+void set_responses_status(nlohmann::json & response,
+                          const std::string & finish_reason);
+
 // Manages SSE streaming for a single request.
 class SseEmitter {
 public:

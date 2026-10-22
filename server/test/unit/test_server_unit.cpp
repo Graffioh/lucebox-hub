@@ -16296,6 +16296,55 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_anthropic_stop_sequence_beat
     TEST_ASSERT(text.find("\"stop_reason\":\"end_turn\"") != std::string::npos);
 }
 
+// The last SSE event's JSON payload.
+static json last_sse_data(const std::vector<std::string> & chunks) {
+    const std::string & last = chunks.back();
+    const size_t at = last.find("data: ");
+    return json::parse(last.substr(at + 6, last.find('\n', at) - at - 6));
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_responses_incomplete_at_cap) {
+    auto em = make_emitter(ApiFormat::RESPONSES);
+    em.emit_start();
+    em.emit_token("hello world");
+    json terminal = last_sse_data(em.emit_finish(10, nullptr, 10));
+    TEST_ASSERT(em.finish_reason() == "length");
+    TEST_ASSERT(terminal["type"] == "response.incomplete");
+    TEST_ASSERT(terminal["response"]["status"] == "incomplete");
+    TEST_ASSERT(terminal["response"]["incomplete_details"]["reason"] == "max_output_tokens");
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_streaming_responses_completed_below_cap) {
+    auto em = make_emitter(ApiFormat::RESPONSES);
+    em.emit_start();
+    em.emit_token("hello world");
+    json terminal = last_sse_data(em.emit_finish(5, nullptr, 10));
+    TEST_ASSERT(terminal["type"] == "response.completed");
+    TEST_ASSERT(terminal["response"]["status"] == "completed");
+    TEST_ASSERT(terminal["response"].contains("incomplete_details"));
+    TEST_ASSERT(terminal["response"]["incomplete_details"].is_null());
+}
+
+// A tool call cut off by the output cap fails to parse and is suppressed;
+// the reply must still report the cap, not a normal stop.
+TEST_CASE(ServerUnitFixture, test_emitter_truncated_tool_call_at_cap_reports_length) {
+    for (ApiFormat format : {ApiFormat::OPENAI_CHAT, ApiFormat::RESPONSES}) {
+        auto em = make_emitter(format, read_tools());
+        em.emit_start();
+        em.emit_token("Reading.\n<tool_call>\n<function=read>\n<parameter=path>\nREAD");
+        const auto chunks = em.emit_finish(8, nullptr, 8);
+        TEST_ASSERT(em.tool_calls().empty());
+        TEST_ASSERT(em.finish_reason() == "length");
+        if (format == ApiFormat::RESPONSES) {
+            json terminal = last_sse_data(chunks);
+            TEST_ASSERT(terminal["type"] == "response.incomplete");
+            TEST_ASSERT(terminal["response"]["incomplete_details"]["reason"] == "max_output_tokens");
+        } else {
+            TEST_ASSERT(concat(chunks).find("\"finish_reason\":\"length\"") != std::string::npos);
+        }
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_json_lines) {
     std::string text =
         "Let me read the files:\n"

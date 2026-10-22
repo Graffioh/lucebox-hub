@@ -320,7 +320,7 @@ struct HeldSingleBackend final : RoutedBackend {
         } else if (!released) {
             return result; // Bounded failure if the server never cancels or releases us.
         } else {
-            result.tokens = {0, 2};
+            result.tokens = output;
             for (int32_t token : result.tokens) io.emit(token);
         }
         result.succeed();
@@ -342,6 +342,7 @@ struct HeldSingleBackend final : RoutedBackend {
     std::mutex mu;
     std::condition_variable cv;
     bool released = false;
+    std::vector<int32_t> output = {0, 2};
     int calls = 0, cancellations = 0;
     std::vector<std::vector<int32_t>> prompts;
     std::vector<float> temperatures;
@@ -643,6 +644,43 @@ TEST_CASE(ModelRoutingFixture, test_responses_nonstream_preserves_prose_and_mult
                           json({{"path", index == 1 ? "." : "README.md"}}));
         }
         ROUTING_CHECK(output.at(1).at("call_id") != output.at(2).at("call_id"));
+    }
+}
+
+// A reply cut off by the output cap mid-tool-call fails to parse; both
+// protocols must still report the cap so clients can retry.
+TEST_CASE(ModelRoutingFixture, test_nonstream_truncated_tool_call_reports_output_cap) {
+    const char * generated = "Listing.\n<tool_call>\n<function=ls>\n<parameter=path>\n";
+    for (bool single : {false, true}) {
+        RunningModels models(false, single, false, 0, false, 0, generated);
+        {
+            std::lock_guard<std::mutex> lock(models.first.engine.mu);
+            models.first.engine.non_eos = {true, true};
+        }
+        models.first_single.output = {0, 1};
+        models.first.engine.finish();
+        models.first_single.finish();
+        const json responses_request = json::parse(R"({
+            "model": "qwen",
+            "input": [{"role": "user", "content": "x"}],
+            "max_output_tokens": 2,
+            "tools": [{"type": "function", "name": "ls",
+                       "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+        })");
+        const auto response = response_body(models.post(responses_request, "/v1/responses").read());
+        ROUTING_CHECK(response.at("status") == "incomplete");
+        ROUTING_CHECK(response.at("incomplete_details") == json({{"reason", "max_output_tokens"}}));
+        ROUTING_CHECK(response.at("output").size() == 1);
+        ROUTING_CHECK(response.at("usage").at("output_tokens") == 2);
+
+        json chat_request = chat();
+        chat_request["max_tokens"] = 2;
+        chat_request["tools"] = json::parse(R"([{"type": "function", "function": {"name": "ls",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}])");
+        const auto completion = response_body(models.post(chat_request).read());
+        const auto & choice = completion.at("choices").at(0);
+        ROUTING_CHECK(choice.at("finish_reason") == "length");
+        ROUTING_CHECK(!choice.at("message").contains("tool_calls"));
     }
 }
 

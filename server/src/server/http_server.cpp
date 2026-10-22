@@ -4620,7 +4620,7 @@ TokenDelivery classify_generated_token(
 
 CompletionTokenCounts feed_non_streaming_tokens(
         const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
+        SseEmitter & emitter, int generation_cap) {
     for (int32_t token : tokens) {
         std::string text;
         const TokenDelivery delivery =
@@ -4635,7 +4635,10 @@ CompletionTokenCounts feed_non_streaming_tokens(
 
     CompletionTokenCounts counts;
     counts.total = (int) tokens.size();
-    emitter.emit_finish(counts.total);
+    const bool is_eos = !tokens.empty() &&
+        (tokens.back() == tokenizer.eos_id() ||
+         tokens.back() == tokenizer.eos_chat_id());
+    emitter.emit_finish(counts.total, nullptr, generation_cap, is_eos);
 
     // Split reasoning vs content at the emitter's REASONING→CONTENT
     // transition; see first_content_token_index() in sse_emitter.h.
@@ -4646,6 +4649,28 @@ CompletionTokenCounts feed_non_streaming_tokens(
     counts.reasoning = first_content < 0 ? emitted : first_content;
     counts.content = first_content < 0 ? 0 : emitted - first_content;
     return counts;
+}
+
+// The emitter only knows "stop" / "tool_calls"; it cannot see that the
+// daemon hit the n_gen cap. Derive "length" from the committed-token
+// count — OpenAI-compatible clients (open-webui, Cline) gate retry
+// logic on finish_reason == "length".
+std::string non_streaming_finish_reason(
+        const GenerateResult & result, int generation_cap,
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer) {
+    const bool is_eos = tokenizer && !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer->eos_id() ||
+         result.tokens.back() == tokenizer->eos_chat_id());
+    std::string finish_reason = emitter.finish_reason();
+    if (finish_reason == "stop" && !is_eos && counts.total >= generation_cap) {
+        finish_reason = "length";
+    }
+    // Degenerate decode (post-close repetition-loop watchdog) also reports
+    // "length": OpenAI/Anthropic/Gemini all collapse budget-class events
+    // into one closed enum, with richer signal in sidecar fields.
+    if (result.degenerate_decode_close) finish_reason = "length";
+    return finish_reason;
 }
 
 json build_openai_completion_response(
@@ -4685,26 +4710,11 @@ json build_openai_completion_response(
         }
         message["tool_calls"] = tool_calls;
     }
-    // The emitter only knows "stop" / "tool_calls"; it cannot see that the
-    // daemon hit the n_gen cap. Derive "length" from the committed-token
-    // count — OpenAI-compatible clients (open-webui, Cline) gate retry
-    // logic on finish_reason == "length".
-    const bool is_eos = tokenizer && !result.tokens.empty() &&
-        (result.tokens.back() == tokenizer->eos_id() ||
-         result.tokens.back() == tokenizer->eos_chat_id());
-    std::string finish_reason = emitter.finish_reason();
-    if (finish_reason == "stop" && !is_eos && counts.total >= generation_cap) {
-        finish_reason = "length";
-    }
-    // Degenerate decode (post-close repetition-loop watchdog) also reports
-    // "length": OpenAI/Anthropic/Gemini all collapse budget-class events
-    // into one closed enum, with richer signal in sidecar fields below.
-    if (result.degenerate_decode_close) finish_reason = "length";
-
     json choice = {
         {"index", 0},
         {"message", message},
-        {"finish_reason", finish_reason},
+        {"finish_reason", non_streaming_finish_reason(
+            result, generation_cap, counts, emitter, tokenizer)},
     };
     if (req.thinking_opt_in) {
         // finish_details mirrors ds4_eval.c's eval_think_close_info.
@@ -4829,8 +4839,9 @@ json build_anthropic_response(
 
 json build_responses_api_response(
         const ParsedRequest & req, const GenerateResult & result,
-        const GenTimings & timings, const CompletionTokenCounts & counts,
-        const SseEmitter & emitter) {
+        int generation_cap, const GenTimings & timings,
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     // The same items as the stream's response.completed: the assistant
     // message first, then one function_call item per call.
     const json output = responses_output_items(
@@ -4848,14 +4859,16 @@ json build_responses_api_response(
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
     };
-    return {
+    json response = {
         {"id", req.response_id},
         {"object", "response"},
-        {"status", "completed"},
         {"model", req.model},
         {"output", output},
         {"usage", usage},
     };
+    set_responses_status(response, non_streaming_finish_reason(
+        result, generation_cap, counts, emitter, tokenizer));
+    return response;
 }
 
 json build_non_streaming_response(
@@ -4872,7 +4885,7 @@ json build_non_streaming_response(
             req, result, generation_cap, timings, counts, emitter, tokenizer);
     case ApiFormat::RESPONSES:
         return build_responses_api_response(
-            req, result, timings, counts, emitter);
+            req, result, generation_cap, timings, counts, emitter, tokenizer);
     default:
         return {{"text", emitter.accumulated_text()}};
     }
@@ -4883,7 +4896,7 @@ json build_non_streaming_response(
         int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
         SseEmitter & emitter) {
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter);
+        result.tokens, tokenizer, emitter, generation_cap);
     return build_non_streaming_response(
         req, result, generation_cap, timings, counts, emitter, &tokenizer);
 }
