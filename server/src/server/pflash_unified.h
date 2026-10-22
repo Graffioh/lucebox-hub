@@ -1,6 +1,6 @@
 #pragma once
 
-// PFLASH_UNIFIED=1: one view/recall mechanism for chat and agent sessions
+// The unified view: one view/recall mechanism for chat and agent sessions
 // (server/README.md, PFlash).
 // The pure parts: the tool list, line-structure detection, region layout,
 // marker and label text, greedy admission of units under a cap, re-read
@@ -223,7 +223,8 @@ struct Region {
 struct Piece {
     int begin = 0;                       // served target tokens [begin, end)
     int end = 0;
-    std::string kind;                    // raw, paged_text, preamble, marker, recall_wrapper, recall_label, recall_text, generation
+    std::string kind;                    // raw, paged_text, preamble, marker, recall_wrapper, recall_label,
+                                         // recall_text, chat_view, generation
     int region = -1;
     int turn = -1;
 };
