@@ -6039,17 +6039,17 @@ TEST_CASE(ServerUnitFixture, test_slide_restore_source_never_evicted) {
     TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 0);
 }
 
-// (c) The protected tools pin is never evicted, even when it is the
-// shallowest ancestor and the only other entry besides the restore source.
-TEST_CASE(ServerUnitFixture, test_slide_protected_pin_never_evicted) {
+// (c) The restore source's own tools pin is never evicted, even when it is
+// the shallowest ancestor and the only other entry besides the restore source.
+TEST_CASE(ServerUnitFixture, test_slide_restore_source_pin_never_evicted) {
     std::vector<std::vector<int32_t>> ids = {
         {9}, {9, 1}, {9, 1, 2}, {9, 1, 2, 3},
     };
     std::vector<bool> protect = {true, false, false, false};
     TEST_ASSERT(select_inline_evict_victim(ids, &protect, 3) == 1);
 
-    // Only the protected pin and the restore source remain: no safe victim,
-    // so no snapshot is reserved instead of destroying the pin.
+    // Only the restore source and its pin remain: no safe victim, so no
+    // snapshot is reserved instead of destroying the pin.
     std::vector<std::vector<int32_t>> two = {{9}, {9, 1}};
     std::vector<bool> two_prot = {true, false};
     TEST_ASSERT(select_inline_evict_victim(two, &two_prot, 1) == -1);
@@ -6140,9 +6140,9 @@ TEST_CASE(ServerUnitFixture, test_slide_branching_oldest_leaf_unchanged) {
     TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 2) == 1);
     // Restore source is the older leaf: the remaining leaf is the victim.
     TEST_ASSERT(select_inline_evict_victim(ids, nullptr, 1) == 2);
-    // A protected leaf is never evicted: with the restore source skipped and
-    // the only remaining leaf protected, the shallowest unprotected ancestor
-    // is the victim instead.
+    // A protected leaf goes last: with the restore source skipped and the
+    // only remaining leaf protected, the shallowest unprotected ancestor is
+    // the victim instead.
     std::vector<bool> protect = {false, true, false};
     TEST_ASSERT(select_inline_evict_victim(ids, &protect, 2) == 0);
 }
