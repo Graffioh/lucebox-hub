@@ -285,6 +285,10 @@ private:
 nlohmann::json view_to_json(const View & view);
 bool view_from_json(const nlohmann::json & j, View & view, std::string & error);
 
+// The paging rules' version, part of a stored view's identity: a view paged under older rules is never served again.
+// 2: a line over its region's cap hands the request to the chat view (it was dropped whole).
+inline constexpr int kViewPagingVersion = 2;
+
 // Views of shortened conversations kept on disk next to the KV cache, so a conversation survives a restart or the
 // RAM store's eviction: written when a view leaves the RAM store and at shutdown, read on a RAM miss. One file per
 // view: a one-line header (identity, config, prefix lengths and hashes) that ``init`` indexes, then the view. A view

@@ -18819,6 +18819,97 @@ TEST_CASE(ServerUnitFixture, test_unified_cold_chat_history_goes_to_the_chat_vie
     TEST_ASSERT(run.unified.value("views", 1) == 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_unified_long_line_paste_goes_to_the_chat_view) {
+    // A needle-in-a-haystack paste: the whole passage is one line, longer than the region's cap. Paging could only
+    // drop that line whole, the kiwi sentence with it; the chat view selects inside the line instead.
+    std::string filler;
+    for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
+    const std::string doc = "Below is a long passage.\n\n" + filler + "The kiwi number is 7. " + filler +
+                            "\n\nQuestion: what is the kiwi number?\n";
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
+    });
+    UnifiedOptions options;
+    options.keep_scored_only = true;
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
+                                         65536, options);
+    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.prepared[0].compressed, run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
+    TEST_ASSERT(run.unified["counts"].value("handback.uncached", 0) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_long_line_under_the_message_cap_but_over_the_region_cap) {
+    // The first two lines are always kept and are long, so the message's cap holds the kiwi line but the region's
+    // cap, on the pageable lines alone, does not: paging would drop the line whole, so the chat view takes it.
+    const auto repeat = [](const std::string & s, int n) {
+        std::string out;
+        for (int i = 0; i < n; ++i) out += s;
+        return out;
+    };
+    const std::string doc = repeat("The sky is blue. ", 250) + "\n" + repeat("The sea is deep. ", 250) + "\n" +
+                            repeat("The grass is green. ", 80) + "The kiwi number is 7. " +
+                            repeat("The grass is green. ", 80) + "\nshort a\nshort b\nshort c\nshort d\nend\n";
+    const json turn = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", doc + "Which sentence mentions KIWI?"}},
+    });
+    UnifiedOptions options;
+    options.keep_scored_only = true;
+    const auto run = run_unified_session({turn}, nullptr, nullptr, 64, unified_fruit_score, 16, 0.3f, nullptr,
+                                         65536, options);
+    TEST_ASSERT_MSG(run.prepared[0].unified_handback == "uncached", run.prepared[0].pflash_stats.dump());
+    TEST_ASSERT_MSG(run.served_text[0].find("kiwi") != std::string::npos, run.served_text[0]);
+}
+
+// A tool output whose body is one line of ``filler`` around ``needle``, framed by short lines.
+static std::string unified_long_line_output(const std::string & needle) {
+    std::string filler;
+    for (int i = 0; i < 300; ++i) filler += "The grass is green. ";
+    return "Header\n\n" + filler + needle + " " + filler + "\n\nfooter\nend\n";
+}
+
+TEST_CASE(ServerUnitFixture, test_unified_long_line_tool_output_is_served_whole) {
+    const json tools = json::array({{{"type", "function"}, {"function", {{"name", "read_file"}}}}});
+    const std::string kiwi_output = unified_long_line_output("The kiwi number is 7.");
+    const json cold = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Read the file. Which sentence mentions KIWI?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "a.txt"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", kiwi_output}},
+    });
+    // A fresh agent turn: the chat view takes it and serves a tool session raw (keep_history), the line whole.
+    const auto fresh = run_unified_session({cold}, tools, "read_file", 600, unified_fruit_score);
+    TEST_ASSERT_MSG(fresh.prepared[0].unified_handback == "uncached", fresh.prepared[0].pflash_stats.dump());
+    TEST_ASSERT(!fresh.prepared[0].compressed);
+    TEST_ASSERT(fresh.prepared[0].tokens == fresh.ids[0]);
+
+    // A view that continues: turn 1 pages an ordinary output; turn 2's one-line output is appended verbatim.
+    const json turn1 = json::array({
+        {{"role", "system"}, {"content", "You are helpful."}},
+        {{"role", "user"}, {"content", "Read both files. Which sentences mention KIWI and MANGO?"}},
+        {{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+            unified_tool_call("call_1", "read_file", {{"path", "a.md"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", unified_doc(80, {{9, "kiwi"}}, "A")}},
+    });
+    json turn2 = turn1;
+    turn2.push_back({{"role", "assistant"}, {"content", ""}, {"tool_calls", json::array({
+        unified_tool_call("call_2", "read_file", {{"path", "b.txt"}})})}});
+    const std::string mango_output = unified_long_line_output("The mango number is 8.");
+    turn2.push_back({{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", mango_output}});
+    const auto run = run_unified_session({turn1, turn2}, tools, "read_file", 600, unified_fruit_score);
+    TEST_ASSERT_MSG(run.prepared[0].compressed && run.prepared[0].unified_view, run.prepared[0].pflash_stats.dump());
+    const auto & p2 = run.prepared[1];
+    TEST_ASSERT_MSG(p2.unified_handback.empty() && p2.unified_view, p2.pflash_stats.dump());
+    const json & admission = p2.pflash_stats["unified"]["admission"];
+    TEST_ASSERT_MSG(admission.size() == 1 && admission[0].value("decision", "") == "long_line", admission.dump());
+    const int vg1 = run.prepared[0].snapshot_cut;
+    TEST_ASSERT(std::equal(run.prepared[0].tokens.begin(), run.prepared[0].tokens.begin() + vg1, p2.tokens.begin()));
+    TEST_ASSERT(run.served_text[1].find(mango_output) != std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_restorable_prefix_counts_disk_only_when_on) {
     using http_detail::pflash_restorable_prefix;
     const auto is = [](const http_detail::PflashRestorablePrefix & got, int tokens, const char * source) {

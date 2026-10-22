@@ -2819,8 +2819,8 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                      (int) pflash_unified_recall_, gate_text);
         // With the disk session cache on, the views of shortened conversations are kept on disk too: written when
         // they leave the RAM store and at shutdown, read on a RAM miss, so neither a restart nor an eviction turns a
-        // shortened conversation cold. Their identity is the disk cache's (model, template, context); the directory
-        // starts with a dot, so the KV cache's scan skips it.
+        // shortened conversation cold. Their identity is the disk cache's (model, template, context) and the paging
+        // rules' version; the directory starts with a dot, so the KV cache's scan skips it.
         if (!disk_cache_.disabled()) {
             std::string identity;
             for (uint8_t b : compute_disk_cache_salt(config_)) {
@@ -2828,6 +2828,7 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                 std::snprintf(hex_byte, sizeof hex_byte, "%02x", b);
                 identity += hex_byte;
             }
+            identity += "-paging" + std::to_string(pflash_unified::kViewPagingVersion);
             pflash_unified_disk_views_.init(config_.disk_cache_dir + "/.pflash-views", identity,
                                             disk_cache_ttl_seconds(config_.disk_cache_ttl_hours), 256);
             // A new conversation must not take the lineage of one on disk (forget_lineage would drop that one).
@@ -5775,7 +5776,9 @@ std::string HttpServer::apply_pflash_compression(
                             }
                             all.all_roles.push_back(role);
                             contents[index] = messages[index].content;
-                            if (role == "system") continue;   // never a candidate nor in E
+                            // An empty content (an assistant turn that only calls tools) has no tokens to map, and
+                            // a placeholder there would change how the template renders the turn.
+                            if (role == "system" || contents[index].empty()) continue;   // never a candidate nor in E
                             placeholders[index] = "\x1e" "PFLASH-MESSAGE-" + std::to_string(index) + "\x1f";
                             placeholder_messages[index].content = placeholders[index];
                         }
@@ -7773,6 +7776,22 @@ std::string HttpServer::apply_unified_view(
     const int restorable = restorable_prefix.tokens;
     if (!disk_cache_.disabled()) stats["cached"] = {{"tokens", restorable}, {"source", restorable_prefix.source}};
 
+    // A region's cap: the release curve on its droppable tokens (kept in the region).
+    const auto base_cap = [&] (int droppable) {
+        const float ratio = http_detail::resolve_pflash_keep_ratio(
+            pflash_keep_ratio(config_, (std::max)(1, droppable)), req.session_id, sessions_);
+        return (int) std::floor((double) ratio * (double) droppable);
+    };
+    // The longest line paging could drop (the first two and last two lines are always kept), in target tokens.
+    const auto longest_pageable_line = [&] (Candidate & c) {
+        const pu::Lines & lines = candidate_lines(c);
+        int longest = 0;
+        for (size_t l = 2; l + 2 < lines.count(); ++l) {
+            longest = (std::max)(longest, token_from(td, lines.ends[l]) - token_from(td, lines.starts[l]));
+        }
+        return longest;
+    };
+
     for (int pass = 0; pass < 2; ++pass) {
         const bool continues = has_view && pass == 0;
         const int new_from = continues ? view.drafter_gen_begin : 0;
@@ -7794,6 +7813,17 @@ std::string HttpServer::apply_unified_view(
                 if (droppable < config_.pflash_threshold) why = "small";
             }
             if (why.empty() && candidate_lines(c).count() < 5) why = "no_lines";
+            // A line over the cap can only be dropped whole, whatever it scores (one long line of prose).
+            if (why.empty()) {
+                const int longest = longest_pageable_line(c);
+                const int cap = base_cap(droppable);
+                if (longest > cap) {
+                    why = "long_line";
+                    std::fprintf(stderr, "[pflash-unified] message %zu: a %d-token line is over its cap %d\n",
+                                 c.message, longest, cap);
+                    std::fflush(stderr);
+                }
+            }
             if (why.empty() && c.kind == pu::RegionKind::ToolOutput) {
                 const auto hashes = pu::line_hashes(text, candidate_lines(c));
                 for (const auto & region : held_regions) {
@@ -7815,8 +7845,8 @@ std::string HttpServer::apply_unified_view(
         }
 
         // A conversation the view would start: when the part it can never page -- the uncached, unpinned history
-        // before the newest turn, and newest content it cannot cut into lines -- is a threshold's worth, the chat
-        // view takes the request (its cache admission compresses such a prompt) instead of a raw prefill of it.
+        // before the newest turn, and newest content it cannot cut into lines that fit -- is a threshold's worth, the
+        // chat view takes the request (its cache admission compresses such a prompt) instead of a raw prefill of it.
         // Newest content the view serves verbatim by design (unlisted tool outputs, small messages) does not count.
         if (!continues) {
             const int uncached_from = (std::min)(turn.generation_begin, (int) std::floor(
@@ -7831,7 +7861,10 @@ std::string HttpServer::apply_unified_view(
             }
             int cannot_page = unpinned(0, newest_begin);
             for (size_t k = 0; k < newest.size(); ++k) {
-                if (admission[k].value("decision", "") == "no_lines") cannot_page += unpinned(newest[k].db, newest[k].de);
+                const std::string decision = admission[k].value("decision", "");
+                if (decision == "no_lines" || decision == "long_line") {
+                    cannot_page += unpinned(newest[k].db, newest[k].de);
+                }
             }
             if (target_estimate(cannot_page) >= config_.pflash_threshold) {
                 // Once the chat view accepts it, the view this turn would have continued goes, with its lineage.
@@ -7937,13 +7970,7 @@ std::string HttpServer::apply_unified_view(
             }
             return weight > 0.0 ? sum / weight : std::nan("");
         };
-        // A region's cap: the release curve on its droppable tokens (kept in the region); a pass whose stage 2
-        // widened the budget widens it once, paging and recall alike.
-        const auto base_cap = [&] (int droppable) {
-            const float ratio = http_detail::resolve_pflash_keep_ratio(
-                pflash_keep_ratio(config_, (std::max)(1, droppable)), req.session_id, sessions_);
-            return (int) std::floor((double) ratio * (double) droppable);
-        };
+        // A pass whose stage 2 widened the budget widens a region's cap once, paging and recall alike.
         const auto widened_cap = [&] (int cap, int droppable) {
             return result.budget_widened ? (std::min)(droppable, cap + cap / 2) : cap;
         };
@@ -8045,6 +8072,32 @@ std::string HttpServer::apply_unified_view(
                                          pu::preamble_text(c.kind, shown, total_lines));
             };
             int fixed = encode_len(preamble_line(total_lines));
+            // A line this cap cannot take even alone (one long line of prose) could only be dropped whole, whatever
+            // it scores. The message's line check above budgets on all of its tokens, the always-kept lines too;
+            // this is the region's own cap. As there, a view this turn would start goes to the chat view, and a
+            // continued view serves the message verbatim. A cap with no room past the overheads takes no line at
+            // all: cap_below_overhead below.
+            {
+                const int base = pu::admit_paging(cost, region.mandatory, {}, fixed, cap, marker_cost).cost;
+                const int widest_marker = marker_cost(0, units - 1);  // the whole run's: the most lines not shown
+                const int room = cap - base - widest_marker;
+                int longest = 0;
+                for (int u = 0; u < units; ++u) {
+                    if (region.mandatory[(size_t) u]) continue;
+                    for (int l = region.layout.cut_line[(size_t) u]; l < region.layout.cut_line[(size_t) u + 1]; ++l) {
+                        longest = (std::max)(longest, token_from(td, lines.ends[(size_t) l]) -
+                                                          token_from(td, lines.starts[(size_t) l]));
+                    }
+                }
+                if (room > 0 && longest > room) {
+                    std::fprintf(stderr, "[pflash-unified] message %zu: a %d-token line is over its region's cap %d\n",
+                                 c.message, longest, cap);
+                    std::fflush(stderr);
+                    if (!continues) return hand_back(found_view ? "reset_uncached" : "uncached");
+                    verbatim_because("long_line");
+                    continue;
+                }
+            }
             const auto order = pu::rank_units(score, region.mandatory);
             pu::Admission admitted;
             std::string preamble;

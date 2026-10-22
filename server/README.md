@@ -540,7 +540,9 @@ described above and served exactly as without the flag: a request without a
 messages array, a remote drafter, a turn structure or generation prompt it
 cannot read, and a conversation it would start (no stored view continues it)
 whose uncached history before the newest turn, with newest content that
-cannot be cut into lines, reaches `--prefill-threshold` (reason `uncached`,
+cannot be cut into lines or has a line longer than its region's cap (one long
+line of prose could only be dropped whole), reaches `--prefill-threshold`
+(reason `uncached`,
 or `reset_uncached` when a stored view could not continue), and a selection
 that gives no per-candidate scores (`unscored_selection`: the legacy or split
 scorer, `PFLASH_QWEN35_LEGACY_SCORER=1`, or the fold strategy). A conversation
