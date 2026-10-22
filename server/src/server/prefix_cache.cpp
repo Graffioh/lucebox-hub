@@ -771,6 +771,15 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         if (!active.has_victim) ++reserved_free_slots;
         pending_bytes += active.bytes;
     }
+    const auto log_no_slot = [&](const char * reason) {
+        int pins = 0;
+        for (const auto & entry : entries_) pins += entry.protect ? 1 : 0;
+        std::fprintf(stderr,
+            "[pc] inline snap skipped, %s: entries=%zu protected=%d "
+            "in_flight=%zu cap=%d restore_slot=%d cut=%d\n",
+            reason, entries_.size(), pins, active_reservations_.size(), cap_,
+            restore_source_slot, target_cut);
+    };
     if ((int)entries_.size() + reserved_free_slots >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
@@ -784,6 +793,7 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
             // Only the restore source and its pinned ancestors remain, or a
             // capture in flight holds the victim. Skip this snapshot; the
             // restore point stays put rather than being destroyed.
+            log_no_slot("no evictable entry");
             return {};
         }
         victim_key = entries_[(size_t)victim].hash;
@@ -811,7 +821,10 @@ PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
             slot = candidate;
             break;
         }
-        if (slot < 0) return {};
+        if (slot < 0) {
+            log_no_slot("no free slot");
+            return {};
+        }
         next_slot_ = (slot + 1) % cap_;
     }
 
