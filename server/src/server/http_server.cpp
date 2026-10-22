@@ -9694,9 +9694,11 @@ bool HttpServer::save_generated_turn(
     if (matched <= prompt_len) return false;
 
     // Keep this request's own checkpoints: they are the fallback when the
-    // next request diverges inside the generated turn.
+    // next request diverges inside the generated turn. A live restore
+    // consumes its source, which leaves nothing to keep in that slot.
     const int keep_slot = cache.snap_prepared ? cache.snap_slot
-        : cache.using_restore && !cache.disk_hit ? cache.cache_slot : -1;
+        : cache.using_restore && !cache.disk_hit &&
+          backend_.snapshot_used(cache.cache_slot) ? cache.cache_slot : -1;
     auto reservation = prefix_cache_.reserve_inline_snap(
         canonical, prompt_len, false, matched, keep_slot,
         [this](int target_cut) {
