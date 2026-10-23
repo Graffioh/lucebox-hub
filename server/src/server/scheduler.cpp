@@ -483,7 +483,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             SseEmitter emitter(req.format, req.response_id, req.model,
                                usage_prompt_tokens(req), req.tools,
                                &tool_memory_, req.stop_sequences,
-                               req.started_in_thinking);
+                               req.started_in_thinking,
+                               tool_checks::tool_calls_allowed(
+                                   req.tool_choice, req.tool_checks_pass));
             GenTimings t{
                 0.0,
                 0.0,
@@ -811,7 +813,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         auto emitter = std::make_unique<SseEmitter>(
             req.format, req.response_id, req.model,
             usage_prompt_tokens(req), req.tools, &tool_memory_,
-            req.stop_sequences, req.started_in_thinking);
+            req.stop_sequences, req.started_in_thinking,
+            tool_checks::tool_calls_allowed(req.tool_choice,
+                                            req.tool_checks_pass));
         if (req.stream) {
             bool ok = send_sse_headers(job);
             if (ok) {

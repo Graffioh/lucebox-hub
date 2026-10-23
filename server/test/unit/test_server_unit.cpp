@@ -12,6 +12,7 @@
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
+#include "server/tool_checks.h"
 #include "server/model_card.h"
 #include "server/response_error.h"
 #include "server/prefix_cache.h"
@@ -7644,6 +7645,75 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_undeclared_bailing_tool_blo
     TEST_ASSERT(em.accumulated_text() == "Visible answer");
     TEST_ASSERT(em.accumulated_text().find("weather") == std::string::npos);
     TEST_ASSERT(em.accumulated_text().find("Rome") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_drops_tool_call_under_tool_choice_none) {
+    const auto emitter_for = [](const json & tool_choice, bool checks_pass) {
+        return SseEmitter(ApiFormat::OPENAI_CHAT, "test_id_001", "test-model", 10,
+                          qwen_read_probe_tools(), nullptr, {}, false,
+                          tool_checks::tool_calls_allowed(tool_choice, checks_pass));
+    };
+    // The call as single delimiter tokens (Qwen), and spelled as ordinary
+    // text with its delimiters split across tokens.
+    const std::vector<std::string> delimiter_tokens = {
+        "Reading it.", "<tool_call>",
+        "\n<function=read_probe>\n<parameter=filePath>\nREADME.md\n"
+        "</parameter>\n</function>\n",
+        "</tool_call>"};
+    const std::vector<std::string> text_tokens = {
+        "Reading it.", "<tool", "_call>\n<function=read",
+        "_probe>\n<parameter=filePath>\nREADME.md\n</parameter>\n</function>\n</tool",
+        "_call>"};
+    const auto reply = [&](const json & tool_choice, bool checks_pass,
+                           const std::vector<std::string> & tokens) {
+        auto em = emitter_for(tool_choice, checks_pass);
+        em.emit_start();
+        for (const std::string & raw_token : tokens) {
+            if (!em.suppress_undeclared_tool_protocol_token(raw_token)) {
+                em.emit_token(raw_token);
+            }
+        }
+        const std::string sse = concat(em.emit_finish(10));
+        return std::make_tuple(em.tool_calls().size(), em.finish_reason(),
+                               em.accumulated_text(), sse);
+    };
+
+    for (const auto * tokens : {&delimiter_tokens, &text_tokens}) {
+        for (const json & none : {json("none"), json{{"type", "none"}}}) {
+            const auto [calls, finish, text, sse] = reply(none, false, *tokens);
+            TEST_ASSERT(calls == 0);
+            TEST_ASSERT(finish == "stop");
+            TEST_ASSERT(text == "Reading it.");
+            TEST_ASSERT(sse.find("tool_call") == std::string::npos);
+            TEST_ASSERT(sse.find("read_probe") == std::string::npos);
+        }
+
+        const auto [auto_calls, auto_finish, auto_text, auto_sse] =
+            reply("auto", false, *tokens);
+        TEST_ASSERT(auto_calls == 1);
+        TEST_ASSERT(auto_finish == "tool_calls");
+
+        // A tool-checks pass sees the call, so the checks can retry without it.
+        const auto [pass_calls, pass_finish, pass_text, pass_sse] =
+            reply("none", true, *tokens);
+        TEST_ASSERT(pass_calls == 1);
+    }
+
+    // Non-streaming: the live callback classifies a reply cut off inside the
+    // call, then the replay classifies the same tokens again and keeps the
+    // text before the call.
+    auto em = emitter_for("none", false);
+    const std::vector<std::string> cut_off = {
+        "Reading it.", "<tool_call>", "\n<function=read_probe>\n<parameter=filePath>\n"};
+    for (const auto & raw_token : cut_off) em.suppress_undeclared_tool_protocol_token(raw_token);
+    em.restart_tool_protocol_suppression();
+    em.emit_start();
+    for (const auto & raw_token : cut_off) {
+        if (!em.suppress_undeclared_tool_protocol_token(raw_token)) em.emit_token(raw_token);
+    }
+    em.emit_finish(10);
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == "Reading it.");
 }
 
 TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
@@ -17126,6 +17196,29 @@ TEST_CASE(ServerUnitFixture, test_emitter_tool_only_bare_name_remains_zero_arg_c
         TEST_ASSERT(em.tool_calls()[0].arguments == "{}");
     }
     TEST_ASSERT(em.accumulated_text().empty());
+}
+
+// Under tool_choice "none" there is no call to recognise: a reply that is
+// only a declared tool's name is the answer, not a call to drop.
+TEST_CASE(ServerUnitFixture, test_emitter_bare_name_is_content_under_tool_choice_none) {
+    json tools = json::array({
+        {
+            {"type", "function"},
+            {"function", {
+                {"name", "ping"},
+                {"parameters", {{"type", "object"}, {"properties", json::object()}}}
+            }}
+        }
+    });
+    SseEmitter em(ApiFormat::OPENAI_CHAT, "test_id_001", "test-model", 10, tools,
+                  nullptr, {}, false, tool_checks::tool_calls_allowed("none", false));
+    em.emit_start();
+    em.emit_token("ping");
+    em.emit_finish(1);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.finish_reason() == "stop");
+    TEST_ASSERT(em.accumulated_text() == "ping");
 }
 
 TEST_CASE(ServerUnitFixture, test_parse_function_calls_mixed_invoke_and_json_line_siblings) {
