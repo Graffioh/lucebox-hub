@@ -2118,6 +2118,48 @@ TEST_CASE(ServerUnitFixture, test_parse_qwen_multiline_xml_parameter_at_true_eof
     }
 }
 
+// A model writing a file emits one parameter value tens of KB long. On a
+// 2 MiB thread stack the regex matcher overflows at about 15 KB; the parser
+// runs on a stack sized to the text, so a 256 KB value parses.
+TEST_CASE(ServerUnitFixture, test_parse_qwen_xml_long_parameter_on_sized_stack) {
+    std::string content;
+    while (content.size() < 256 * 1024) {
+        content += "\tconst kept: number[] = items.filter((x) => x < limit);\n";
+    }
+    content.pop_back();
+    const std::string head =
+        "<tool_call>\n<function=read_probe>\n"
+        "<parameter=filePath>\nsanity.ts\n</parameter>\n"
+        "<parameter=content>\n" + content;
+    const std::string closed =
+        head + "\n</parameter>\n</function>\n</tool_call>";
+
+    // Closed, and cut off at the output cap before any closing tag.
+    for (const std::string * text : {&closed, &head}) {
+        const ToolParseResult result = parse_tool_calls(*text, qwen_read_probe_tools());
+        if (text != &closed) {
+            TEST_ASSERT(result.tool_calls.empty());
+            TEST_ASSERT(result.cleaned_text == head);
+            continue;
+        }
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            const auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["filePath"] == "sanity.ts");
+            TEST_ASSERT(args["content"] == content);
+        }
+    }
+
+    // Past the parse limit (about 1 MB) the text comes back unparsed.
+    std::string huge = content;
+    while (huge.size() < 2 * 1024 * 1024) huge += content;
+    const std::string oversized = "<tool_call>\n<function=read_probe>\n"
+        "<parameter=content>\n" + huge + "\n</parameter>\n</function>\n</tool_call>";
+    const ToolParseResult unparsed = parse_tool_calls(oversized, qwen_read_probe_tools());
+    TEST_ASSERT(unparsed.tool_calls.empty());
+    TEST_ASSERT(unparsed.cleaned_text == oversized);
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml) {
     std::string text =
         "Some text\n"
