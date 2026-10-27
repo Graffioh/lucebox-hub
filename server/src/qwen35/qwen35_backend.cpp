@@ -2475,24 +2475,21 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
-    // The HIP legacy pool retains freed graph temporaries. During a long,
-    // shape-changing prefill those cached blocks can fragment VRAM until the
-    // next allocation fails even though a large part of the pool is idle.
-    // Trimming is deliberately opt-in and performed only between completed
-    // chunks: ggml_backend_cuda_trim_pool() synchronizes the backend and
-    // retires captured graphs before returning cached blocks to the driver.
+    // Legacy (non-VMM) CUDA/HIP pools keep every temporary block a long
+    // prefill outgrows (see kQwen35PrefillPoolTrimTokens), so return them to
+    // the driver every so many tokens, between completed chunks:
+    // ggml_backend_cuda_trim_pool() synchronizes the backend and retires
+    // captured graphs before freeing cached blocks.
     static const int prefill_pool_trim_tokens = []() {
         const char * value = std::getenv("LUCE_PREFILL_POOL_TRIM_TOKENS");
-        if (value == nullptr || value[0] == '\0') return 0;
-        char * end = nullptr;
-        const long parsed = std::strtol(value, &end, 10);
-        if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+        bool valid = true;
+        const int tokens = qwen35_prefill_pool_trim_tokens(value, &valid);
+        if (!valid) {
             std::fprintf(stderr,
-                "[vram] ignoring invalid LUCE_PREFILL_POOL_TRIM_TOKENS=%s\n",
-                value);
-            return 0;
+                "[vram] ignoring invalid LUCE_PREFILL_POOL_TRIM_TOKENS=%s; "
+                "trimming every %d tokens\n", value, tokens);
         }
-        return (int)parsed;
+        return tokens;
     }();
     int64_t next_prefill_pool_trim = prefill_pool_trim_tokens > 0
         ? ((int64_t)kv_offset / prefill_pool_trim_tokens + 1) * prefill_pool_trim_tokens

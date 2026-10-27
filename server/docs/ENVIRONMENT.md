@@ -110,7 +110,7 @@ profile and the requirements checked at startup.
 | `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
 | `LUCE_TARGET_DEVICE` | unset (`auto` in the container) | Target device (`backend:gpu` or `auto`) used when neither `--target-device`, `--target-devices` nor a `--profile` names one. |
 | `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name (unset: for a single model, the first of its card's default profiles whose GPUs, in HIP order, start the visible ones with the memory it needs; `none`: no profile), and extra `luce_server` flags split on whitespace. |
-| `LUCE_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
+| `LUCE_PREFILL_POOL_TRIM_TOKENS` | 8192 | KILL SWITCH (burn-in, to be removed once the default has soaked): `0` turns off the trims of the legacy (non-VMM) CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries; another whole number sets the interval between them in prompt tokens. Without the trims a long cold prefill keeps every flash-attention temporary it outgrows and can run out of VRAM. Each trim synchronizes the target backend and retires captured graphs. |
 | `LUCE_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `LUCE_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
 | `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` / `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
@@ -367,7 +367,7 @@ profile and the requirements checked at startup.
 - `LUCE_PROF` - prof_env.h
 - `LUCE_MMPROJ` - scripts/entrypoint.sh (maps to `--mmproj`)
 - `LUCE_PREFILL_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefill-cache-slots`)
-- `LUCE_PREFILL_POOL_TRIM_TOKENS` - qwen35_backend.cpp (OPT-IN: trim legacy device pools during long prefills)
+- `LUCE_PREFILL_POOL_TRIM_TOKENS` - prefill_helpers.h, qwen35_backend.cpp (KILL SWITCH: =0 turns off the legacy device-pool trims during long prefills; another value sets their interval)
 - `LUCE_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)
 - `LUCE_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
 - `LUCE_PREFIX_CACHE_MAX_MIB` - scripts/entrypoint.sh (maps to `--prefix-cache-max-mib`)

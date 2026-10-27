@@ -9894,6 +9894,25 @@ TEST_CASE(ServerUnitFixture, test_qwen35_prefill_chunks) {
                 off_grid[1] - off_grid[0] >= kQwen35OffGridLeadTokens);
 }
 
+// Long prefills trim the legacy device pools by default (a cold 125K-token
+// prompt filled a 32 GB card without it); 0 opts out, and a bad value keeps
+// the default rather than turning the trims off.
+TEST_CASE(ServerUnitFixture, test_qwen35_prefill_pool_trim_tokens) {
+    bool valid = false;
+    TEST_ASSERT(kQwen35PrefillPoolTrimTokens > 0);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens(nullptr, &valid) == kQwen35PrefillPoolTrimTokens && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("", &valid) == kQwen35PrefillPoolTrimTokens && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("0", &valid) == 0 && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("2048", &valid) == 2048 && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("-1", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("8k", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+    // Past INT_MAX keeps the default too, also where long is 32 bits and
+    // strtol saturates at INT_MAX (Windows).
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("2147483647", &valid) == INT_MAX && valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("2147483648", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+    TEST_ASSERT(qwen35_prefill_pool_trim_tokens("99999999999999999999", &valid) == kQwen35PrefillPoolTrimTokens && !valid);
+}
+
 // An agent turn that continues a generated-turn checkpoint skips its own
 // snapshot while another checkpoint lies close behind; it keeps it when the
 // other checkpoints are far behind, and other requests always keep it.
