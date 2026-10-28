@@ -8366,6 +8366,54 @@ TEST_CASE(ServerUnitFixture, test_qwen_render_follows_gguf_template_history_and_
     }
 }
 
+// Assistant turns without reasoning (a client that does not send it back, or
+// thinking off) render as the model's template writes them: an empty thinking
+// block wherever the template renders thinking, for Qwen3.8 on every turn
+// unless preserve_thinking is false and for Qwen3.5 after the last query only.
+TEST_CASE(ServerUnitFixture, test_qwen_render_matches_gguf_templates_without_reasoning) {
+    ToolMemory tool_memory;
+    const auto messages = normalize_chat_messages(json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "hi"}},
+        {{"role", "assistant"}, {"content", "Hello."}},
+        {{"role", "user"}, {"content", "and now?"}},
+        {{"role", "assistant"}, {"content", "Still here."}, {"reasoning_content", "Answer."}},
+        {{"role", "user"}, {"content", "fix the bug"}},
+        {{"role", "assistant"}, {"content", " Let me look.\n"},
+         {"tool_calls", json::array({
+             {{"id", "call_1"}, {"type", "function"},
+              {"function", {{"name", "bash"}, {"arguments", "{\"command\": \"ls\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "a.py"}},
+        {{"role", "assistant"}, {"content", nullptr}, {"reasoning_content", "Read it."},
+         {"tool_calls", json::array({
+             {{"id", "call_2"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", "{\"path\": \"a.py\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", "print(1)"}},
+        {{"role", "assistant"}, {"content", nullptr},
+         {"tool_calls", json::array({
+             {{"id", "call_3"}, {"type", "function"},
+              {"function", {{"name", "read"}, {"arguments", "{\"path\": \"b.py\"}"}}}}})}},
+        {{"role", "tool"}, {"tool_call_id", "call_3"}, {"content", "print(2)"}},
+    }), ApiFormat::OPENAI_CHAT, tool_memory);
+
+    for (const char * name : {"Qwen3.8-27B.jinja", "Qwen3.5-9B.jinja"}) {
+        const std::string tmpl = read_qwen_chat_template(name);
+        const auto rules = qwen_template_rules(tmpl);
+        for (const int preserve_thinking : {-1, 0, 1}) {
+            for (const bool thinking : {true, false}) {
+                const std::string label = std::string(name) + " preserve_thinking=" +
+                    std::to_string(preserve_thinking) + " thinking=" + (thinking ? "on" : "off");
+                const std::string builtin = render_chat_template(
+                    messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true, thinking, "", "",
+                    preserve_thinking, rules);
+                const std::string jinja = render_chat_template_jinja(
+                    tmpl, messages, "", "", true, thinking, "", "medium", preserve_thinking);
+                TEST_ASSERT_MSG(builtin == jinja, label + "\n--- built-in\n" + builtin + "\n--- jinja\n" + jinja);
+            }
+        }
+    }
+}
+
 // The built-in renderer and the model's own Jinja template render the same
 // multi-turn agent conversation byte for byte: system, a thinking turn before
 // the last query, thinking tool-call turns, a cut reply and a continue prompt.

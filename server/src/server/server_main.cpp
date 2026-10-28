@@ -1968,9 +1968,11 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::string efforts;
         for (const auto & [effort, line] : rules.effort_lines) efforts += (efforts.empty() ? "" : ",") + effort;
         std::fprintf(stderr,
-                     "[server] GGUF chat template: earlier turns %s their thinking%s; effort lines: %s\n",
+                     "[server] GGUF chat template: earlier turns %s their thinking%s; "
+                     "turns without reasoning %s; effort lines: %s\n",
                      rules.keeps_past_thinking ? "keep" : "drop",
                      rules.reads_preserve_thinking ? " (preserve_thinking overrides)" : "",
+                     rules.empty_thinking ? "get an empty thinking block" : "render as text only",
                      efforts.empty() ? "none" : efforts.c_str());
     }
 

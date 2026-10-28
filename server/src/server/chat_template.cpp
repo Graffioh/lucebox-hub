@@ -655,10 +655,11 @@ std::string render_chat_template(
                 // As the Qwen templates do, an assistant turn after the last
                 // user query replays its thinking (a raw turn from tool memory
                 // already holds it); earlier turns do when the template keeps
-                // them, else they keep their text only.
+                // them, else they keep their text only. A turn without
+                // reasoning gets an empty block where the template writes one.
                 const std::string_view reasoning = trim_whitespace(msg.reasoning_content);
                 if (msg.role == "assistant" && (last_query < i || keep_past_thinking) &&
-                    !msg.tool_calls_replayed && !reasoning.empty()) {
+                    !msg.tool_calls_replayed && (!reasoning.empty() || qwen_rules.empty_thinking)) {
                     result += "<think>\n";
                     result += reasoning;
                     result += "\n</think>\n\n";
@@ -1294,6 +1295,16 @@ QwenTemplateRules qwen_template_rules(const std::string & template_src) {
     };
     rules.keeps_past_thinking = keeps(-1);
     rules.reads_preserve_thinking = keeps(0) != keeps(1);
+
+    // A turn after the query with no reasoning, not the conversation's last
+    // (Qwen3 writes an empty block only on its last turn).
+    const std::vector<ChatMessage> step = {
+        {"user", "Q", "", ""},
+        {"assistant", "A", "", ""},
+        {"tool", "R", "", ""},
+    };
+    rules.empty_thinking = render(step, true, "", -1)
+        .find("<|im_start|>assistant\n<think>\n\n</think>\n\nA<|im_end|>") != std::string::npos;
 
     // An effort line is the whole system turn the template adds ahead of a
     // lone query, when it adds none without thinking.

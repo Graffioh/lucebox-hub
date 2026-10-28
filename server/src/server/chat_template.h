@@ -55,6 +55,9 @@ struct QwenTemplateRules {
     bool keeps_past_thinking = false;
     // The template reads `preserve_thinking`, so a request can override it.
     bool reads_preserve_thinking = false;
+    // A turn rendered with thinking but without reasoning text gets an empty
+    // thinking block (Qwen3.5 and Qwen3.8 write one; the default writes none).
+    bool empty_thinking = false;
     // The template's system line for each effort it states ("low", "xhigh");
     // an effort without a line (Qwen3.8's "medium") adds nothing.
     std::map<std::string, std::string> effort_lines;
