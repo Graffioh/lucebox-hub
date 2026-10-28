@@ -218,6 +218,18 @@ struct SchedulerTestHarness {
         return server.agent_turn_cache_slots_.count(slot) != 0;
     }
 
+    // One HTTP request through the serving path: parsing, rendering, the
+    // worker started by start_worker(), and the response written to `fd`.
+    static bool start_worker(HttpServer & server) { return server.start_worker(); }
+    static bool route(HttpServer & server, SocketHandle fd, const std::string & path,
+                      const json & body) {
+        HttpServer::HttpRequest request;
+        request.method = "POST";
+        request.path = path;
+        request.body = body.dump();
+        return server.route_request(fd, request);
+    }
+
     // `own_snapshot_slot` is the inline snapshot the request itself took,
     // `restored_slot` the checkpoint it restored from.
     static bool save_generated_turn(
@@ -9785,6 +9797,178 @@ TEST_CASE(ServerUnitFixture, test_save_generated_turn_keys_live_state) {
         TEST_ASSERT(cache.lookup(next).first == 2);
     }
     unlink(path.c_str());
+}
+
+#if !defined(_WIN32)  // socketpair()
+// Serves every generation with `reply`, keeping the state a real backend
+// would: an inline snapshot at the planned cut, and after decode the prompt
+// plus every generated token but the last (sampled, never decoded).
+struct ScriptedReplyBackend : MockBackend {
+    std::vector<int32_t> reply;
+    std::vector<std::vector<int32_t>> prompts;
+    int restored_prefix = 0;
+    std::map<int, int> positions;
+    int live_position = 0;
+
+    bool snapshot_save(int slot) override {
+        positions[slot] = live_position;
+        return true;
+    }
+    void snapshot_free(int slot) override { positions.erase(slot); }
+    bool snapshot_used(int slot) const override { return positions.count(slot) != 0; }
+    int snapshot_cur_pos(int slot) const override {
+        const auto it = positions.find(slot);
+        return it == positions.end() ? 0 : it->second;
+    }
+
+    GenerateResult serve(const GenerateRequest & req, const DaemonIO & io) {
+        prompts.push_back(req.prompt);
+        if (req.snap_slot >= 0 && req.snap_pos > 0) positions[req.snap_slot] = req.snap_pos;
+        GenerateResult result;
+        result.succeed();
+        for (const int32_t token : reply) {
+            result.tokens.push_back(token);
+            if (io.on_token && !io.on_token(token)) break;
+        }
+        live_position = (int) (req.prompt.size() + result.tokens.size()) - 1;
+        return result;
+    }
+    GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+        return serve(req, io);
+    }
+    GenerateResult restore_and_generate_impl(int slot, const GenerateRequest & req,
+                                             const DaemonIO & io) override {
+        restored_prefix = snapshot_cur_pos(slot);
+        GenerateResult result = serve(req, io);
+        result.restored_prefix_tokens = restored_prefix;
+        return result;
+    }
+};
+
+// A stateless agent sends the thinking tool-call turn back with its tool
+// result. The next prompt must hold the turn exactly as generated (previous
+// prompt + generated tokens), and the server's checkpoint of the generated
+// turn must serve it, so only the tool result is prefilled.
+TEST_CASE(ServerUnitFixture, test_thinking_tool_turn_replays_as_generated) {
+    // Qwen-shaped vocabulary: the think and tool markers are single tokens,
+    // and "\n\n" and "\n\n\n" are distinct newline tokens.
+    std::string printable = "\n";
+    for (char c = ' '; c <= '~'; ++c) printable += c;
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"\n\n", "\n\n\n"}, printable,
+        {"<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>",
+         "</tool_call>", "<tool_response>", "</tool_response>"});
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    // The model closes its thinking with the </think> token followed by the
+    // "\n\n" token, then calls a tool and ends its turn.
+    std::vector<int32_t> generated = tokenizer.encode(
+        "I will read a.py first.\n</think>\n\n<tool_call>\n<function=read>\n"
+        "<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>");
+    generated.push_back(tokenizer.eos_chat_id());
+
+    auto backend_owner = std::make_unique<ScriptedReplyBackend>();
+    ScriptedReplyBackend & backend = *backend_owner;
+    backend.reply = generated;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.max_ctx = 4096;
+    config.prefix_cache_cap = 4;
+    HttpServer server(engine, tokenizer, config);
+    TEST_ASSERT(SchedulerTestHarness::start_worker(server));
+
+    const json tools = json::array({{
+        {"type", "function"},
+        {"function", {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"parameters", {
+                {"type", "object"},
+                {"properties", {{"path", {{"type", "string"}}}}},
+                {"required", json::array({"path"})}}}}}}});
+    const auto chat = [&](const json & messages) {
+        int sockets[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        const json body = {
+            {"model", "test"},
+            {"messages", messages},
+            {"tools", tools},
+            {"max_tokens", 64},
+            {"chat_template_kwargs", {{"enable_thinking", true}}},
+            // Only the client's requests reach the backend.
+            {"tool_checks", false},
+        };
+        TEST_ASSERT(SchedulerTestHarness::route(
+            server, sockets[0], "/v1/chat/completions", body));
+        close(sockets[0]);
+        std::string wire;
+        char buf[4096];
+        ssize_t n = 0;
+        while ((n = read(sockets[1], buf, sizeof(buf))) > 0) wire.append(buf, (size_t) n);
+        close(sockets[1]);
+        const size_t body_at = wire.find("\r\n\r\n");
+        TEST_ASSERT_MSG(body_at != std::string::npos, wire);
+        return json::parse(wire.substr(body_at + 4));
+    };
+
+    json messages = json::array({
+        {{"role", "system"}, {"content", "You are a coding agent."}},
+        {{"role", "user"}, {"content", "Read a.py."}},
+    });
+    const json first = chat(messages);
+    const json reply = first["choices"][0]["message"];
+    TEST_ASSERT_MSG(reply.contains("tool_calls") && reply["tool_calls"].size() == 1,
+                    first.dump());
+    messages.push_back(reply);
+    messages.push_back({{"role", "tool"},
+                        {"tool_call_id", reply["tool_calls"][0]["id"]},
+                        {"content", "print(1)"}});
+    backend.reply = {tokenizer.eos_chat_id()};
+    chat(messages);
+    unlink(path.c_str());
+
+    TEST_ASSERT(backend.prompts.size() == 2);
+    if (backend.prompts.size() != 2) return;
+    std::vector<int32_t> turn = backend.prompts[0];
+    turn.insert(turn.end(), generated.begin(), generated.end());
+    const std::vector<int32_t> & next = backend.prompts[1];
+    size_t same = 0;
+    while (same < turn.size() && same < next.size() && turn[same] == next[same]) ++same;
+    TEST_ASSERT_MSG(same == turn.size() && next.size() > turn.size(),
+                    "next prompt leaves the generated turn at token " +
+                    std::to_string(same) + " of " + std::to_string(turn.size()) +
+                    ": " + tokenizer.decode({next.begin() + (long) same,
+                                             next.begin() + (long) std::min(next.size(), same + 4)}));
+    TEST_ASSERT_MSG(backend.restored_prefix == (int) turn.size() - 1,
+                    "restored " + std::to_string(backend.restored_prefix) + " of " +
+                    std::to_string(turn.size()));
+}
+#endif  // !defined(_WIN32)
+
+// Tool memory keeps a generated turn minus its end-of-turn token, and the
+// template closes the turn again. A Laguna GGUF has no EOT key, and its
+// backend ends turns at </assistant> even when the vocabulary has
+// <|im_end|>: the server must too, or the replayed turn holds two
+// </assistant>.
+TEST_CASE(ServerUnitFixture, test_laguna_end_of_turn_matches_backend) {
+    gguf_context * g = gguf_init_empty();
+    const char * tokens[] = {"x", "<|EOS|>", "<|im_end|>", "<assistant>", "</assistant>"};
+    const uint32_t token_types[] = {1, 3, 3, 3, 3};
+    gguf_set_val_str(g, "general.architecture", "laguna");
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens, 5);
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32, token_types, 5);
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
+    const std::string path = test_tmp_path("luce_test_laguna_eot.gguf").string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    unlink(path.c_str());
+    TEST_ASSERT_MSG(tokenizer.eos_chat_id() == 4,
+                    "eos_chat_id=" + std::to_string(tokenizer.eos_chat_id()));
 }
 
 // A hit whose backend snapshot is gone (a deferred snapshot a live
