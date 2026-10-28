@@ -439,7 +439,9 @@ std::string render_chat_template(
     bool add_generation_prompt,
     bool enable_thinking,
     const std::string & tools_json,
-    const std::string & reasoning_effort)
+    const std::string & reasoning_effort,
+    int preserve_thinking,
+    const QwenTemplateRules & qwen_rules)
 {
     std::string result;
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
@@ -563,9 +565,23 @@ std::string render_chat_template(
             start_idx = 1;
         }
 
+        // The template's effort line opens the system turn, only when the
+        // request names an effort the template states.
+        std::string_view effort_line;
+        if (enable_thinking && !reasoning_effort.empty()) {
+            const auto line = qwen_rules.effort_lines.find(qwen4exp_template_effort(reasoning_effort));
+            if (line != qwen_rules.effort_lines.end()) effort_line = line->second;
+        }
+        const auto append_effort_line = [&](std::string_view separator) {
+            if (effort_line.empty()) return;
+            result += effort_line;
+            result += separator;
+        };
+
         // Emit system message with tool preamble if tools are present.
         if (has_tools) {
             result += "<|im_start|>system\n";
+            append_effort_line("\n\n");
             result += QWEN3_TOOL_PREAMBLE;
             result += '\n';
             result += tools_json;
@@ -577,7 +593,12 @@ std::string render_chat_template(
             result += "<|im_end|>\n";
         } else if (!system_content.empty()) {
             result += "<|im_start|>system\n";
+            append_effort_line("\n\n");
             result += system_content;
+            result += "<|im_end|>\n";
+        } else if (!effort_line.empty()) {
+            result += "<|im_start|>system\n";
+            append_effort_line("");
             result += "<|im_end|>\n";
         }
 
@@ -596,6 +617,13 @@ std::string render_chat_template(
                 break;
             }
         }
+
+        // Turns before it keep their thinking when the model's template
+        // keeps them (Qwen3.8 by default, unless preserve_thinking is false).
+        const bool keep_past_thinking =
+            qwen_rules.reads_preserve_thinking && preserve_thinking >= 0
+                ? preserve_thinking != 0
+                : qwen_rules.keeps_past_thinking;
 
         // Render remaining messages.
         bool in_tool_response = false;
@@ -626,9 +654,10 @@ std::string render_chat_template(
                 std::string_view content = msg.content;
                 // As the Qwen templates do, an assistant turn after the last
                 // user query replays its thinking (a raw turn from tool memory
-                // already holds it). Earlier turns keep their text only.
+                // already holds it); earlier turns do when the template keeps
+                // them, else they keep their text only.
                 const std::string_view reasoning = trim_whitespace(msg.reasoning_content);
-                if (msg.role == "assistant" && last_query < i &&
+                if (msg.role == "assistant" && (last_query < i || keep_past_thinking) &&
                     !msg.tool_calls_replayed && !reasoning.empty()) {
                     result += "<think>\n";
                     result += reasoning;
@@ -1234,6 +1263,57 @@ std::string render_chat_template_jinja(
         return render_jinja(template_src, messages, bos_token, eos_token, add_generation_prompt,
                             enable_thinking, tools_json, reasoning_effort, preserve_thinking, true);
     }
+}
+
+QwenTemplateRules qwen_template_rules(const std::string & template_src) {
+    QwenTemplateRules rules;
+    if (template_src.empty()) return rules;
+    // A template that fails a probe keeps that probe's default.
+    const auto render = [&](const std::vector<ChatMessage> & messages, bool thinking,
+                            const std::string & effort, int preserve_thinking) {
+        try {
+            return render_chat_template_jinja(template_src, messages, "", "",
+                                              /*add_generation_prompt=*/false, thinking, "",
+                                              effort, preserve_thinking);
+        } catch (const std::exception &) {
+            return std::string();
+        }
+    };
+
+    // An earlier turn keeps its thinking if the template renders it as the
+    // built-in renderer does.
+    const std::vector<ChatMessage> history = {
+        {"user", "Q1", "", ""},
+        {"assistant", "A1", "", "R1"},
+        {"user", "Q2", "", ""},
+    };
+    const auto keeps = [&](int preserve_thinking) {
+        return render(history, true, "", preserve_thinking)
+                   .find("<|im_start|>assistant\n<think>\nR1\n</think>\n\nA1<|im_end|>") !=
+               std::string::npos;
+    };
+    rules.keeps_past_thinking = keeps(-1);
+    rules.reads_preserve_thinking = keeps(0) != keeps(1);
+
+    // An effort line is the whole system turn the template adds ahead of a
+    // lone query, when it adds none without thinking.
+    const std::vector<ChatMessage> query = {{"user", "Q", "", ""}};
+    const std::string turn = "<|im_start|>user\nQ<|im_end|>\n";
+    if (render(query, false, "", -1) != turn) return rules;
+    static constexpr std::string_view open = "<|im_start|>system\n";
+    static constexpr std::string_view close = "<|im_end|>\n";
+    for (const char * effort : {"low", "medium", "xhigh"}) {
+        const std::string out = render(query, true, effort, -1);
+        const size_t frame = open.size() + close.size() + turn.size();
+        if (out.size() <= frame || out.compare(0, open.size(), open) != 0 ||
+            out.compare(out.size() - turn.size() - close.size(), close.size(), close) != 0 ||
+            out.compare(out.size() - turn.size(), turn.size(), turn) != 0) {
+            continue;
+        }
+        std::string line = out.substr(open.size(), out.size() - frame);
+        if (line.find("<|im_") == std::string::npos) rules.effort_lines[effort] = std::move(line);
+    }
+    return rules;
 }
 
 }  // namespace luce::common
