@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/uma-budget.h"
 #include "ggml-cuda/vision-bias.cuh"
 #include "ggml-cuda/vision-rotary.cuh"
 #include "ggml-cuda/vision-softmax.cuh"
@@ -323,6 +324,20 @@ static bool ggml_cuda_device_is_integrated(int device) {
     return device >= 0 && device < GGML_CUDA_MAX_DEVICES && integrated[device];
 }
 
+static bool ggml_cuda_device_has_managed_memory(int device) {
+    static const std::array<bool, GGML_CUDA_MAX_DEVICES> managed = []() {
+        std::array<bool, GGML_CUDA_MAX_DEVICES> flags{};
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) { n = 0; }
+        for (int i = 0; i < n && i < GGML_CUDA_MAX_DEVICES; i++) {
+            cudaDeviceProp prop;
+            flags[i] = (cudaGetDeviceProperties(&prop, i) == cudaSuccess && prop.managedMemory);
+        }
+        return flags;
+    }();
+    return device >= 0 && device < GGML_CUDA_MAX_DEVICES && managed[device];
+}
+
 static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         return true;
@@ -486,11 +501,57 @@ size_t ggml_backend_cuda_host_spill_bytes(int device) {
     return g_host_spill[device].host_used;
 }
 
+// A managed allocation on an integrated GPU can succeed for more memory than is
+// free, so check it against the RAM available now (ggml-cuda/uma-budget.h) and
+// fail it like any out-of-memory allocation. Bypass: LUCE_HIP_UMA_NO_RAM_CHECK=1.
+static bool ggml_cuda_uma_ram_admits(int device, size_t size) {
+#if defined(__linux__)
+    if (getenv("LUCE_HIP_UMA_NO_RAM_CHECK") != nullptr || !ggml_cuda_device_is_integrated(device)) {
+        return true;
+    }
+    std::string meminfo;
+    uint64_t live_gpu_host = 0;
+    const bool live_known = ggml_cuda_uma_live_gpu_host_bytes(&live_gpu_host);
+    uint64_t cgroup_room = 0;
+    const bool limited = ggml_cuda_uma_cgroup_room_bytes(&cgroup_room);
+    uint64_t available = 0;
+    if (!ggml_cuda_uma_read_meminfo(&meminfo) ||
+        !ggml_cuda_uma_available_bytes(meminfo.c_str(), live_known ? &live_gpu_host : nullptr,
+                                       limited ? &cgroup_room : nullptr, &available)) {
+        return true; // RAM unknown: admit, as before the check existed
+    }
+    const size_t total_ram = ggml_cuda_total_ram_bytes();
+    if (ggml_cuda_uma_alloc_fits(size, (size_t) available, total_ram)) {
+        return true;
+    }
+    GGML_LOG_ERROR("ggml_cuda: device %d managed alloc %.1f GiB does not fit in %.1f GiB available RAM "
+                   "(with the GPU driver's reclaimable pages, within cgroup limits) minus a %.1f GiB reserve; "
+                   "failing it as out of memory "
+                   "(LUCE_HIP_UMA_NO_RAM_CHECK=1 to bypass)\n",
+                   device, (double) size / 1073741824.0, (double) available / 1073741824.0,
+                   (double) ggml_cuda_uma_reserve_bytes(total_ram) / 1073741824.0);
+    return false;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(size);
+    return true;
+#endif // defined(__linux__)
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * out_managed = nullptr) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     bool managed = false;
     if (ggml_cuda_device_use_uma(device, size)) {
+        // Only buffers (out_managed set) are checked: their allocation failure
+        // reaches the caller as a null buffer, while the pools and split
+        // tensors abort on any error (CUDA_CHECK). A device without managed
+        // memory is not: its cudaMallocManaged fails as unsupported and the
+        // buffer takes the cudaMalloc fallback below.
+        if (out_managed != nullptr && ggml_cuda_device_has_managed_memory(device) &&
+            !ggml_cuda_uma_ram_admits(device, size)) {
+            return cudaErrorMemoryAllocation;
+        }
         err = cudaMallocManaged(ptr, size);
         if (err == cudaSuccess) {
             managed = true;
@@ -531,7 +592,8 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device,
         // memory so the carve and GTT are usable together; same opt-out as
         // the auto-UMA path above.
         if (err != cudaSuccess && !ggml_cuda_qwen4exp_enabled() && getenv("LUCE_HIP_NO_AUTO_UMA") == nullptr &&
-            ggml_cuda_device_is_integrated(device)) {
+            ggml_cuda_device_is_integrated(device) &&
+            (out_managed == nullptr || ggml_cuda_uma_ram_admits(device, size))) {
             (void)hipGetLastError();
             err = cudaMallocManaged(ptr, size);
             if (err == cudaSuccess) {
