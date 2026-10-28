@@ -124,6 +124,50 @@ static void append_python_json(std::string & out, const Json & value) {
     }
 }
 
+// Tool definitions as chat templates receive them, in the OpenAI shape: Chat
+// Completions wraps functions, Responses flattens them, and Anthropic names
+// the parameter schema input_schema. Throws if tools_json does not parse.
+static nlohmann::ordered_json template_tools(const std::string & tools_json) {
+    auto tools = nlohmann::ordered_json::parse(tools_json);
+    for (auto & tool : tools) {
+        if (!tool.is_object()) continue;
+        if (!tool.contains("function") && tool.contains("name")) {
+            auto function = std::move(tool);
+            function.erase("type");
+            tool = nlohmann::ordered_json::object();
+            tool["type"] = "function";
+            tool["function"] = std::move(function);
+        }
+        if (!tool.contains("function") || !tool["function"].is_object()) continue;
+        auto & function = tool["function"];
+        const auto input_schema = function.find("input_schema");
+        if (input_schema != function.end()) {
+            if (!function.contains("parameters")) {
+                auto schema = std::move(*input_schema);
+                function.erase("input_schema");
+                function["parameters"] = std::move(schema);
+            } else {
+                function.erase("input_schema");
+            }
+        }
+    }
+    return tools;
+}
+
+// The Qwen templates' tool list: one `tool | tojson` per line.
+static void append_qwen_tools(std::string & result, const std::string & tools_json) {
+    std::string lines;
+    try {
+        for (const auto & tool : template_tools(tools_json)) {
+            lines += '\n';
+            append_python_json(lines, tool);
+        }
+    } catch (const std::exception &) {
+        lines = '\n' + tools_json;
+    }
+    result += lines;
+}
+
 static void append_ds41_tools(std::string & result, const std::string & tools_json) {
     result += DS41_TOOLS_HEADER;
     try {
@@ -583,8 +627,7 @@ std::string render_chat_template(
             result += "<|im_start|>system\n";
             append_effort_line("\n\n");
             result += QWEN3_TOOL_PREAMBLE;
-            result += '\n';
-            result += tools_json;
+            append_qwen_tools(result, tools_json);
             result += QWEN3_TOOL_SUFFIX;
             if (!system_content.empty()) {
                 result += "\n\n";
@@ -1187,32 +1230,7 @@ static std::string render_jinja(
     bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
     if (has_tools) {
         try {
-            inputs["tools"] = nlohmann::ordered_json::parse(tools_json);
-            // Chat Completions wraps functions, Responses flattens them, and
-            // Anthropic names the parameter schema input_schema. Templates
-            // receive the same OpenAI-shaped function definition for all three.
-            for (auto & tool : inputs["tools"]) {
-                if (!tool.is_object()) continue;
-                if (!tool.contains("function") && tool.contains("name")) {
-                    auto function = std::move(tool);
-                    function.erase("type");
-                    tool = nlohmann::ordered_json::object();
-                    tool["type"] = "function";
-                    tool["function"] = std::move(function);
-                }
-                if (!tool.contains("function") || !tool["function"].is_object()) continue;
-                auto & function = tool["function"];
-                const auto input_schema = function.find("input_schema");
-                if (input_schema != function.end()) {
-                    if (!function.contains("parameters")) {
-                        auto schema = std::move(*input_schema);
-                        function.erase("input_schema");
-                        function["parameters"] = std::move(schema);
-                    } else {
-                        function.erase("input_schema");
-                    }
-                }
-            }
+            inputs["tools"] = template_tools(tools_json);
         } catch (const std::exception & e) {
             throw std::runtime_error(
                 std::string("render_chat_template_jinja: failed to parse tools JSON: ") + e.what());

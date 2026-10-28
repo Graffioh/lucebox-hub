@@ -8367,8 +8367,9 @@ TEST_CASE(ServerUnitFixture, test_qwen_render_follows_gguf_template_history_and_
 }
 
 // The built-in renderer and the model's own Jinja template render the same
-// multi-turn agent conversation byte for byte: system, a thinking turn before
-// the last query, thinking tool-call turns, a cut reply and a continue prompt.
+// multi-turn agent conversation byte for byte: system, the tools, a thinking
+// turn before the last query, thinking tool-call turns, a cut reply and a
+// continue prompt.
 // The built-in default (no effort named) equals the template at "medium",
 // which states no effort. Not covered: raw turns replayed from tool memory,
 // which the Jinja path refuses (and which keep their thinking wherever they sit).
@@ -8395,21 +8396,45 @@ TEST_CASE(ServerUnitFixture, test_qwen_render_matches_gguf_templates) {
         {{"role", "assistant"}, {"content", "The bug is"}, {"reasoning_content", "a.py prints 1."}},
         {{"role", "user"}, {"content", "continue"}},
     }), ApiFormat::OPENAI_CHAT, tool_memory);
+    // The same two tools as Chat Completions, Responses and Anthropic send
+    // them, held as the server holds request JSON (keys sorted).
+    const json bash_schema = {{"type", "object"}, {"required", json::array({"command"})},
+                              {"properties", {{"command", {{"type", "string"}}},
+                                              {"timeout", {{"type", "integer"}, {"default", 30}}}}}};
+    const json read_schema = {{"type", "object"}, {"properties", {{"path", {{"type", "string"}}}}}};
+    const char * bash_doc = "Run a shell command; prints \"stdout\".";
+    const char * read_doc = "Read a file (UTF-8, e.g. café.py).";
+    const std::pair<const char *, std::string> tool_sets[] = {
+        {"chat", json::array({
+            {{"type", "function"}, {"function", {{"name", "bash"}, {"description", bash_doc}, {"parameters", bash_schema}}}},
+            {{"type", "function"}, {"function", {{"name", "read"}, {"description", read_doc}, {"parameters", read_schema}}}},
+        }).dump()},
+        {"responses", json::array({
+            {{"type", "function"}, {"name", "bash"}, {"description", bash_doc}, {"parameters", bash_schema}},
+            {{"type", "function"}, {"name", "read"}, {"description", read_doc}, {"parameters", read_schema}},
+        }).dump()},
+        {"anthropic", json::array({
+            {{"name", "bash"}, {"description", bash_doc}, {"input_schema", bash_schema}},
+            {{"name", "read"}, {"description", read_doc}, {"input_schema", read_schema}},
+        }).dump()},
+    };
 
     for (const char * name : {"Qwen3.8-27B.jinja", "Qwen3.5-9B.jinja"}) {
         const std::string tmpl = read_qwen_chat_template(name);
         const auto rules = qwen_template_rules(tmpl);
-        for (const int preserve_thinking : {-1, 0, 1}) {
-            for (const char * effort : {"", "low", "medium", "high"}) {
-                const std::string label = std::string(name) + " preserve_thinking=" +
-                    std::to_string(preserve_thinking) + " effort=" + effort;
-                const std::string builtin = render_chat_template(
-                    messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
-                    /*enable_thinking=*/true, "", effort, preserve_thinking, rules);
-                const std::string jinja = render_chat_template_jinja(
-                    tmpl, messages, "", "", true, true, "",
-                    qwen4exp_template_effort(*effort ? effort : "medium"), preserve_thinking);
-                TEST_ASSERT_MSG(builtin == jinja, label + "\n--- built-in\n" + builtin + "\n--- jinja\n" + jinja);
+        for (const auto & [shape, tools] : tool_sets) {
+            for (const int preserve_thinking : {-1, 0, 1}) {
+                for (const char * effort : {"", "low", "medium", "high"}) {
+                    const std::string label = std::string(name) + " tools=" + shape + " preserve_thinking=" +
+                        std::to_string(preserve_thinking) + " effort=" + effort;
+                    const std::string builtin = render_chat_template(
+                        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+                        /*enable_thinking=*/true, tools, effort, preserve_thinking, rules);
+                    const std::string jinja = render_chat_template_jinja(
+                        tmpl, messages, "", "", true, true, tools,
+                        qwen4exp_template_effort(*effort ? effort : "medium"), preserve_thinking);
+                    TEST_ASSERT_MSG(builtin == jinja, label + "\n--- built-in\n" + builtin + "\n--- jinja\n" + jinja);
+                }
             }
         }
     }
@@ -17858,6 +17883,8 @@ static PflashKeepHistoryRun run_keep_history_session(
             tools.is_array() && !tools.empty() ? tools.dump() : ""));
         cover += rendered.back();
     }
+    // The server's own text: the recall block the served prompt may carry.
+    cover += "[Earlier in this conversation]\n[End of earlier excerpts]\n";
     const std::string path = write_pflash_bpe_tokenizer_fixture(
         {"user", "assistant", "system", "\n", "tool"}, cover);
     Tokenizer tokenizer;
