@@ -9915,10 +9915,19 @@ void HttpServer::remember_agent_turn(
     // Preserve template-injected generation text (for example Qwen's
     // <think> prefix) in tool memory so the next stateless request renders the
     // same token stream as the checkpointed generation.
+    // The turn is the text of the generated tokens, not the emitter's text:
+    // the emitter receives the think markers in their client form (`</think>`
+    // arrives as "</think>\n"), which would add a token to the replayed turn.
+    // The end-of-turn token is not part of it: the template closes the turn.
+    std::vector<int32_t> generated = result.tokens;
+    if (!generated.empty() && (generated.back() == tokenizer_.eos_id() ||
+                               generated.back() == tokenizer_.eos_chat_id())) {
+        generated.pop_back();
+    }
     std::string assistant_content;
     if (!http_detail::canonical_assistant_content(
             req.rendered_prompt, sentinel_rendered, kSentinel,
-            emitter.accumulated_raw(), assistant_content)) {
+            tokenizer_.decode(generated), assistant_content)) {
         return;
     }
     messages.back().content = assistant_content;
