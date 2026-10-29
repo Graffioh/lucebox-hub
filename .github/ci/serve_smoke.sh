@@ -34,9 +34,13 @@ for _ in $(seq 600); do
 done
 curl -sf -m 5 "$url/v1/models" > /dev/null || { echo "::error::luce_server was not ready in 10 minutes"; exit 1; }
 
+# Greedy, as lucebox is served. A sampler field the request leaves out comes from
+# the model card (Qwen 3.8's no-thinking presence_penalty is 1.5), and concurrent
+# Qwen decodes a request that samples or penalizes without its drafter.
 ask() {
   curl -sf -m 300 "$url/v1/chat/completions" -H 'Content-Type: application/json' -d '{
-    "model": "'"$name"'", "max_tokens": 128, "temperature": 0, "reasoning_effort": "none",
+    "model": "'"$name"'", "max_tokens": 128, "reasoning_effort": "none",
+    "temperature": 0, "presence_penalty": 0, "repetition_penalty": 1,
     "messages": [{"role": "user", "content": "Count from 1 to 30, separated by commas. Reply with the numbers only."}]}'
 }
 
