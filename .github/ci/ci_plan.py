@@ -44,7 +44,12 @@ RULES = [
     ("server/src/qwen35/gguf_target_loader.cpp", ALL, "code both models link"),
     ("server/src/qwen35/", QWEN38, "Qwen 3.8 27B's code"),
     ("server/src/deepseek4/", DS41, "DeepSeek V4.1's code"),
-    ("server/share/deepseek41/", DS41, "the ds41-lucebox profile's files"),
+    ("server/share/deepseek41/", DS41, "the ds41-halo profile's files"),
+    # The model cards: sampler defaults and launch profiles. Only the served
+    # models' cards change what the serve checks run.
+    ("share/model_cards/qwen3.8-27b.json", QWEN38, "Qwen 3.8 27B's model card"),
+    ("share/model_cards/deepseek-v4.1-flash.json", DS41, "DeepSeek V4.1 Flash's model card"),
+    ("share/model_cards/", NONE, "cards of models the jobs don't serve"),
     ("server/test/", GPU, "tests (luce_server links none of them)"),
     # Nothing the lucebox3 jobs build or read.
     ("*.md", NONE, "documentation"),

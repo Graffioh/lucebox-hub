@@ -1805,16 +1805,19 @@ const std::vector<int32_t> & ppp_tool_prefix_source(
 
 // Sampler parameters. When the request omits a value, fall back to the
 // model card's sampling defaults (spec §3.3); when the card doesn't
-// supply one either, use the hard-coded default.
+// supply one either, use the hard-coded default. A greedy card's values
+// apply only to a request that sets a temperature above 0.
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults) {
     SamplerCfg sampler;
     sampler.temp = body.value(
-        "temperature", defaults.has_temperature ? defaults.temperature : 0.0f);
+        "temperature",
+        defaults.has_temperature && !defaults.greedy ? defaults.temperature : 0.0f);
+    const bool card = !defaults.greedy || sampler.temp > 0.0f;
     sampler.top_p = body.value(
-        "top_p", defaults.has_top_p ? defaults.top_p : 1.0f);
+        "top_p", card && defaults.has_top_p ? defaults.top_p : 1.0f);
     sampler.top_k = body.value(
-        "top_k", defaults.has_top_k ? defaults.top_k : 0);
+        "top_k", card && defaults.has_top_k ? defaults.top_k : 0);
     if (body.contains("seed")) {
         sampler.seed = body["seed"].get<uint64_t>();
         sampler.has_seed = true;
@@ -1824,14 +1827,14 @@ SamplerCfg parse_request_sampler(const json & body,
     sampler.freq_pen = body.value("frequency_penalty", 0.0f);
     sampler.pres_pen = body.value(
         "presence_penalty",
-        defaults.has_presence_penalty ? defaults.presence_penalty : 0.0f);
+        card && defaults.has_presence_penalty ? defaults.presence_penalty : 0.0f);
     // HuggingFace-style multiplicative repetition penalty (also used by
     // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and the
     // shorter "rep_pen" for daemon compatibility.
     sampler.rep_pen = body.value(
         "repetition_penalty",
         body.value("rep_pen",
-                   defaults.has_repetition_penalty
+                   card && defaults.has_repetition_penalty
                        ? defaults.repetition_penalty
                        : 1.0f));
     if (body.contains("rep_window")) {
@@ -1845,7 +1848,9 @@ void apply_no_thinking_sampler_defaults(const json & body,
                                         SamplerCfg & sampler) {
     // Mirrors the body-key checks in parse_request_sampler: only backfill a
     // field the request left unset, and only when the card actually
-    // supplied a no-thinking value for it.
+    // supplied a no-thinking value for it. A greedy card backfills only a
+    // request that samples.
+    if (no_thinking.greedy && !(sampler.temp > 0.0f)) return;
     if (no_thinking.has_temperature && !body.contains("temperature")) {
         sampler.temp = no_thinking.temperature;
     }
@@ -2039,15 +2044,17 @@ json build_props_body(const ServerConfig & config,
     // here regardless of what the model card said, which caused gemma4
     // benchmarks to silently run at temp=0 (degenerate-decode collapse)
     // when the model card specifies temp=1.0/top_p=0.95/top_k=64.
+    // A greedy card's values are for requests that sample, not defaults.
     const auto & smp = config.sampler_defaults;
+    const bool card = !smp.greedy;
     json body = {
         {"default_generation_settings", {
             {"n_ctx",          config.max_ctx},
-            {"temperature",    smp.has_temperature        ? smp.temperature        : 0.0f},
-            {"top_p",          smp.has_top_p              ? smp.top_p              : 1.0f},
-            {"top_k",          smp.has_top_k              ? smp.top_k              : 0},
-            {"min_p",          smp.has_min_p              ? smp.min_p              : 0.0f},
-            {"repeat_penalty", smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
+            {"temperature",    card && smp.has_temperature        ? smp.temperature        : 0.0f},
+            {"top_p",          card && smp.has_top_p              ? smp.top_p              : 1.0f},
+            {"top_k",          card && smp.has_top_k              ? smp.top_k              : 0},
+            {"min_p",          card && smp.has_min_p              ? smp.min_p              : 0.0f},
+            {"repeat_penalty", card && smp.has_repetition_penalty ? smp.repetition_penalty : 1.0f},
         }},
         {"model_alias", config.model_name},
         {"model_path",  config.model_path},

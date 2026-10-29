@@ -2,7 +2,8 @@
 # Serve a model the way lucebox3 serves it and check what it answers: one
 # request whose drafts the drafter must get accepted, then, when the server
 # takes several at once, that many together. Each must count to 30. Run from
-# the repository root, where a --profile finds its server/share files.
+# the repository root, where a profile finds its server/share files. With
+# SERVE_SMOKE_PROFILE set, the server must have applied that launch profile.
 #
 #   serve_smoke.sh <model id> <requests at once> <luce_server> <model.gguf> [luce_server flags...]
 set -euo pipefail
@@ -33,6 +34,9 @@ for _ in $(seq 600); do
   sleep 1
 done
 curl -sf -m 5 "$url/v1/models" > /dev/null || { echo "::error::luce_server was not ready in 10 minutes"; exit 1; }
+if [[ -n ${SERVE_SMOKE_PROFILE:-} ]] && ! grep -q "^\[server\] profile $SERVE_SMOKE_PROFILE: flags" "$log"; then
+  echo "::error::luce_server did not apply the $SERVE_SMOKE_PROFILE profile"; exit 1
+fi
 
 ask() {
   curl -sf -m 300 "$url/v1/chat/completions" -H 'Content-Type: application/json' -d '{

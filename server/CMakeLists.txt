@@ -2830,6 +2830,11 @@ if(LUCE_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        # The launch profiles are the repository's model cards.
+        target_link_libraries(test_feature_gate PRIVATE nlohmann_json::nlohmann_json)
+        target_compile_definitions(test_feature_gate PRIVATE
+            LUCE_MODEL_CARDS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../share/model_cards"
+            LUCE_SERVER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         # compiled_placement_backend() is decided by these defines, so the
         # gate must be tested with the same ones the server is built with.
         if(LUCE_GPU_BACKEND STREQUAL "hip")
@@ -3339,7 +3344,7 @@ if(LUCE_SERVER)
             )
             install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/share/status.html"
                     DESTINATION share)
-            # The ds41-lucebox profile's data files, found next to the binary
+            # The ds41-halo profile's data files, found next to the binary
             # (build/share, <prefix>/share) like status.html.
             add_custom_command(TARGET luce_server POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_directory

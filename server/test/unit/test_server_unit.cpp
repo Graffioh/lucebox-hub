@@ -6843,6 +6843,65 @@ TEST_CASE(ServerUnitFixture, test_sampler_defaults_no_thinking_absent_keeps_toda
     TEST_ASSERT(std::fabs(sampler.pres_pen - 0.0f) < 0.001f);
 }
 
+// A greedy card (`default_sampling: greedy`, Qwen 3.8 27B and DeepSeek V4.1
+// Flash): a request that does not sample decodes greedily with no penalties,
+// whatever the thinking state, so the drafter stays on; one that sets a
+// temperature above 0 gets the card's sampling recipe for what it omits.
+TEST_CASE(ServerUnitFixture, test_greedy_card_samples_only_when_the_request_does) {
+    ServerConfig config = qwen4exp_dual_sampling_config();
+    config.sampler_defaults.greedy = true;
+    config.sampler_defaults_no_thinking.greedy = true;
+    const json no_thinking = {{"enable_thinking", false}};
+
+    for (const json & body : {json::object(), json{{"chat_template_kwargs", no_thinking}},
+                              json{{"temperature", 0}, {"chat_template_kwargs", no_thinking}}}) {
+        const SamplerCfg greedy = resolve_request_sampler(body, config);
+        TEST_ASSERT(greedy.temp == 0.0f);
+        TEST_ASSERT(greedy.pres_pen == 0.0f);
+        TEST_ASSERT(greedy.rep_pen == 1.0f);
+        TEST_ASSERT(!greedy.needs_logit_processing());
+    }
+
+    const SamplerCfg thinking = resolve_request_sampler({{"temperature", 0.6f}}, config);
+    TEST_ASSERT(std::fabs(thinking.temp - 0.6f) < 0.001f);
+    TEST_ASSERT(std::fabs(thinking.top_p - 0.95f) < 0.001f);
+    TEST_ASSERT(thinking.top_k == 20);
+    TEST_ASSERT(thinking.pres_pen == 0.0f);
+
+    const SamplerCfg instruct = resolve_request_sampler(
+        {{"temperature", 0.6f}, {"chat_template_kwargs", no_thinking}}, config);
+    TEST_ASSERT(std::fabs(instruct.temp - 0.6f) < 0.001f);
+    TEST_ASSERT(std::fabs(instruct.top_p - 0.80f) < 0.001f);
+    TEST_ASSERT(std::fabs(instruct.pres_pen - 1.5f) < 0.001f);
+
+    // A field the request sets is its own, greedy or not.
+    const SamplerCfg penalized = resolve_request_sampler({{"presence_penalty", 0.5f}}, config);
+    TEST_ASSERT(penalized.temp == 0.0f);
+    TEST_ASSERT(std::fabs(penalized.pres_pen - 0.5f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_model_card_parses_default_sampling) {
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "luce-mc-default-sampling-test";
+    fs::remove_all(root);
+    fs::create_directories(root / "share" / "model_cards");
+    const auto write = [&](const char * stem, const char * mode) {
+        std::ofstream((root / "share" / "model_cards" / (std::string(stem) + ".json")).string())
+            << "{\"name\":\"" << stem << "\",\"source\":\"test\",\"verified_at\":\"2026-10-29\","
+            << "\"max_tokens\":32768,\"default_sampling\":\"" << mode << "\","
+            << "\"sampling\":{\"temperature\":1.0}}";
+    };
+    write("greedy-model", "greedy");
+    write("sampled-model", "sampling");
+    const auto greedy = luce::common::resolve_model_card("", "greedy-model", "qwen35", root.string());
+    const auto sampled = luce::common::resolve_model_card("", "sampled-model", "qwen35", root.string());
+    fs::remove_all(root);
+
+    TEST_ASSERT(greedy.sampling.greedy && greedy.sampling_no_thinking.greedy);
+    TEST_ASSERT(greedy.sampling.has_temperature && greedy.sampling.temperature == 1.0f);
+    TEST_ASSERT(!sampled.sampling.greedy && !sampled.sampling_no_thinking.greedy);
+}
+
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {
     const json valid = {{"messages", json::array({
         {{"role", "user"}, {"content", "hi"}},

@@ -17,6 +17,9 @@ REPO = Path(__file__).resolve().parents[2]
         (["server/src/deepseek4/deepseek4_dspark.cpp"], DS41),
         (["server/share/deepseek41/placement_lucebox.json", "server/docs/DS41.md"], DS41),
         (["server/test/unit/test_server_unit.cpp"], GPU),
+        (["share/model_cards/qwen3.8-27b.json"], QWEN38),
+        (["share/model_cards/deepseek-v4.1-flash.json", "share/model_cards/README.md"], DS41),
+        (["share/model_cards/gemma-4-31b-it.json", "share/model_cards/_schema.json"], NONE),
         (["README.md", "server/docs/DS41.md", "harness/clients/run_pi.sh"], NONE),
         (["server/tools/ds4_mix_converter/ds4_mix_converter.cpp", "uv.lock"], NONE),
         # Both models, shared code, other models and unlisted paths run everything.
@@ -27,7 +30,6 @@ REPO = Path(__file__).resolve().parents[2]
         (["server/src/laguna/laguna_internal.h"], ALL),
         (["server/deps/llama.cpp/ggml/src/ggml-cuda/mmq.cu"], ALL),
         (["server/CMakeLists.txt"], ALL),
-        (["share/model_cards/qwen3.8-27b.json"], ALL),
         ([".github/ci/serve_smoke.sh"], ALL),
         ([".github/workflows/ci.yml", "README.md"], ALL),
         (["server/share/status.html"], ALL),

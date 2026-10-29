@@ -889,7 +889,9 @@ size_t auto_concurrent_prefix_budget(size_t per_checkpoint, int slots, size_t me
 PrefixCacheBudget resolve_prefix_cache_budget(const ServerConfig & config,
                                               const ModelBackend & backend);
 
-// Parse request sampler fields, applying model-card defaults where present.
+// Parse request sampler fields, applying model-card defaults where present
+// (a greedy card's defaults apply only to a request that sets a temperature
+// above 0).
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
 

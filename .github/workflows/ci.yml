@@ -489,7 +489,7 @@ jobs:
     # asked to count to 30 with its drafter's drafts accepted (.github/ci/serve_smoke.sh).
     # Qwen 3.8 27B runs on the R9700 with the DFlash2 drafter, eight at once. DeepSeek
     # V4.1 Flash is 383 GB, so it runs only across both GPUs and the SSD (the
-    # ds41-lucebox profile), with the DSpark drafter; it replaces the V4 the per-device
+    # ds41-halo profile), with the DSpark drafter; it replaces the V4 the per-device
     # job loaded for ds4_load_transactional, a qtype-105 load V4.1 files (qtype 107)
     # cannot run. After gpu-tests-amd on the same runner, so a kernel failure stops it
     # before the model loads. Each model's step runs when plan-lucebox3 says the
@@ -522,21 +522,24 @@ jobs:
           cmake --build "$RUNNER_TEMP/serve-build" --target luce_server --parallel 8
 
       - name: Serve Qwen 3.8 27B with DFlash2, eight at once
-        # Lucebox Manage's launch (run-qwen38-server.sh) at its 204,800-token context.
+        # The model card's default profile on the R9700 (qwen38-r9700, a
+        # 204,800-token context) with Lucebox Manage's batching on top.
         if: needs.plan-lucebox3.outputs.qwen38 != 'false'
+        env:
+          SERVE_SMOKE_PROFILE: qwen38-r9700
         run: |
           .github/ci/serve_smoke.sh qwen3.8-27b 8 "$RUNNER_TEMP/serve-build/luce_server" \
-            "$LUCE_TEST_MODEL_QWEN38" --target-device hip:0 \
-            --draft "$LUCE_TEST_MODEL_QWEN38_DRAFT" --draft-device hip:0 --draft-block-size 16 \
-            --paged-attention --max-concurrency 8 --kv-pool-tokens 204800 --max-ctx 204800 \
-            --cache-type-k q8_0 --cache-type-v q8_0
+            "$LUCE_TEST_MODEL_QWEN38" --draft "$LUCE_TEST_MODEL_QWEN38_DRAFT" \
+            --paged-attention --max-concurrency 8 --kv-pool-tokens 204800
 
       - name: Serve DeepSeek V4.1 Flash with DSpark
+        # The model card's default profile on the Lucebox (ds41-halo).
         if: needs.plan-lucebox3.outputs.ds41 != 'false'
+        env:
+          SERVE_SMOKE_PROFILE: ds41-halo
         run: |
           .github/ci/serve_smoke.sh deepseek-v4.1-flash 1 "$RUNNER_TEMP/serve-build/luce_server" \
-            "$LUCE_TEST_MODEL_DEEPSEEK41" --profile ds41-lucebox \
-            --draft "$LUCE_TEST_MODEL_DEEPSEEK41_DRAFT"
+            "$LUCE_TEST_MODEL_DEEPSEEK41" --draft "$LUCE_TEST_MODEL_DEEPSEEK41_DRAFT"
 
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)

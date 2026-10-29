@@ -109,7 +109,7 @@ profile and the requirements checked at startup.
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
 | `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
 | `LUCE_TARGET_DEVICE` | unset (`auto` in the container) | Target device (`backend:gpu` or `auto`) used when neither `--target-device`, `--target-devices` nor a `--profile` names one. |
-| `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name, and extra `luce_server` flags split on whitespace. |
+| `LUCE_PROFILE` / `LUCE_ARGS` | unset | Container entrypoint only: `--profile` name (unset: for a single model, the first of its card's default profiles whose GPUs, in HIP order, start the visible ones with the memory it needs; `none`: no profile), and extra `luce_server` flags split on whitespace. |
 | `LUCE_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
 | `LUCE_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `LUCE_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
@@ -141,24 +141,24 @@ profile and the requirements checked at startup.
 - `LUCE_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (default on: paged full-attention layers run the WMMA kernel; =0 returns them to V_DOT2; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
 - `LUCE_DS4_LATE_CONTEXT_BEGIN` - deepseek4/deepseek4_backend.cpp (hybrid prefill position where chunks shrink to 1K; default 32768)
 - `LUCE_DS4_LONG_CONTEXT_CHUNK` - deepseek4/deepseek4_backend.cpp (hybrid prefill chunk cap for prompts ending above 4K; default 2048 on R9700 + Strix Halo, 1024 elsewhere)
-- `LUCE_DS41_DECODER_BOUNDED_REPLAY` - deepseek4/deepseek4_backend.cpp (=1: the V4.1 decoder SWA bounded replay: prompt rows before the last n_swa run only the layers up to the last KV source; approximate by design, the model is trained for it; set by `--profile ds41-gorgon`)
+- `LUCE_DS41_DECODER_BOUNDED_REPLAY` - deepseek4/deepseek4_backend.cpp (=1: the V4.1 decoder SWA bounded replay: prompt rows before the last n_swa run only the layers up to the last KV source; approximate by design, the model is trained for it; set by `--profile ds41-r9700-gorgon`)
 - `LUCE_DS4_DRAFT_SWAP` - deepseek4/deepseek4_backend.cpp (=1: a prefill longer than 10K tokens moves the DSpark weights to pinned host memory and uses the larger chunk; opt-in, no profile sets it. A later request that restores a snapshot of such a prompt and prefills less than 10K tokens runs smaller chunks, so its answer can differ from the full prefill's; with the per-chunk pipeline bands it no longer speeds up prefill on an R9700 + Ryzen AI Max+ PRO 495)
-- `LUCE_DS4_HYBRID_F16_VERIFY_KV` - deepseek4/deepseek4_backend.cpp (=1: two-GPU serving keeps verify K/V in F16, like `--ds4-fused-verify-f16-kv` on one GPU; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_ENGRAM_DEVICE` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill applies Engram on the device residual; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_EXPLICIT_SPLIT` - deepseek4/deepseek4_graph.cpp, deepseek4_fused_verify.inc (=1: V4.1 explicit verify lanes run the split-KV flash schedule on the F16 cache; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_MASK_F16_ONCE` - deepseek4/deepseek4_fused_verify.inc (=1: one F16 copy of the verify mask per step; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_F16_KV_LANES` - deepseek4/deepseek4_graph.cpp (=1: single-token verify lanes keep F16 K/V too; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_FUSE_ROUTER` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact router select and weights ops for decode and verify; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_FUSE_COLLAPSE` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact HC collapse op; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_DEVICE_TOPK` - deepseek4/deepseek4_graph.cpp (=1: hybrid prefill takes each token's top route candidates from the device; the host orders them exactly as before; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_PREFILL_ARENA_CHUNK_MB` - deepseek4/deepseek4_graph.cpp (chunk size of the shared prefill arena; 0 = one chunk that only grows; set to 0 by `--profile ds41-gorgon`)
-- `LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill keeps the residual on the primary GPU; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_PREFILL_PIPELINE` - deepseek4/deepseek4_graph.cpp (N > 0: layer-major prefill runs each chunk as max(N, 2) parts and overlaps one part's cold-owner FFN with the next part's attention; set to 2 by `--profile ds41-gorgon`)
-- `LUCE_DS4_SPLIT_DEVICE_JOIN` - moe_hybrid_ffn_eval.cpp (=1: both owners' prefill partials join on the device; set by `--profile ds41-gorgon`)
-- `LUCE_DS4_GROUPED_HYBRID_PREFILL` - moe_hybrid_ffn_eval.cpp (1 = cold owner's ROCmFP2-down stacks, 2 = both owners', through the grouped MUL_MAT_ID prefill; set to 1 by `--profile ds41-gorgon`)
-- `LUCE_MOE_SIDE_COPY` - moe_hybrid_ffn_eval.cpp (=1: another device's owner input crosses on the producer's side stream, so the producer keeps computing; set by `--profile ds41-gorgon`)
-- `LUCE_ROCMFP2_WMMA_PREFILL` - mix-wmma-moe.cu (ggml-cuda) (=1: plain ROCmFP2 prefill batches on gfx1151 take the WMMA routed-expert GEMM; set by `--profile ds41-gorgon`)
-- `GGML_CUDA_MLA_SPLIT_KV_COUNT` - fattn.cu (ggml-cuda) (4, 8 or 16 split-KV segments for the D=512 indexed decode kernel; default 4; set to 8 by `--profile ds41-gorgon`)
+- `LUCE_DS4_HYBRID_F16_VERIFY_KV` - deepseek4/deepseek4_backend.cpp (=1: two-GPU serving keeps verify K/V in F16, like `--ds4-fused-verify-f16-kv` on one GPU; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_ENGRAM_DEVICE` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill applies Engram on the device residual; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_EXPLICIT_SPLIT` - deepseek4/deepseek4_graph.cpp, deepseek4_fused_verify.inc (=1: V4.1 explicit verify lanes run the split-KV flash schedule on the F16 cache; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_MASK_F16_ONCE` - deepseek4/deepseek4_fused_verify.inc (=1: one F16 copy of the verify mask per step; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_F16_KV_LANES` - deepseek4/deepseek4_graph.cpp (=1: single-token verify lanes keep F16 K/V too; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_FUSE_ROUTER` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact router select and weights ops for decode and verify; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
+- `LUCE_DS4_FUSE_COLLAPSE` - deepseek4/deepseek4_graph.cpp (=1: fused, bit-exact HC collapse op; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
+- `LUCE_DS4_DEVICE_TOPK` - deepseek4/deepseek4_graph.cpp (=1: hybrid prefill takes each token's top route candidates from the device; the host orders them exactly as before; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_PREFILL_ARENA_CHUNK_MB` - deepseek4/deepseek4_graph.cpp (chunk size of the shared prefill arena; 0 = one chunk that only grows; set to 0 by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_LAYER_MAJOR_DEVICE_RESIDUAL` - deepseek4/deepseek4_graph.cpp (=1: layer-major prefill keeps the residual on the primary GPU; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_PREFILL_PIPELINE` - deepseek4/deepseek4_graph.cpp (N > 0: layer-major prefill runs each chunk as max(N, 2) parts and overlaps one part's cold-owner FFN with the next part's attention; set to 2 by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_SPLIT_DEVICE_JOIN` - moe_hybrid_ffn_eval.cpp (=1: both owners' prefill partials join on the device; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_DS4_GROUPED_HYBRID_PREFILL` - moe_hybrid_ffn_eval.cpp (1 = cold owner's ROCmFP2-down stacks, 2 = both owners', through the grouped MUL_MAT_ID prefill; set to 1 by `--profile ds41-r9700-gorgon`)
+- `LUCE_MOE_SIDE_COPY` - moe_hybrid_ffn_eval.cpp (=1: another device's owner input crosses on the producer's side stream, so the producer keeps computing; set by `--profile ds41-r9700-gorgon`)
+- `LUCE_ROCMFP2_WMMA_PREFILL` - mix-wmma-moe.cu (ggml-cuda) (=1: plain ROCmFP2 prefill batches on gfx1151 take the WMMA routed-expert GEMM; set by `--profile ds41-r9700-gorgon` and `ds41-gorgon`)
+- `GGML_CUDA_MLA_SPLIT_KV_COUNT` - fattn.cu (ggml-cuda) (4, 8 or 16 split-KV segments for the D=512 indexed decode kernel; default 4; set to 8 by `--profile ds41-r9700-gorgon`)
 - `LUCE_PREFILL_UBATCH` - qwen35/prefill_helpers.h
 - `LUCE_QWEN35_MASK_FULL_WIDTH` - qwen35/prefill_helpers.h
 - `LUCE_ADAPTIVE_K_DENSE` - mmid_adaptive_k.h
