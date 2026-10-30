@@ -57,6 +57,11 @@ static void test_requested() {
     CHECK(!requested(body, true));
     body["tool_checks"] = true;
     CHECK(requested(body, false));
+    body.erase("tool_checks");
+    body["extra_body"] = {{"tool_checks", true}};
+    CHECK(requested(body, false));
+    body.erase("extra_body");
+    CHECK(!requested(body, false));
 }
 
 static void test_agent_request() {

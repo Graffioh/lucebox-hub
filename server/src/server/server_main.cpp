@@ -254,8 +254,10 @@ static void print_usage(const char * prog) {
         "  --agent-turn-cache         When the next request renders a tool-call turn\n"
         "                       with other tokens, prefill it into the prefix\n"
         "                       cache while idle\n"
+        "  --tool-checks       Serve chat requests with tools with the tool-use\n"
+        "                       checks (rules, re-plan, final self-check; default: off)\n"
         "  --no-tool-checks    Serve chat requests with tools without the tool-use\n"
-        "                       checks (rules, re-plan, final self-check; default: on)\n"
+        "                       checks (the default)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
@@ -833,6 +835,8 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
             }
         } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
             sconfig.agent_turn_cache = true;
+        } else if (std::strcmp(argv[i], "--tool-checks") == 0) {
+            sconfig.tool_checks = true;
         } else if (std::strcmp(argv[i], "--no-tool-checks") == 0) {
             sconfig.tool_checks = false;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {

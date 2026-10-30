@@ -1,6 +1,7 @@
 // Tool-use checks: the model looks at its own agent turn before it goes out.
 //
-// For an OpenAI chat request that carries tools, the server
+// Off by default. For an OpenAI chat request that carries tools and asks for
+// them ("tool_checks": true, or --tool-checks on the server), the server
 //   1. adds short working rules to the system message and turns thinking on,
 //      unless the client chose a thinking setting itself;
 //   2. re-plans a turn that calls two or more different tools at once: the
@@ -57,8 +58,9 @@ private:
     std::unordered_set<std::string> ids_;
 };
 
-// The request gets checks: it has tools, the server has checks on, and the
-// client did not set "tool_checks": false (top level or extra_body).
+// The request gets checks: it has tools, and either the client set
+// "tool_checks": true (top level or extra_body) or the server has checks on
+// (--tool-checks) and the client did not set "tool_checks": false.
 bool requested(const json & body, bool server_default);
 
 bool tool_choice_is_none(const json & tool_choice);
