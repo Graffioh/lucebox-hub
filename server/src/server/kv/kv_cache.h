@@ -325,6 +325,11 @@ public:
     // Free the state-only backups whose deeper snapshot left RAM.
     void free_orphaned_state_backups();
 
+    // A released model (residency.cpp): copy each entry worth keeping that
+    // has no file yet to disk, most recently used first, until `stop` says
+    // something waits. The entries stay in RAM. Returns how many it queued.
+    size_t save_resident(const CancellationProbe & stop);
+
     // Graceful shutdown: write out every entry worth keeping, most recently
     // used first, while `limit_s` (counted from `started`) lasts; < 0: no
     // limit. Waits for the writer within the same limit.

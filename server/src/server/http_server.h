@@ -1233,6 +1233,11 @@ private:
     void service_residency_ops(bool releases_only = false);
     bool ensure_resident(std::string & error);        // serving thread
     bool residency_release(const std::vector<int> & gpus, std::string & error);  // serving thread
+    // After a release, while nothing waits: the sessions in RAM that have no
+    // disk file yet are copied to it (KvCache::save_resident), so a crash or
+    // a kill while another model runs loses none of them. Serving thread.
+    bool sessions_to_save_ = false;
+    void save_sessions_while_released();
     void refresh_residency(const char * last_event = nullptr, double seconds = 0.0,
                            const std::string & error = std::string());
     bool residency_blocks_admission_locked() const {  // queue_mu_ held

@@ -1185,6 +1185,21 @@ void KvCache::free_orphaned_state_backups() {
     for (size_t i = 0; i < slots.size(); ++i) free_payload(slots[i], tokens[i]);
 }
 
+size_t KvCache::save_resident(const CancellationProbe & stop) {
+    if (disk_.disabled() || (engine_ && !concurrent_disk_)) return 0;
+    size_t queued = 0;
+    for (const auto & entry : index_.entries_for_shutdown()) {
+        if (stop && stop()) break;
+        if (!worth_writing(entry)) continue;
+        const Checkpoint checkpoint = Checkpoint::of_cache_slot(entry.slot);
+        if (!checkpoints_.used(checkpoint) || disk_.contains(entry.disk_key)) continue;
+        if (!disk_.save(checkpoint, entry.disk_key, entry.aux)) continue;
+        ++queued;
+        disk_.prune_ancestors(entry.disk_key, disk_keep_max_tokens_);
+    }
+    return queued;
+}
+
 void KvCache::flush(const char * reason, double limit_s,
                     std::chrono::steady_clock::time_point started) {
     flush_pins(/*force=*/true);

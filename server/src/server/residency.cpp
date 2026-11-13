@@ -84,9 +84,22 @@ bool HttpServer::residency_release(const std::vector<int> & gpus, std::string & 
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     refresh_residency("release", s, ok ? std::string() : error);
     publish_memory_report();
+    // Written once the release is answered, so the peer's start waits for none of it.
+    if (ok && !disk_cache_.disabled()) sessions_to_save_ = true;
     std::fprintf(stderr, "[swap] release %s in %.2f s%s%s\n", ok ? "done" : "failed", s,
                  ok ? "" : ": ", ok ? "" : error.c_str());
     return ok;
+}
+
+void HttpServer::save_sessions_while_released() {
+    sessions_to_save_ = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t queued = kv_cache_.save_resident([this] {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        return queue_head_ != nullptr || residency_head_ != nullptr || stopping_.load();
+    });
+    std::fprintf(stderr, "[disk-cache] released: %zu sessions queued for the disk in %.2f s\n", queued,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 bool HttpServer::ensure_resident(std::string & error) {

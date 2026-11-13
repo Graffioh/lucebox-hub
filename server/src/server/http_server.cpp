@@ -7568,6 +7568,12 @@ ServerJob * HttpServer::dequeue() {
     while (true) {
         // Use timed wait so the worker periodically wakes to send SSE heartbeats.
         while (!queue_head_ && !residency_head_ && !stopping_.load()) {
+            if (sessions_to_save_ && residency_released_.load(std::memory_order_acquire)) {
+                lk.unlock();
+                save_sessions_while_released();
+                lk.lock();
+                continue;
+            }
             if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
                 // Send SSE heartbeat (comment line) to detect disconnected clients.
                 lk.unlock();
