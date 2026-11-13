@@ -103,6 +103,9 @@ public:
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
+    Residency residency() const override;
+    bool release_gpus(const std::vector<int> & gpus, std::string & error) override;
+    bool reinstate(std::string & error) override;
 
     GenerateResult generate_impl(const GenerateRequest & req,
                                  const DaemonIO & io) override;
@@ -272,6 +275,8 @@ private:
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
+    void release_target_state(bool keep_snapshots);
+    bool released_ = false;   // residency: every GPU released for another model
     void release_pflash_drafter();
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;

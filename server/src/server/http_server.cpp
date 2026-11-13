@@ -2357,6 +2357,7 @@ void HttpServer::shutdown() {
 }
 
 bool HttpServer::start_worker() {
+    refresh_residency();
     // LuceEngine owns the serving thread: a backend-provided sequence engine
     // replaces the one-request worker with the concurrent scheduler.
     // Upstream forwarding stays on the classic path even when the local
@@ -2599,6 +2600,14 @@ void HttpServer::handle_client(SocketHandle fd) {
     // Health check.
     if (hr.method == "GET" && (hr.path == "/health" || hr.path == "/")) {
         send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
+        socket_close(fd);
+        return;
+    }
+
+    // Model switching: what the model holds on its GPUs, and releasing or
+    // reinstating them (residency.cpp, docs/specs/model-swap.md).
+    if (hr.path == "/v1/residency" && (hr.method == "GET" || hr.method == "POST")) {
+        handle_residency_request(fd, hr.method, hr.body);
         socket_close(fd);
         return;
     }
@@ -7547,31 +7556,74 @@ void HttpServer::enqueue(ServerJob * job) {
 
 bool HttpServer::has_pending_jobs() {
     std::lock_guard<std::mutex> lock(queue_mu_);
-    return queue_head_ != nullptr;
+    return queue_head_ != nullptr || residency_head_ != nullptr;
 }
 
+// The only dequeue that runs residency operations (residency.cpp) and brings a
+// released model back: the serving loops call it once nothing runs. The
+// polling dequeues below admit nothing while an operation is queued or the
+// model is released, so running requests finish first.
 ServerJob * HttpServer::dequeue() {
     std::unique_lock<std::mutex> lk(queue_mu_);
-    // Use timed wait so the worker periodically wakes to send SSE heartbeats.
-    while (!queue_head_ && !stopping_.load()) {
-        if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
-            // Send SSE heartbeat (comment line) to detect disconnected clients.
-            lk.unlock();
-            sse_heartbeat();
-            lk.lock();
+    while (true) {
+        // Use timed wait so the worker periodically wakes to send SSE heartbeats.
+        while (!queue_head_ && !residency_head_ && !stopping_.load()) {
+            if (queue_cv_.wait_for(lk, std::chrono::seconds(30)) == std::cv_status::timeout) {
+                // Send SSE heartbeat (comment line) to detect disconnected clients.
+                lk.unlock();
+                sse_heartbeat();
+                lk.lock();
+            }
         }
+        if (stopping_.load()) {
+            residency_cv_.notify_all();   // queued operations give up
+            if (!queue_head_) return nullptr;
+            if (residency_released_.load(std::memory_order_acquire)) {
+                // Nothing to run it on: answer it instead of loading the model to stop.
+                ServerJob * failed = queue_head_;
+                queue_head_ = failed->next;
+                if (!queue_head_) queue_tail_ = nullptr;
+                failed->next = nullptr;
+                lk.unlock();
+                fail_unstarted_job(failed, "server stopping");
+                lk.lock();
+                continue;
+            }
+        } else if (residency_head_) {
+            lk.unlock();
+            service_residency_ops();
+            lk.lock();
+            continue;
+        }
+        if (!queue_head_) return nullptr;
+        if (residency_released_.load(std::memory_order_acquire) && !stopping_.load()) {
+            lk.unlock();
+            std::string error;
+            if (!ensure_resident(error)) {
+                lk.lock();
+                ServerJob * failed = queue_head_;
+                if (failed) {
+                    queue_head_ = failed->next;
+                    if (!queue_head_) queue_tail_ = nullptr;
+                    failed->next = nullptr;
+                }
+                lk.unlock();
+                if (failed) fail_unstarted_job(failed, "the model could not be loaded: " + error);
+            }
+            lk.lock();
+            continue;
+        }
+        ServerJob * j = queue_head_;
+        queue_head_ = j->next;
+        if (!queue_head_) queue_tail_ = nullptr;
+        j->next = nullptr;
+        return j;
     }
-    if (!queue_head_) return nullptr;
-    ServerJob * j = queue_head_;
-    queue_head_ = j->next;
-    if (!queue_head_) queue_tail_ = nullptr;
-    j->next = nullptr;
-    return j;
 }
 
 ServerJob * HttpServer::try_dequeue() {
     std::lock_guard<std::mutex> lk(queue_mu_);
-    if (!queue_head_) return nullptr;
+    if (!queue_head_ || residency_blocks_admission_locked()) return nullptr;
     ServerJob * job = queue_head_;
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
@@ -7595,13 +7647,13 @@ int HttpServer::queued_shared_prefix(const std::vector<int32_t> & prompt) {
 ServerJob * HttpServer::dequeue_for(
         std::chrono::steady_clock::duration timeout) {
     std::unique_lock<std::mutex> lk(queue_mu_);
-    if (!queue_head_ && !stopping_.load() &&
+    if (!queue_head_ && !residency_head_ && !stopping_.load() &&
         timeout > std::chrono::steady_clock::duration::zero()) {
         queue_cv_.wait_for(lk, timeout, [&] {
-            return queue_head_ != nullptr || stopping_.load();
+            return queue_head_ != nullptr || residency_head_ != nullptr || stopping_.load();
         });
     }
-    if (!queue_head_) return nullptr;
+    if (!queue_head_ || residency_blocks_admission_locked()) return nullptr;
     ServerJob * job = queue_head_;
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
