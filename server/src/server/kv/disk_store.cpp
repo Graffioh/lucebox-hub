@@ -754,6 +754,10 @@ void DiskStore::merge_locked(const std::vector<ScannedFile> & files) {
             continue;
         }
         DiskEntry entry;
+        std::memcpy(entry.salt.data(), file.hdr.identity_salt, 16);
+        // Only another server's files are new to the index: one of this
+        // process's that it lacks was deleted after the scan.
+        if (local_locked(entry)) continue;
         entry.id          = next_entry_id_++;
         entry.path        = file.path;
         std::memcpy(entry.token_hash.data(), file.hdr.token_hash, 16);
@@ -763,7 +767,6 @@ void DiskStore::merge_locked(const std::vector<ScannedFile> & files) {
         entry.last_used   = file.hdr.last_used & ~DISK_CACHE_PINNED_BIT;
         entry.pinned      = (file.hdr.last_used & DISK_CACHE_PINNED_BIT) != 0;
         entry.file_size   = file.size;
-        std::memcpy(entry.salt.data(), file.hdr.identity_salt, 16);
         total_bytes_ += entry.file_size;
         entries_.push_back(std::move(entry));
         ++added;
