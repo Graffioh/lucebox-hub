@@ -165,8 +165,11 @@ public:
     Stats stats() const;
 
     // Learn the layout fingerprint from a live snapshot (call once after
-    // first snapshot_save, before any disk operations).
+    // first snapshot_save, before any disk operations). A store that packs
+    // its payloads itself (CheckpointStore::exports) gives no SnapshotRef:
+    // its layout is learned from the first snapshot saved.
     void learn_layout(Checkpoint checkpoint);
+
 
     // Set a config/model identity salt prepended to the layout hash buffer
     // so that layout_id encodes model identity in addition to tensor structure.

@@ -278,7 +278,7 @@ void DiskPrefixCache::learn_layout(Checkpoint checkpoint) {
     // A memory-only backend is detected even before init().
     auto ref = store_.ref(checkpoint);
     if (!ref.ctx) {
-        if (store_.used(checkpoint)) {
+        if (store_.used(checkpoint) && !store_.exports()) {
             backend_snapshot_unsupported_ = true;
             std::fprintf(stderr,
                          "[disk-cache] disabled: backend snapshots are "
@@ -632,18 +632,22 @@ bool DiskPrefixCache::save(Checkpoint checkpoint, const std::vector<int32_t> & p
     learn_layout(checkpoint);
     if (off()) return false;
     if ((int)prompt_ids.size() < config_.min_tokens) return false;
-    const auto ref = store_.ref(checkpoint);
-    if (!ref.ctx) return false;
-    // Pooled snapshots keep KV in a pager blob that is not a ggml tensor in
-    // ref.ctx; a file written from ref.ctx would restore with no KV.
-    if (ref.pooled) {
-        std::fprintf(stderr, "[disk-cache] skip save: pooled (KVFlash) snapshot not persistable\n");
-        return false;
+    if (!store_.exports()) {
+        const auto ref = store_.ref(checkpoint);
+        if (!ref.ctx) return false;
+        // Pooled snapshots keep KV in a pager blob that is not a ggml tensor in
+        // ref.ctx; a file written from ref.ctx would restore with no KV.
+        if (ref.pooled) {
+            std::fprintf(stderr, "[disk-cache] skip save: pooled (KVFlash) snapshot not persistable\n");
+            return false;
+        }
     }
-    if (ref.cur_pos > (int)prompt_ids.size()) {
+    const int position = store_.position(checkpoint);
+    if (position <= 0) return false;
+    if (position > (int)prompt_ids.size()) {
         std::fprintf(stderr,
                      "[disk-cache] skip save: snapshot pos=%d exceeds key of "
-                     "%zu tokens\n", ref.cur_pos, prompt_ids.size());
+                     "%zu tokens\n", position, prompt_ids.size());
         return false;
     }
     {
@@ -656,8 +660,7 @@ bool DiskPrefixCache::save(Checkpoint checkpoint, const std::vector<int32_t> & p
             return true;
         }
     }
-    return save_async(OwnedSnapshot::clone_to_host(ref.ctx, ref.cur_pos, ref.last_tok),
-                      prompt_ids, aux);
+    return save_async(store_.copy(checkpoint), prompt_ids, aux);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
