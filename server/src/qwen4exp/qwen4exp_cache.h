@@ -330,14 +330,16 @@ bool drop_qwen4exp_snapshot_rows(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
 void free_qwen4exp_snapshot(Qwen4ExpSnapshot & s);
 
 // The disk session cache's form of a whole snapshot (an OwnedSnapshot in system memory): its buffer as one I8 tensor
-// named "qwen4exp.<signature of c's strip layout>", so the disk layout fingerprint separates cache layouts, and an I32
-// tensor "qwen4exp.meta" with the host fields, each strip's place in that buffer, the tokens and the logits (lengths in
-// dimension 1); `s` keeps its own. Empty for an empty or state-only snapshot. `c`: the cache `s` was saved from, or one
-// with its layout.
-OwnedSnapshot export_qwen4exp_snapshot(const Qwen4ExpCache & c, const Qwen4ExpSnapshot & s);
+// named after the cache's strip layout (qwen4exp_disk_layout), so the disk layout fingerprint separates cache layouts,
+// and an I32 tensor "qwen4exp.meta" with the host fields, each strip's place in that buffer, the tokens and the logits
+// (lengths in dimension 1). `layout`: the name of the cache `s` was saved from, taken while that cache was allocated
+// (a released model keeps its snapshots, not its caches). `s` keeps its own. Empty for an empty or state-only
+// snapshot, or without a layout.
+std::string qwen4exp_disk_layout(const Qwen4ExpCache & c);
+OwnedSnapshot export_qwen4exp_snapshot(const std::string & layout, const Qwen4ExpSnapshot & s);
 // The same, handing s's buffer over without a copy when it is system memory; `s` is left empty either way (freed
 // after a copy, and when it has no disk form).
-OwnedSnapshot take_qwen4exp_snapshot(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s);
+OwnedSnapshot take_qwen4exp_snapshot(const std::string & layout, Qwen4ExpSnapshot & s);
 // The snapshot in `in`, written by export_qwen4exp_snapshot for a cache with c's layout: checked strip by strip (type
 // and bytes) against `c`, then kept on `store`, in `in`'s buffer itself when `store` is system memory (`in` is left
 // empty then). False, with `in` and `out` untouched, when it does not fit.

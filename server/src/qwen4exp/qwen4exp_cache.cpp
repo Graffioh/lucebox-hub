@@ -642,8 +642,11 @@ uint64_t get64(const int32_t * m) {
     return (uint64_t) (uint32_t) m[0] | ((uint64_t) (uint32_t) m[1] << 32);
 }
 
+} // namespace
+
 // Every strip a snapshot of `c` can hold, as types and row widths: the same for every position of one layout.
-std::string qwen4exp_disk_name(const Qwen4ExpCache & c) {
+std::string qwen4exp_disk_layout(const Qwen4ExpCache & c) {
+    if (!c.buf) return {};
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](uint64_t v) {
         for (int i = 0; i < 8; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 1099511628211ull; }
@@ -658,12 +661,11 @@ std::string qwen4exp_disk_name(const Qwen4ExpCache & c) {
     std::snprintf(name, sizeof name, "qwen4exp.%016llx", (unsigned long long) h);
     return name;
 }
-} // namespace
 
 // `take`: export_qwen4exp_snapshot's snapshot, handed over (take_qwen4exp_snapshot).
-static OwnedSnapshot qwen4exp_disk_form(const Qwen4ExpCache & c, const Qwen4ExpSnapshot & s,
+static OwnedSnapshot qwen4exp_disk_form(const std::string & layout, const Qwen4ExpSnapshot & s,
                                         Qwen4ExpSnapshot * take) {
-    if (!s.ctx || !s.buf || s.state_only || s.cur_pos <= 0) return {};
+    if (layout.empty() || !s.ctx || !s.buf || s.state_only || s.cur_pos <= 0) return {};
     const size_t size = ggml_backend_buffer_get_size(s.buf);
     auto * base = (uint8_t *) ggml_backend_buffer_get_base(s.buf);
     std::vector<int32_t> meta = {kQwen4ExpDiskVersion, s.cur_pos, s.indexer_blocks, s.mtp ? 1 : 0, s.mtp_prev_pos};
@@ -688,7 +690,7 @@ static OwnedSnapshot qwen4exp_disk_form(const Qwen4ExpCache & c, const Qwen4ExpS
     ggml_context * ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
     if (!ctx) return {};
     ggml_tensor * blob = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, 1, (int64_t) size);
-    ggml_set_name(blob, qwen4exp_disk_name(c).c_str());
+    ggml_set_name(blob, layout.c_str());
     ggml_tensor * info = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, (int64_t) meta.size());
     ggml_set_name(info, kQwen4ExpDiskMeta);
     const int32_t last_tok = s.tokens.empty() ? -1 : s.tokens.back();
@@ -723,19 +725,19 @@ static OwnedSnapshot qwen4exp_disk_form(const Qwen4ExpCache & c, const Qwen4ExpS
     return OwnedSnapshot(ctx, buf, pos, last_tok);
 }
 
-OwnedSnapshot export_qwen4exp_snapshot(const Qwen4ExpCache & c, const Qwen4ExpSnapshot & s) {
-    return qwen4exp_disk_form(c, s, nullptr);
+OwnedSnapshot export_qwen4exp_snapshot(const std::string & layout, const Qwen4ExpSnapshot & s) {
+    return qwen4exp_disk_form(layout, s, nullptr);
 }
 
-OwnedSnapshot take_qwen4exp_snapshot(const Qwen4ExpCache & c, Qwen4ExpSnapshot & s) {
-    OwnedSnapshot out = qwen4exp_disk_form(c, s, &s);
+OwnedSnapshot take_qwen4exp_snapshot(const std::string & layout, Qwen4ExpSnapshot & s) {
+    OwnedSnapshot out = qwen4exp_disk_form(layout, s, &s);
     free_qwen4exp_snapshot(s);   // no disk form, or a failed copy
     return out;
 }
 
 bool import_qwen4exp_snapshot(ggml_backend_t store, const Qwen4ExpCache & c, OwnedSnapshot & in, Qwen4ExpSnapshot & out) {
     if (in.empty() || !c.buf) return false;
-    const std::string name = qwen4exp_disk_name(c);
+    const std::string name = qwen4exp_disk_layout(c);
     ggml_tensor * blob = nullptr, * info = nullptr;
     for (ggml_tensor * t = ggml_get_first_tensor(in.ctx()); t; t = ggml_get_next_tensor(in.ctx(), t)) {
         if (name == t->name) blob = t;

@@ -353,7 +353,9 @@ static void disk_form(ggml_backend_t backend, ggml_backend_t store) {
     };
     const bool system_store = ggml_backend_get_default_buffer_type(store) == ggml_backend_cpu_buffer_type();
     // A copy: one buffer, the snapshot keeps its own.
-    OwnedSnapshot copy = export_qwen4exp_snapshot(c, s);
+    const std::string layout = qwen4exp_disk_layout(c);
+    CHECK(layout.rfind("qwen4exp.", 0) == 0 && layout != qwen4exp_disk_layout(other));
+    OwnedSnapshot copy = export_qwen4exp_snapshot(layout, s);
     CHECK(!copy.empty() && copy.single_buffer() && copy.cur_pos() == pos && copy.last_tok() == 100 + pos - 1);
     CHECK(s.buf);
     int n_tensors = 0;
@@ -371,7 +373,7 @@ static void disk_form(ggml_backend_t backend, ggml_backend_t store) {
     (void)copy_buf;
     // A hand-over: the snapshot is left empty; in system memory its buffer is the payload itself.
     ggml_backend_buffer_t snapshot_buf = s.buf;
-    OwnedSnapshot taken = take_qwen4exp_snapshot(c, s);
+    OwnedSnapshot taken = take_qwen4exp_snapshot(layout, s);
     CHECK(!taken.empty() && !s.buf && !s.ctx && s.strips.empty());
     CHECK((taken.buf() == snapshot_buf) == (ggml_backend_buffer_get_type(snapshot_buf) == ggml_backend_cpu_buffer_type()));
     // What the disk reader hands back: the same tensors in one fresh system-memory buffer.
@@ -381,8 +383,8 @@ static void disk_form(ggml_backend_t backend, ggml_backend_t store) {
     // A state-only snapshot has no disk form.
     CHECK(save_qwen4exp_snapshot(backend, store, c, s));
     CHECK(drop_qwen4exp_snapshot_rows(c, s) && s.state_only);
-    CHECK(export_qwen4exp_snapshot(c, s).empty());
-    CHECK(take_qwen4exp_snapshot(c, s).empty() && !s.buf);
+    CHECK(export_qwen4exp_snapshot(layout, s).empty());
+    CHECK(take_qwen4exp_snapshot(layout, s).empty() && !s.buf);
     free_qwen4exp_cache(other);
     free_qwen4exp_cache(c);
     std::printf("PASS prefix snapshot disk form: copy, hand-over, read back, other layout, state-only (%s memory)\n",
