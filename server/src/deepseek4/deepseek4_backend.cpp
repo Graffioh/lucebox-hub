@@ -4151,6 +4151,108 @@ void DeepSeek4Backend::print_ready_banner() const {
     std::fflush(stdout);
 }
 
+static bool luce_gpu_overlap_empty(const std::vector<int> & a, const std::vector<int> & b) {
+    for (int g : a) {
+        if (std::find(b.begin(), b.end(), g) != b.end()) return false;
+    }
+    return true;
+}
+
+// Frees the target model's device state: cache, weights, expert tiers and
+// their backends. Prefix snapshots live in system memory; a park drops them,
+// a release for model switching keeps them (the cache geometry they need is
+// configured, not derived from the expert placement a reload recomputes).
+void DeepSeek4Backend::release_target_state(bool keep_snapshots) {
+    maybe_save_routing_stats();
+    if (!keep_snapshots) {
+        for (int i = 0; i < PREFIX_SLOTS; ++i) {
+            snapshot_free(i);
+        }
+    }
+    last_logits_.clear();
+    last_logits_pos_ = -1;
+    free_deepseek4_cache(cache_);
+    expert_runtime_.reset();
+    expert_cache_.destroy();
+    stream_engine_.destroy();
+    moe_hybrid_.reset();
+    if (expert_backend_) {
+        ggml_backend_free(expert_backend_);
+        expert_backend_ = nullptr;
+    }
+    moe_placement_ = {};
+    moe_decode_placement_ = {};
+    release_vision();
+    free_deepseek4_weights(w_);
+    parked_ = true;
+}
+
+// ── Residency (model switching) ─────────────────────────────────────────
+// One request at a time (no paged serving): every GPU is released and the
+// model comes back through unpark(). The prefix snapshots stay.
+
+ModelBackend::Residency DeepSeek4Backend::residency() const {
+    Residency r;
+    auto add = [&r](int gpu) {
+        if (gpu >= 0 && std::find(r.gpus.begin(), r.gpus.end(), gpu) == r.gpus.end()) r.gpus.push_back(gpu);
+    };
+    add(cfg_.device.gpu);
+    add(stream_cache_device_);
+    if (expert_backend_) add(ggml_backend_cuda_get_device_id(expert_backend_));
+    if (cfg_.paged_attention) {
+        r.reason = "deepseek4: paged serving is not supported";
+    } else if (!backend_) {
+        r.reason = "deepseek4: not loaded";
+    } else {
+        r.supported = true;
+    }
+    if (released_) r.released = r.gpus;
+    r.bytes.assign(r.gpus.size(), 0);
+    if (!released_) {
+        const MemoryReport m = memory_report();
+        if (!m.cache.host) {
+            r.bytes[0] = m.cache.kv_bytes + m.cache.recurrent_bytes + m.cache.other_bytes;
+        }
+    }
+    return r;
+}
+
+bool DeepSeek4Backend::release_gpus(const std::vector<int> & gpus, std::string & error) {
+    const Residency r = residency();
+    if (!r.supported) {
+        error = r.reason;
+        return false;
+    }
+    if (released_) return true;
+    if (!gpus.empty() && luce_gpu_overlap_empty(gpus, r.gpus)) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (backend_) ggml_backend_synchronize(backend_);
+    if (spec_drafter_) release_spec_drafter(/*mark_parked=*/true);
+    if (pflash_drafter_loaded_) release_pflash_drafter();
+    if (!parked_) release_target_state(/*keep_snapshots=*/true);
+    ggml_backend_cuda_trim_pool(backend_);
+    released_ = true;
+    std::printf("[residency] deepseek4 released its GPUs in %.2f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    return true;
+}
+
+bool DeepSeek4Backend::reinstate(std::string & error) {
+    if (!released_) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!unpark(ParkTarget::All)) {
+        error = "deepseek4: reload failed";
+        if (!parked_) release_target_state(/*keep_snapshots=*/true);
+        return false;
+    }
+    released_ = false;
+    std::printf("[residency] deepseek4 reinstated in %.2f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fflush(stdout);
+    return true;
+}
+
 bool DeepSeek4Backend::park(ParkTarget target) {
     const bool want_draft = park_target_includes_draft_model(target);
     const bool want_target_model = park_target_includes_target_model(target);
@@ -4173,26 +4275,7 @@ bool DeepSeek4Backend::park(ParkTarget target) {
         return false;
     }
 
-    maybe_save_routing_stats();
-    for (int i = 0; i < PREFIX_SLOTS; ++i) {
-        snapshot_free(i);
-    }
-    last_logits_.clear();
-    last_logits_pos_ = -1;
-    free_deepseek4_cache(cache_);
-    expert_runtime_.reset();
-    expert_cache_.destroy();
-    stream_engine_.destroy();
-    moe_hybrid_.reset();
-    if (expert_backend_) {
-        ggml_backend_free(expert_backend_);
-        expert_backend_ = nullptr;
-    }
-    moe_placement_ = {};
-    moe_decode_placement_ = {};
-    release_vision();
-    free_deepseek4_weights(w_);
-    parked_ = true;
+    release_target_state(/*keep_snapshots=*/false);
     if (spec_drafter_) {
         std::printf("[deepseek4] target parked (target VRAM released; "
                     "DSpark drafter retained)\n");

@@ -978,11 +978,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // time, once the server has been idle for a moment. A
                     // request arriving during a warm waits for its current
                     // engine step (KvCache::warm_next_on_engine).
-                    if (kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
+                    // A released model has no caches to warm (residency.cpp).
+                    const bool can_warm = !residency_released_.load(std::memory_order_acquire);
+                    if (can_warm && kv_cache_.warm_pending() && config_.shared_prefix_warm_grace_ms > 0) {
                         job = dequeue_for(
                             std::chrono::milliseconds(config_.shared_prefix_warm_grace_ms));
                     }
-                    while (!job && !stopping_.load() && kv_cache_.warm_pending() &&
+                    while (can_warm && !job && !stopping_.load() && kv_cache_.warm_pending() &&
                            !has_pending_jobs() &&
                            kv_cache_.warm_next_on_engine([this] {
                                return has_pending_jobs() || stopping_.load();
