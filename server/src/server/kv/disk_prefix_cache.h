@@ -193,6 +193,7 @@ private:
     // The directory's files, shared with the other models of the process
     // (null before init and when the disk cache is off).
     std::shared_ptr<DiskStore> disk_;
+    bool holds_identity_ = false;  // DiskStore::hold_identity
     // Some backends support in-memory snapshots but deliberately do not
     // implement SnapshotRef/adoption. Detect that once from a live slot and
     // stop scheduling disk work for the rest of the process.
