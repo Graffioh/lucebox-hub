@@ -138,6 +138,8 @@ private:
     std::array<Qwen4ExpSnapshot, kMaxSlots> snapshots_;
     // The concurrency engine's checkpoints are snapshots_; the ones its captures replaced wait here for the scheduler.
     std::array<Qwen4ExpSnapshot, kMaxSlots> displaced_;
+    // The snapshots' disk layout (qwen4exp_disk_layout), taken when the cache is made: they outlive a released cache.
+    std::string disk_layout_;
     int live_slot_ = -1;
     std::vector<int32_t> tokens_;
     std::vector<float> logits_;

@@ -620,9 +620,12 @@ bool Qwen4ExpBackend::create_main_cache() {
     // The slot states do not depend on the context, so a context fit's rebuilt cache keeps them.
     if (cfg_.max_concurrency > 1 && !slot_states_.buf &&
         !create_qwen4exp_slot_states(backend_, weights_, cfg_.max_concurrency, slot_states_)) return false;
-    return create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
-        cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
-        slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx));
+    if (!create_qwen4exp_cache(backend_, weights_, cfg_.device.max_ctx, cache_, /*mtp=*/true,
+            cfg_.verify_width == 0 ? QWEN4EXP_MTP_MAX_DRAFT : std::max(1, cfg_.verify_width - 1),
+            slot_states_.ctx ? &slot_states_ : nullptr, 0, remote_layers_, kvflash_pool_for(cfg_.device.max_ctx)))
+        return false;
+    disk_layout_ = qwen4exp_disk_layout(cache_);
+    return true;
 }
 
 // --kvflash: each slot's pool, sized with the weights resident and no cache yet ("auto" takes a share of the free
@@ -1096,18 +1099,18 @@ void Qwen4ExpBackend::snapshot_free(int slot) {
 OwnedSnapshot Qwen4ExpBackend::snapshot_copy(int slot) const {
     // The live state of a deferred save is copied out by snapshot_flush_deferred first.
     if (slot < 0 || slot >= kMaxSlots || slot == live_slot_) return {};
-    return export_qwen4exp_snapshot(cache_, snapshots_[slot]);
+    return export_qwen4exp_snapshot(disk_layout_, snapshots_[slot]);
 }
 
 OwnedSnapshot Qwen4ExpBackend::snapshot_detach(int slot) {
     if (slot < 0 || slot >= kMaxSlots) return {};
     if (slot == live_slot_) snapshot_flush_deferred();
-    return take_qwen4exp_snapshot(cache_, snapshots_[slot]);
+    return take_qwen4exp_snapshot(disk_layout_, snapshots_[slot]);
 }
 
 OwnedSnapshot Qwen4ExpBackend::snapshot_take_displaced(int slot) {
     if (slot < 0 || slot >= kMaxSlots) return {};
-    return take_qwen4exp_snapshot(cache_, displaced_[slot]);
+    return take_qwen4exp_snapshot(disk_layout_, displaced_[slot]);
 }
 
 void Qwen4ExpBackend::snapshot_drop_displaced(int slot) {
